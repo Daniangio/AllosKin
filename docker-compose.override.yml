@@ -1,0 +1,43 @@
+# This file is for LOCAL DEVELOPMENT only.
+# It overrides settings in docker-compose.yml
+
+services:
+  backend:
+    # Override the command to enable --reload for uvicorn
+    command: uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000 --reload-dir /app/alloskin --reload-dir /app/backend
+    volumes:
+      # Volumes are already defined in the base file,
+      # but we re-state them here for clarity.
+      - ./alloskin:/app/alloskin
+      - ./backend:/app/backend
+      - ./config:/app/config
+      - ./data:/app/data
+
+  frontend:
+    # Use the dev-specific Dockerfile
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    volumes:
+      # Mount the source code
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+    environment:
+      # This is required for create-react-app
+      # to detect file changes inside Docker
+      - CHOKIDAR_USEPOLLING=true
+  
+  # Add an override for the 'worker' service for live-reloading
+  worker:
+    # This command uses 'watchmedo' (from the 'watchdog' package)
+    # to monitor the /app/alloskin directory for .py file changes
+    # and automatically restart the 'rq worker' command.
+    command: >
+      watchmedo auto-restart
+        --directory=/app/alloskin
+        --pattern="*.py"
+        --recursive
+        --
+        rq worker alloskin-jobs --url redis://redis:6379/0
+    # The volumes are inherited from docker-compose.yml,
+    # so the local files are already mounted.

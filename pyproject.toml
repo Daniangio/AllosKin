@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alloskin"
+version = "0.1.0"
+authors = [
+  { name="AllosKin Developer", email="dev@example.com" },
+]
+description = "A pipeline for causal analysis of allosteric signaling in GPCRs."
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+# Add core dependencies here
+dependencies = [
+    "numpy",
+    "MDAnalysis",
+    # "dadapy",
+    # "idtxl", # Or "pyJIDT" if you prefer
+    "pyyaml",
+    "redis", # Added for worker/backend
+    "rq"     # Added for worker/backend
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "mypy",
+    "ruff"
+]
+
+[project.scripts]
+# This creates the `alloskin` command
+alloskin = "alloskin.cli:main"
+
+## This explicitly tells setuptools to *only* look for packages starting with 'alloskin'
+[tool.setuptools.packages.find]
+include = ["alloskin*"]

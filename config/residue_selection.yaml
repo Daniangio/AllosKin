@@ -1,0 +1,17 @@
+# Configuration file for AllosKin analysis
+#
+# Define the residues of interest here.
+# The key (e.g., 'res_50_TM1') is a unique identifier.
+# The value (e.g., 'resid 50') is an MDAnalysis selection string.
+#
+# These selections will be used by the FeatureExtractor.
+
+residue_selections:
+  res_10: 'resid 10'
+  res_20: 'resid 20'
+  # res_50_TM1: 'resid 50'
+  # res_131_DRY: 'resid 131'
+  # res_132_DRY: 'resid 132'
+  # res_133_DRY: 'resid 133'
+  # res_320_NPxxY: 'resid 320'
+  # res_323_NPxxY: 'resid 323'

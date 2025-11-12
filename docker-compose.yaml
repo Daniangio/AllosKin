@@ -1,0 +1,53 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount code for live-reload during development
+      - ./alloskin:/app/alloskin
+      - ./backend:/app/backend
+      - ./config:/app/config
+      # Mount the shared data directory
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Note: We use the internal service name 'redis' and its default internal port '6379'
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile # Uses the same Python environment
+    # This is the PRODUCTION command
+    command: rq worker alloskin-jobs --url redis://redis:6379/0
+    volumes:
+      # The worker needs the exact same volumes as the backend
+      - ./alloskin:/app/alloskin
+      - ./backend:/app/backend
+      - ./config:/app/config
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      # Changing host port to 6380 to avoid conflicts with 6379
+      # The container port remains the standard Redis port 6379
+      - "6380:6379"
