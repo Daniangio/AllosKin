@@ -1,22 +1,10 @@
 """
-Implements QUBO analysis (Goal 2) using Random Forest Regression.
+Implements QUBO analysis (Goal 2) using Random Forest Regression
+and PyQUBO for solving.
 
-This module replaces the Information Imbalance metric with a predictive
-power metric based on scikit-learn's RandomForestRegressor.
-
-The QUBO formulation remains mRMR (Maximize Relevance, Minimize Redundancy):
-H(x) = sum_i h_i * x_i + sum_ij J_ij * x_i * x_j
-
-where:
-- x_i: Binary variable (1 if residue 'i' is in the set, 0 otherwise).
-- h_i (Relevance): -R^2(R_i -> S)
-  We use the R^2 score from a regressor predicting the target(s) S
-  using residue R_i. It's negative because QUBO minimizes, and we
-  want to maximize relevance.
-- J_ij (Redundancy): lambda * max(R^2(R_i -> R_j), R^2(R_j -> R_i))
-  We use the max of the reciprocal R^2 scores to penalize *any*
-  predictive relationship between R_i and R_j. It's positive
-  to penalize redundant pairs.
+This module is refactored to accept a `target_selection_string`
+(e.g., "resid 131 140") and the path to a real topology file
+to robustly parse selections and detect overlaps.
 """
 
 import numpy as np
@@ -30,9 +18,18 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import cross_val_score
 import pyqubo
 import neal
+# --- MODIFICATION: Need MDAnalysis to parse selection string ---
+import MDAnalysis as mda
+from MDAnalysis.core.selection import SelectionError
+from MDAnalysis.core.groups import AtomGroup
+# --- END MODIFICATION ---
 
 # --- Local Imports ---
-from alloskin.common.types import FeatureDict
+try:
+    from alloskin.common.types import FeatureDict
+except ImportError:
+    FeatureDict = Dict[str, np.ndarray]
+    
 from .components import AnalysisComponent
 
 
@@ -48,16 +45,6 @@ def _compute_rf_regression_r2(
     """
     Internal helper to compute the R^2 score for a single
     regression task: X -> y.
-    
-    Args:
-        X_features_3d: Input features, shape (n_samples, 1, n_feat_X)
-        y_features_3d: Target features, shape (n_samples, 1, n_feat_y)
-        n_samples: Total number of frames.
-        cv_folds: Number of cross-validation folds.
-        n_estimators: Number of trees in the forest.
-        
-    Returns:
-        The mean cross-validated R^2 score.
     """
     try:
         # Reshape for sklearn: (n_samples, n_features)
@@ -101,14 +88,6 @@ def _compute_relevance_worker(
     """
     Worker function for parallel Relevance calculation.
     Computes R^2(R_i -> S)
-    
-    Args:
-        item: Tuple of (res_key, X_features_3d)
-        y_target_3d: The target feature array S, shape (n_samples, 1, n_feat_S)
-        ... other params ...
-        
-    Returns:
-        (res_key, r2_score)
     """
     res_key, X_features_3d = item
     
@@ -140,14 +119,6 @@ def _compute_redundancy_worker(
     """
     Worker function for parallel Redundancy calculation.
     Computes max( R^2(R_i -> R_j), R^2(R_j -> R_i) )
-    
-    Args:
-        item: Tuple of (res_key_i, res_key_j)
-        all_features_static: The complete feature dictionary
-        ... other params ...
-        
-    Returns:
-        (res_key_i, res_key_j, max_r2_score)
     """
     key_i, key_j = item
     
@@ -182,7 +153,7 @@ class QUBOSet(AnalysisComponent):
     Computes the QUBO Hamiltonian components using RF Regression
     and solves for the optimal predictive set.
     """
-    
+        
     def run(self, 
             data: Tuple[FeatureDict, np.ndarray, Dict[str, str]], 
             num_workers: int = None,
@@ -197,57 +168,113 @@ class QUBOSet(AnalysisComponent):
                   (all_features_static, labels_Y, mapping)
             num_workers (int, optional): Number of parallel processes.
             **kwargs:
-                target_residues (List[str]): REQUIRED. List of residue keys
-                    to use as the target S (e.g., ['res_131', 'res_140']).
-                lambda_redundancy (float): Penalty coefficient for redundancy.
-                    Default: 1.0
-                num_solutions (int): Number of optimal solutions to find.
-                    Default: 5
-                cv_folds (int): CV folds for RF. Default: 3
-                n_estimators (int): Trees for RF. Default: 50
+                target_selection_string (str): REQUIRED. MDAnalysis selection
+                    string for the target(s) S (e.g., 'resid 131 140').
+                active_topo_file (str): REQUIRED. Path to the topology file
+                    to parse selections against.
+                lambda_redundancy (float): Penalty coefficient. Default: 1.0
+                num_solutions (int): Solutions to find. Default: 5
+                qubo_cv_folds (int): CV folds for RF. Default: 3
+                qubo_n_estimators (int): Trees for RF. Default: 50
         """
         print("\n--- Running QUBO Hamiltonian (Random Forest) ---")
         
         # --- 1. Unpack Data and Kwargs ---
-        all_features_static, _, _ = data # labels_Y and mapping not needed
+        all_features_static, _, mapping = data # labels_Y not needed
         
-        max_workers = num_workers if num_workers is not None else None
+        max_workers = num_workers if num_workers is not None else os.cpu_count()
         print(f"Using max {max_workers or 'all'} workers for analysis.")
-            
-        target_residues = kwargs.get('target_residues')
-        if not target_residues:
-            raise ValueError("QUBO analysis requires 'target_residues' list in kwargs")
+
+        target_selection_string = kwargs.get('target_selection_string')
+        if not target_selection_string:
+            raise ValueError("QUBO analysis requires 'target_selection_string' in kwargs")
+        
+        active_topo_file = kwargs.get('active_topo_file')
+        if not active_topo_file:
+            raise ValueError("QUBO analysis requires 'active_topo_file' in kwargs")
         
         lambda_redundancy = float(kwargs.get('lambda_redundancy', 1.0))
         num_solutions = int(kwargs.get('num_solutions', 5))
         cv_folds = int(kwargs.get('qubo_cv_folds', 3))
         n_estimators = int(kwargs.get('qubo_n_estimators', 50))
         
-        print(f"Parameters: Target(s)={target_residues}, Lambda={lambda_redundancy}, NumSolutions={num_solutions}")
+        print(f"Parameters: Target='{target_selection_string}', Lambda={lambda_redundancy}")
         print(f"RF Params: {cv_folds}-fold CV, {n_estimators} trees")
 
         if not all_features_static:
             print("  Warning: No features found to analyze.")
             return {}
+        if not mapping:
+            raise ValueError("QUBO analysis requires the 'mapping' dictionary, but it is missing.")
 
         # --- 2. Prepare Target (S) and Candidate (R_i) sets ---
-        target_features_list: List[np.ndarray] = []
-        candidate_keys: List[str] = []
-        n_samples = 0
         
-        target_set = set(target_residues)
+        print(f"Loading topology {active_topo_file} to resolve selections...")
+        try:
+            u = mda.Universe(active_topo_file)
+        except Exception as e:
+            raise ValueError(f"Failed to load topology file {active_topo_file}: {e}")
 
-        for key, features in all_features_static.items():
-            if n_samples == 0:
-                n_samples = features.shape[0]
-            
-            if key in target_set:
-                target_features_list.append(features)
-            else:
-                candidate_keys.append(key)
+        # 1. Select the target atom group (S)
+        try:
+            target_ag = u.select_atoms(target_selection_string)
+            if target_ag.n_atoms == 0:
+                raise ValueError(f"Target selection '{target_selection_string}' matched 0 atoms.")
+        except SelectionError as e:
+            raise ValueError(f"Invalid target selection string: '{target_selection_string}'. Error: {e}")
+        
+        print(f"Target selection '{target_selection_string}' resolved to {target_ag.n_atoms} atoms.")
+
+        target_keys = set()
+        candidate_keys = [] # This is the disjoint set R
+        n_samples = 0
+        if all_features_static:
+            n_samples = next(iter(all_features_static.values())).shape[0]
+
+        # 2. Partition all available features into Target (S) or Candidate (R)
+        print("Partitioning features into Target (S) and Candidate (R) pools...")
+        for key, selection_string in mapping.items():
+            if key not in all_features_static:
+                continue # This key wasn't in the common aligned set
+
+            try:
+                candidate_ag = u.select_atoms(selection_string)
+                if candidate_ag.n_atoms == 0:
+                    print(f"  Warning: Candidate '{key}' ('{selection_string}') matched 0 atoms. Skipping.")
+                    continue
+                
+                # Check for overlap
+                # We use the intersection of the *residues* to be safe
+                overlap_residues = AtomGroup.intersection(target_ag, candidate_ag).residues
+                
+                if overlap_residues.n_residues > 0:
+                    # This key belongs to the target set
+                    print(f"  -> Found Target key: {key} (overlaps with S)")
+                    target_keys.add(key)
+                else:
+                    # This key is a valid candidate
+                    candidate_keys.append(key)
+
+            except SelectionError as e:
+                print(f"  Warning: Could not parse selection for candidate '{key}' ('{selection_string}'). Skipping. Error: {e}")
+            except Exception as e:
+                print(f"  Warning: Error processing candidate '{key}'. Skipping. Error: {e}")
+
+
+        # 3. Build the final target feature vector (S)
+        if not target_keys:
+             raise ValueError(f"Target selection '{target_selection_string}' did not match any residues from the mapping.")
+             
+        print(f"Target selection resolved to feature keys: {target_keys}")
+
+        target_features_list: List[np.ndarray] = []
+        for key in sorted(list(target_keys)): # Sort for consistent concatenation
+            target_features_list.append(all_features_static[key])
         
         if not target_features_list:
-            raise ValueError(f"Target residues {target_residues} not found in features.")
+            # This should be caught by the check above, but as a failsafe
+            raise ValueError(f"Target keys {target_keys} not found in features dictionary.")
+        
         if not candidate_keys:
             print("  Warning: No candidate residues found (all residues are targets?).")
             return {}
@@ -306,13 +333,12 @@ class QUBOSet(AnalysisComponent):
                     raw_redundancy_scores_r2[key_i] = {}
                 raw_redundancy_scores_r2[key_i][key_j] = max_r2
 
-        # --- 5. Build and Solve QUBO (Modified for PyQUBO) ---
+        # --- 5. Build and Solve QUBO (using PyQUBO) ---
         print("Assembling Hamiltonian for PyQUBO...")
         h_i_terms: Dict[str, float] = {}
         J_ij_terms: Dict[str, Dict[str, float]] = {}
         
         # 1. Create a dictionary of pyqubo binary variables
-        # Using string keys is cleaner than integer indices
         x_vars = {key: pyqubo.Binary(key) for key in candidate_keys}
 
         # 2. Build Hamiltonian terms symbolically
@@ -362,35 +388,27 @@ class QUBOSet(AnalysisComponent):
             num_reads = max(num_solutions * 20, 100)
             response = sampler.sample_qubo(Q, num_reads=num_reads)
             
-            # 5. Decode results (NEW: Parsing dimod.SampleSet directly)
-            # This replaces the call to model.decode_response()
+            # 5. Decode results (Parsing dimod.SampleSet directly)
             print("Decoding solutions from dimod.SampleSet...")
             
-            # Get the ordered list of variable names (e.g., ['res_185', 'res_238', ...])
             variable_names = list(response.variables)
-            
             unique_solutions_found = 0
             seen_solutions = set() # To track unique solutions
 
-            # response.record is a numpy structured array, sorted by energy
             for record in response.record:
                 if unique_solutions_found >= num_solutions:
                     break # We have enough unique solutions
 
                 solution_vector_array = record['sample']
-                # The energy from the record is for the QUBO (Q)
                 qubo_energy = record['energy']
                 num_occurrences = record['num_occurrences']
                 
-                # Create a hashable representation (a tuple) of the solution vector
                 solution_tuple = tuple(solution_vector_array)
                 
                 if solution_tuple not in seen_solutions:
-                    # This is a new, unique, low-energy solution
                     seen_solutions.add(solution_tuple)
                     unique_solutions_found += 1
                     
-                    # Reconstruct the solution dictionary {var_name: value}
                     solution_vector_dict = {}
                     selected_residues = []
                     for i, var_name in enumerate(variable_names):
@@ -399,9 +417,6 @@ class QUBOSet(AnalysisComponent):
                         if val == 1:
                             selected_residues.append(var_name)
                             
-                    # Add to our final list
-                    # IMPORTANT: We add the offset back to get the true
-                    # energy of the original Hamiltonian (H)
                     solutions_list.append({
                         "energy": qubo_energy + offset,
                         "selected_residues": selected_residues,
@@ -426,7 +441,8 @@ class QUBOSet(AnalysisComponent):
         return {
             "analysis_type": "QUBO_RandomForest_PyQUBO",
             "parameters": {
-                "target_residues": target_residues,
+                "target_selection_string": target_selection_string,
+                "target_keys_resolved": list(target_keys),
                 "lambda_redundancy": lambda_redundancy,
                 "num_solutions_requested": num_solutions,
                 "cv_folds": cv_folds,

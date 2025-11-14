@@ -1,5 +1,9 @@
 """
 AllosKin: Command-Line Interface (CLI)
+
+This script has been refactored to align with the new
+analysis logic (e.g., passing a selection string and
+topology path for QUBO).
 """
 import argparse
 import yaml
@@ -10,8 +14,10 @@ from alloskin.io.readers import MDAnalysisReader
 from alloskin.features.extraction import FeatureExtractor
 from alloskin.pipeline.builder import DatasetBuilder
 from alloskin.analysis.static import StaticReportersRF
+# --- MODIFIED IMPORTS ---
 from alloskin.analysis.qubo import QUBOSet
 from alloskin.analysis.dynamic import TransferEntropy
+# --- END MODIFIED ---
 
 
 def load_config(config_file: str) -> Dict[str, Any]:
@@ -50,8 +56,7 @@ def main():
     # Config and parameter arguments
     parser.add_argument(
         "--config", 
-        required=True, 
-        help="Path to the residue_selections.yml config file."
+        help="Path to the residue_selections.yml config file. If not provided, will analyze all protein residues."
     )
     
     # --- Slicing and Multiprocessing ---
@@ -74,12 +79,13 @@ def main():
         help="Number of parallel workers for analysis. (Default: all available cores)"
     )
 
-    # --- QUBO Arguments ---
+    # --- Goal 2 (QUBO) Arguments (MODIFIED) ---
     parser.add_argument(
-        '--target_residues', 
-        nargs='+', 
-        help='REQUIRED for QUBO. List of target residue keys (e.g., res_131 res_140)'
+        '--target_selection', 
+        type=str,
+        help='REQUIRED for QUBO. MDAnalysis selection string (e.g., "resid 131 140")'
     )
+    # --- END MODIFICATION ---
     parser.add_argument(
         '--qubo_lambda', 
         type=float, 
@@ -105,7 +111,7 @@ def main():
         help='Number of trees for QUBO RF regressors. Default: 50'
     )
 
-    # --- Dynamic Arguments ---
+    # --- Goal 3 (Dynamic) Arguments ---
     parser.add_argument("--te_lag", type=int, default=10, help="Lag time for TE (in frames). Default: 10.")
     
 
@@ -113,14 +119,18 @@ def main():
 
     # --- 1. Initialization ---
     print("--- Initializing Pipeline ---")
-    config = load_config(args.config)
-    # Allow residue_selections to be None if not provided in the config.
-    residue_selections = config.get('residue_selections', None)
+    
+    # --- MODIFICATION: Config is now optional ---
+    residue_selections = None
+    if args.config:
+        config = load_config(args.config)
+        residue_selections = config.get('residue_selections', None)
     
     if residue_selections is None:
-        print("NOTE: 'residue_selections' not found in config. Will analyze ALL protein residues.")
+        print("NOTE: No config or 'residue_selections' not found. Will analyze ALL protein residues.")
     elif not any(residue_selections.values()):
         print("Warning: 'residue_selections' is empty. Will analyze ALL protein residues.")
+    # --- END MODIFICATION ---
 
     # Note: extractor is now a 'prototype' holding the config
     reader = MDAnalysisReader()
@@ -147,15 +157,18 @@ def main():
             num_workers=args.num_workers
         )
         print("\n--- Final Static Results (Sorted by best reporter, highest accuracy) ---")
-        print(results)
+        import json
+        print(json.dumps(results, indent=2))
 
     elif args.analysis == "qubo":
         print("\n--- Preparing Data for QUBO Analysis ---")
         
-        if not args.target_residues:
-            print("Error: --target_residues argument is required for QUBO analysis.", file=sys.stderr)
-            print("Example: --target_residues res_131 res_140", file=sys.stderr)
+        # --- MODIFICATION: Check new argument ---
+        if not args.target_selection:
+            print("Error: --target_selection argument is required for QUBO analysis.", file=sys.stderr)
+            print("Example: --target_selection \"resid 131 140\"", file=sys.stderr)
             sys.exit(1)
+        # --- END MODIFICATION ---
 
         # QUBO also uses the static dataset
         static_data, labels_Y, mapping = builder.prepare_static_analysis_data(
@@ -167,13 +180,17 @@ def main():
         
         # Pass all data and kwargs to the analyzer
         qubo_data_tuple = (static_data, labels_Y, mapping)
+        
+        # --- MODIFICATION: Build correct kwargs ---
         qubo_kwargs = {
-            "target_residues": args.target_residues,
+            "target_selection_string": args.target_selection,
+            "active_topo_file": args.active_topo,
             "lambda_redundancy": args.qubo_lambda,
             "num_solutions": args.qubo_solutions,
             "qubo_cv_folds": args.qubo_cv_folds,
             "qubo_n_estimators": args.qubo_n_estimators
         }
+        # --- END MODIFICATION ---
 
         print("--- Running Optimal Predictive Set (QUBO) ---")
         analyzer = QUBOSet()
@@ -207,7 +224,8 @@ def main():
             num_workers=args.num_workers
         )
         print("\n--- Final Dynamic Results ---")
-        print(results)
+        import json
+        print(json.dumps(results, indent=2))
 
-if __name__ == "__main":
+if __name__ == "__main__":
     main()

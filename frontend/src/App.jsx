@@ -3,7 +3,8 @@ import {
   Upload, Activity, Server, CheckCircle, XCircle, AlertTriangle, 
   Loader2, Database, FileText, ChevronRight, ArrowLeft, Brain, Sliders, Zap,
   Eye, 
-  Palette
+  Palette,
+  Target // Add Target icon for QUBO
 } from 'lucide-react';
 
 /*
@@ -11,13 +12,7 @@ import {
 Main Application Component (App)
 ================================================================================
 */
-
-/**
- * Main App component. Manages routing between pages using internal state.
- * * This file is structured to simulate a modular project.
- * Each major "Page" component is grouped with its sub-components
- * and delineated by `// --- ... ---` comments.
- */
+// ... (Main App component remains unchanged) ...
 export default function App() {
   const [page, setPage] = useState('submit');
   const [pollingJobId, setPollingJobId] = useState(null); // This is the RQ_JOB_ID
@@ -42,9 +37,6 @@ export default function App() {
     setPage('visualize_result');
   };
 
-  /**
-   * Render the currently active page component based on the 'page' state.
-   */
   const renderPage = () => {
     switch (page) {
       case 'submit':
@@ -117,7 +109,7 @@ export default function App() {
 Navigation Component (Navbar)
 ================================================================================
 */
-
+// ... (Navbar component remains unchanged) ...
 const Navbar = ({ setPage, currentPage }) => {
   const navItems = [
     { name: 'submit', label: 'Submit Job', icon: <Upload className="h-4 w-4" /> },
@@ -165,7 +157,7 @@ const Navbar = ({ setPage, currentPage }) => {
         </button>
       )}
     </nav>
-  ); // <-- ERROR FIX: Added closing parenthesis for the return() statement.
+  );
 };
 
 
@@ -174,7 +166,7 @@ const Navbar = ({ setPage, currentPage }) => {
 Shared Utility Components (Errors, Loaders, Upload)
 ================================================================================
 */
-
+// ... (ErrorDisplay, FullPageLoader, FileDropzone, xhrUpload remain unchanged) ...
 const ErrorDisplay = ({ error }) => (
   <div className="bg-red-900 border border-red-700 text-red-100 p-3 rounded-md flex items-center space-x-2">
     <XCircle className="h-5 w-5" /> <span>{error}</span>
@@ -187,10 +179,8 @@ const FullPageLoader = () => (
     </div>
 );
 
-// --- MODIFIED: Added drag counter to fix flickering ---
 const FileDropzone = ({ name, label, file, onChange }) => {
   const [isDragging, setIsDragging] = useState(false);
-  // Ref to track drag event depth
   const dragCounter = useRef(0);
 
   const handleDragEnter = (e) => {
@@ -213,18 +203,17 @@ const FileDropzone = ({ name, label, file, onChange }) => {
 
   const handleDragOver = (e) => {
     e.preventDefault();
-    e.stopPropagation(); // This is crucial to mark as a drop target
+    e.stopPropagation();
   };
 
   const handleDrop = (e) => {
     e.preventDefault();
     e.stopPropagation();
     setIsDragging(false);
-    dragCounter.current = 0; // Reset counter
+    dragCounter.current = 0;
 
     const droppedFiles = e.dataTransfer.files;
     if (droppedFiles && droppedFiles.length > 0) {
-      // Simulate the event structure that onChange expects
       const syntheticEvent = {
         target: {
           name: name,
@@ -240,7 +229,7 @@ const FileDropzone = ({ name, label, file, onChange }) => {
       <label className="block text-sm font-medium text-gray-300 mb-1">{label}</label>
       <div
         className={`mt-1 flex justify-center px-6 pt-5 pb-6 border-2 ${
-          isDragging ? 'border-cyan-500' : 'border-gray-600' // Highlight when dragging
+          isDragging ? 'border-cyan-500' : 'border-gray-600'
         } border-dashed rounded-md transition-colors`}
         onDragEnter={handleDragEnter}
         onDragLeave={handleDragLeave}
@@ -269,10 +258,6 @@ const FileDropzone = ({ name, label, file, onChange }) => {
   );
 };
 
-/**
- * Utility function to handle XHR uploads with progress.
- * Returns a Promise that resolves with the parsed JSON response or rejects with an Error.
- */
 function xhrUpload(url, formData, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -320,12 +305,13 @@ function xhrUpload(url, formData, onProgress) {
   });
 }
 
+
 /*
 ================================================================================
 Page: Submit Job (SubmitJobPage)
 ================================================================================
 */
-
+// ... (SubmitJobPage and its sub-components remain unchanged) ...
 const SubmitJobPage = ({ onJobSubmitted }) => {
   const [analysisType, setAnalysisType] = useState('static');
   const [files, setFiles] = useState({
@@ -334,7 +320,7 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
     config: null,
   });
   const [teLag, setTeLag] = useState(10);
-  const [targetSwitch, setTargetSwitch] = useState('res_50');
+  const [targetSelection, setTargetSelection] = useState('resid 131');
   const [activeSlice, setActiveSlice] = useState('');
   const [inactiveSlice, setInactiveSlice] = useState('');
   const [selectionMode, setSelectionMode] = useState('all');
@@ -388,7 +374,7 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
           .map(line => line.trim())
           .filter(line => line)
           .reduce((acc, line) => {
-            const key = line.replace(/\s+/g, '_');
+            const key = line.replace(/[^a-zA-Z0-9]/g, '_');
             acc[key] = line;
             return acc;
           }, {});
@@ -407,12 +393,12 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
         break;
       case 'qubo':
         endpoint = '/api/v1/submit/qubo';
-        if (!targetSwitch) {
-            setError("Target Switch residue is required for QUBO.");
+        if (!targetSelection) {
+            setError("Target Selection string is required for QUBO.");
             setIsLoading(false);
             return;
         }
-        formData.append('target_switch', targetSwitch);
+        formData.append('target_selection_string', targetSelection);
         break;
       case 'dynamic':
         endpoint = '/api/v1/submit/dynamic';
@@ -433,7 +419,7 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
       if (!data.job_id) {
           throw new Error("Submission succeeded but did not return a job ID.");
       }
-      onJobSubmitted(data.job_id); // This is the RQ_JOB_ID
+      onJobSubmitted(data.job_id);
     } catch (err) {
       setError(err.message || "Upload failed. Please check the console.");
     } finally {
@@ -490,7 +476,7 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
         </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <div className="bg-gray-800 p-4 rounded-lg border border-gray-700">
-            <h3 className="text-lg font-semibold mb-3 text-cyan-400">Residue Selections</h3>
+            <h3 className="text-lg font-semibold mb-3 text-cyan-400">Candidate Residues (Input Set)</h3>
             <div className="flex space-x-1 rounded-lg bg-gray-900 p-1 mb-4">
               <TabButton label="Analyze All" isActive={selectionMode === 'all'} onClick={() => setSelectionMode('all')} />
               <TabButton label="Upload File" isActive={selectionMode === 'file'} onClick={() => setSelectionMode('file')} />
@@ -498,7 +484,7 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
             </div>
             {selectionMode === 'all' && (
               <div className="text-sm text-gray-400 p-4 bg-gray-900 rounded-md">
-                The analysis will run on all protein residues found to be common between the active and inactive states.
+                All common protein residues will be used as the candidate pool for analysis.
               </div>
             )}
             {selectionMode === 'file' && (
@@ -523,21 +509,24 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
             )}
           </div>
           <div className="bg-gray-800 p-4 rounded-lg border border-gray-700">
-            <h3 className="text-lg font-semibold mb-3 text-cyan-400">Parameters</h3>
+            <h3 className="text-lg font-semibold mb-3 text-cyan-400">Analysis Parameters</h3>
             {analysisType === 'static' && (
               <p className="text-sm text-gray-400">No additional parameters required for Static analysis.</p>
             )}
             {analysisType === 'qubo' && (
               <div>
-                <label htmlFor="target_switch" className="block text-sm font-medium text-gray-300 mb-1">
-                  Target Switch (e.g., res_50)
+                <label htmlFor="target_selection" className="block text-sm font-medium text-gray-300 mb-1">
+                  Target Selection (MDAnalysis string)
                 </label>
                 <input
-                  type="text" id="target_switch" value={targetSwitch}
-                  onChange={(e) => setTargetSwitch(e.target.value)}
-                  className="w-full bg-gray-900 border border-gray-600 rounded-md p-2 text-white focus:ring-cyan-500 focus:border-cyan-500"
-                  placeholder="Enter residue key (e.g., res_50)"
+                  type="text" id="target_selection" value={targetSelection}
+                  onChange={(e) => setTargetSelection(e.target.value)}
+                  className="w-full bg-gray-900 border border-gray-600 rounded-md p-2 text-white focus:ring-cyan-500 focus:border-cyan-500 font-mono text-sm"
+                  placeholder="e.g., resid 131 or resid 131 140"
                 />
+                <p className="text-xs text-gray-500 mt-1">
+                  The residue(s) to predict. These will be removed from the candidate pool.
+                </p>
               </div>
             )}
             {analysisType === 'dynamic' && (
@@ -565,8 +554,6 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
     </div>
   );
 };
-
-// --- SubmitJobPage Sub-components ---
 
 const TabButton = ({ icon, label, isActive, onClick }) => (
   <button
@@ -634,7 +621,7 @@ const UploadProgress = ({ progress }) => (
 Page: Job Status (JobStatusPage)
 ================================================================================
 */
-
+// ... (JobStatusPage and its sub-components remain unchanged) ...
 const JobStatusPage = ({ jobId, onNavigateToResults, onNavigateToResultDetail }) => {
   const [status, setStatus] = useState(null);
   const [error, setError] = useState(null);
@@ -677,7 +664,7 @@ const JobStatusPage = ({ jobId, onNavigateToResults, onNavigateToResultDetail })
   const jobStatus = status?.status || 'queued';
   const metaStatus = status?.meta?.status || (jobStatus === 'queued' ? 'Waiting in queue...' : 'Initializing...');
   const progress = status?.meta?.progress || (jobStatus === 'queued' ? 0 : 5);
-  const resultPayload = status?.result; // This is the full result JSON from the task
+  const resultPayload = status?.result;
 
   if (jobStatus === 'finished' && resultPayload) {
     return (
@@ -733,8 +720,6 @@ const JobStatusPage = ({ jobId, onNavigateToResults, onNavigateToResultDetail })
   );
 };
 
-// --- JobStatusPage Sub-components ---
-
 const StatusDisplay = ({ icon, title, message, jobId, children }) => (
   <div className="max-w-3xl mx-auto bg-gray-800 rounded-lg border border-gray-700 shadow-xl p-8 text-center">
     <div className="flex justify-center mb-6">{icon}</div>
@@ -753,7 +738,7 @@ const StatusDisplay = ({ icon, title, message, jobId, children }) => (
 Page: Results List (ResultsListPage)
 ================================================================================
 */
-
+// ... (ResultsListPage and its sub-components remain unchanged) ...
 const ResultsListPage = ({ onSelectResult, onSelectRunningJob }) => {
   const [results, setResults] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -827,8 +812,6 @@ const ResultsListPage = ({ onSelectResult, onSelectRunningJob }) => {
   );
 };
 
-// --- ResultsListPage Sub-components ---
-
 const ResultItem = ({ item, onSelectResult, onSelectRunningJob }) => {
   const status = item.status || 'unknown';
   
@@ -844,7 +827,7 @@ const ResultItem = ({ item, onSelectResult, onSelectRunningJob }) => {
       icon = <CheckCircle className="h-5 w-5 text-green-500" />;
       text = item.job_id;
       date = formattedDate(item.completed_at, "Completed ");
-      handler = () => onSelectResult(item.job_id); // Pass JOB_UUID
+      handler = () => onSelectResult(item.job_id);
       classes = "hover:bg-gray-700 cursor-pointer";
       break;
     case 'started':
@@ -852,14 +835,14 @@ const ResultItem = ({ item, onSelectResult, onSelectRunningJob }) => {
       icon = <Loader2 className="h-5 w-5 text-cyan-400 animate-spin" />;
       text = item.job_id;
       date = formattedDate(item.created_at, "Started ");
-      handler = () => onSelectRunningJob(item.rq_job_id); // Pass RQ_JOB_ID
+      handler = () => onSelectRunningJob(item.rq_job_id);
       classes = "hover:bg-gray-700 cursor-pointer";
       break;
     case 'failed':
       icon = <XCircle className="h-5 w-5 text-red-500" />;
       text = item.job_id;
       date = formattedDate(item.completed_at, "Failed ");
-      handler = null; // Not clickable
+      handler = null;
       classes = "opacity-60 cursor-not-allowed";
       break;
     default:
@@ -893,7 +876,7 @@ const ResultItem = ({ item, onSelectResult, onSelectRunningJob }) => {
 Page: Result Detail (ResultDetailPage)
 ================================================================================
 */
-
+// ... (ResultDetailPage remains unchanged) ...
 const ResultDetailPage = ({ resultId, onBack, onVisualize }) => {
   const [result, setResult] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -928,7 +911,12 @@ const ResultDetailPage = ({ resultId, onBack, onVisualize }) => {
   if (error) return <ErrorDisplay error={error} />;
   if (!result) return <ErrorDisplay error="Result data could not be loaded." />;
 
-  const canVisualize = result.residue_selections_mapping && result.results;
+  // --- MODIFICATION: Updated check for QUBO ---
+  // We check for `params.target_selection_string` which is present in QUBO
+  // and `results` (which is a dict) for static.
+  const canVisualize = result.residue_selections_mapping && 
+                       (result.analysis_type === 'static' && typeof result.results === 'object') ||
+                       (result.analysis_type === 'qubo' && result.params?.target_selection_string);
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -974,9 +962,44 @@ const ResultDetailPage = ({ resultId, onBack, onVisualize }) => {
 
 /*
 ================================================================================
-Page: Visualize Result (VisualizeResultPage)
+Page: Visualize Result (VisualizeResultPage) - (HEAVILY MODIFIED)
 ================================================================================
 */
+
+/**
+ * Helper to build an NGL-compatible selection string from residue keys
+ * and the selection mapping.
+ */
+const getNglSelection = (keys, mapping) => {
+  if (!keys || !mapping) return 'none';
+  
+  const selectionStrings = keys
+    .map(key => mapping[key]) // 'res_50' -> 'resid 50'
+    .filter(Boolean);         // Filter out any undefined mappings
+    
+  // Convert 'resid 50' to '50'
+  // Convert 'resid 131 22' to '131 or 22'
+  const nglResidueNumbers = selectionStrings
+    .map(sel => sel.replace(/resid /gi, '')) // '50', '131 22'
+    .join(' or '); // '50 or 131 22'
+    
+  // Final cleanup for NGL: '131 22' -> '131 or 22'
+  const finalSelection = nglResidueNumbers.replace(/\s+/g, ' or ') || 'none';
+  // console.log(`Keys: ${keys}, NGL Selection: ${finalSelection}`);
+  return finalSelection;
+};
+
+/**
+ * Helper to parse the simple target string (e.g., "resid 131 140")
+ * directly into an NGL selection.
+ */
+const getNglSelectionFromTargetString = (targetString) => {
+  if (!targetString) return 'none';
+  // "resid 131 140" -> "131 140" -> "131 or 140"
+  const selection = targetString.replace(/resid /gi, '');
+  return selection.replace(/\s+/g, ' or ') || 'none';
+};
+
 
 const VisualizeResultPage = ({ resultId, onBack }) => {
   const [resultData, setResultData] = useState(null);
@@ -984,11 +1007,16 @@ const VisualizeResultPage = ({ resultId, onBack }) => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   
-  const nglStageRef = useRef(null);
+  // --- FIX 2: Use useState for NGL stage, not useRef ---
+  // This ensures React's effects run when the stage is ready.
+  const [nglStage, setNglStage] = useState(null);
   const nglViewportRef = useRef(null);
+  // --- END FIX 2 ---
   
-  const [threshold, setThreshold] = useState(0.8);
+  const [staticThreshold, setStaticThreshold] = useState(0.8);
+  const [quboSolutionIndex, setQuboSolutionIndex] = useState(0);
   
+  // NGL script loader (unchanged)
   useEffect(() => {
     const nglScriptId = 'ngl-script';
     if (document.getElementById(nglScriptId)) {
@@ -1001,6 +1029,7 @@ const VisualizeResultPage = ({ resultId, onBack }) => {
     document.body.appendChild(script);
   }, []);
 
+  // Result data fetcher (unchanged)
   useEffect(() => {
     if (!resultId) {
       setError("No result ID specified.");
@@ -1029,65 +1058,115 @@ const VisualizeResultPage = ({ resultId, onBack }) => {
     fetchResult();
   }, [resultId]);
   
+  // NGL Initialization Effect
   useEffect(() => {
-    if (window.NGL && structureFile && nglViewportRef.current && !nglStageRef.current) {
+    // Wait for NGL, the structure file, the DOM element, AND for the stage to NOT be set
+    if (window.NGL && structureFile && nglViewportRef.current && !nglStage) {
+      console.log("Initializing NGL stage...");
       const stage = new window.NGL.Stage(nglViewportRef.current);
-      nglStageRef.current = stage;
+      // --- FIX 2: Store stage in state ---
+      setNglStage(stage);
+      // --- END FIX 2 ---
       
       const ext = structureFile.name.split('.').pop();
       stage.loadFile(structureFile, { ext: ext }).then((component) => {
-        component.addRepresentation("cartoon", { color: 'resname' });
-        component.addRepresentation("ball+stick", {
-          name: "highlight",
-          sele: "none",
-          color: "red",
+        // Base protein (greyed out)
+        component.addRepresentation("cartoon", { 
+          color: '#555555', // Dark grey
+          opacity: 0.3
         });
+        
+        // Representation for TARGET residues (e.g., QUBO target)
+        component.addRepresentation("ball+stick", {
+          name: "target_highlight",
+          sele: "none",
+          color: "#3b82f6", // Blue-500
+        });
+        
+        // Representation for SELECTED residues (e.g., Static reporters or QUBO solution)
+        component.addRepresentation("ball+stick", {
+          name: "selected_highlight",
+          sele: "none",
+          color: "#ef4444", // Red-500
+        });
+        
         component.autoView();
       });
     }
     
+    // Cleanup
     return () => {
-      if (nglStageRef.current) {
-        nglStageRef.current.dispose();
-        nglStageRef.current = null;
+      // --- FIX 2: Use state variable for cleanup ---
+      if (nglStage) {
+        console.log("Disposing NGL stage");
+        nglStage.dispose();
+        setNglStage(null);
       }
+      // --- END FIX 2 ---
     };
-  }, [structureFile, resultData]);
+  }, [structureFile, nglStage]); // Re-run if the structure file changes or stage is manually cleared
   
+  // NGL Update Effect
   useEffect(() => {
-    if (!nglStageRef.current || !resultData) return;
+    // --- FIX 2: Wait for state variable, not ref ---
+    if (!nglStage || !resultData) return;
+    // --- END FIX 2 ---
     
-    const { results, residue_selections_mapping } = resultData;
+    // --- FIX 1: Correctly destructure 'params' not 'parameters' ---
+    const { analysis_type, results, residue_selections_mapping, params } = resultData;
     
-    const highScoringKeys = Object.keys(results).filter(
-      key => results[key] >= threshold
-    );
+    const targetRep = nglStage.getRepresentationsByName('target_highlight');
+    const selectedRep = nglStage.getRepresentationsByName('selected_highlight');
     
-    const selectionStrings = highScoringKeys
-      .map(key => {
-        const baseKey = key.replace(/_aligned$/, ''); 
-        return residue_selections_mapping[baseKey];
-      })
-      .filter(Boolean);
-      
-    const nglSelection = selectionStrings
-      .map(sel => sel.replace(/resid /gi, ''))
-      .join(' or ');
+    if (!targetRep || !selectedRep) return;
 
-    const highlightRep = nglStageRef.current.getRepresentationsByName('highlight');
-    if (highlightRep) {
-      if (nglSelection) {
-        highlightRep.setSelection(nglSelection);
-      } else {
-        highlightRep.setSelection("none");
+    let targetSele = "none";
+    let selectedSele = "none";
+
+    if (analysis_type === 'static') {
+      // Static Analysis Logic (unchanged)
+      const highScoringKeys = Object.keys(results).filter(
+        key => results[key] >= staticThreshold
+      );
+      selectedSele = getNglSelection(highScoringKeys, residue_selections_mapping);
+      
+    } else if (analysis_type === 'qubo') {
+      // QUBO Analysis Logic
+      if (!results.solutions || !params || !params.target_selection_string) {
+        console.error("QUBO result is missing 'solutions' or 'params.target_selection_string'");
+        return;
+      }
+      
+      // --- FIX 3: Use 'params.target_selection_string' directly, as you suggested ---
+      targetSele = getNglSelectionFromTargetString(params.target_selection_string);
+      // --- END FIX 3 ---
+
+      // 2. Get Selected Residues R_i from the chosen solution
+      const solution = results.solutions[quboSolutionIndex];
+      if (solution) {
+        const selectedKeys = solution.selected_residues;
+        selectedSele = getNglSelection(selectedKeys, residue_selections_mapping);
       }
     }
     
-  }, [threshold, resultData, nglStageRef.current]);
+    // Apply the selections
+    targetRep.setSelection(targetSele);
+    selectedRep.setSelection(selectedSele);
+    
+  // --- FIX 2: Use state variable in dependency array ---
+  }, [resultData, nglStage, staticThreshold, quboSolutionIndex]);
+  // --- END FIX 2 ---
 
   const handleFileChange = (e) => {
     const file = e.target.files[0];
     if (file) {
+      // If we are changing the file, dispose the old stage first
+      // --- FIX 2: Use state variable ---
+      if (nglStage) {
+        nglStage.dispose();
+        setNglStage(null);
+      }
+      // --- END FIX 2 ---
       setStructureFile(file);
       setError(null);
     }
@@ -1114,7 +1193,6 @@ const VisualizeResultPage = ({ resultId, onBack }) => {
           <div className="text-center bg-gray-900 p-8 rounded-lg border-2 border-dashed border-gray-600">
             <h3 className="text-xl font-semibold text-white mb-4">Upload Structure File</h3>
             <p className="text-gray-400 mb-6">Please upload the PDB or GRO file you used for this analysis.</p>
-            {/* --- Uses the same, now-fixed FileDropzone --- */}
             <FileDropzone 
               name="structure_file"
               label="Structure (PDB, GRO, ...)"
@@ -1124,36 +1202,32 @@ const VisualizeResultPage = ({ resultId, onBack }) => {
           </div>
         ) : (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            <div className="lg:col-span-2 bg-black rounded-lg h-96 w-full">
+            {/* NGL Viewport */}
+            <div className="lg:col-span-2 bg-black rounded-lg h-96 w-full relative">
               <div ref={nglViewportRef} style={{ width: '100%', height: '100%' }} />
-            </div>
-            
-            <div className="bg-gray-900 p-4 rounded-lg">
-              <h3 className="text-lg font-semibold text-cyan-400 mb-4 flex items-center space-x-2">
-                <Palette className="h-5 w-5" />
-                <span>Highlight Controls</span>
-              </h3>
-              <div className="space-y-4">
-                <div>
-                  <label htmlFor="threshold" className="block text-sm font-medium text-gray-300 mb-1">
-                    Highlight Threshold
-                  </label>
-                  <input
-                    type="range"
-                    id="threshold"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={threshold}
-                    onChange={(e) => setThreshold(parseFloat(e.target.value))}
-                    className="w-full"
-                  />
-                  <div className="text-center text-cyan-400 font-mono text-lg">{threshold.toFixed(2)}</div>
+              {/* Legend */}
+              <div className="absolute top-2 left-2 bg-gray-900 bg-opacity-70 p-2 rounded-md text-xs text-white">
+                <h4 className="font-bold mb-1">Legend</h4>
+                <div className="flex items-center space-x-2">
+                  <div className="w-3 h-3 rounded-full bg-blue-500"></div>
+                  <span>Target (S)</span>
                 </div>
-                <div className="text-xs text-gray-400">
-                  Showing residues with a score greater than or equal to {threshold.toFixed(2)}.
+                <div className="flex items-center space-x-2 mt-1">
+                  <div className="w-3 h-3 rounded-full bg-red-500"></div>
+                  <span>Selected (R)</span>
                 </div>
               </div>
+            </div>
+            
+            {/* Controls */}
+            <div className="bg-gray-900 p-4 rounded-lg">
+              <VisualizationControls
+                resultData={resultData}
+                staticThreshold={staticThreshold}
+                setStaticThreshold={setStaticThreshold}
+                quboSolutionIndex={quboSolutionIndex}
+                setQuboSolutionIndex={setQuboSolutionIndex}
+              />
             </div>
           </div>
         )}
@@ -1162,13 +1236,107 @@ const VisualizeResultPage = ({ resultId, onBack }) => {
   );
 };
 
+// --- VisualizationControls Sub-component ---
+// ... (This component remains unchanged, but is now correct
+//      due to the fixes in its parent) ...
+const VisualizationControls = ({ 
+  resultData, 
+  staticThreshold, 
+  setStaticThreshold, 
+  quboSolutionIndex, 
+  setQuboSolutionIndex 
+}) => {
+  if (!resultData) return null;
+
+  const { analysis_type, results } = resultData;
+
+  if (analysis_type === 'static') {
+    return (
+      <>
+        <h3 className="text-lg font-semibold text-cyan-400 mb-4 flex items-center space-x-2">
+          <Palette className="h-5 w-5" />
+          <span>Static Reporter Controls</span>
+        </h3>
+        <div className="space-y-4">
+          <div>
+            <label htmlFor="threshold" className="block text-sm font-medium text-gray-300 mb-1">
+              Highlight Threshold (Accuracy)
+            </label>
+            <input
+              type="range"
+              id="threshold"
+              min="0"
+              max="1"
+              step="0.05"
+              value={staticThreshold}
+              onChange={(e) => setStaticThreshold(parseFloat(e.target.value))}
+              className="w-full"
+            />
+            <div className="text-center text-cyan-400 font-mono text-lg">{staticThreshold.toFixed(2)}</div>
+          </div>
+          <div className="text-xs text-gray-400">
+            Showing residues with an score $\ge$ {staticThreshold.toFixed(2)}.
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  if (analysis_type === 'qubo') {
+    if (!results.solutions || results.solutions.length === 0) {
+      return <ErrorDisplay error="QUBO result has no solutions to display." />;
+    }
+    return (
+      <>
+        <h3 className="text-lg font-semibold text-cyan-400 mb-4 flex items-center space-x-2">
+          <Target className="h-5 w-5" />
+          <span>QUBO Solution Controls</span>
+        </h3>
+        <div className="space-y-4">
+          <div>
+            <label htmlFor="qubo_solution" className="block text-sm font-medium text-gray-300 mb-1">
+              Select Solution
+            </label>
+            <select
+              id="qubo_solution"
+              value={quboSolutionIndex}
+              onChange={(e) => setQuboSolutionIndex(parseInt(e.target.value))}
+              className="w-full bg-gray-800 border border-gray-600 rounded-md p-2 text-white focus:ring-cyan-500 focus:border-cyan-500"
+            >
+              {results.solutions.map((solution, index) => (
+                <option key={index} value={index}>
+                  Solution {index + 1} (Energy: {solution.energy.toFixed(4)})
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="text-xs text-gray-400">
+            <p><span className="text-blue-400 font-bold">Blue:</span> Target residues (S)</p>
+            <p><span className="text-red-400 font-bold">Red:</span> Selected residues (R) for this solution</p>
+          </div>
+          <div className="bg-gray-800 p-2 rounded-md text-xs">
+            <p className="font-bold text-gray-300">Selected Residues:</p>
+            <p className="text-red-400 break-all">
+              {results.solutions[quboSolutionIndex]?.selected_residues.join(', ') || 'None'}
+            </p>
+          </div>
+        </div>
+      </>
+    );
+  }
+
+  // Fallback for other types
+  return <p className="text-gray-400">No visualization controls available for this analysis type.</p>;
+};
+
+
 
 /*
 ================================================================================
 Page: System Health (HealthCheckPage)
 ================================================================================
 */
-
+// ... (HealthCheckPage and its sub-components remain unchanged) ...
 const HealthCheckPage = () => {
   const [healthReport, setHealthReport] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -1218,8 +1386,6 @@ const HealthCheckPage = () => {
     </div>
   );
 };
-
-// --- HealthCheckPage Sub-components ---
 
 const HealthStatusCard = ({ title, status, details }) => {
   const isOk = status === 'ok';

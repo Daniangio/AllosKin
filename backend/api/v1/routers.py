@@ -44,10 +44,10 @@ async def save_uploaded_files(
     
     # Map frontend form keys to worker path keys
     key_to_path_key = {
-        "active_traj": "active_traj_path",
-        "active_topo": "active_topo_path",
-        "inactive_traj": "inactive_traj_path",
-        "inactive_topo": "inactive_topo_path",
+        "active_traj": "active_traj_file",
+        "active_topo": "active_topo_file",
+        "inactive_traj": "inactive_traj_file",
+        "inactive_topo": "inactive_topo_file",
         "config": "config_path",
     }
 
@@ -79,7 +79,7 @@ async def save_uploaded_files(
     # The old check `if len(saved_paths) != 5:` was incorrect.
     # We must validate that the 4 *required* files are present.
     # The 'config' file is optional.
-    required_paths = ["active_traj_path", "active_topo_path", "inactive_traj_path", "inactive_topo_path"]
+    required_paths = ["active_traj_file", "active_topo_file", "inactive_traj_file", "inactive_topo_file"]
     missing_files = [key for key in required_paths if key not in saved_paths]
     if missing_files:
             raise HTTPException(status_code=400, detail=f"Missing required files: {', '.join(missing_files)}")
@@ -91,7 +91,10 @@ async def save_uploaded_files(
 
 @api_router.get("/health/check", summary="End-to-end system health check")
 async def health_check(request: Request):
-    # ... (existing health_check code remains unchanged)
+    """
+    Performs an end-to-end health check of the API, Redis connection,
+    and RQ worker availability.
+    """
     report = {
         "api_status": "ok",
         "redis_status": {"status": "unknown"},
@@ -113,7 +116,16 @@ async def health_check(request: Request):
     if report["redis_status"]["status"] == "ok":
         task_queue = request.app.state.task_queue
         try:
-            report["worker_status"] = {"status": "ok", "queue_length": task_queue.count}
+            worker_count = len(task_queue.get_workers())
+            if worker_count > 0:
+                report["worker_status"] = {
+                    "status": "ok", 
+                    "queue_name": task_queue.name,
+                    "queue_length": task_queue.count,
+                    "workers_found": worker_count
+                }
+            else:
+                report["worker_status"] = {"status": "error", "error": "No workers are listening to this queue."}
         except Exception as e:
             report["worker_status"] = {"status": "error", "error": f"Error interacting with RQ queue: {str(e)}"}
 
@@ -168,7 +180,6 @@ async def submit_job(
         saved_paths = await save_uploaded_files(files_dict, job_folder)
         
         # 3. Prepare arguments for the worker task
-        # --- BUG FIX ---
         # Pop worker-specific params. `params` will be passed to the worker.
         residue_selections_dict = params.pop("residue_selections_dict", None)
         # Get the config_path *if it was saved*
@@ -183,7 +194,7 @@ async def submit_job(
                 job_uuid,                 # 1. job_uuid
                 analysis_type,            # 2. analysis_type
                 saved_paths,              # 3. file_paths
-                params,                   # 4. params (now without residue_selections_dict)
+                params,                   # 4. params (now contains analysis-specific args)
                 config_path,              # 5. config_path (can be None)
                 residue_selections_dict   # 6. residue_selections_dict (can be None)
             ),
@@ -191,7 +202,6 @@ async def submit_job(
             result_ttl=86400, # Keep result in Redis for 1 day
             job_id=f"analysis-{job_uuid}" # Use a predictable RQ job ID
         )
-        # --- END BUG FIX ---
 
         # 5. Return the RQ job ID for polling
         return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
@@ -210,10 +220,8 @@ async def submit_static_job(
     active_topo: UploadFile = File(...),
     inactive_traj: UploadFile = File(...),
     inactive_topo: UploadFile = File(...),
-    # --- BUG FIX: Both config and residue_selections_json are now Optional ---
     config: Optional[UploadFile] = File(None),
     residue_selections_json: Optional[str] = Form(None),
-    # --- END BUG FIX ---
     active_slice: Optional[str] = Form(None),
     inactive_slice: Optional[str] = Form(None),
     task_queue: get_queue = Depends(),
@@ -232,13 +240,11 @@ async def submit_static_job(
         "inactive_slice": inactive_slice,
     }
     
-    # --- BUG FIX: Handle manual selections ---
     if residue_selections_json:
         try:
             params["residue_selections_dict"] = json.loads(residue_selections_json)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON format for residue_selections_json.")
-    # --- END BUG FIX ---
             
     return await submit_job("static", files_dict, params, task_queue)
 
@@ -248,10 +254,8 @@ async def submit_dynamic_job(
     active_topo: UploadFile = File(...),
     inactive_traj: UploadFile = File(...),
     inactive_topo: UploadFile = File(...),
-    # --- BUG FIX: Both config and residue_selections_json are now Optional ---
     config: Optional[UploadFile] = File(None),
     residue_selections_json: Optional[str] = Form(None),
-    # --- END BUG FIX ---
     te_lag: int = Form(10),
     active_slice: Optional[str] = Form(None),
     inactive_slice: Optional[str] = Form(None),
@@ -268,13 +272,11 @@ async def submit_dynamic_job(
         "inactive_slice": inactive_slice,
     }
 
-    # --- BUG FIX: Handle manual selections ---
     if residue_selections_json:
         try:
             params["residue_selections_dict"] = json.loads(residue_selections_json)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON format for residue_selections_json.")
-    # --- END BUG FIX ---
 
     return await submit_job("dynamic", files_dict, params, task_queue)
 
@@ -284,13 +286,18 @@ async def submit_qubo_job(
     active_topo: UploadFile = File(...),
     inactive_traj: UploadFile = File(...),
     inactive_topo: UploadFile = File(...),
-    # --- BUG FIX: Both config and residue_selections_json are now Optional ---
     config: Optional[UploadFile] = File(None),
     residue_selections_json: Optional[str] = Form(None),
-    # --- END BUG FIX ---
-    target_switch: str = Form(...),
+    # --- MODIFICATION: Changed parameter name ---
+    target_selection_string: str = Form(...),
+    # --- END MODIFICATION ---
     active_slice: Optional[str] = Form(None),
     inactive_slice: Optional[str] = Form(None),
+    # Add QUBO-specific params with defaults from your previous script
+    qubo_lambda: float = Form(1.0, alias="lambda_redundancy"),
+    qubo_solutions: int = Form(5, alias="num_solutions"),
+    qubo_cv_folds: int = Form(3),
+    qubo_n_estimators: int = Form(50),
     task_queue: get_queue = Depends(),
 ):
     files_dict = {
@@ -298,19 +305,23 @@ async def submit_qubo_job(
         "inactive_traj": inactive_traj, "inactive_topo": inactive_topo,
         "config": config
     }
+    # --- MODIFICATION: Add all QUBO params ---
     params = {
-        "target_switch": target_switch,
+        "target_selection_string": target_selection_string,
         "active_slice": active_slice,
         "inactive_slice": inactive_slice,
+        "lambda_redundancy": qubo_lambda,
+        "num_solutions": qubo_solutions,
+        "qubo_cv_folds": qubo_cv_folds,
+        "qubo_n_estimators": qubo_n_estimators
     }
+    # --- END MODIFICATION ---
     
-    # --- BUG FIX: Handle manual selections ---
     if residue_selections_json:
         try:
             params["residue_selections_dict"] = json.loads(residue_selections_json)
         except json.JSONDecodeError:
             raise HTTPException(status_code=400, detail="Invalid JSON format for residue_selections_json.")
-    # --- END BUG FIX ---
 
     return await submit_job("qubo", files_dict, params, task_queue)
 
@@ -318,9 +329,10 @@ async def submit_qubo_job(
 
 @api_router.get("/results", summary="List all available analysis results")
 async def get_results_list():
-    # --- NO CHANGE NEEDED ---
-    # This function will now automatically pick up the 'started' .json files
-    # created by the worker.
+    """
+    Fetches the metadata for all jobs (finished, running, or failed)
+    by reading the JSON files from the persistent results directory.
+    """
     results_list = []
     try:
         # Sort by mtime (newest first)
@@ -350,6 +362,10 @@ async def get_results_list():
 
 @api_router.get("/results/{job_uuid}", summary="Get the full JSON data for a specific result")
 async def get_result_detail(job_uuid: str):
+    """
+    Fetches the complete, persisted JSON data for a single analysis job
+    using its unique job_uuid.
+    """
     try:
         result_file = RESULTS_DIR / f"{job_uuid}.json"
         if not result_file.exists():

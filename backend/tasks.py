@@ -121,7 +121,7 @@ def run_analysis_job(
         )
         
         # Step 2: Prepare data based on analysis type
-        analysis_data = None
+        analysis_data_tuple = None # Will hold the tuple for the analyzer
         mapping = None
         
         active_slice = params.get("active_slice")
@@ -130,22 +130,26 @@ def run_analysis_job(
         if analysis_type in ['static', 'qubo']:
             save_progress("Preparing static dataset", 30)
             all_features_static, labels_Y, mapping = builder.prepare_static_analysis_data(
-                file_paths['active_traj_path'], file_paths['active_topo_path'],
-                file_paths['inactive_traj_path'], file_paths['inactive_topo_path'],
+                file_paths['active_traj_file'], file_paths['active_topo_file'],
+                file_paths['inactive_traj_file'], file_paths['inactive_topo_file'],
                 active_slice=active_slice,
                 inactive_slice=inactive_slice
             )
-            analysis_data = (all_features_static, labels_Y)
+            if analysis_type == 'static':
+                analysis_data_tuple = (all_features_static, labels_Y)
+            else:
+                # QUBO needs the mapping
+                analysis_data_tuple = (all_features_static, labels_Y, mapping)
             
         elif analysis_type == 'dynamic':
             save_progress("Preparing dynamic dataset", 30)
             features_active, features_inactive, mapping = builder.prepare_dynamic_analysis_data(
-                file_paths['active_traj_path'], file_paths['active_topo_path'],
-                file_paths['inactive_traj_path'], file_paths['inactive_topo_path'],
+                file_paths['active_traj_file'], file_paths['active_topo_file'],
+                file_paths['inactive_traj_file'], file_paths['inactive_topo_file'],
                 active_slice=active_slice,
                 inactive_slice=inactive_slice
             )
-            analysis_data = (features_active, features_inactive)
+            analysis_data_tuple = (features_active, features_inactive)
             
         else:
             raise ValueError(f"Unknown analysis type: {analysis_type}")
@@ -158,19 +162,26 @@ def run_analysis_job(
         
         if analysis_type == 'static':
             analyzer = StaticReportersRF()
-            job_results = analyzer.run(analysis_data)
+            # `params` might contain num_workers, cv_folds, etc.
+            job_results = analyzer.run(analysis_data_tuple, **params)
             
         elif analysis_type == 'qubo':
             analyzer = QUBOSet()
-            target_switch = params.get('target_switch')
-            if not target_switch:
-                raise ValueError("QUBO analysis requires 'target_switch' parameter.")
-            job_results = analyzer.run(analysis_data, target_switch=target_switch)
+            # `params` already contains target_selection_string, lambda_redundancy, etc.
+            if 'target_selection_string' not in params:
+                raise ValueError("QUBO analysis requires 'target_selection_string' parameter.")
+            
+            if 'active_topo_file' not in file_paths:
+                raise ValueError("QUBO analysis requires 'active_topo_file', but it's missing.")
+            params['active_topo_file'] = file_paths['active_topo_file']
+
+            # Pass the tuple and all other params
+            job_results = analyzer.run(analysis_data_tuple, **params)
             
         elif analysis_type == 'dynamic':
             analyzer = TransferEntropy()
-            te_lag = params.get('te_lag', 10)
-            job_results = analyzer.run(analysis_data, lag=te_lag)
+            # Pass the tuple and all other params (te_lag, num_workers)
+            job_results = analyzer.run(analysis_data_tuple, **params)
 
         # Step 4: Finalize
         save_progress("Analysis complete", 90)
@@ -188,9 +199,7 @@ def run_analysis_job(
         save_progress("Saving final result", 95)
         result_payload["completed_at"] = datetime.utcnow().isoformat()
         
-        # --- MODIFICATION: Overwrite file with final status ---
         write_result_to_disk(result_payload)
-        # --- END MODIFICATION ---
 
         # Clean up the temporary upload folder
         try:
