@@ -7,6 +7,8 @@ Refactored to include:
   any feature extraction.
 - This fixes a critical bug where non-equivalent residues could be compared.
 - Parallelism is maintained by loading in parallel, then extracting in parallel.
+
+*** MODIFIED to plumb the 'selections_to_process' map all the way out. ***
 """
 
 import collections
@@ -23,13 +25,7 @@ from alloskin.features.extraction import FeatureExtractor, FeatureDict
 def sequence_alignment(mobile, reference):
     """
     Aligns two MDAnalysis ResidueGroups using Bio.Align.
-    
-    Args:
-        reference: The reference ResidueGroup (e.g., inactive state).
-        mobile: The mobile ResidueGroup (e.g., active state).
-        
-    Returns:
-        A tuple of (aligned_mobile_seq, aligned_reference_seq)
+    (Content unchanged)
     """
     residue_map = {
         "ACE": "E", "NME": "M",
@@ -37,12 +33,10 @@ def sequence_alignment(mobile, reference):
         "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "HIE": "H", "HID": "H", "ILE": "I",
         "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
         "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
-        # Add other non-canonical amino acids and ligands if needed
-        "HOH": "W", # Example for water
+        "HOH": "W", 
     }
     
     def get_seq(resgroup):
-        """Helper to convert resnames to 1-letter code, skipping unknowns."""
         seq = []
         for r in resgroup.resnames:
             if r in residue_map:
@@ -58,11 +52,6 @@ def sequence_alignment(mobile, reference):
         open_gap_score=-2,
         extend_gap_score=-0.1)
         
-    # Get 1-letter code sequences
-    # Note: reference.resnames and mobile.resnames might have different lengths
-    # from the *actual* protein if non-standard residues were skipped.
-    # We must use the *original* residue groups (inact_prot_res, act_prot_res)
-    # to build the final map, as they have the correct indices.
     ref_seq_str = get_seq(reference)
     mob_seq_str = get_seq(mobile)
     
@@ -72,9 +61,8 @@ def sequence_alignment(mobile, reference):
 
     try:
         aln = aligner.align(mob_seq_str, ref_seq_str)
-        # choose top alignment with highest score
         topalignment = aln[0]
-        return topalignment.indices # Returns tuple with np.array of indices of seqA and np.array of indices of seqB
+        return topalignment.indices
     except Exception as e:
         print(f"  Error during Bio.Align: {e}")
         return None, None
@@ -87,14 +75,13 @@ class DatasetBuilder:
     """
     def __init__(self, reader: AbstractTrajectoryReader, extractor: FeatureExtractor):
         self.reader = reader
-        # The 'extractor' is now a prototype, holding the *original* config selections
         self.config_extractor = extractor
 
     def _parse_slice(self, slice_str: Optional[str]) -> slice:
         """Converts a string 'start:stop:step' into a slice object."""
-        # ... existing code ...
+        # ... (Content unchanged) ...
         if not slice_str:
-            return slice(None) # Returns slice(None, None, None)
+            return slice(None)
         try:
             parts = [int(p) if p else None for p in slice_str.split(':')]
             if len(parts) > 3:
@@ -112,82 +99,73 @@ class DatasetBuilder:
         Performs sequence alignment and filters the config selections
         to only include residues present and aligned in both states.
         
+        --- MODIFIED ---
         Returns:
-            (active_selections, inactive_selections):
-            Two new selection dictionaries for the FeatureExtractors.
+            (active_selections, inactive_selections, selections_to_process):
+            Two new selection dictionaries for the FeatureExtractors,
+            AND the original mapping dictionary that was processed.
         """
         print("--- Performing Sequence Alignment (Active to Inactive) ---")
         
         try:
-            # Select all protein residues for sequence alignment
             inact_prot_res = u_inact.select_atoms('protein').residues
             act_prot_res = u_act.select_atoms('protein').residues
         except Exception as e:
             print(f"  Error selecting protein residues for alignment: {e}")
-            return {}, {}
+            return {}, {}, {} # <-- MODIFIED
 
         if len(inact_prot_res) == 0 or len(act_prot_res) == 0:
             print("  Error: No protein residues found in one or both universes. Cannot align.")
-            return {}, {}
+            return {}, {}, {} # <-- MODIFIED
 
-        # Align active (mobile) *to* inactive (reference)
-        # This returns (aligned_active_string, aligned_inactive_string)
         indices_act, indices_inact = sequence_alignment(act_prot_res, inact_prot_res)
 
         if indices_act is None or indices_inact is None:
             print("  Error: Alignment failed. Cannot filter selections.")
-            return {}, {}
+            return {}, {}, {} # <-- MODIFIED
         
-        # Build a map from active residue index to inactive residue index for aligned pairs
         alignment_map = {}
         for i, act_idx in enumerate(indices_act):
             inact_idx = indices_inact[i]
-            # A value of -1 from Bio.Align indicates a gap
             if act_idx != -1 and inact_idx != -1:
-                # Check if residues at these indices are the same type
                 if act_prot_res[act_idx].resname == inact_prot_res[inact_idx].resname:
                     alignment_map[act_idx] = inact_idx
 
         print(f"  Alignment produced {len(alignment_map)} matching residue pairs.")
 
-        # Now, filter the *original* config selections based on this alignment map
         active_selections_final = {}
         inactive_selections_final = {}
 
-        # Get the selections to iterate over. If none were provided, generate them now.
+        # --- THIS IS THE KEY SECTION ---
         selections_to_process = self.config_extractor.residue_selections
         if not selections_to_process:
             print("  No residue selections provided. Generating selections for all protein residues...")
+            # This is the mapping we need to save!
             selections_to_process = {
                 f"res_{res.resid}": f"resid {res.resid}" for res in act_prot_res
             }
             print(f"  Generated {len(selections_to_process)} selections to check against inactive state.")
+        # --- END KEY SECTION ---
 
-        # We iterate through the original selections requested by the user
         for key, selection_str in selections_to_process.items():
             try:
-                # Select the residue(s) in the active trajectory based on the user's string
                 selected_residues = u_act.select_atoms(selection_str).residues
-
                 if selected_residues.n_residues > 0:
                     aligned_active_resids = []
                     aligned_inactive_resids = []
                     all_residues_in_group_aligned = True
 
                     for res_act in selected_residues:
-                        # Is this residue part of our valid alignment?
                         if res_act.ix in alignment_map:
                             inact_res_ix = alignment_map[res_act.ix]
                             res_inact = inact_prot_res[inact_res_ix]
                             aligned_active_resids.append(str(res_act.resid))
                             aligned_inactive_resids.append(str(res_inact.resid))
                         else:
-                            # If any residue in the group is not aligned, we must skip the whole group.
                             print(f"  Warning: Residue {res_act.resid} in selection '{key}' is not in the alignment. Skipping this entire group.")
                             all_residues_in_group_aligned = False
                             break
                     
-                    # If all residues were aligned, create the new selection strings
                     if all_residues_in_group_aligned and aligned_active_resids:
                         active_selections_final[key] = f"resid {' '.join(aligned_active_resids)}"
                         inactive_selections_final[key] = f"resid {' '.join(aligned_inactive_resids)}"
@@ -195,9 +173,10 @@ class DatasetBuilder:
             except Exception as e:
                 print(f"  Warning: Could not process selection '{selection_str}' for key '{key}'. Skipping. Error: {e}")
         
-
         print(f"--- Alignment & Filtering Complete: {len(active_selections_final)} common residues selected ---")
-        return active_selections_final, inactive_selections_final
+        
+        # --- MODIFIED RETURN ---
+        return active_selections_final, inactive_selections_final, selections_to_process
 
 
     def _parallel_load_and_extract(
@@ -206,17 +185,19 @@ class DatasetBuilder:
         inactive_traj_file: str, inactive_topo_file: str,
         active_slice: Optional[str] = None,
         inactive_slice: Optional[str] = None
-    ) -> Tuple[FeatureDict, int, FeatureDict, int, Set[str]]:
+    ) -> Tuple[FeatureDict, int, FeatureDict, int, Set[str], Dict[str, str]]: # <-- MODIFIED
         """
         Internal method to manage the full parallel pipeline:
         1. Parallel Load
         2. Serial Align & Filter
         3. Parallel Extract
+        
+        --- MODIFIED ---
+        Returns the original selection mapping as the 6th tuple item.
         """
         act_slice_obj = self._parse_slice(active_slice)
         inact_slice_obj = self._parse_slice(inactive_slice)
         
-        # --- 1. Parallel Load (I/O Bound) ---
         print("Submitting parallel trajectory load tasks...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             future_active = executor.submit(
@@ -227,26 +208,20 @@ class DatasetBuilder:
                 self.reader.load_trajectory, 
                 inactive_traj_file, inactive_topo_file
             )
-            
-            print("Waiting for load tasks...")
             u_act = future_active.result()
             u_inact = future_inactive.result()
         
         if u_act is None or u_inact is None:
             raise ValueError("Trajectory loading failed for one or both states.")
-        
         print("Trajectory loading complete.")
 
-        # --- 2. Serial Align & Filter (Fast, CPU) ---
-        active_selections, inactive_selections = self._get_aligned_selections(u_act, u_inact)
+        # --- MODIFIED ---
+        # Capture the mapping
+        active_selections, inactive_selections, mapping = self._get_aligned_selections(u_act, u_inact)
         
         if not active_selections:
             raise ValueError("No common aligned residues found based on config. Cannot proceed.")
             
-        # --- 3. Parallel Extract (CPU Bound) ---
-        # Create new extractors with the *filtered and aligned* selections
-        print(active_selections)
-        print(inactive_selections)
         extractor_act = FeatureExtractor(active_selections)
         extractor_inact = FeatureExtractor(inactive_selections)
         
@@ -262,14 +237,11 @@ class DatasetBuilder:
                 extractor_inact.extract_all_features, 
                 u_inact, inact_slice_obj
             )
-
-            print("Waiting for extraction tasks...")
             features_active, n_frames_active = future_act_extract.result()
             features_inactive, n_frames_inactive = future_inact_extract.result()
 
         print("Feature extraction complete.")
         
-        # Final check: only return keys present in *both* extracted sets
         common_keys = set(features_active.keys()) & set(features_inactive.keys())
         
         if not common_keys:
@@ -277,7 +249,8 @@ class DatasetBuilder:
         
         print(f"Found {len(common_keys)} common features after extraction.")
 
-        return features_active, n_frames_active, features_inactive, n_frames_inactive, common_keys
+        # --- MODIFIED RETURN ---
+        return features_active, n_frames_active, features_inactive, n_frames_inactive, common_keys, mapping
 
 
     def prepare_static_analysis_data(
@@ -286,18 +259,18 @@ class DatasetBuilder:
         inactive_traj_file: str, inactive_topo_file: str,
         active_slice: Optional[str] = None,
         inactive_slice: Optional[str] = None
-    ) -> Tuple[FeatureDict, np.ndarray]:
+    ) -> Tuple[FeatureDict, np.ndarray, Dict[str, str]]: # <-- MODIFIED
         """
         Prepares data for GOAL 1 and GOAL 2 (Static Analysis).
-        - Loads/aligns/extracts active and inactive trajectories concurrently.
-        - Concatenates *aligned* features into a single (time-scrambled) dataset.
-        - Creates a corresponding binary state label vector Y.
+        
+        --- MODIFIED ---
+        Returns the selection mapping as the 3rd tuple item.
         """
         print("\n--- Preparing STATIC Analysis Dataset ---")
         
         features_active, n_frames_active, \
         features_inactive, n_frames_inactive, \
-        common_keys = self._parallel_load_and_extract(
+        common_keys, mapping = self._parallel_load_and_extract( # <-- MODIFIED
             active_traj_file, active_topo_file,
             inactive_traj_file, inactive_topo_file,
             active_slice, inactive_slice
@@ -310,12 +283,11 @@ class DatasetBuilder:
         print(f"Tasks complete. Active sliced frames: {n_frames_active}, Inactive sliced frames: {n_frames_inactive}, Total: {n_total_frames}")
 
         labels_Y = np.concatenate([
-            np.ones(n_frames_active, dtype=int),    # 1 = Active
-            np.zeros(n_frames_inactive, dtype=int)  # 0 = Inactive
+            np.ones(n_frames_active, dtype=int),
+            np.zeros(n_frames_inactive, dtype=int)
         ])
 
         all_features_static: FeatureDict = {}
-        # Only iterate over keys guaranteed to be in both
         for res_key in common_keys:
             all_features_static[res_key] = np.concatenate(
                 [features_active[res_key], features_inactive[res_key]],
@@ -330,7 +302,9 @@ class DatasetBuilder:
             all_features_static[res_key] = all_features_static[res_key][shuffle_indices]
         
         print("Static dataset prepared and shuffled successfully.")
-        return all_features_static, labels_Y
+        
+        # --- MODIFIED RETURN ---
+        return all_features_static, labels_Y, mapping
 
     def prepare_dynamic_analysis_data(
         self,
@@ -338,17 +312,18 @@ class DatasetBuilder:
         inactive_traj_file: str, inactive_topo_file: str,
         active_slice: Optional[str] = None,
         inactive_slice: Optional[str] = None
-    ) -> Tuple[FeatureDict, FeatureDict]:
+    ) -> Tuple[FeatureDict, FeatureDict, Dict[str, str]]: # <-- MODIFIED
         """
         Prepares data for Dynamic Analysis.
-        - Loads/aligns/extracts active and inactive trajectories concurrently.
-        - Returns two SEPARATE, TIME-ORDERED, and ALIGNED feature sets.
+        
+        --- MODIFIED ---
+        Returns the selection mapping as the 3rd tuple item.
         """
         print("\n--- Preparing DYNAMIC Analysis Dataset ---")
 
         features_active, n_frames_active, \
         features_inactive, n_frames_inactive, \
-        common_keys = self._parallel_load_and_extract(
+        common_keys, mapping = self._parallel_load_and_extract( # <-- MODIFIED
             active_traj_file, active_topo_file,
             inactive_traj_file, inactive_topo_file,
             active_slice, inactive_slice
@@ -357,10 +332,10 @@ class DatasetBuilder:
         if n_frames_active == 0 or n_frames_inactive == 0:
             raise ValueError("Extraction failed for one or both states (0 frames returned).")
 
-        # Filter dictionaries to only contain common keys
         final_features_active = {k: features_active[k] for k in common_keys}
         final_features_inactive = {k: features_inactive[k] for k in common_keys}
 
         print(f"Dynamic datasets prepared. Active frames: {n_frames_active}, Inactive frames: {n_frames_inactive}. Common residues: {len(common_keys)}")
         
-        return final_features_active, final_features_inactive
+        # --- MODIFIED RETURN ---
+        return final_features_active, final_features_inactive, mapping

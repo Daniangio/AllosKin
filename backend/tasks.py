@@ -17,16 +17,18 @@ from alloskin.analysis.qubo import QUBOSet
 from alloskin.analysis.dynamic import TransferEntropy
 
 # Define the persistent results directory
-# This is inside the /app/data mount
 RESULTS_DIR = Path("/app/data/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Helper Function ---
+# --- Helper Function (MODIFIED) ---
 def get_builder(
     config_path: Optional[str] = None, 
     residue_selections_dict: Optional[Dict[str, str]] = None
 ) -> DatasetBuilder:
-    """Initializes the core components."""
+    """
+    Initializes the core components.
+    The builder will now be responsible for generating the mapping.
+    """
     residue_selections = None
 
     if residue_selections_dict is not None:
@@ -35,7 +37,7 @@ def get_builder(
     elif config_path:
         print(f"[Worker] Loading config from {config_path}")
         with open(config_path, 'r') as f:
-            config = yaml.safe_load(f) or {} # Handle empty config file
+            config = yaml.safe_load(f) or {}
         residue_selections = config.get('residue_selections')
         if residue_selections is None:
             print("[Worker] Warning: 'residue_selections' not found in config file. Will analyze all protein residues.")
@@ -43,19 +45,21 @@ def get_builder(
         print("[Worker] No config file or residue selections provided. Will analyze all protein residues.")
         
     reader = MDAnalysisReader()
+    # This extractor is the 'prototype' holding the user's config
     extractor = FeatureExtractor(residue_selections)
     builder = DatasetBuilder(reader, extractor)
+    # Only return the builder
     return builder
 
-# --- Master Analysis Job ---
+# --- Master Analysis Job (MODIFIED) ---
 
 def run_analysis_job(
     job_uuid: str,
     analysis_type: str, 
     file_paths: Dict[str, str],
     params: Dict[str, Any],
-    config_path: Optional[str] = None, # New: Path to uploaded config file
-    residue_selections_dict: Optional[Dict[str, str]] = None # New: Direct residue selections dict
+    config_path: Optional[str] = None,
+    residue_selections_dict: Optional[Dict[str, str]] = None
 ):
     """
     The main, long-running analysis function.
@@ -65,11 +69,12 @@ def run_analysis_job(
     start_time = datetime.utcnow()
     
     result_payload = {
-        "job_id": job_uuid, # Use the UUID we generated, not the RQ id
+        "job_id": job_uuid,
         "analysis_type": analysis_type,
         "status": "started",
         "created_at": start_time.isoformat(),
         "params": params,
+        "residue_selections_mapping": None, # <-- This will be populated now
         "results": None,
         "error": None
     }
@@ -82,40 +87,57 @@ def run_analysis_job(
         print(f"[Job {job_uuid}] {status_msg}")
 
     try:
+        # --- MODIFICATION ---
         # Step 1: Initialize components
         save_progress("Initializing Analysis Pipeline", 10)
-        builder = get_builder(config_path=config_path, residue_selections_dict=residue_selections_dict)
+        # We just get the builder. The mapping is generated *by* the builder.
+        builder = get_builder(
+            config_path=config_path, 
+            residue_selections_dict=residue_selections_dict
+        )
         
         # Step 2: Prepare data based on analysis type
         analysis_data = None
+        mapping = None # <-- Variable to store the mapping
+        
         active_slice = params.get("active_slice")
         inactive_slice = params.get("inactive_slice")
 
         if analysis_type in ['static', 'qubo']:
             save_progress("Preparing static dataset", 30)
-            analysis_data = builder.prepare_static_analysis_data(
+            # Unpack the new 3-tuple return from the refactored builder
+            all_features_static, labels_Y, mapping = builder.prepare_static_analysis_data(
                 file_paths['active_traj_path'], file_paths['active_topo_path'],
                 file_paths['inactive_traj_path'], file_paths['inactive_topo_path'],
                 active_slice=active_slice,
                 inactive_slice=inactive_slice
             )
+            # This is the 2-tuple that analyzer.run expects
+            analysis_data = (all_features_static, labels_Y)
+            
         elif analysis_type == 'dynamic':
             save_progress("Preparing dynamic dataset", 30)
-            analysis_data = builder.prepare_dynamic_analysis_data(
+            # Unpack the new 3-tuple return from the refactored builder
+            features_active, features_inactive, mapping = builder.prepare_dynamic_analysis_data(
                 file_paths['active_traj_path'], file_paths['active_topo_path'],
                 file_paths['inactive_traj_path'], file_paths['inactive_topo_path'],
                 active_slice=active_slice,
                 inactive_slice=inactive_slice
             )
+            # This is the 2-tuple that analyzer.run expects
+            analysis_data = (features_active, features_inactive)
+            
         else:
             raise ValueError(f"Unknown analysis type: {analysis_type}")
         
+        # --- END MODIFICATION ---
+
         # Step 3: Run the correct analysis
         save_progress(f"Running {analysis_type} analysis", 60)
         
         if analysis_type == 'static':
             analyzer = StaticReportersRF()
-            # No extra params needed
+            # analyzer.run just gets the data tuple
             job_results = analyzer.run(analysis_data)
             
         elif analysis_type == 'qubo':
@@ -135,6 +157,11 @@ def run_analysis_job(
         result_payload["status"] = "finished"
         result_payload["results"] = job_results
         
+        # --- THIS IS THE FIX ---
+        # Save the mapping we extracted from the builder
+        result_payload["residue_selections_mapping"] = mapping
+        # --- END OF FIX ---
+        
     except Exception as e:
         print(f"[Job {job_uuid}] FAILED: {e}")
         traceback.print_exc()
@@ -144,7 +171,7 @@ def run_analysis_job(
     finally:
         # Step 5: Save persistent JSON result
         save_progress("Saving persistent result", 95)
-        result_payload["completed_at"] = datetime.utcnow().isoformat() #
+        result_payload["completed_at"] = datetime.utcnow().isoformat()
         
         result_filepath = RESULTS_DIR / f"{job_uuid}.json"
         try:
@@ -159,13 +186,11 @@ def run_analysis_job(
 
         # Clean up the temporary upload folder
         try:
-            upload_dir = Path("/app/data/uploads") / job_uuid # Derive from job_uuid
+            upload_dir = Path("/app/data/uploads") / job_uuid
             if upload_dir.exists() and upload_dir.name == job_uuid:
                 shutil.rmtree(upload_dir)
                 print(f"Cleaned up upload directory: {upload_dir}")
         except Exception as e:
             print(f"Warning: Failed to clean up upload dir: {e}")
 
-    # This return value is saved in Redis by RQ
-    # and is used by the JobStatusPage
     return result_payload
