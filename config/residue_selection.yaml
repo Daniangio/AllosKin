@@ -67,12 +67,18 @@
 #   res_98_224: 'resid 98 224'
 
 # Toggle Switch (PIF + TRP)
+# residue_selections:
+#   res_242: 'resid 242'
+#   res_242_88: 'resid 242 88'
+#   res_242_185: 'resid 242 185'
+#   res_242_238: 'resid 242 238'
+#   res_242_88_185: 'resid 242 88 185'
+#   res_242_88_238: 'resid 242 88 238'
+#   res_242_185_238: 'resid 242 185 238'
+#   res_242_88_185_238: 'resid 242 88 185 238'
+
+# QUBO
+
 residue_selections:
-  res_242: 'resid 242'
-  res_242_88: 'resid 242 88'
-  res_242_185: 'resid 242 185'
-  res_242_238: 'resid 242 238'
-  res_242_88_185: 'resid 242 88 185'
-  res_242_88_238: 'resid 242 88 238'
-  res_242_185_238: 'resid 242 185 238'
-  res_242_88_185_238: 'resid 242 88 185 238'
+  singles: 'resid 1 to 5 [singles]'
+  pairs: 'resid 1 to 5 [pairs]'

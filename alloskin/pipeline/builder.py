@@ -20,6 +20,7 @@ import Bio.Align
 # We need the other components for the new logic
 # Assuming they are in the same module directory
 from alloskin.io.readers import AbstractTrajectoryReader
+from alloskin.pipeline.selection_parser import parse_and_expand_selections
 from alloskin.features.extraction import FeatureExtractor, FeatureDict
 
 def sequence_alignment(mobile, reference):
@@ -137,15 +138,10 @@ class DatasetBuilder:
         inactive_selections_final = {}
 
         # --- THIS IS THE KEY SECTION ---
-        selections_to_process = self.config_extractor.residue_selections
-        if not selections_to_process:
-            print("  No residue selections provided. Generating selections for all protein residues...")
-            # This is the mapping we need to save!
-            selections_to_process = {
-                f"res_{res.resid}": f"resid {res.resid}" for res in act_prot_res
-            }
-            print(f"  Generated {len(selections_to_process)} selections to check against inactive state.")
-        # --- END KEY SECTION ---
+        # Use the new parser to expand wildcards or generate selections for all residues.
+        # This needs a universe object, so we use the active one.
+        selections_to_process = parse_and_expand_selections(u_act, self.config_extractor.residue_selections)
+        # --- END MODIFICATION ---
 
         for key, selection_str in selections_to_process.items():
             try:
