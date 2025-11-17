@@ -4,8 +4,8 @@ Defines endpoints for job submission, status polling, and result retrieval.
 """
 
 import shutil
-import json
-from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile, File, Form
+import json, os
+from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile, File, Form, Response
 from typing import Dict, Any, List, Optional
 import uuid
 from pathlib import Path
@@ -363,18 +363,51 @@ async def get_result_detail(job_uuid: str):
     """
     try:
         result_file = RESULTS_DIR / f"{job_uuid}.json"
-        if not result_file.exists():
+        if not result_file.exists() or not result_file.is_file():
             # It's possible the user is requesting a job that just started
             # and the file hasn't been written yet.
             # But 'started' jobs should lead to the status page.
             # If they have a direct link, 404 is correct.
             raise HTTPException(status_code=404, detail=f"Result file for job '{job_uuid}' not found.")
         
-        with open(result_file, 'r') as f:
-            data = json.load(f)
-        return data
+        # Use FileResponse to correctly stream the file for download
+        return Response(
+            content=result_file.read_text(),
+            media_type="application/json",
+            headers={"Content-Disposition": f"attachment; filename={os.path.basename(result_file)}"}
+        )
         
     except Exception as e:
         if isinstance(e, HTTPException):
             raise e
         raise HTTPException(status_code=500, detail=f"Failed to read result: {e}")
+
+@api_router.delete("/results/{job_uuid}", summary="Delete a job and its associated data")
+async def delete_result(job_uuid: str):
+    """
+    Deletes a job's result JSON file and its uploaded data folder.
+    """
+    result_file = RESULTS_DIR / f"{job_uuid}.json"
+    upload_folder = UPLOAD_DIR / job_uuid
+
+    file_existed = False
+    folder_existed = False
+
+    try:
+        if result_file.exists():
+            result_file.unlink()
+            file_existed = True
+
+        if upload_folder.exists() and upload_folder.is_dir():
+            shutil.rmtree(upload_folder)
+            folder_existed = True
+
+        if not file_existed and not folder_existed:
+            raise HTTPException(status_code=404, detail=f"No data found for job UUID '{job_uuid}'.")
+
+        return {"status": "deleted", "job_id": job_uuid}
+
+    except Exception as e:
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=f"Failed to delete job data: {str(e)}")

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   Upload, Activity, Server, CheckCircle, XCircle, AlertTriangle, 
   Loader2, Database, FileText, ChevronRight, ArrowLeft, Brain, Sliders, Zap,
-  Eye, Save, Trash2, FolderDown,
+  Eye, Save, Trash2, FolderDown, Download,
   Palette,
   Target // Add Target icon for QUBO
 } from 'lucide-react';
@@ -887,7 +887,6 @@ const StatusDisplay = ({ icon, title, message, jobId, children }) => (
 Page: Results List (ResultsListPage)
 ================================================================================
 */
-// ... (ResultsListPage and its sub-components remain unchanged) ...
 const ResultsListPage = ({ onSelectResult, onSelectRunningJob }) => {
   const [results, setResults] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -912,6 +911,10 @@ const ResultsListPage = ({ onSelectResult, onSelectRunningJob }) => {
     };
     fetchResults();
   }, []);
+
+  const handleDeleteResult = (deletedJobId) => {
+    setResults(prevResults => prevResults.filter(r => r.job_id !== deletedJobId));
+  };
 
   const groupResults = (results) => {
     if (!results) return {};
@@ -950,6 +953,7 @@ const ResultsListPage = ({ onSelectResult, onSelectRunningJob }) => {
                     item={item} 
                     onSelectResult={onSelectResult}
                     onSelectRunningJob={onSelectRunningJob}
+                    onDelete={handleDeleteResult}
                   />
                 ))}
               </ul>
@@ -961,7 +965,7 @@ const ResultsListPage = ({ onSelectResult, onSelectRunningJob }) => {
   );
 };
 
-const ResultItem = ({ item, onSelectResult, onSelectRunningJob }) => {
+const ResultItem = ({ item, onSelectResult, onSelectRunningJob, onDelete }) => {
   const status = item.status || 'unknown';
   
   let icon, text, date, handler, classes;
@@ -971,6 +975,26 @@ const ResultItem = ({ item, onSelectResult, onSelectRunningJob }) => {
     return `${prefix}${new Date(dateStr).toLocaleString()}`;
   };
 
+  const handleDeleteClick = async (e) => {
+    e.stopPropagation(); // Prevent navigating when clicking the delete button
+
+    if (window.confirm(`Are you sure you want to permanently delete job ${item.job_id}? This action cannot be undone.`)) {
+      try {
+        const response = await fetch(`/api/v1/results/${item.job_id}`, {
+          method: 'DELETE',
+        });
+
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error(data.detail || 'Failed to delete job.');
+        }
+        // Notify parent to remove this item from the list
+        onDelete(item.job_id);
+      } catch (err) {
+        alert(`Error: ${err.message}`);
+      }
+    }
+  };
   switch (status) {
     case 'finished':
       icon = <CheckCircle className="h-5 w-5 text-green-500" />;
@@ -991,7 +1015,7 @@ const ResultItem = ({ item, onSelectResult, onSelectRunningJob }) => {
       icon = <XCircle className="h-5 w-5 text-red-500" />;
       text = item.job_id;
       date = formattedDate(item.completed_at, "Failed ");
-      handler = null;
+      handler = () => onSelectResult(item.job_id); // Allow viewing failed job details
       classes = "opacity-60 cursor-not-allowed";
       break;
     default:
@@ -1005,16 +1029,33 @@ const ResultItem = ({ item, onSelectResult, onSelectRunningJob }) => {
   return (
     <li
       className={`flex items-center justify-between p-4 ${classes} transition-colors`}
-      onClick={handler}
     >
-      <div className="flex items-center space-x-3">
+      {/* Main clickable area for navigation */}
+      <div onClick={handler} className="flex-grow flex items-center space-x-3 cursor-pointer">
         {icon}
-        <div>
+        <div className="flex-grow">
           <p className="text-sm font-medium text-white">{text}</p>
           <p className="text-sm text-gray-400">{date}</p>
         </div>
       </div>
-      {handler && <ChevronRight className="h-5 w-5 text-gray-500" />}
+      <div className="flex items-center space-x-4">
+        <a
+          href={`/api/v1/results/${item.job_id}`}
+          download={`${item.job_id}.json`}
+          onClick={(e) => e.stopPropagation()}
+          title="Download Result JSON"
+          className="text-gray-500 hover:text-cyan-500 p-1 rounded-full transition-colors"
+        >
+          <Download className="h-5 w-5" />
+        </a>
+        <button
+          onClick={handleDeleteClick}
+          title="Delete Job"
+          className="text-gray-500 hover:text-red-500 p-1 rounded-full transition-colors"
+        >
+          <Trash2 className="h-5 w-5" />
+        </button>
+      </div>
     </li>
   );
 };
@@ -1060,12 +1101,10 @@ const ResultDetailPage = ({ resultId, onBack, onVisualize }) => {
   if (error) return <ErrorDisplay error={error} />;
   if (!result) return <ErrorDisplay error="Result data could not be loaded." />;
 
-  // --- MODIFICATION: Updated check for QUBO ---
-  // We check for `params.target_selection_string` which is present in QUBO
-  // and `results` (which is a dict) for static.
+  // For QUBO, we now also check that the solutions array is not empty.
   const canVisualize = result.residue_selections_mapping && 
                        (result.analysis_type === 'static' && typeof result.results === 'object') ||
-                       (result.analysis_type === 'qubo' && result.params?.target_selection_string);
+                       (result.analysis_type === 'qubo' && result.params?.target_selection_string && result.results?.solutions?.length > 0);
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -1099,6 +1138,13 @@ const ResultDetailPage = ({ resultId, onBack, onVisualize }) => {
           )}
         </div>
         
+        {result.analysis_type === 'qubo' && (!result.results?.solutions || result.results.solutions.length === 0) && (
+          <div className="bg-yellow-900 border border-yellow-700 text-yellow-100 p-3 rounded-md flex items-center space-x-2 my-4">
+            <AlertTriangle className="h-5 w-5" />
+            <span>No valid solutions with negative energy were found. Visualization is disabled.</span>
+          </div>
+        )}
+
         <h3 className="text-lg font-semibold text-cyan-400 mb-2">Raw Result Data</h3>
         <pre className="bg-gray-900 p-4 rounded-md text-gray-200 text-xs overflow-auto">
           {JSON.stringify(result, null, 2)}

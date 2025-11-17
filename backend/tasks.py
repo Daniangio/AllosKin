@@ -7,51 +7,13 @@ from pathlib import Path
 from datetime import datetime
 from rq import get_current_job
 from typing import Dict, Any, Optional
-
-# Import core analysis components
-from alloskin.io.readers import MDAnalysisReader
-from alloskin.features.extraction import FeatureExtractor
-from alloskin.pipeline.builder import DatasetBuilder
-from alloskin.analysis.static import StaticReportersRF
-from alloskin.analysis.qubo import QUBOSet
-from alloskin.analysis.dynamic import TransferEntropy
+from alloskin.pipeline.runner import run_analysis
 
 # Define the persistent results directory
 RESULTS_DIR = Path("/app/data/results")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# --- Helper Function (Unchanged) ---
-def get_builder(
-    config_path: Optional[str] = None, 
-    residue_selections_dict: Optional[Dict[str, str]] = None
-) -> DatasetBuilder:
-    """
-    Initializes the core components.
-    The builder will now be responsible for generating the mapping.
-    """
-    residue_selections = None
-
-    if residue_selections_dict is not None:
-        residue_selections = residue_selections_dict
-        print(f"[Worker] Using provided residue selections: {residue_selections}")
-    elif config_path:
-        print(f"[Worker] Loading config from {config_path}")
-        with open(config_path, 'r') as f:
-            config = yaml.safe_load(f) or {}
-        residue_selections = config.get('residue_selections')
-        if residue_selections is None:
-            print("[Worker] Warning: 'residue_selections' not found in config file. Will analyze all protein residues.")
-    else:
-        print("[Worker] No config file or residue selections provided. Will analyze all protein residues.")
-        
-    reader = MDAnalysisReader()
-    # This extractor is the 'prototype' holding the user's config
-    extractor = FeatureExtractor(residue_selections)
-    builder = DatasetBuilder(reader, extractor)
-    # Only return the builder
-    return builder
-
-# --- Master Analysis Job (MODIFIED) ---
+# --- Master Analysis Job ---
 
 def run_analysis_job(
     job_uuid: str,
@@ -68,7 +30,6 @@ def run_analysis_job(
     job = get_current_job()
     start_time = datetime.utcnow()
     
-    # --- MODIFICATION: Get RQ Job ID ---
     # This ID is needed by the frontend to link from the results page
     # back to the live status page.
     rq_job_id = job.id if job else f"analysis-{job_uuid}" # Reconstruct as fallback
@@ -108,83 +69,37 @@ def run_analysis_job(
             payload["error"] = f"Failed to save result file: {e}"
 
     try:
-        # --- MODIFICATION: Write "started" file immediately ---
         save_progress("Initializing...", 0)
         write_result_to_disk(result_payload)
-        # --- END MODIFICATION ---
 
-        # Step 1: Initialize components
-        save_progress("Initializing Analysis Pipeline", 10)
-        builder = get_builder(
-            config_path=config_path, 
-            residue_selections_dict=residue_selections_dict
+        # Step 1: Load residue selections if a config file is provided
+        residue_selections = residue_selections_dict
+        if config_path and not residue_selections:
+            print(f"[Worker] Loading config from {config_path}")
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f) or {}
+            residue_selections = config.get('residue_selections')
+
+        # Step 2: Prepare arguments for the runner
+        # The runner expects specific keys for file paths
+        runner_file_paths = {
+            'active_traj': file_paths['active_traj_file'],
+            'active_topo': file_paths['active_topo_file'],
+            'inactive_traj': file_paths['inactive_traj_file'],
+            'inactive_topo': file_paths['inactive_topo_file'],
+        }
+        
+        # Step 3: Delegate to the core runner
+        job_results, mapping = run_analysis(
+            analysis_type=analysis_type,
+            file_paths=runner_file_paths,
+            params=params,
+            residue_selections=residue_selections,
+            progress_callback=save_progress
         )
-        
-        # Step 2: Prepare data based on analysis type
-        analysis_data_tuple = None # Will hold the tuple for the analyzer
-        mapping = None
-        
-        active_slice = params.get("active_slice")
-        inactive_slice = params.get("inactive_slice")
-
-        if analysis_type in ['static', 'qubo']:
-            save_progress("Preparing static dataset", 30)
-            all_features_static, labels_Y, mapping = builder.prepare_static_analysis_data(
-                file_paths['active_traj_file'], file_paths['active_topo_file'],
-                file_paths['inactive_traj_file'], file_paths['inactive_topo_file'],
-                active_slice=active_slice,
-                inactive_slice=inactive_slice
-            )
-            if analysis_type == 'static':
-                analysis_data_tuple = (all_features_static, labels_Y)
-            else:
-                # QUBO needs the mapping
-                analysis_data_tuple = (all_features_static, labels_Y, mapping)
-            
-        elif analysis_type == 'dynamic':
-            save_progress("Preparing dynamic dataset", 30)
-            features_active, features_inactive, mapping = builder.prepare_dynamic_analysis_data(
-                file_paths['active_traj_file'], file_paths['active_topo_file'],
-                file_paths['inactive_traj_file'], file_paths['inactive_topo_file'],
-                active_slice=active_slice,
-                inactive_slice=inactive_slice
-            )
-            analysis_data_tuple = (features_active, features_inactive)
-            
-        else:
-            raise ValueError(f"Unknown analysis type: {analysis_type}")
-        
-        # Save the mapping as soon as we have it
         result_payload["residue_selections_mapping"] = mapping
 
-        # Step 3: Run the correct analysis
-        save_progress(f"Running {analysis_type} analysis", 60)
-        
-        if analysis_type == 'static':
-            analyzer = StaticReportersRF()
-            # `params` might contain num_workers, cv_folds, etc.
-            job_results = analyzer.run(analysis_data_tuple, **params)
-            
-        elif analysis_type == 'qubo':
-            analyzer = QUBOSet()
-            # `params` already contains target_selection_string, lambda_redundancy, etc.
-            if 'target_selection_string' not in params:
-                raise ValueError("QUBO analysis requires 'target_selection_string' parameter.")
-            
-            if 'active_topo_file' not in file_paths:
-                raise ValueError("QUBO analysis requires 'active_topo_file', but it's missing.")
-            params['active_topo_file'] = file_paths['active_topo_file']
-
-            # Pass the tuple and all other params
-            job_results = analyzer.run(analysis_data_tuple, **params)
-            
-        elif analysis_type == 'dynamic':
-            analyzer = TransferEntropy()
-            # Pass the tuple and all other params (te_lag, num_workers)
-            job_results = analyzer.run(analysis_data_tuple, **params)
-
         # Step 4: Finalize
-        save_progress("Analysis complete", 90)
         result_payload["status"] = "finished"
         result_payload["results"] = job_results
         
@@ -193,6 +108,10 @@ def run_analysis_job(
         traceback.print_exc()
         result_payload["status"] = "failed"
         result_payload["error"] = str(e)
+        # --- Re-raise the exception AFTER saving the result. ---
+        # This ensures that the RQ job itself is marked as 'failed',
+        # which is what the frontend status page is polling for.
+        raise e
     
     finally:
         # Step 5: Save final persistent JSON result

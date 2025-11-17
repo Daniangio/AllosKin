@@ -211,7 +211,6 @@ class DatasetBuilder:
             raise ValueError("Trajectory loading failed for one or both states.")
         print("Trajectory loading complete.")
 
-        # --- MODIFIED ---
         # Capture the mapping
         active_selections, inactive_selections, mapping = self._get_aligned_selections(u_act, u_inact)
         
@@ -255,7 +254,7 @@ class DatasetBuilder:
         inactive_traj_file: str, inactive_topo_file: str,
         active_slice: Optional[str] = None,
         inactive_slice: Optional[str] = None
-    ) -> Tuple[FeatureDict, np.ndarray, Dict[str, str]]: # <-- MODIFIED
+    ) -> Tuple[FeatureDict, np.ndarray, Dict[str, str]]:
         """
         Prepares data for GOAL 1 and GOAL 2 (Static Analysis).
         
@@ -266,7 +265,7 @@ class DatasetBuilder:
         
         features_active, n_frames_active, \
         features_inactive, n_frames_inactive, \
-        common_keys, mapping = self._parallel_load_and_extract( # <-- MODIFIED
+        common_keys, mapping = self._parallel_load_and_extract(
             active_traj_file, active_topo_file,
             inactive_traj_file, inactive_topo_file,
             active_slice, inactive_slice

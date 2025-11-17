@@ -223,69 +223,57 @@ class QUBOSet(AnalysisComponent):
         except SelectionError as e:
             raise ValueError(f"Invalid target selection string: '{target_selection_string}'. Error: {e}")
         
-        print(f"Target selection '{target_selection_string}' resolved to {target_ag.n_atoms} atoms.")
+        print(f"Target selection string '{target_selection_string}' resolved to {target_ag.n_atoms} atoms.")
 
-        target_keys = set()
-        candidate_keys = [] # This is the disjoint set R
         n_samples = 0
         if all_features_static:
             n_samples = next(iter(all_features_static.values())).shape[0]
 
-        # 2. Partition all available features into Target (S) or Candidate (R)
-        print("Partitioning features into Target (S) and Candidate (R) pools...")
+        # --- CORRECTED LOGIC ---
+        # 1. Identify Candidate Keys to Exclude
+        # The candidate set (R) should not contain any feature that overlaps with the target selection (S).
+        # We iterate through all available features and exclude those that are part of the target.
+        print("Filtering candidate features to exclude the target set...")
+        candidate_keys = []
+        excluded_keys = set()
         for key, selection_string in mapping.items():
-            if key not in all_features_static:
-                continue # This key wasn't in the common aligned set
-
+            if key not in all_features_static: continue
             try:
-                candidate_ag = u.select_atoms(selection_string)
-                if candidate_ag.n_atoms == 0:
-                    print(f"  Warning: Candidate '{key}' ('{selection_string}') matched 0 atoms. Skipping.")
-                    continue
-                
-                # Check for overlap
-                # We use the intersection of the *residues* to be safe
-                overlap_residues = AtomGroup.intersection(target_ag, candidate_ag).residues
-                
-                if overlap_residues.n_residues > 0:
-                    # This key belongs to the target set
-                    print(f"  -> Found Target key: {key} (overlaps with S)")
-                    target_keys.add(key)
+                input_ag = u.select_atoms(selection_string)
+                if AtomGroup.intersection(target_ag, input_ag).n_residues > 0:
+                    print(f"  -> Excluding feature '{key}' because it overlaps with the target selection.")
+                    excluded_keys.add(key)
                 else:
-                    # This key is a valid candidate
                     candidate_keys.append(key)
-
             except SelectionError as e:
-                print(f"  Warning: Could not parse selection for candidate '{key}' ('{selection_string}'). Skipping. Error: {e}")
-            except Exception as e:
-                print(f"  Warning: Error processing candidate '{key}'. Skipping. Error: {e}")
-
-
-        # 3. Build the final target feature vector (S)
-        if not target_keys:
-             raise ValueError(f"Target selection '{target_selection_string}' did not match any residues from the mapping.")
-             
-        print(f"Target selection resolved to feature keys: {target_keys}")
-
-        target_features_list: List[np.ndarray] = []
-        for key in sorted(list(target_keys)): # Sort for consistent concatenation
-            target_features_list.append(all_features_static[key])
+                print(f"  Warning: Could not parse selection for key '{key}' ('{selection_string}'). Skipping. Error: {e}")
         
-        if not target_features_list:
-            # This should be caught by the check above, but as a failsafe
-            raise ValueError(f"Target keys {target_keys} not found in features dictionary.")
-        
+        candidate_keys = sorted(candidate_keys)
+
         if not candidate_keys:
-            print("  Warning: No candidate residues found (all residues are targets?).")
-            return {}
-            
-        # Concatenate target features if it's a motif
-        # Shape: (n_samples, 1, n_feat_S)
-        target_features_S_3d = np.concatenate(target_features_list, axis=-1)
-        candidate_keys.sort()
+            raise ValueError("The Candidate Set (R) is empty. This happens if all input features overlap with the target selection.")
+
+        print(f"Final feature keys for Candidate (R): {candidate_keys}")
+
+        # 2. Build the Target Feature Vector (S)
+        # The target feature vector (S) should ONLY be the feature corresponding to the
+        # 'qubo_target_selection' key we added in the runner. Other features might be in
+        # `excluded_keys` due to incidental overlap, but they are not the target.
+        target_key = 'qubo_target_selection'
+        print(f"Building target feature vector (S) from key: '{target_key}'")
+
+        if target_key not in all_features_static:
+            # This error is critical. It means the runner added the selection, but the
+            # feature extractor failed to produce a feature for it.
+            raise ValueError(f"The designated QUBO target feature '{target_key}' was not found after feature extraction. "
+                             "This indicates a problem with the feature extraction for the target selection.")
+
+        # The target feature is just the feature array for this one key.
+        target_features_S_3d = all_features_static[target_key]
         
         print(f"Target S shape: {target_features_S_3d.shape}. Candidates: {len(candidate_keys)}.")
-        
+        # --- END CORRECTED LOGIC ---
+
         # --- 3. Compute Relevance (h_i) in Parallel ---
         print("Computing Relevance vector (h_i = -R^2(R_i -> S))...")
         raw_relevance_scores_r2: Dict[str, float] = {}
@@ -396,14 +384,15 @@ class QUBOSet(AnalysisComponent):
             seen_solutions = set() # To track unique solutions
 
             for record in response.record:
+                # --- Only consider solutions with negative energy ---
+                calculated_energy = record['energy'] + offset
+                if calculated_energy >= 0:
+                    continue # Discard non-informative solutions
+
                 if unique_solutions_found >= num_solutions:
                     break # We have enough unique solutions
 
-                solution_vector_array = record['sample']
-                qubo_energy = record['energy']
-                num_occurrences = record['num_occurrences']
-                
-                solution_tuple = tuple(solution_vector_array)
+                solution_tuple = tuple(record['sample'])
                 
                 if solution_tuple not in seen_solutions:
                     seen_solutions.add(solution_tuple)
@@ -411,16 +400,16 @@ class QUBOSet(AnalysisComponent):
                     
                     solution_vector_dict = {}
                     selected_residues = []
-                    for i, var_name in enumerate(variable_names):
-                        val = int(solution_vector_array[i])
+                    for i, var_name in enumerate(response.variables):
+                        val = int(record['sample'][i])
                         solution_vector_dict[var_name] = val
                         if val == 1:
                             selected_residues.append(var_name)
                             
                     solutions_list.append({
-                        "energy": qubo_energy + offset,
+                        "energy": calculated_energy,
                         "selected_residues": selected_residues,
-                        "num_occurrences": int(num_occurrences),
+                        "num_occurrences": int(record['num_occurrences']),
                         "solution_vector": solution_vector_dict
                     })
             
@@ -442,7 +431,7 @@ class QUBOSet(AnalysisComponent):
             "analysis_type": "QUBO_RandomForest_PyQUBO",
             "parameters": {
                 "target_selection_string": target_selection_string,
-                "target_keys_resolved": list(target_keys),
+                "target_keys_resolved": sorted(list(excluded_keys)),
                 "lambda_redundancy": lambda_redundancy,
                 "num_solutions_requested": num_solutions,
                 "cv_folds": cv_folds,

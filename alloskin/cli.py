@@ -5,19 +5,9 @@ This script has been refactored to align with the new
 analysis logic (e.g., passing a selection string and
 topology path for QUBO).
 """
-import argparse
-import yaml
-import sys
+import argparse, yaml, sys, json
 from typing import Dict, Any
-
-from alloskin.io.readers import MDAnalysisReader
-from alloskin.features.extraction import FeatureExtractor
-from alloskin.pipeline.builder import DatasetBuilder
-from alloskin.analysis.static import StaticReportersRF
-# --- MODIFIED IMPORTS ---
-from alloskin.analysis.qubo import QUBOSet
-from alloskin.analysis.dynamic import TransferEntropy
-# --- END MODIFIED ---
+from alloskin.pipeline.runner import run_analysis
 
 
 def load_config(config_file: str) -> Dict[str, Any]:
@@ -79,13 +69,13 @@ def main():
         help="Number of parallel workers for analysis. (Default: all available cores)"
     )
 
-    # --- Goal 2 (QUBO) Arguments (MODIFIED) ---
+    # --- QUBO Analysis Arguments ---
     parser.add_argument(
         '--target_selection', 
         type=str,
         help='REQUIRED for QUBO. MDAnalysis selection string (e.g., "resid 131 140")'
     )
-    # --- END MODIFICATION ---
+
     parser.add_argument(
         '--qubo_lambda', 
         type=float, 
@@ -111,7 +101,7 @@ def main():
         help='Number of trees for QUBO RF regressors. Default: 50'
     )
 
-    # --- Goal 3 (Dynamic) Arguments ---
+    # --- Dynamic Analysis Arguments ---
     parser.add_argument("--te_lag", type=int, default=10, help="Lag time for TE (in frames). Default: 10.")
     
 
@@ -120,7 +110,6 @@ def main():
     # --- 1. Initialization ---
     print("--- Initializing Pipeline ---")
     
-    # --- MODIFICATION: Config is now optional ---
     residue_selections = None
     if args.config:
         config = load_config(args.config)
@@ -130,102 +119,47 @@ def main():
         print("NOTE: No config or 'residue_selections' not found. Will analyze ALL protein residues.")
     elif not any(residue_selections.values()):
         print("Warning: 'residue_selections' is empty. Will analyze ALL protein residues.")
-    # --- END MODIFICATION ---
 
-    # Note: extractor is now a 'prototype' holding the config
-    reader = MDAnalysisReader()
-    extractor = FeatureExtractor(residue_selections)
-    builder = DatasetBuilder(reader, extractor)
-    print("--- Initialization Complete ---")
-
-    # --- 2. Analysis-Based Execution ---
-    
-    if args.analysis == "static":
-        print("\n--- Preparing Data for Static Analysis ---")
-        # prepare_static_analysis_data returns (all_features_static, labels_Y, mapping)
-        static_data, labels_Y, mapping = builder.prepare_static_analysis_data(
-            args.active_traj, args.active_topo,
-            args.inactive_traj, args.inactive_topo,
-            active_slice=args.active_slice,
-            inactive_slice=args.inactive_slice
-        )
-        print("\n--- Running Static Reporters (Random Forest) ---")
-        analyzer = StaticReportersRF()
-        # The analyzer only needs the first two items
-        results = analyzer.run(
-            (static_data, labels_Y), 
-            num_workers=args.num_workers
-        )
-        print("\n--- Final Static Results (Sorted by best reporter, highest accuracy) ---")
-        import json
-        print(json.dumps(results, indent=2))
-
-    elif args.analysis == "qubo":
-        print("\n--- Preparing Data for QUBO Analysis ---")
-        
-        # --- MODIFICATION: Check new argument ---
+    # --- 2. Prepare arguments for the runner ---
+    if args.analysis == "qubo":
         if not args.target_selection:
             print("Error: --target_selection argument is required for QUBO analysis.", file=sys.stderr)
             print("Example: --target_selection \"resid 131 140\"", file=sys.stderr)
             sys.exit(1)
-        # --- END MODIFICATION ---
 
-        # QUBO also uses the static dataset
-        static_data, labels_Y, mapping = builder.prepare_static_analysis_data(
-            args.active_traj, args.active_topo,
-            args.inactive_traj, args.inactive_topo,
-            active_slice=args.active_slice,
-            inactive_slice=args.inactive_slice
-        )
-        
-        # Pass all data and kwargs to the analyzer
-        qubo_data_tuple = (static_data, labels_Y, mapping)
-        
-        # --- MODIFICATION: Build correct kwargs ---
-        qubo_kwargs = {
-            "target_selection_string": args.target_selection,
-            "active_topo_file": args.active_topo,
-            "lambda_redundancy": args.qubo_lambda,
-            "num_solutions": args.qubo_solutions,
-            "qubo_cv_folds": args.qubo_cv_folds,
-            "qubo_n_estimators": args.qubo_n_estimators
-        }
-        # --- END MODIFICATION ---
+    file_paths = {
+        'active_traj': args.active_traj,
+        'active_topo': args.active_topo,
+        'inactive_traj': args.inactive_traj,
+        'inactive_topo': args.inactive_topo,
+    }
 
-        print("--- Running Optimal Predictive Set (QUBO) ---")
-        analyzer = QUBOSet()
-        results = analyzer.run(
-            qubo_data_tuple, 
-            num_workers=args.num_workers, 
-            **qubo_kwargs
+    # Collect all other parameters into a single dict
+    params = {
+        "active_slice": args.active_slice,
+        "inactive_slice": args.inactive_slice,
+        "num_workers": args.num_workers,
+        "target_selection_string": args.target_selection,
+        "lambda_redundancy": args.qubo_lambda,
+        "num_solutions": args.qubo_solutions,
+        "qubo_cv_folds": args.qubo_cv_folds,
+        "qubo_n_estimators": args.qubo_n_estimators,
+        "lag": args.te_lag, # Renamed from te_lag for consistency
+    }
+
+    # --- 3. Delegate to the core runner ---
+    try:
+        results, mapping = run_analysis(
+            analysis_type=args.analysis,
+            file_paths=file_paths,
+            params=params,
+            residue_selections=residue_selections
         )
-        
-        print("\n--- Final QUBO Results ---")
-        # Pretty-print the dictionary results
-        import json
+        print(f"\n--- Final {args.analysis.upper()} Results ---")
         print(json.dumps(results, indent=2))
-
-
-    elif args.analysis == "dynamic":
-        print("\n--- Preparing Data for Dynamic Analysis ---")
-        # prepare_dynamic_analysis_data returns (features_active, features_inactive, mapping)
-        features_active, features_inactive, mapping = builder.prepare_dynamic_analysis_data(
-            args.active_traj, args.active_topo,
-            args.inactive_traj, args.inactive_topo,
-            active_slice=args.active_slice,
-            inactive_slice=args.inactive_slice
-        )
-        print("--- Running Dynamic 'Orchestrated Action' (Transfer Entropy) ---")
-        analyzer = TransferEntropy()
-        # The analyzer only needs the first two items
-        results = analyzer.run(
-            (features_active, features_inactive), 
-            lag=args.te_lag, 
-            num_workers=args.num_workers
-        )
-        print("\n--- Final Dynamic Results ---")
-        import json
-        print(json.dumps(results, indent=2))
+    except Exception as e:
+        print(f"\nFATAL ERROR during analysis: {e}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
