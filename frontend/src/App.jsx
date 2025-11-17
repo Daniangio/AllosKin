@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { 
   Upload, Activity, Server, CheckCircle, XCircle, AlertTriangle, 
   Loader2, Database, FileText, ChevronRight, ArrowLeft, Brain, Sliders, Zap,
-  Eye, 
+  Eye, Save, Trash2, FolderDown,
   Palette,
   Target // Add Target icon for QUBO
 } from 'lucide-react';
@@ -17,6 +17,28 @@ export default function App() {
   const [page, setPage] = useState('submit');
   const [pollingJobId, setPollingJobId] = useState(null); // This is the RQ_JOB_ID
   const [selectedResultId, setSelectedResultId] = useState(null); // This is the JOB_UUID
+
+  // State for the submission form, lifted up to preserve it across pages
+  const [formState, setFormState] = useState({
+    analysisType: 'static',
+    files: {
+      active_topo: null, active_traj: null,
+      inactive_topo: null, inactive_traj: null,
+      config: null,
+    },
+    teLag: 10,
+    targetSelection: 'resid 131',
+    activeSlice: '',
+    inactiveSlice: '',
+    selectionMode: 'all',
+    manualSelections: 'resid 50\nresid 131',
+  });
+
+  // State for user-defined custom selections, persisted in localStorage
+  const [customSelections, setCustomSelections] = useState(() => {
+    const saved = localStorage.getItem('alloskin_custom_selections');
+    return saved ? JSON.parse(saved) : [];
+  });
 
   const navigateToStatus = (rqJobId) => {
     setPollingJobId(rqJobId);
@@ -40,7 +62,12 @@ export default function App() {
   const renderPage = () => {
     switch (page) {
       case 'submit':
-        return <SubmitJobPage onJobSubmitted={navigateToStatus} />;
+        return <SubmitJobPage 
+                 formState={formState}
+                 setFormState={setFormState}
+                 customSelections={customSelections}
+                 setCustomSelections={setCustomSelections}
+                 onJobSubmitted={navigateToStatus} />;
       case 'status':
         return (
           <JobStatusPage 
@@ -74,7 +101,12 @@ export default function App() {
           />
         );
       default:
-        return <SubmitJobPage onJobSubmitted={navigateToStatus} />;
+        return <SubmitJobPage 
+                formState={formState}
+                setFormState={setFormState}
+                customSelections={customSelections}
+                setCustomSelections={setCustomSelections}
+                onJobSubmitted={navigateToStatus} />;
     }
   };
 
@@ -311,27 +343,35 @@ function xhrUpload(url, formData, onProgress) {
 Page: Submit Job (SubmitJobPage)
 ================================================================================
 */
-// ... (SubmitJobPage and its sub-components remain unchanged) ...
-const SubmitJobPage = ({ onJobSubmitted }) => {
-  const [analysisType, setAnalysisType] = useState('static');
-  const [files, setFiles] = useState({
-    active_topo: null, active_traj: null,
-    inactive_topo: null, inactive_traj: null,
-    config: null,
-  });
-  const [teLag, setTeLag] = useState(10);
-  const [targetSelection, setTargetSelection] = useState('resid 131');
-  const [activeSlice, setActiveSlice] = useState('');
-  const [inactiveSlice, setInactiveSlice] = useState('');
-  const [selectionMode, setSelectionMode] = useState('all');
-  const [manualSelections, setManualSelections] = useState('resid 50\nresid 131');
+const SubmitJobPage = ({ formState, setFormState, customSelections, setCustomSelections, onJobSubmitted }) => {
+  // Local state for UI feedback (loading, errors)
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
   const [uploadProgress, setUploadProgress] = useState(0);
 
+  // Destructure state and create setters for easier use
+  const {
+    analysisType, files, teLag, targetSelection, activeSlice,
+    inactiveSlice, selectionMode, manualSelections
+  } = formState;
+
+  const setAnalysisType = (value) => setFormState(prev => ({ ...prev, analysisType: value }));
+  const setFiles = (updater) => setFormState(prev => ({ ...prev, files: typeof updater === 'function' ? updater(prev.files) : updater }));
+  const setTeLag = (value) => setFormState(prev => ({ ...prev, teLag: value }));
+  const setTargetSelection = (value) => setFormState(prev => ({ ...prev, targetSelection: value }));
+  const setActiveSlice = (value) => setFormState(prev => ({ ...prev, activeSlice: value }));
+  const setInactiveSlice = (value) => setFormState(prev => ({ ...prev, inactiveSlice: value }));
+  const setSelectionMode = (value) => setFormState(prev => ({ ...prev, selectionMode: value }));
+  const setManualSelections = (value) => setFormState(prev => ({ ...prev, manualSelections: value }));
+
+  // Persist custom selections to localStorage whenever they change
+  useEffect(() => {
+    localStorage.setItem('alloskin_custom_selections', JSON.stringify(customSelections));
+  }, [customSelections]);
+
   const handleFileChange = (e) => {
-    const { name, files } = e.target;
-    setFiles((prev) => ({ ...prev, [name]: files[0] }));
+    const { name, files: selectedFiles } = e.target;
+    setFiles(prev => ({ ...prev, [name]: selectedFiles[0] }));
   };
 
   const handleSliceChange = (e) => {
@@ -474,6 +514,7 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
             onChange={handleFileChange}
           />
         </div>
+
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <div className="bg-gray-800 p-4 rounded-lg border border-gray-700">
             <h3 className="text-lg font-semibold mb-3 text-cyan-400">Candidate Residues (Input Set)</h3>
@@ -495,14 +536,13 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
             )}
             {selectionMode === 'manual' && (
               <div>
-                <label htmlFor="manual_selections" className="block text-sm font-medium text-gray-300 mb-1">
-                  Enter MDAnalysis Selections (one per line)
-                </label>
-                <textarea
-                  id="manual_selections" rows={4} value={manualSelections}
-                  onChange={(e) => setManualSelections(e.target.value)}
-                  className="w-full bg-gray-900 border border-gray-600 rounded-md p-2 text-white focus:ring-cyan-500 focus:border-cyan-500 font-mono text-sm"
-                  placeholder="e.g., resid 50 and name CA&#10;resid 130-140"
+                <SelectionField
+                  label="Enter MDAnalysis Selections (one per line)"
+                  value={manualSelections}
+                  onChange={setManualSelections}
+                  selectionType="manual"
+                  customSelections={customSelections}
+                  setCustomSelections={setCustomSelections}
                 />
                 <p className="text-xs text-gray-500 mt-1">Each line will become a feature. Keys are auto-generated.</p>
               </div>
@@ -515,14 +555,13 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
             )}
             {analysisType === 'qubo' && (
               <div>
-                <label htmlFor="target_selection" className="block text-sm font-medium text-gray-300 mb-1">
-                  Target Selection (MDAnalysis string)
-                </label>
-                <input
-                  type="text" id="target_selection" value={targetSelection}
-                  onChange={(e) => setTargetSelection(e.target.value)}
-                  className="w-full bg-gray-900 border border-gray-600 rounded-md p-2 text-white focus:ring-cyan-500 focus:border-cyan-500 font-mono text-sm"
-                  placeholder="e.g., resid 131 or resid 131 140"
+                <SelectionField
+                  label="Target Selection (MDAnalysis string)"
+                  value={targetSelection}
+                  onChange={setTargetSelection}
+                  selectionType="target"
+                  customSelections={customSelections}
+                  setCustomSelections={setCustomSelections}
                 />
                 <p className="text-xs text-gray-500 mt-1">
                   The residue(s) to predict. These will be removed from the candidate pool.
@@ -551,6 +590,116 @@ const SubmitJobPage = ({ onJobSubmitted }) => {
         
         <SubmitButton isLoading={isLoading} />
       </form>
+    </div>
+  );
+};
+
+const SelectionField = ({ label, value, onChange, selectionType, customSelections, setCustomSelections }) => {
+  const [showLoadPopup, setShowLoadPopup] = useState(false);
+  const wrapperRef = useRef(null);
+
+  // Close popup when clicking outside
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (wrapperRef.current && !wrapperRef.current.contains(event.target)) {
+        setShowLoadPopup(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [wrapperRef]);
+
+  const handleSave = () => {
+    if (!value.trim()) {
+      alert('There is no content to save.');
+      return;
+    }
+    const name = window.prompt('Enter a name for this selection:');
+    if (!name || !name.trim()) {
+      return;
+    }
+    const newSelection = { id: Date.now(), name: name.trim(), type: selectionType, content: value };
+    setCustomSelections(prev => [...prev, newSelection]);
+  };
+
+  const handleLoad = (content) => {
+    onChange(content);
+    setShowLoadPopup(false);
+  };
+
+  const deleteSelection = (id) => {
+    setCustomSelections(prev => prev.filter(s => s.id !== id));
+  };
+
+  const relevantSelections = customSelections.filter(s => s.type === selectionType);
+
+  const InputComponent = selectionType === 'manual' ? 'textarea' : 'input';
+
+  return (
+    <div className="relative" ref={wrapperRef}>
+      <label className="block text-sm font-medium text-gray-300 mb-1">{label}</label>
+      <div className="flex items-center space-x-2">
+        <InputComponent
+          rows={selectionType === 'manual' ? 4 : undefined}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="w-full bg-gray-900 border border-gray-600 rounded-md p-2 text-white focus:ring-cyan-500 focus:border-cyan-500 font-mono text-sm"
+          placeholder={selectionType === 'manual' ? "e.g., resid 50\nresid 130 to 150" : "e.g., resid 131"}
+        />
+        <div className="flex flex-col space-y-2">
+          <button type="button" onClick={handleSave} title="Save current selection" className="p-2 bg-gray-700 hover:bg-gray-600 rounded-md text-white transition-colors">
+            <Save className="h-5 w-5" />
+          </button>
+          <button type="button" onClick={() => setShowLoadPopup(p => !p)} disabled={relevantSelections.length === 0} title="Load a saved selection" className="p-2 bg-gray-700 hover:bg-gray-600 rounded-md text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+            <FolderDown className="h-5 w-5" />
+          </button>
+        </div>
+      </div>
+      {showLoadPopup && relevantSelections.length > 0 && (
+        <LoadSelectionsPopup
+          selections={relevantSelections}
+          onLoad={handleLoad}
+          onDelete={deleteSelection}
+          onClose={() => setShowLoadPopup(false)}
+        />
+      )}
+    </div>
+  );
+};
+
+const LoadSelectionsPopup = ({ selections, onLoad, onDelete, onClose }) => {
+  return (
+    <div className="absolute top-full right-0 mt-2 w-72 bg-gray-800 border border-gray-600 rounded-lg shadow-lg z-10">
+      <div className="flex justify-between items-center p-2 border-b border-gray-700">
+        <h4 className="font-semibold text-white text-sm">Load Selection</h4>
+        <button onClick={onClose} className="text-gray-400 hover:text-white">
+          <XCircle className="h-5 w-5" />
+        </button>
+      </div>
+      <ul className="max-h-60 overflow-y-auto p-1">
+        {selections.map(sel => (
+          <li key={sel.id} className="group flex items-center justify-between p-2 rounded-md hover:bg-gray-700">
+            <button
+              type="button"
+              onClick={() => onLoad(sel.content)}
+              className="text-left w-full"
+            >
+              <p className="font-medium text-white truncate">{sel.name}</p>
+              <p className="text-xs text-gray-400 truncate">
+                {sel.content.replace(/\n/g, '; ')}
+              </p>
+            </button>
+            <button
+              type="button"
+              onClick={() => onDelete(sel.id)}
+              className="text-gray-500 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity ml-2 p-1"
+              title="Delete selection"
+            >
+              <Trash2 className="h-4 w-4" />
+            </button>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 };

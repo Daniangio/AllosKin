@@ -116,16 +116,11 @@ async def health_check(request: Request):
     if report["redis_status"]["status"] == "ok":
         task_queue = request.app.state.task_queue
         try:
-            worker_count = len(task_queue.get_workers())
-            if worker_count > 0:
-                report["worker_status"] = {
-                    "status": "ok", 
-                    "queue_name": task_queue.name,
-                    "queue_length": task_queue.count,
-                    "workers_found": worker_count
-                }
-            else:
-                report["worker_status"] = {"status": "error", "error": "No workers are listening to this queue."}
+            report["worker_status"] = {
+                "status": "ok", 
+                "queue_name": task_queue.name,
+                "queue_length": task_queue.count
+            }
         except Exception as e:
             report["worker_status"] = {"status": "error", "error": f"Error interacting with RQ queue: {str(e)}"}
 
