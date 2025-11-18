@@ -52,7 +52,7 @@ class BaseStaticReporter(AnalysisComponent):
         method_name = self.__class__.__name__
         print(f"\n--- Running {method_name} ---")
         
-        max_workers = num_workers if num_workers is not None else os.cpu_count()
+        max_workers = num_workers if num_workers is not None else min(64, os.cpu_count())
         all_features_static, labels_Y = data
         results: Dict[str, Dict[str, float]] = {}
         
