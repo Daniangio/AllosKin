@@ -147,15 +147,15 @@ export default function SystemDetailPage() {
             <StaticAnalysisForm onSubmit={(params) => enqueueJob(submitStaticJob, params)} />
           </div>
           <div className="bg-gray-900 border border-gray-700 rounded-lg p-4">
-            <h3 className="text-md font-semibold text-white mb-2">Dynamic TE</h3>
-            <DynamicAnalysisForm onSubmit={(params) => enqueueJob(submitDynamicJob, params)} />
-          </div>
-          <div className="bg-gray-900 border border-gray-700 rounded-lg p-4">
             <h3 className="text-md font-semibold text-white mb-2">QUBO</h3>
             <QuboAnalysisForm
               staticOptions={staticResults}
               onSubmit={(params) => enqueueJob(submitQuboJob, params)}
             />
+          </div>
+          <div className="bg-gray-900 border border-gray-700 rounded-lg p-4">
+            <h3 className="text-md font-semibold text-white mb-2">Dynamic TE</h3>
+            <DynamicAnalysisForm onSubmit={(params) => enqueueJob(submitDynamicJob, params)} />
           </div>
         </div>
       </section>

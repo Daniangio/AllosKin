@@ -1,73 +1,62 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import Loader from '../components/common/Loader';
 import ErrorMessage from '../components/common/ErrorMessage';
 import { fetchResult } from '../api/jobs';
-import { downloadStructure } from '../api/projects';
+import { createPluginUI } from 'molstar/lib/mol-plugin-ui/index';
+import { renderReact18 } from 'molstar/lib/mol-plugin-ui/react18';
+import { Asset } from 'molstar/lib/mol-util/assets';
+import { MolScriptBuilder as MS } from 'molstar/lib/mol-script/language/builder';
+import { Color } from 'molstar/lib/mol-util/color';
+import 'molstar/build/viewer/molstar.css';
 
-const buildSelection = (keys, mapping) => {
-  if (!keys || !mapping) return 'none';
-  const residues = keys
-    .map((key) => mapping[key])
-    .filter(Boolean)
-    .map((sel) => sel.replace(/resid /gi, ''))
-    .join(' or ')
-    .replace(/\s+/g, ' or ');
-  return residues || 'none';
+const parseResidueIds = (selection) => {
+  if (!selection) return [];
+  const cleaned = selection.replace(/resid/gi, '');
+  const matches = cleaned.match(/-?\d+/g);
+  if (!matches) return [];
+  return matches.map((val) => Number(val)).filter((id) => Number.isFinite(id));
+};
+
+const convertKeysToResidues = (keys, mapping) => {
+  if (!keys || !mapping) return [];
+  const residues = new Set();
+  keys.forEach((key) => {
+    parseResidueIds(mapping[key]).forEach((id) => residues.add(id));
+  });
+  return Array.from(residues);
 };
 
 export default function VisualizePage() {
   const { jobId } = useParams();
   const navigate = useNavigate();
+
+  const containerRef = useRef(null);
+  const pluginRef = useRef(null);
+  const highlightComponentsRef = useRef([]);
+
   const [resultData, setResultData] = useState(null);
-  const [structureFile, setStructureFile] = useState(null);
-  const [structureLoading, setStructureLoading] = useState(false);
-  const [structureError, setStructureError] = useState(null);
-  const stageRef = useRef(null);
-  const [stageReady, setStageReady] = useState(false);
-  const [stageKey, setStageKey] = useState(0);
-  const componentRef = useRef(null);
-  const [nglReady, setNglReady] = useState(() => typeof window !== 'undefined' && !!window.NGL);
-  const [staticThreshold, setStaticThreshold] = useState(0.8);
-  const [quboSolutionIndex, setQuboSolutionIndex] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
-  const nglViewportRef = useRef(null);
 
-  useEffect(() => {
-    const scriptId = 'ngl-script';
-    if (window.NGL) {
-      setNglReady(true);
-      return;
-    }
-    if (!document.getElementById(scriptId)) {
-      const script = document.createElement('script');
-      script.id = scriptId;
-      script.src = 'https://cdn.jsdelivr.net/npm/ngl/dist/ngl.js';
-      script.async = true;
-      script.onload = () => setNglReady(true);
-      document.body.appendChild(script);
-    } else {
-      const existing = document.getElementById(scriptId);
-      existing.addEventListener('load', () => setNglReady(true), { once: true });
-    }
-  }, []);
+  const [status, setStatus] = useState('initializing'); // initializing | ready | loading-structure | error
+  const [structureError, setStructureError] = useState(null);
+  const [staticThreshold, setStaticThreshold] = useState(0.8);
+  const [structureVersion, setStructureVersion] = useState(0);
 
+  // Fetch job/result metadata to locate the system and structures
   useEffect(() => {
     const loadResult = async () => {
       setIsLoading(true);
       setError(null);
       try {
         const data = await fetchResult(jobId);
-        if (!data.residue_selections_mapping || !data.results) {
-          throw new Error('Result is missing selections or outputs.');
-        }
         if (!data.system_reference?.project_id || !data.system_reference?.system_id) {
           throw new Error('Result does not reference a stored system.');
         }
         setResultData(data);
       } catch (err) {
-        setError(err.message);
+        setError(err.message || 'Failed to load result metadata.');
       } finally {
         setIsLoading(false);
       }
@@ -75,128 +64,152 @@ export default function VisualizePage() {
     loadResult();
   }, [jobId]);
 
+  // Initialize Mol* viewer
   useEffect(() => {
-    let cancelled = false;
-    const fetchStructure = async () => {
-      if (!resultData) return;
-      const { project_id, system_id } = resultData.system_reference || {};
-      if (!project_id || !system_id) return;
-      setStructureLoading(true);
-      setStructureError(null);
-      setStructureFile(null);
+    let disposed = false;
+    const initViewer = async () => {
+      if (!containerRef.current || pluginRef.current) return;
+      setStatus((prev) => (prev === 'initializing' ? prev : 'initializing'));
       try {
-        const blob = await downloadStructure(project_id, system_id, 'active');
-        if (cancelled) return;
-        const file = new File([blob], `active.pdb`, { type: 'chemical/x-pdb' });
-        setStructureFile(file);
-      } catch (err) {
-        if (!cancelled) {
-          setStructureError(err.message);
+        const plugin = await createPluginUI({
+          target: containerRef.current,
+          render: renderReact18,
+        });
+        if (disposed) {
+          plugin.dispose?.();
+          return;
         }
-      } finally {
-        if (!cancelled) {
-          setStructureLoading(false);
-        }
+        pluginRef.current = plugin;
+        setStatus('ready');
+      } catch (viewerErr) {
+        console.error('Failed to initialize Mol* viewer', viewerErr);
+        setError('3D viewer initialization failed.');
+        setStatus('error');
       }
     };
-    fetchStructure();
+    initViewer();
     return () => {
-      cancelled = true;
+      disposed = true;
+      if (pluginRef.current) {
+        try {
+          pluginRef.current.dispose?.();
+        } catch (err) {
+          console.warn('Failed to dispose Mol* viewer', err);
+        }
+        pluginRef.current = null;
+      }
     };
   }, [resultData]);
 
-  useEffect(() => {
-    if (!nglReady || !window.NGL || !nglViewportRef.current) return undefined;
-    const stage = new window.NGL.Stage(nglViewportRef.current);
-    stageRef.current = stage;
-    setStageReady(true);
-    setStageKey((key) => key + 1);
-    return () => {
-      setStageReady(false);
-      if (stageRef.current) {
-        try {
-          stageRef.current.dispose();
-        } catch (err) {
-          console.warn('Failed to dispose NGL stage', err);
-        }
-        stageRef.current = null;
-        componentRef.current = null;
-      }
-    };
-  }, [nglReady]);
-
-  useEffect(() => {
-    const stage = stageRef.current;
-    if (!nglReady || !stageReady || !stage || !structureFile || !resultData) return;
-    stage.removeAllComponents();
-    componentRef.current = null;
-    const ext = structureFile.name.split('.').pop();
-    stage
-      .loadFile(structureFile, { ext })
-      .then((component) => {
-        component.autoView();
-        componentRef.current = component;
-        renderHighlights(component, resultData, staticThreshold, quboSolutionIndex);
-      })
-      .catch((err) => {
-        console.error('Failed to load structure', err);
-        setStructureError(err.message || 'Failed to load structure.');
-      });
-  }, [structureFile, resultData, nglReady, stageReady]);
-
-  useEffect(() => {
-    const component = componentRef.current;
-    if (!component || !resultData) return;
-    renderHighlights(component, resultData, staticThreshold, quboSolutionIndex);
-  }, [resultData, staticThreshold, quboSolutionIndex, stageReady, stageKey]);
-
-function renderHighlights(component, resultData, staticThreshold, quboSolutionIndex) {
-  if (!component || !resultData) return;
-  const { analysis_type, results, residue_selections_mapping } = resultData;
-  component.removeAllRepresentations();
-  component.addRepresentation('cartoon', { color: '#555555', opacity: 0.3 });
-
-  if (analysis_type === 'static') {
-    const selected = Object.keys(results).filter(
-      (key) => results[key]?.state_score >= staticThreshold
-    );
-    const selection = buildSelection(selected, residue_selections_mapping);
-    if (selection !== 'none') {
-      component.addRepresentation('ball+stick', { sele: selection, color: '#ef4444' });
+  const clearHighlights = useCallback(async () => {
+    const plugin = pluginRef.current;
+    if (!plugin || highlightComponentsRef.current.length === 0) return;
+    const manager = plugin.managers?.structure?.componentManager;
+    if (!manager) return;
+    try {
+      await manager.removeComponents(highlightComponentsRef.current);
+    } catch (err) {
+      console.warn('Failed to clear highlights', err);
     }
-  } else if (analysis_type === 'qubo' && results.classification) {
-    const solution = results.solutions?.[quboSolutionIndex];
-    const selectedSet = new Set(solution?.residues || []);
-    const classification = results.classification;
-    const switches = [];
-    const silentOps = [];
-    const decoys = [];
+    highlightComponentsRef.current = [];
+  }, []);
 
-    Object.keys(classification).forEach((key) => {
-      const entry = classification[key];
-      if (selectedSet.has(key)) {
-        if (entry.jsd > (results.classification_threshold || 0.3)) {
-          switches.push(key);
-        } else {
-          silentOps.push(key);
+  const createHighlightComponent = useCallback(async (residueIds, colorHex) => {
+    const plugin = pluginRef.current;
+    if (!plugin || residueIds.length === 0) return;
+    const structureCell = plugin.managers.structure.hierarchy.current.structures[0]?.cell;
+    if (!structureCell) return;
+    try {
+      const residueTests =
+        residueIds.length === 1
+          ? MS.core.rel.eq([MS.struct.atomProperty.macromolecular.label_seq_id(), residueIds[0]])
+          : MS.core.set.has([
+              MS.set(...residueIds),
+              MS.struct.atomProperty.macromolecular.label_seq_id(),
+            ]);
+
+      const expression = MS.struct.generator.atomGroups({
+        'residue-test': residueTests,
+      });
+      const component = await plugin.builders.structure.tryCreateComponentFromExpression(
+        structureCell,
+        expression,
+        'alloskin-selection'
+      );
+      if (!component) return;
+      highlightComponentsRef.current.push(component);
+      await plugin.builders.structure.representation.addRepresentation(component, {
+        type: 'ball-and-stick',
+        color: 'illustrative',
+      });
+    } catch (err) {
+      console.warn('Highlight failed', err);
+    }
+  }, []);
+
+  const loadStructure = async (state = 'active') => {
+    if (!pluginRef.current || !resultData) return;
+    const { project_id, system_id } = resultData.system_reference || {};
+    if (!project_id || !system_id) {
+      setError('Result does not reference a stored system.');
+      return;
+    }
+
+    setStatus('loading-structure');
+    setStructureError(null);
+    setError(null);
+
+    try {
+      await pluginRef.current.clear(); // reset any previous state tree
+      await pluginRef.current.dataTransaction(async () => {
+        const url = `/api/v1/projects/${project_id}/systems/${system_id}/structures/${state}`;
+        const data = await pluginRef.current.builders.data.download(
+          { url: Asset.Url(url), isBinary: false },
+          { state: { isGhost: true } }
+        );
+        const trajectory = await pluginRef.current.builders.structure.parseTrajectory(data, 'pdb');
+        await pluginRef.current.builders.structure.hierarchy.applyPreset(trajectory, 'default');
+      });
+      // Add a translucent cartoon overlay for context
+      const structureCell = pluginRef.current.managers.structure.hierarchy.current.structures[0]?.cell;
+      if (structureCell) {
+        const allExpr = MS.struct.generator.all();
+        const baseComponent = await pluginRef.current.builders.structure.tryCreateComponentFromExpression(
+          structureCell,
+          allExpr,
+          'alloskin-base'
+        );
+        if (baseComponent) {
+          await pluginRef.current.builders.structure.representation.addRepresentation(baseComponent, {
+            type: 'cartoon',
+            color: { name: 'uniform', params: { value: Color.fromHexString('#9ca3af') } },
+            transparency: { name: 'uniform', params: { value: 0.6 } },
+          });
         }
-      } else {
-        decoys.push(key);
       }
-    });
+      await clearHighlights();
+      setStructureVersion((prev) => prev + 1);
+      setStatus('ready');
+    } catch (err) {
+      console.error('Structure load failed', err);
+      setStructureError(err.message || `Failed to load ${state} structure.`);
+      setStatus('ready');
+    }
+  };
 
-    const addRep = (keys, color, style = 'ball+stick') => {
-      const selection = buildSelection(keys, residue_selections_mapping);
-      if (selection !== 'none') {
-        component.addRepresentation(style, { sele: selection, color });
-      }
+  useEffect(() => {
+    const applyStaticHighlights = async () => {
+      if (!pluginRef.current || !pluginRef.current.managers?.structure || !resultData || structureVersion === 0) return;
+      if (resultData.analysis_type !== 'static') return;
+      const { results, residue_selections_mapping } = resultData;
+      if (!results || !residue_selections_mapping) return;
+      await clearHighlights();
+      const selected = Object.keys(results).filter((key) => results[key]?.state_score >= staticThreshold);
+      const residues = convertKeysToResidues(selected, residue_selections_mapping);
+      await createHighlightComponent(residues, '#ef4444');
     };
-
-    addRep(switches, '#ef4444');
-    addRep(silentOps, '#f59e0b');
-    addRep(decoys, '#9ca3af', 'licorice');
-  }
-}
+    applyStaticHighlights();
+  }, [resultData, structureVersion, staticThreshold, clearHighlights, createHighlightComponent]);
 
   if (isLoading) return <Loader message="Preparing visualization..." />;
   if (error) return <ErrorMessage message={error} />;
@@ -208,12 +221,22 @@ function renderHighlights(component, resultData, staticThreshold, quboSolutionIn
         ← Back to result
       </button>
       <h1 className="text-2xl font-bold text-white">Visualization: {jobId}</h1>
+      <p className="text-sm text-gray-400">
+        Use the buttons below to load the stored active or inactive structure for this system. Once working, we will add
+        the highlighting controls back in.
+      </p>
 
-      {structureError && <ErrorMessage message={structureError} />}
+      {(structureError || status === 'error') && (
+        <ErrorMessage message={structureError || error || 'Viewer error'} />
+      )}
 
-      <div className="bg-gray-800 border border-gray-700 rounded-lg p-4">
-        {structureLoading && <p className="text-sm text-gray-400 mb-2">Loading structure...</p>}
-        <div ref={nglViewportRef} className="w-full h-[500px] rounded-lg bg-black" />
+      <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-2">
+        {status === 'initializing' && <Loader message="Initializing Mol* plugin..." />}
+        {status === 'loading-structure' && <Loader message="Loading structure into viewer..." />}
+        <div
+          ref={containerRef}
+          className="w-full h-[500px] rounded-lg bg-black overflow-hidden border border-gray-700 relative"
+        />
       </div>
 
       {resultData.analysis_type === 'static' && (
@@ -232,22 +255,27 @@ function renderHighlights(component, resultData, staticThreshold, quboSolutionIn
         </div>
       )}
 
-      {resultData.analysis_type === 'qubo' && (
-        <div className="bg-gray-800 border border-gray-700 rounded-lg p-4">
-          <label className="block text-sm text-gray-300 mb-1">Solution</label>
-          <select
-            value={quboSolutionIndex}
-            onChange={(e) => setQuboSolutionIndex(Number(e.target.value))}
-            className="bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
+      <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-3">
+        <h2 className="text-lg font-semibold text-white">Load structures</h2>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => loadStructure('active')}
+            disabled={status !== 'ready'}
+            className="px-4 py-2 rounded-md bg-cyan-600 text-white text-sm disabled:opacity-50"
           >
-            {resultData.results?.solutions?.map((solution, idx) => (
-              <option key={solution.energy} value={idx}>
-                Solution {idx + 1} – energy {solution.energy.toFixed(3)}
-              </option>
-            ))}
-          </select>
+            {status === 'loading-structure' ? 'Loading...' : 'Load Active'}
+          </button>
+          <button
+            type="button"
+            onClick={() => loadStructure('inactive')}
+            disabled={status !== 'ready'}
+            className="px-4 py-2 rounded-md bg-purple-600 text-white text-sm disabled:opacity-50"
+          >
+            {status === 'loading-structure' ? 'Loading...' : 'Load Inactive'}
+          </button>
         </div>
-      )}
+      </div>
     </div>
   );
 }

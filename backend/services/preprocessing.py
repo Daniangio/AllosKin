@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from alloskin.features.extraction import FeatureDict, FeatureExtractor
 from alloskin.io.readers import MDAnalysisReader
@@ -20,13 +20,16 @@ class DescriptorBuildResult:
     residue_mapping: Dict[str, str]
 
 
+SelectionInput = Union[Dict[str, str], List[str]]
+
+
 class DescriptorPreprocessor:
     """
     Wraps the DatasetBuilder to extract the phi/psi/chi1 descriptors once,
     without persisting the original trajectory files.
     """
 
-    def __init__(self, residue_selections: Optional[Dict[str, str]] = None):
+    def __init__(self, residue_selections: Optional[SelectionInput] = None):
         reader = MDAnalysisReader()
         extractor = FeatureExtractor(residue_selections)
         self.builder = DatasetBuilder(reader, extractor)
@@ -70,4 +73,3 @@ class DescriptorPreprocessor:
             residue_keys=sorted(common_keys),
             residue_mapping=mapping,
         )
-

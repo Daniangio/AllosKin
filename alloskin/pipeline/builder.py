@@ -113,17 +113,17 @@ class DatasetBuilder:
             act_prot_res = u_act.select_atoms('protein').residues
         except Exception as e:
             print(f"  Error selecting protein residues for alignment: {e}")
-            return {}, {}, {} # <-- MODIFIED
+            return {}, {}, {}
 
         if len(inact_prot_res) == 0 or len(act_prot_res) == 0:
             print("  Error: No protein residues found in one or both universes. Cannot align.")
-            return {}, {}, {} # <-- MODIFIED
+            return {}, {}, {}
 
         indices_act, indices_inact = sequence_alignment(act_prot_res, inact_prot_res)
 
         if indices_act is None or indices_inact is None:
             print("  Error: Alignment failed. Cannot filter selections.")
-            return {}, {}, {} # <-- MODIFIED
+            return {}, {}, {}
         
         alignment_map = {}
         for i, act_idx in enumerate(indices_act):
@@ -137,11 +137,9 @@ class DatasetBuilder:
         active_selections_final = {}
         inactive_selections_final = {}
 
-        # --- THIS IS THE KEY SECTION ---
         # Use the new parser to expand wildcards or generate selections for all residues.
         # This needs a universe object, so we use the active one.
         selections_to_process = parse_and_expand_selections(u_act, self.config_extractor.residue_selections)
-        # --- END MODIFICATION ---
 
         for key, selection_str in selections_to_process.items():
             try:
@@ -188,7 +186,6 @@ class DatasetBuilder:
         2. Serial Align & Filter
         3. Parallel Extract
         
-        --- MODIFIED ---
         Returns the original selection mapping as the 6th tuple item.
         """
         act_slice_obj = self._parse_slice(active_slice)
@@ -243,8 +240,6 @@ class DatasetBuilder:
              raise ValueError("Feature extraction succeeded but no common keys were found. Check extractor logic.")
         
         print(f"Found {len(common_keys)} common features after extraction.")
-
-        # --- MODIFIED RETURN ---
         return features_active, n_frames_active, features_inactive, n_frames_inactive, common_keys, mapping
 
 
@@ -257,8 +252,6 @@ class DatasetBuilder:
     ) -> Tuple[FeatureDict, np.ndarray, Dict[str, str]]:
         """
         Prepares data for GOAL 1 and GOAL 2 (Static Analysis).
-        
-        --- MODIFIED ---
         Returns the selection mapping as the 3rd tuple item.
         """
         print("\n--- Preparing STATIC Analysis Dataset ---")
@@ -297,8 +290,6 @@ class DatasetBuilder:
             all_features_static[res_key] = all_features_static[res_key][shuffle_indices]
         
         print("Static dataset prepared and shuffled successfully.")
-        
-        # --- MODIFIED RETURN ---
         return all_features_static, labels_Y, mapping
 
     def prepare_dynamic_analysis_data(

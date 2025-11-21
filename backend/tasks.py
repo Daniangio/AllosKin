@@ -22,6 +22,11 @@ def _convert_nan_to_none(obj):
         return {k: _convert_nan_to_none(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [_convert_nan_to_none(elem) for elem in obj]
+    elif isinstance(obj, np.ndarray):
+        return _convert_nan_to_none(obj.tolist())
+    elif isinstance(obj, (np.floating, np.integer)):
+        val = obj.item()
+        return None if isinstance(val, float) and not np.isfinite(val) else val
     # --- FIX: Handle both nan and inf ---
     elif isinstance(obj, float) and not np.isfinite(obj):
         return None # Convert nan, inf, -inf to None (JSON null)
@@ -177,4 +182,5 @@ def run_analysis_job(
 
     # This is the value returned to RQ and shown on the status page
     # --- FIX: Return the sanitized payload ---
+    save_progress("Analysis completed", 100)
     return sanitized_payload

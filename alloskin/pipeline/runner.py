@@ -1,8 +1,19 @@
 """
-Core Analysis Pipeline Runner.
-Refactored for "Entropic Decoy" vs "Silent Operator" Logic.
-Includes Safe Handling for None/NaN values from JSON.
+Refactored runner for two-state QUBO analysis.
+
+This implements:
+  • QUBO_active   (Δ_act only)
+  • QUBO_inactive (Δ_inact only)
+  • QUBO_combined (Δ_avg, your original mode)
+
+Classification uses all 3 QUBOs based on 9-label taxonomy:
+  Global Hub, Active Hub, Inactive Hub,
+  State-Switch Hub, Local Switch, Relay,
+  Passive Scaffold, Redundant, Entropic Decoy.
+
+We heavily comment classification logic for clarity.
 """
+
 import json
 import numpy as np
 from typing import Dict, Any, Optional, Tuple, List
@@ -12,8 +23,13 @@ from alloskin.features.extraction import FeatureExtractor
 from alloskin.pipeline.builder import DatasetBuilder
 
 from alloskin.analysis.static import StaticStateSensitivity
-from alloskin.analysis.qubo import QUBOMaxCoverage
+from alloskin.analysis.qubo import QUBOMaxCoverage   # Must be updated QUBO 2.0
 from alloskin.analysis.dynamic import TransferEntropy
+
+
+# ======================================================================
+# Utility
+# ======================================================================
 
 def _safe_get(d: Dict, key: str, default: float = 0.0) -> float:
     """
@@ -27,7 +43,6 @@ def _safe_get(d: Dict, key: str, default: float = 0.0) -> float:
         return float(val)
     except (ValueError, TypeError):
         return default
-
 
 def _load_descriptor_features(
     dataset_cfg: Dict[str, Any]
@@ -59,7 +74,6 @@ def _load_descriptor_features(
         residue_mapping,
     )
 
-
 def _combine_static_features(
     active_features: Dict[str, np.ndarray],
     inactive_features: Dict[str, np.ndarray],
@@ -77,39 +91,49 @@ def _combine_static_features(
             np.zeros(n_frames_inactive, dtype=int),
         ]
     )
-    shuffle_idx = np.random.permutation(labels.shape[0])
-    labels = labels[shuffle_idx]
-    for key in combined:
-        combined[key] = combined[key][shuffle_idx]
+    # shuffle_idx = np.random.permutation(labels.shape[0])
+    # labels = labels[shuffle_idx]
+    # for key in combined:
+    #     combined[key] = combined[key][shuffle_idx]
 
     return combined, labels
+
+# ======================================================================
+# Runner
+# ======================================================================
 
 def run_analysis(
     analysis_type: str,
     file_paths: Dict[str, str],
     params: Dict[str, Any],
     residue_selections: Optional[Dict[str, str]] = None,
-    progress_callback: Optional[callable] = None
+    progress_callback: Optional[callable] = None,
 ):
-    def report(msg, pct):
-        if progress_callback: progress_callback(msg, pct)
-        else: print(f"[{pct}%] {msg}")
 
-    report("Initializing Pipeline", 5)
+    # ------------------------------------------------------------
+    # Helpers for printing / callback
+    # ------------------------------------------------------------
+    def report(msg, pct):
+        if progress_callback:
+            progress_callback(msg, pct)
+        else:
+            print(f"[{pct}%] {msg}")
+
+
+    # ------------------------------------------------------------
+    # Load data
+    # ------------------------------------------------------------
     use_descriptors = "active_descriptors" in file_paths
-    mapping = file_paths.get("residue_mapping") if use_descriptors else None
 
     reader = None
     extractor = None
     builder = None
-    active_slice = params.get("active_slice")
-    inactive_slice = params.get("inactive_slice")
 
     if not use_descriptors:
         reader = MDAnalysisReader()
         extractor = FeatureExtractor(residue_selections)
         builder = DatasetBuilder(reader, extractor)
-        report(f"Loading Data for {analysis_type}", 15)
+        report("Loading trajectories", 10)
 
     if analysis_type in ['static', 'qubo']:
         if use_descriptors:
@@ -130,177 +154,245 @@ def run_analysis(
             )
         else:
             features_dict, labels_Y, mapping = builder.prepare_static_analysis_data(
-                file_paths['active_traj'], file_paths['active_topo'],
-                file_paths['inactive_traj'], file_paths['inactive_topo'],
-                active_slice=active_slice, inactive_slice=inactive_slice
+                file_paths["active_traj"], file_paths["active_topo"],
+                file_paths["inactive_traj"], file_paths["inactive_topo"],
+                active_slice=params.get("active_slice"),
+                inactive_slice=params.get("inactive_slice"),
             )
-    elif analysis_type == 'dynamic':
-        if use_descriptors:
-            (
-                active_features_raw,
-                inactive_features_raw,
-                descriptor_keys,
-                _,
-                _,
-                mapping,
-            ) = _load_descriptor_features(file_paths)
-            features_act = {k: active_features_raw[k] for k in descriptor_keys}
-            features_inact = {k: inactive_features_raw[k] for k in descriptor_keys}
-        else:
-            features_act, features_inact, mapping = builder.prepare_dynamic_analysis_data(
-                file_paths['active_traj'], file_paths['active_topo'],
-                file_paths['inactive_traj'], file_paths['inactive_topo'],
-                active_slice=active_slice, inactive_slice=inactive_slice
-            )
+        # Build static dataset (active only / inactive only / combined)
+        # Split state-wise
+        features_act = {k: features_dict[k][labels_Y == 1] for k in features_dict}
+        features_inact = {k: features_dict[k][labels_Y == 0] for k in features_dict}
 
-    # --- Execution ---
-    
-    if analysis_type == 'static':
-        report("Running Goal 1: Entropy & State Filter", 30)
-        analyzer = StaticStateSensitivity()
-        results = analyzer.run((features_dict, labels_Y), **params) 
-        # Safe sort
-        sorted_keys = sorted(results.keys(), key=lambda k: _safe_get(results[k], 'state_score'), reverse=True)
-        final_output = {k: results[k] for k in sorted_keys}
-        return final_output, mapping
+    # ==================================================================
+    # GOAL 1 — Static state sensitivity
+    # ==================================================================
+    if analysis_type == "static":
+        report("Running Static State Sensitivity (Goal 1)", 20)
 
-    elif analysis_type == 'qubo':
-        report("Running Goal 2: Hierarchical Dominating Set", 30)
-        
-        static_results_path = params.get('static_results_path')
+        static = StaticStateSensitivity()
+        stats = static.run((features_dict, labels_Y), **params)
 
-        if static_results_path:
-            report("Loading pre-computed static analysis results", 35)
-            with open(static_results_path, 'r') as f:
-                static_stats = json.load(f)
-            
-            report("Re-building dataset for selected candidates", 40)
-            # If loading from file, the mapping might be inside the file structure
-            # or we rely on the one we just built.
-            # For consistency, we should use the mapping relevant to the loaded keys.
-            loaded_mapping = static_stats.get('residue_selections_mapping')
-            if loaded_mapping:
-                 extractor = FeatureExtractor(residue_selections=loaded_mapping)
-            if reader is None:
-                reader = MDAnalysisReader()
-            # We must rebuild features to get the trajectory data for the QUBO calculation
-            builder = DatasetBuilder(reader, extractor)
-            features_dict, labels_Y, mapping = builder.prepare_static_analysis_data(
-                file_paths['active_traj'], file_paths['active_topo'],
-                file_paths['inactive_traj'], file_paths['inactive_topo'],
-                active_slice=active_slice, inactive_slice=inactive_slice
-            )
-        else:
-            report("Running Static pre-filter for candidates", 35)
-            static_analyzer = StaticStateSensitivity()
-            static_stats = static_analyzer.run((features_dict, labels_Y), **params)
-        
-        # --- DUAL-STREAM FILTERING LOGIC ---
-        candidates = []
-        candidate_state_scores = {} # JSD for QUBO weights
-        
-        # Params
-        min_id = params.get('filter_min_id', 1.5)      # Discard Rocks
-        top_total = params.get('filter_top_total', 100) # Total bandwidth
-        top_jsd_guaranteed = params.get('filter_top_jsd', 20) # Guaranteed Switches
-        
-        report(f"Filtering: Top {top_jsd_guaranteed} JSD + Rest by Entropy (Total {top_total})", 60)
-        
-        static_results = static_stats['results'] if 'results' in static_stats else static_stats
-        
-        # 1. Identify Valid "Movers" (Remove Rocks)
-        # FIX: Use _safe_get to handle None values from JSON
-        movers = [
-            k for k, v in static_results.items() 
-            if _safe_get(v, 'id', 0.0) >= min_id
-        ]
-        
-        # 2. Sort Movers by JSD (State Sensitivity)
-        # FIX: Use _safe_get
-        movers_by_jsd = sorted(
-            movers, 
-            key=lambda k: _safe_get(static_results[k], 'state_score', 0.0), 
+        # Fail fast only if *all* state_score values are missing/non-finite.
+        def _is_finite(val) -> bool:
+            try:
+                return np.isfinite(float(val))
+            except Exception:
+                return False
+        invalid_scores = [k for k, v in stats.items() if not _is_finite(v.get("state_score"))]
+        if stats and len(invalid_scores) == len(stats):
+            preview = ", ".join(invalid_scores[:5])
+            suffix = "…" if len(invalid_scores) > 5 else ""
+            raise ValueError(f"Static analysis produced non-finite state_score for all residues: {preview}{suffix}")
+
+        # Sort by state sensitivity
+        sorted_keys = sorted(
+            stats.keys(),
+            key=lambda k: _safe_get(stats[k], "state_score"),
             reverse=True
         )
-        
-        # 3. Select Guaranteed Switches (Stream A)
-        selection_set = set()
-        for k in movers_by_jsd[:top_jsd_guaranteed]:
-            selection_set.add(k)
-            
-        # 4. Fill remaining slots with High Entropy residues (Stream B)
-        # Sort ALL movers by ID to find the "Silent Operators"
-        movers_by_id = sorted(
-            movers, 
-            key=lambda k: _safe_get(static_results[k], 'id', 0.0), 
-            reverse=True
-        )
-        
-        slots_remaining = top_total - len(selection_set)
-        if slots_remaining > 0:
-            for k in movers_by_id:
-                if k not in selection_set:
-                    selection_set.add(k)
-                    slots_remaining -= 1
-                    if slots_remaining == 0:
-                        break
-        
-        candidates = list(selection_set)
-        for k in candidates:
-            # FIX: Use _safe_get
-            candidate_state_scores[k] = _safe_get(static_results[k], 'state_score', 0.0)
-            
-        print(f"  Final Candidate Pool: {len(candidates)} residues.")
-        
-        if not candidates:
-            raise ValueError("No candidate residues found. Try lowering filter_min_id.")
+        final_static = {k: stats[k] for k in sorted_keys}
 
-        candidate_features = {k: features_dict[k] for k in candidates}
-        
-        # 5. Run QUBO
-        params['candidate_state_scores'] = candidate_state_scores
-        
-        report("Running QUBO analysis on filtered candidates", 80)
-        qubo_analyzer = QUBOMaxCoverage()
-        qubo_results = qubo_analyzer.run((candidate_features, None, None), **params)
-        
-        # --- POST-PROCESS: CLASSIFICATION ---
-        if qubo_results.get('solutions'):
-            best_sol = qubo_results['solutions'][0]
-            selected_set = set(best_sol['residues'])
-            
-            classification = {}
-            
-            # Heuristic threshold for visualization
-            vals = list(candidate_state_scores.values())
-            max_jsd = max(vals) if vals else 1.0
-            switch_threshold = 0.3 * max_jsd 
-            
-            for k in candidates:
-                jsd = candidate_state_scores.get(k, 0.0)
-                is_selected = k in selected_set
-                
-                if is_selected:
-                    if jsd > switch_threshold:
-                        cat = "Switch"
-                    else:
-                        cat = "Silent Operator"
+        report("Returning results", 100)
+        return final_static, mapping
+
+    # ==================================================================
+    # GOAL 2 — QUBO
+    # ==================================================================
+
+    if analysis_type != "qubo":
+        raise ValueError("Only 'static' and 'qubo' supported in this refactor.")
+
+    report("Running QUBO (Goal 2)", 20)
+
+    # ------------------------------------------------------------
+    # 1. Gather static results (from file or new computation)
+    # ------------------------------------------------------------
+    static_results = None
+    static_results_path = params.get("static_results_path")
+
+    if static_results_path:
+        report("Loading static analysis results from file", 30)
+        with open(static_results_path, "r") as fh:
+            static_results = json.load(fh)
+    else:
+        report("Running Static State Sensitivity (Goal 1)", 30)
+        static = StaticStateSensitivity()
+        static_results = static.run((features_dict, labels_Y), **params)
+
+    # =============================================================
+    # 2. RUN THE THREE QUBOS
+    # =============================================================
+
+    qubo = QUBOMaxCoverage()
+    qubo_allowed_params = [
+        "alpha", "beta_switch", "beta_hub",
+        "gamma_redundancy", "ii_threshold",
+        "ii_scale", "soft_threshold_power",
+        "num_reads", "num_solutions", "seed",
+        "use_per_state_imbalance",
+        "filter_min_id", "filter_top_jsd", "filter_top_total",
+        "static_results_path", "maxk",
+    ]
+
+    # Normalize param names to analyzer expectations
+    qubo_params = dict(params)
+    if "alpha_size" in qubo_params and "alpha" not in qubo_params:
+        qubo_params["alpha"] = qubo_params.pop("alpha_size")
+    final_qubo_params = {k: v for k, v in qubo_params.items() if k in qubo_allowed_params}
+
+    # A) ACTIVE only → use_per_state_imbalance=False (Δ_act only)
+    report("Running QUBO_active (only active-state Δ)", 40)
+    res_act = qubo.run(
+        features_act,   # active only
+        static_results=static_results,
+        **final_qubo_params
+    )
+
+    # B) INACTIVE only
+    report("Running QUBO_inactive (only inactive-state Δ)", 60)
+    res_inact = qubo.run(
+        features_inact,
+        static_results=static_results,
+        **final_qubo_params
+    )
+
+    # C) COMBINED
+    report("Running QUBO_combined (avg Δ across states)", 80)
+    res_comb = qubo.run(
+        features_dict,
+        static_results=static_results,
+        **final_qubo_params
+    )
+
+
+    # ==================================================================
+    # 4. CLASSIFICATION USING THE 9-LABEL TAXONOMY
+    # ==================================================================
+
+    report("Assigning taxonomy labels", 90)
+
+    candidates = res_comb.get("matrix_indices", [])
+    candidate_state_scores = res_comb.get("raw_state_scores", {})
+
+    if not candidates:
+        return {
+            "qubo_active": res_act,
+            "qubo_inactive": res_inact,
+            "qubo_combined": res_comb,
+            "classification": {},
+            "mapping": mapping,
+        }
+
+    # Extract selections
+    sel_act = set(res_act["solutions"][0]["selected"]) if "solutions" in res_act else set()
+    sel_inact = set(res_inact["solutions"][0]["selected"]) if "solutions" in res_inact else set()
+    sel_comb = set(res_comb["solutions"][0]["selected"]) if "solutions" in res_comb else set()
+
+    # hub scores
+    hub_act = res_act.get("hub_scores", {})
+    hub_inact = res_inact.get("hub_scores", {})
+    hub_comb = res_comb.get("hub_scores", {})
+
+    # thresholds
+    switch_high = params.get("taxonomy_switch_high", 0.8)
+    switch_low = params.get("taxonomy_switch_low", 0.3)
+
+    # For hub cutoffs, we use active/inactive distributions
+    hub_act_vals = np.array([hub_act.get(k,0.0) for k in candidates])
+    hub_inact_vals = np.array([hub_inact.get(k,0.0) for k in candidates])
+    delta_vals = np.abs(hub_act_vals - hub_inact_vals)
+
+    # percentiles
+    hub_high_act = np.percentile(hub_act_vals, params.get("taxonomy_hub_high_percentile", 80))
+    hub_high_inact = np.percentile(hub_inact_vals, params.get("taxonomy_hub_high_percentile", 80))
+    hub_low_act = np.percentile(hub_act_vals, params.get("taxonomy_hub_low_percentile", 50))
+    hub_low_inact = np.percentile(hub_inact_vals, params.get("taxonomy_hub_low_percentile", 50))
+    delta_high = np.percentile(delta_vals, params.get("taxonomy_delta_hub_high_percentile", 80))
+
+
+    classification = {}
+
+    reg_scores = res_comb.get("regularized_state_scores", {})
+
+    for k in candidates:
+        s_raw = float(candidate_state_scores.get(k, 0.0))
+        s_reg = reg_scores.get(k, s_raw)
+
+        ha = hub_act.get(k, 0.0)
+        hi = hub_inact.get(k, 0.0)
+        dH = abs(ha - hi)
+
+        in_act = k in sel_act
+        in_inact = k in sel_inact
+        in_comb = k in sel_comb
+
+        # ------------------------------------------------------------
+        # Determine taxonomy
+        # ------------------------------------------------------------
+
+        if in_act and in_inact:
+            # Selected in both → structural core of both ensembles
+            if ha >= hub_high_act and hi >= hub_high_inact:
+                role = "Global Hub"
+            else:
+                role = "Global Hub [minor]"  # fallback
+
+        elif in_act and not in_inact:
+            if ha >= hub_high_act and hi <= hub_low_inact:
+                role = "Active Hub"
+            elif s_reg >= switch_high and dH >= delta_high:
+                role = "State-Switch Hub"
+            else:
+                role = "Relay"
+
+        elif in_inact and not in_act:
+            if hi >= hub_high_inact and ha <= hub_low_act:
+                role = "Inactive Hub"
+            elif s_reg >= switch_high and dH >= delta_high:
+                role = "State-Switch Hub"
+            else:
+                role = "Relay"
+
+        else:
+            # Not selected in either active or inactive QUBO
+            # → Evaluate redundancy using combined QUBO coverage
+            idx = candidates.index(k)
+            W = np.array(res_comb["coverage_weights"], float)
+            sel = [candidates.index(x) for x in sel_comb]
+            if len(sel)>0:
+                union_cov = np.max(W[sel,:],axis=0)
+                unique = float(np.maximum(W[idx]-union_cov,0).sum())
+            else:
+                unique = float(W[idx].sum())
+
+            if unique<1e-6:
+                role="Redundant"
+            else:
+                # Distinguish local switches, passive scaffold
+                if s_reg >= switch_high:
+                    role="Local Switch"
+                elif s_reg<switch_low:
+                    role="Passive Scaffold"
                 else:
-                    cat = "Entropic Decoy"
-                    
-                classification[k] = {
-                    "category": cat,
-                    "jsd": jsd,
-                    "selected": is_selected
-                }
-            
-            qubo_results['classification'] = classification
-            qubo_results['classification_threshold'] = switch_threshold
+                    role="Entropic Decoy"
 
-        return qubo_results, mapping
+        classification[k] = {
+            "label": role,
+            "s_reg": float(s_reg),
+            "hub_active": float(ha),
+            "hub_inactive": float(hi),
+            "delta_hub": float(dH),
+            "selected_active": in_act,
+            "selected_inactive": in_inact,
+            "selected_combined": in_comb,
+        }
 
-    elif analysis_type == 'dynamic':
-        report("Running Goal 3: Dynamic Causality", 30)
-        analyzer = TransferEntropy()
-        res = analyzer.run((features_act, features_inact), **params)
-        return res, mapping
+    report("Returning results", 100)
+    return {
+        "qubo_active": res_act,
+        "qubo_inactive": res_inact,
+        "qubo_combined": res_comb,
+        "classification": classification,
+        "mapping": mapping,
+    }

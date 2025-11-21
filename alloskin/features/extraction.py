@@ -21,6 +21,23 @@ def deg2rad(deg_array: np.ndarray) -> np.ndarray:
     """Converts an array of degrees to radians."""
     return np.deg2rad(deg_array)
 
+def transform_to_circular(angles_rad: np.ndarray) -> np.ndarray:
+    """
+    Transforms an array of angles (n_frames, n_residues, n_angles)
+    into the 2D vector representation [sin(th), cos(th)].
+    Output shape: (n_frames, n_residues, n_angles * 2)
+    """
+    sin_transformed = np.sin(angles_rad)
+    cos_transformed = np.cos(angles_rad)
+    
+    n_frames, n_residues, n_angles = angles_rad.shape
+    circular_features = np.empty((n_frames, n_residues, n_angles * 2))
+    
+    circular_features[..., 0::2] = sin_transformed
+    circular_features[..., 1::2] = cos_transformed
+    
+    return circular_features
+
 class FeatureExtractor:
     """
     Handles calculation of backbone (phi, psi) and sidechain (chi1)
@@ -36,23 +53,6 @@ class FeatureExtractor:
             print(f"FeatureExtractor initialized for {len(self.residue_selections)} residues.")
         else:
             print("FeatureExtractor initialized in automatic mode (will use all residues).")
-
-    def _transform_to_circular(self, angles_rad: np.ndarray) -> np.ndarray:
-        """
-        Transforms an array of angles (n_frames, n_residues, n_angles)
-        into the 2D vector representation [sin(th), cos(th)].
-        Output shape: (n_frames, n_residues, n_angles * 2)
-        """
-        sin_transformed = np.sin(angles_rad)
-        cos_transformed = np.cos(angles_rad)
-        
-        n_frames, n_residues, n_angles = angles_rad.shape
-        circular_features = np.empty((n_frames, n_residues, n_angles * 2))
-        
-        circular_features[..., 0::2] = sin_transformed
-        circular_features[..., 1::2] = cos_transformed
-        
-        return circular_features
 
     def _get_sliced_length(self, traj: TrajectoryObject, slice_obj: slice) -> int:
         """Helper to calculate frames in a slice."""
@@ -149,11 +149,6 @@ class FeatureExtractor:
             psi_selections = protein_residues.psi_selections()
             chi1_selections = protein_residues.chi1_selections()
 
-            # We need to know which residue corresponds to which angle
-            phi_res_indices = [res.ix for res in protein_residues if res.phi_selection() is not None]
-            psi_res_indices = [res.ix for res in protein_residues if res.psi_selection() is not None]
-            chi1_res_indices = [res.ix for res in protein_residues if res.chi1_selection() is not None]
-
             all_selections = phi_selections + psi_selections + chi1_selections
             if not all_selections:
                 print("      Warning: No valid dihedrals found for the entire protein selection.")
@@ -175,11 +170,10 @@ class FeatureExtractor:
             res_angle_map = {res.ix: np.zeros((n_frames, 3)) for res in protein_residues}
 
             # Populate the map
-            for i, res_ix in enumerate(phi_res_indices):
+            res_indices = [res.ix for res in protein_residues]
+            for i, res_ix in enumerate(res_indices):
                 res_angle_map[res_ix][:, 0] = phi_angles_all[:, i]
-            for i, res_ix in enumerate(psi_res_indices):
                 res_angle_map[res_ix][:, 1] = psi_angles_all[:, i]
-            for i, res_ix in enumerate(chi1_res_indices):
                 res_angle_map[res_ix][:, 2] = chi1_angles_all[:, i]
 
             # Now, transform to circular coordinates and store in the final dict
@@ -188,8 +182,8 @@ class FeatureExtractor:
                 # Reshape to (n_frames, 1, 3) to match transform function's expectation
                 angles_deg_reshaped = angles_deg[:, np.newaxis, :]
                 angles_rad = np.deg2rad(angles_deg_reshaped)
-                # Resulting shape is (n_frames, 1, 6)
-                all_residue_features[res_ix] = self._transform_to_circular(angles_rad)
+                # Resulting shape is (n_frames, 1, 3)
+                all_residue_features[res_ix] = angles_rad
 
             print(f"      Bulk extraction complete. Found features for {len(all_residue_features)} residues.")
             return all_residue_features, n_frames
@@ -265,7 +259,7 @@ class FeatureExtractor:
                     # If all features were found, concatenate them
                     if all_found and feature_list_for_group:
                         # Concatenate along the last axis (the feature dimension)
-                        # (n_frames, 1, 6), (n_frames, 1, 6) -> (n_frames, 1, 12)
+                        # (n_frames, 1, 3), (n_frames, 1, 3) -> (n_frames, 1, 6)
                         filtered_features_dict[key] = np.concatenate(feature_list_for_group, axis=-1)
                 else:
                     print(f"    Warning: Selection '{sel_string}' for key '{key}' resolved to 0 residues. Skipping.")

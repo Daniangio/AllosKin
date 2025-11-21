@@ -13,6 +13,7 @@ Available state metrics:
 """
 
 import os
+from alloskin.features.extraction import transform_to_circular
 import numpy as np
 from typing import Tuple, Dict, Any, Callable
 from sklearn.metrics import mutual_info_score, roc_auc_score
@@ -81,7 +82,14 @@ def estimate_symmetric_kl(pA, pI, bandwidth=0.1):
 
 def estimate_auc(X, Y):
     """Logistic regression AUC using 5-fold stratified cross-validation."""
-    skf = StratifiedKFold(5, shuffle=True, random_state=0)
+    counts = np.bincount(Y.astype(int))
+    if len(counts) < 2 or np.any(counts < 1):
+        return np.nan
+    n_splits = min(5, counts.min())
+    if n_splits < 2:
+        return np.nan
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0)
     aucs = []
     for train, test in skf.split(X, Y):
         model = LogisticRegression(max_iter=200, solver="lbfgs").fit(X[train], Y[train])
@@ -106,14 +114,16 @@ def compute_state_sensitivity(X, Y, method="mi"):
     XA = X[Y == 1]
     XI = X[Y == 0]
 
-    if XA.shape[0] < 10 or XI.shape[0] < 10:
+    # Require at least 2 samples per class; smaller slices just return NaN.
+    if XA.shape[0] < 2 or XI.shape[0] < 2:
         return np.nan
 
     method = method.lower()
 
     if method == "mi":
         # Discretize using quantiles
-        bins = 30
+        n = X.shape[0]
+        bins = min(100, max(4, int(np.sqrt(n))))
         X_disc = np.zeros(X.shape[0], dtype=int)
         for k in range(X.shape[1]):
             X_disc += np.digitize(X[:, k], np.quantile(X[:, k], np.linspace(0,1,bins))) * (k+1)
@@ -151,22 +161,28 @@ def _static_worker_state(
     results = {"id": np.nan, "id_error": np.nan, "state_score": np.nan}
 
     try:
-        X = features_3d.reshape(n_samples, -1)
+        X_circ = transform_to_circular(features_3d).reshape(n_samples, -1)
+    except Exception as exc:
+        print(f"  Warning: Failed to prepare circular features for {res_key}: {exc}")
+        return (res_key, results)
 
+    try:
         # 1. Intrinsic Dimension (same as your original implementation)
         if DADAPY_AVAILABLE:
-            data_obj = Data(coordinates=X, maxk=maxk, n_jobs=1)
+            data_obj = Data(coordinates=X_circ, maxk=maxk, n_jobs=1)
             id_val, id_err, _ = data_obj.compute_id_2NN()
             results["id"] = id_val
             results["id_error"] = id_err
+    except Exception as exc:
+        print(f"  Warning: ID computation failed for {res_key}: {exc}")
 
+    try:
         # 2. State sensitivity (new, correct)
-        score = compute_state_sensitivity(X, labels_Y, method=state_metric)
+        score = compute_state_sensitivity(X_circ, labels_Y, method=state_metric)
         results["state_score"] = score
-
-    except Exception:
-        pass
-
+    except Exception as exc:
+        print(f"  Warning: State metric '{state_metric}' failed for {res_key}: {exc}")
+        results["state_score"] = str(exc)
     return (res_key, results)
 
 

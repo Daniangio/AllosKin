@@ -168,8 +168,8 @@ export default function ProjectsPage() {
             <h3 className="text-md font-semibold text-white mb-2">New System</h3>
             {selectedProjectId ? (
               <SystemForm
-                onCreate={async (formData) => {
-                  await createSystem(selectedProjectId, formData);
+                onCreate={async (formData, options) => {
+                  await createSystem(selectedProjectId, formData, options);
                   const data = await listSystems(selectedProjectId);
                   setSystems(data);
                 }}

@@ -1,8 +1,10 @@
 """
 Parses and expands residue selection strings with special wildcards.
 
-This module introduces a pre-processing step for the `residue_selections`
-dictionary to support dynamic generation of selections.
+In addition to the legacy JSON dictionary, this module now supports
+newline-delimited selections. Each line is treated as a standalone
+selection and can optionally end with the `[singles]` or `[pairs]`
+wildcards described below.
 
 Wildcard Syntax:
 - `[singles]`: Expands a selection into its constituent single residues.
@@ -12,9 +14,18 @@ Wildcard Syntax:
 """
 import re
 import itertools
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Union
 
 import MDAnalysis as mda
+
+SelectionConfig = Optional[Union[Dict[str, str], List[str]]]
+
+
+def _slugify_selection_label(selection: str, fallback: str) -> str:
+    """Create a deterministic key for unnamed selections."""
+    slug = re.sub(r"[^a-z0-9]+", "_", selection.lower()).strip("_")
+    slug = slug[:48]  # keep keys readable
+    return slug or fallback
 
 
 def _get_residues_from_selection(universe: mda.Universe, selection_str: str) -> mda.ResidueGroup:
@@ -81,20 +92,61 @@ def expand_selection_wildcards(
         # --- Case 3: No wildcard, add directly ---
         else:
             expanded_selections[key] = sel_string
-            
+    
     return expanded_selections
+
+
+def _normalize_selections(
+    raw_selections: SelectionConfig
+) -> Dict[str, str]:
+    """
+    Converts supported user input formats into a normalized dictionary.
+    Accepts dictionaries (legacy JSON) or iterables of strings
+    (newline-delimited textarea).
+    """
+    if raw_selections is None:
+        return {}
+
+    if isinstance(raw_selections, dict):
+        # Filter out empty strings but retain legacy keys
+        return {
+            k: v.strip()
+            for k, v in raw_selections.items()
+            if isinstance(v, str) and v.strip()
+        }
+
+    if isinstance(raw_selections, (list, tuple)):
+        normalized: Dict[str, str] = {}
+        for idx, raw in enumerate(raw_selections, start=1):
+            if raw is None:
+                continue
+            selection = str(raw).strip()
+            if not selection:
+                continue
+            base_key = _slugify_selection_label(selection, f"selection_{idx}")
+            key = base_key
+            suffix = 2
+            while key in normalized:
+                key = f"{base_key}_{suffix}"
+                suffix += 1
+            normalized[key] = selection
+        return normalized
+
+    raise TypeError(f"Unsupported residue selection type: {type(raw_selections)!r}")
 
 
 def parse_and_expand_selections(
     universe: mda.Universe,
-    config_selections: Optional[Dict[str, str]]
+    config_selections: SelectionConfig
 ) -> Dict[str, str]:
     """
     Main entry point to generate the final selection mapping.
     If no selections are provided, it generates them for all protein residues.
     If selections are provided, it expands any wildcards.
     """
-    if not config_selections:
+    normalized = _normalize_selections(config_selections)
+
+    if not normalized:
         print("  No residue selections provided. Generating selections for all protein residues...")
         protein_residues = universe.select_atoms('protein').residues
         selections_to_process = {
@@ -103,6 +155,6 @@ def parse_and_expand_selections(
         print(f"  Generated {len(selections_to_process)} selections to check against inactive state.")
     else:
         print("  Expanding residue selections with wildcards (if any)...")
-        selections_to_process = expand_selection_wildcards(universe, config_selections)
+        selections_to_process = expand_selection_wildcards(universe, normalized)
 
     return selections_to_process

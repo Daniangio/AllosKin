@@ -5,6 +5,7 @@ import SystemDetailPage from './pages/SystemDetailPage';
 import ResultsPage from './pages/ResultsPage';
 import ResultDetailPage from './pages/ResultDetailPage';
 import VisualizePage from './pages/VisualizePage';
+import MolstarDebugPage from './pages/MolstarDebugPage';
 import HealthPage from './pages/HealthPage';
 import JobStatusPage from './pages/JobStatusPage';
 
@@ -21,6 +22,7 @@ export default function App() {
           <Route path="/visualize/:jobId" element={<VisualizePage />} />
           <Route path="/health" element={<HealthPage />} />
           <Route path="/jobs/:jobId" element={<JobStatusPage />} />
+          <Route path="/debug/molstar" element={<MolstarDebugPage />} />
           <Route path="*" element={<Navigate to="/projects" replace />} />
         </Routes>
       </AppLayout>

@@ -1,4 +1,4 @@
-import { requestJSON, requestBlob } from './client';
+import { requestJSON, requestBlob, API_BASE } from './client';
 
 export function fetchProjects() {
   return requestJSON('/projects');
@@ -15,10 +15,81 @@ export function createProject(payload) {
   });
 }
 
-export function createSystem(projectId, payload) {
-  return requestJSON(`/projects/${projectId}/systems`, {
-    method: 'POST',
-    body: payload,
+export function createSystem(projectId, payload, options = {}) {
+  const { onUploadProgress, onProcessing } = options;
+
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE}/projects/${projectId}/systems`);
+    xhr.responseType = 'json';
+
+    const signalProcessing = (isProcessing) => {
+      if (typeof onProcessing === 'function') {
+        onProcessing(isProcessing);
+      }
+    };
+
+    if (xhr.upload) {
+      xhr.upload.addEventListener('loadstart', () => {
+        if (typeof onUploadProgress === 'function') {
+          onUploadProgress(0);
+        }
+      });
+      xhr.upload.addEventListener('progress', (event) => {
+        if (typeof onUploadProgress !== 'function') return;
+        if (!event.lengthComputable) return;
+        const percent = Math.round((event.loaded / event.total) * 100);
+        onUploadProgress(Math.min(100, percent));
+      });
+      xhr.upload.addEventListener('loadend', () => {
+        if (typeof onUploadProgress === 'function') {
+          onUploadProgress(100);
+        }
+        signalProcessing(true);
+      });
+    } else {
+      signalProcessing(true);
+    }
+
+    const parseResponseJSON = () => {
+      if (xhr.response !== null && xhr.response !== undefined) {
+        return xhr.response;
+      }
+      try {
+        return xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch (err) {
+        return null;
+      }
+    };
+
+    const handleError = () => {
+      signalProcessing(false);
+      const response = parseResponseJSON() || {};
+      const message =
+        response.detail ||
+        response.error ||
+        (typeof response === 'string' ? response : '') ||
+        xhr.statusText ||
+        'Failed to create system.';
+      reject(new Error(message));
+    };
+
+    xhr.onreadystatechange = () => {
+      if (xhr.readyState !== XMLHttpRequest.DONE) return;
+      signalProcessing(false);
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(parseResponseJSON());
+      } else {
+        handleError();
+      }
+    };
+
+    xhr.onerror = () => {
+      signalProcessing(false);
+      reject(new Error('Network error while creating system.'));
+    };
+
+    xhr.send(payload);
   });
 }
 

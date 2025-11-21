@@ -69,16 +69,36 @@ def _stride_to_slice(stride: int) -> Optional[str]:
     return f"::{stride}" if stride > 1 else None
 
 
-def _parse_residue_selections(raw_json: Optional[str]) -> Optional[Dict[str, str]]:
-    if not raw_json:
+def _parse_residue_selections(raw_value: Optional[str], expect_json: bool = False):
+    """
+    Accepts either legacy JSON objects/arrays or newline-delimited text inputs.
+    Returns None, a dict, or a list of selection strings.
+    """
+    if not raw_value:
         return None
-    try:
-        data = json.loads(raw_json)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON for residue selections.")
-    if not isinstance(data, dict):
-        raise HTTPException(status_code=400, detail="Residue selections JSON must be an object.")
-    return data
+    stripped = raw_value.strip()
+    if not stripped:
+        return None
+
+    should_parse_json = expect_json or stripped[0] in ("{", "[")
+
+    if should_parse_json:
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            if expect_json:
+                raise HTTPException(status_code=400, detail="Invalid JSON for residue selections.") from exc
+        else:
+            if isinstance(data, dict):
+                cleaned = {k: str(v).strip() for k, v in data.items() if isinstance(v, str) and v.strip()}
+                return cleaned or None
+            if isinstance(data, list):
+                lines = [str(item).strip() for item in data if str(item).strip()]
+                return lines or None
+            raise HTTPException(status_code=400, detail="Residue selections JSON must be an object or array.")
+
+    lines = [line.strip() for line in raw_value.splitlines() if line.strip()]
+    return lines or None
 
 
 def _ensure_system_ready(project_id: str, system_id: str) -> SystemMetadata:
@@ -220,6 +240,7 @@ async def create_system_with_descriptors(
     inactive_traj: UploadFile = File(...),
     active_stride: int = Form(1),
     inactive_stride: int = Form(1),
+    residue_selections_text: Optional[str] = Form(None),
     residue_selections_json: Optional[str] = Form(None),
 ):
     try:
@@ -227,7 +248,11 @@ async def create_system_with_descriptors(
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Project '{project_id}' not found.")
 
-    residue_selections = _parse_residue_selections(residue_selections_json)
+    raw_selection_input = residue_selections_text or residue_selections_json
+    residue_selections = _parse_residue_selections(
+        raw_selection_input,
+        expect_json=bool(residue_selections_json and not residue_selections_text),
+    )
     try:
         system_meta = project_store.create_system(
             project_id, name=name, description=description, residue_selections=residue_selections
@@ -422,9 +447,7 @@ async def submit_static_job(
     payload: StaticJobRequest,
     task_queue: get_queue = Depends(),
 ):
-    params = {
-        "state_metric": payload.state_metric,
-    }
+    params = payload.dict(exclude_none=True, exclude={"project_id", "system_id"})
     return submit_job("static", payload.project_id, payload.system_id, params, task_queue)
 
 
@@ -442,19 +465,13 @@ async def submit_qubo_job(
     payload: QUBOJobRequest,
     task_queue: get_queue = Depends(),
 ):
-    params = {
-        "alpha_size": payload.alpha_size,
-        "beta_hub": payload.beta_hub,
-        "beta_switch": payload.beta_switch,
-        "gamma_redundancy": payload.gamma_redundancy,
-        "ii_threshold": payload.ii_threshold,
-        "filter_top_total": payload.filter_top_total,
-        "filter_top_jsd": payload.filter_top_jsd,
-        "filter_min_id": payload.filter_min_id,
-    }
-    if payload.static_job_uuid:
-        params["static_job_uuid"] = payload.static_job_uuid
-
+    params = payload.dict(exclude_none=True, exclude={"project_id", "system_id"})
+    # Clean up optional static reference to avoid passing empty strings
+    static_uuid = params.get("static_job_uuid")
+    if not static_uuid:
+        params.pop("static_job_uuid", None)
+    else:
+        params["static_job_uuid"] = static_uuid
     return submit_job("qubo", payload.project_id, payload.system_id, params, task_queue)
 
 # --- Results Endpoints ---

@@ -18,6 +18,8 @@ export default function SystemForm({ onCreate }) {
   const [formKey, setFormKey] = useState(0);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState(null);
+  const [uploadProgress, setUploadProgress] = useState(null);
+  const [isProcessing, setIsProcessing] = useState(false);
 
   const handleChange = (field, value) => {
     setForm((prev) => ({ ...prev, [field]: value }));
@@ -36,6 +38,8 @@ export default function SystemForm({ onCreate }) {
 
     setIsSubmitting(true);
     setError(null);
+    setUploadProgress(null);
+    setIsProcessing(false);
     try {
       const payload = new FormData();
       if (form.name) payload.append('name', form.name);
@@ -46,17 +50,23 @@ export default function SystemForm({ onCreate }) {
       payload.append('inactive_traj', form.inactiveTraj);
       payload.append('active_stride', form.activeStride);
       payload.append('inactive_stride', form.inactiveStride);
-      if (form.residueSelections) {
-        payload.append('residue_selections_json', form.residueSelections);
+      const selectionsText = form.residueSelections.trim();
+      if (selectionsText) {
+        payload.append('residue_selections_text', selectionsText);
       }
 
-      await onCreate(payload);
+      await onCreate(payload, {
+        onUploadProgress: (percent) => setUploadProgress(percent),
+        onProcessing: (processing) => setIsProcessing(processing),
+      });
       setForm(defaultForm);
       setFormKey((prev) => prev + 1);
     } catch (err) {
       setError(err.message);
     } finally {
       setIsSubmitting(false);
+      setUploadProgress(null);
+      setIsProcessing(false);
     }
   };
 
@@ -109,15 +119,46 @@ export default function SystemForm({ onCreate }) {
       </div>
 
       <div>
-        <label className="block text-sm text-gray-300 mb-1">Residue Selections JSON (optional)</label>
+        <label className="block text-sm text-gray-300 mb-1">Residue Selections (optional)</label>
         <textarea
           rows={4}
           value={form.residueSelections}
           onChange={(e) => handleChange('residueSelections', e.target.value)}
-          placeholder='{"res_50": "resid 50"}'
+          placeholder={'resid 50 51\nchain A and resid 10 to 15 [singles]\nsegid CORE and resid 20 to 25 [pairs]'}
           className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
         />
+        <p className="text-xs text-gray-500 mt-1">
+          Enter one selection per line. Use optional [singles] or [pairs] wildcards to expand entries automatically.
+        </p>
       </div>
+
+      {(uploadProgress !== null || isProcessing) && (
+        <div className="space-y-3">
+          {uploadProgress !== null && (
+            <div>
+              <div className="flex items-center justify-between text-xs text-gray-400 mb-1">
+                <span>Uploading files</span>
+                <span>{uploadProgress}%</span>
+              </div>
+              <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-cyan-500 transition-all duration-200"
+                  style={{ width: `${uploadProgress}%` }}
+                />
+              </div>
+            </div>
+          )}
+          {isProcessing && (
+            <div>
+              <p className="text-xs text-gray-400 mb-1">Processing descriptors...</p>
+              <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
+                <div className="h-full w-1/3 bg-amber-400 animate-pulse" />
+              </div>
+              <p className="text-xs text-gray-500 mt-1">This may take a few minutes.</p>
+            </div>
+          )}
+        </div>
+      )}
 
       <ErrorMessage message={error} />
       <button

@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import shutil
 
 
@@ -61,7 +61,7 @@ class SystemMetadata:
     description: Optional[str]
     created_at: str
     status: str = "processing"
-    residue_selections: Optional[Dict[str, str]] = None
+    residue_selections: Optional[SelectionInput] = None
     residue_selections_mapping: Dict[str, str] = field(default_factory=dict)
     descriptor_keys: List[str] = field(default_factory=list)
     states: Dict[str, DescriptorState] = field(default_factory=dict)
@@ -181,7 +181,7 @@ class ProjectStore:
         project_id: str,
         name: Optional[str] = None,
         description: Optional[str] = None,
-        residue_selections: Optional[Dict[str, str]] = None,
+        residue_selections: Optional[SelectionInput] = None,
     ) -> SystemMetadata:
         project_meta = self.get_project(project_id)
         system_id = str(uuid.uuid4())
@@ -248,3 +248,4 @@ class ProjectStore:
         if not project_dir.exists():
             raise FileNotFoundError(f"Project '{project_id}' not found.")
         shutil.rmtree(project_dir)
+SelectionInput = Union[Dict[str, str], List[str]]
