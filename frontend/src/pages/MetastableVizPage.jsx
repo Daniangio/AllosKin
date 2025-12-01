@@ -20,10 +20,13 @@ export default function MetastableVizPage() {
   const [error, setError] = useState(null);
   const [actionError, setActionError] = useState(null);
   const [loadedMap, setLoadedMap] = useState({});
+  const [viewerStatus, setViewerStatus] = useState('initializing'); // initializing | ready | error
+  const statusRef = useRef('initializing');
 
   const loadMetastable = useCallback(async () => {
     setError(null);
     setLoading(true);
+    console.info('[MetastableViz] Loading metastable states…', { projectId, systemId });
     try {
       const [metaRes, sysRes] = await Promise.all([
         fetchMetastableStates(projectId, systemId),
@@ -31,8 +34,13 @@ export default function MetastableVizPage() {
       ]);
       setMetastableStates(metaRes.metastable_states || []);
       setSystemName(sysRes?.name || systemId);
+      console.info('[MetastableViz] Loaded metastable states', {
+        count: (metaRes.metastable_states || []).length,
+        systemName: sysRes?.name,
+      });
     } catch (err) {
       setError(err.message || 'Failed to load metastable states.');
+      console.error('[MetastableViz] Failed to load metastable states', err);
     } finally {
       setLoading(false);
     }
@@ -40,26 +48,58 @@ export default function MetastableVizPage() {
 
   useEffect(() => {
     let disposed = false;
-    const init = async () => {
-      if (!containerRef.current || pluginRef.current) return;
+    let rafId;
+
+    const tryInit = async () => {
+      if (disposed || loading) return;
+      if (!containerRef.current) {
+        console.warn('[MetastableViz] containerRef not ready, retrying...');
+        rafId = requestAnimationFrame(tryInit);
+        return;
+      }
+      if (pluginRef.current) {
+        return;
+      }
+      setViewerStatus('initializing');
+      statusRef.current = 'initializing';
+      const timeout = setTimeout(() => {
+        if (statusRef.current === 'initializing') {
+          console.error('[MetastableViz] Mol* init timeout.');
+          setViewerStatus('error');
+          statusRef.current = 'error';
+          setError('3D viewer initialization timed out.');
+        }
+      }, 8000);
       try {
+        console.info('[MetastableViz] Initializing Mol* plugin…', { hasContainer: !!containerRef.current });
         const plugin = await createPluginUI({
           target: containerRef.current,
           render: renderReact18,
         });
         if (disposed) {
           plugin.dispose?.();
+          clearTimeout(timeout);
           return;
         }
         pluginRef.current = plugin;
+        setViewerStatus('ready');
+        statusRef.current = 'ready';
+        console.info('[MetastableViz] Mol* plugin ready');
+        clearTimeout(timeout);
       } catch (viewerErr) {
         console.error('Failed to initialize Mol* viewer', viewerErr);
         setError('3D viewer initialization failed.');
+        setViewerStatus('error');
+        statusRef.current = 'error';
+      } finally {
+        clearTimeout(timeout);
       }
     };
-    init();
+
+    tryInit();
     return () => {
       disposed = true;
+      if (rafId) cancelAnimationFrame(rafId);
       if (pluginRef.current) {
         try {
           pluginRef.current.dispose?.();
@@ -69,7 +109,7 @@ export default function MetastableVizPage() {
         pluginRef.current = null;
       }
     };
-  }, []);
+  }, [loading]);
 
   useEffect(() => {
     loadMetastable();
@@ -77,23 +117,57 @@ export default function MetastableVizPage() {
 
   const removeMetastable = async (metastableId) => {
     const plugin = pluginRef.current;
-    const refs = loadedMap[metastableId];
-    if (plugin && refs) {
-      try {
-        if (refs.trajectoryRef) {
-          await plugin.state.data.remove(refs.trajectoryRef);
-        } else if (refs.dataRef) {
-          await plugin.state.data.remove(refs.dataRef);
-        }
-      } catch (err) {
-        // ignore
+    if (!plugin) return;
+
+    // Clear entire scene and re-load remaining loaded metastables (simpler than per-node removal).
+    const remainingKeys = Object.keys(loadedMap).filter((k) => k !== metastableId);
+    const remainingMetas = metastableStates.filter((m) => remainingKeys.includes(m.metastable_id));
+
+    try {
+      await plugin.clear();
+      setLoadedMap({});
+      for (const meta of remainingMetas) {
+        await loadStructureRaw(meta);
       }
+      console.info('[MetastableViz] Unloaded metastable and reloaded remaining', metastableId);
+    } catch (err) {
+      console.warn('[MetastableViz] Failed to unload metastable', metastableId, err);
     }
-    setLoadedMap((prev) => {
-      const next = { ...prev };
-      delete next[metastableId];
-      return next;
-    });
+  };
+
+  const loadStructureRaw = async (meta) => {
+    if (!meta.metastable_id) return;
+    setActionError(null);
+    const plugin = pluginRef.current;
+    if (!plugin) {
+      console.error('[MetastableViz] Plugin not initialized; cannot load structure');
+      return;
+    }
+    try {
+      const url = metastablePdbUrl(projectId, systemId, meta.metastable_id);
+      console.info('[MetastableViz] Loading PDB', { url, meta });
+      await plugin.dataTransaction(async () => {
+        const data = await plugin.builders.data.download(
+          { url: Asset.Url(url), label: meta.name || meta.metastable_id },
+          { state: { isGhost: true } }
+        );
+        const trajectory = await plugin.builders.structure.parseTrajectory(data, 'pdb');
+        const preset = await plugin.builders.structure.hierarchy.applyPreset(trajectory, 'default');
+        const structureRef = preset?.structure?.cell?.transform?.ref;
+        setLoadedMap((prev) => ({
+          ...prev,
+          [meta.metastable_id]: {
+            dataRef: data.ref,
+            trajectoryRef: trajectory.ref,
+            structureRef,
+          },
+        }));
+      });
+      console.info('[MetastableViz] Loaded metastable', meta.metastable_id);
+    } catch (err) {
+      setActionError(err.message || 'Failed to load structure.');
+      console.error('[MetastableViz] Failed to load structure', err);
+    }
   };
 
   const loadStructure = async (meta) => {
@@ -102,26 +176,7 @@ export default function MetastableVizPage() {
       await removeMetastable(meta.metastable_id);
       return;
     }
-    setActionError(null);
-    const plugin = pluginRef.current;
-    if (!plugin) return;
-    try {
-      const url = metastablePdbUrl(projectId, systemId, meta.metastable_id);
-      await plugin.dataTransaction(async () => {
-        const data = await plugin.builders.data.download(
-          { url: Asset.Url(url), label: meta.name || meta.metastable_id },
-          { state: { isGhost: true } }
-        );
-        const trajectory = await plugin.builders.structure.parseTrajectory(data, 'pdb');
-        await plugin.builders.structure.hierarchy.applyPreset(trajectory, 'default');
-        setLoadedMap((prev) => ({
-          ...prev,
-          [meta.metastable_id]: { dataRef: data.ref, trajectoryRef: trajectory.ref },
-        }));
-      });
-    } catch (err) {
-      setActionError(err.message || 'Failed to load structure.');
-    }
+    await loadStructureRaw(meta);
   };
 
   const handleRename = async (meta, name) => {
@@ -180,10 +235,22 @@ export default function MetastableVizPage() {
           </div>
         </div>
         <div className="md:col-span-2">
-          <div
-            ref={containerRef}
-            className="w-full h-[520px] bg-black rounded-lg overflow-hidden border border-gray-700"
-          />
+          <div className="relative">
+            {viewerStatus === 'initializing' && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/50 z-10">
+                <Loader message="Initializing viewer..." />
+              </div>
+            )}
+            {viewerStatus === 'error' && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/60 z-10">
+                <ErrorMessage message="Viewer failed to load. Check console logs." />
+              </div>
+            )}
+            <div
+              ref={containerRef}
+              className="w-full h-[520px] bg-black rounded-lg overflow-hidden border border-gray-700"
+            />
+          </div>
         </div>
       </div>
     </div>
