@@ -46,3 +46,17 @@ export async function requestBlob(path) {
   }
   return response.blob();
 }
+
+export async function requestBlobWithBody(path, { method = 'POST', body, headers = {} } = {}) {
+  const options = {
+    method,
+    headers: { 'Content-Type': 'application/json', ...headers },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  };
+  const response = await fetch(`${API_BASE}${path}`, options);
+  if (!response.ok) {
+    const message = await parseError(response);
+    throw new Error(message);
+  }
+  return response.blob();
+}

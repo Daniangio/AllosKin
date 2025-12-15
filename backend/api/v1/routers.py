@@ -32,6 +32,7 @@ from backend.services.project_store import (
     SystemMetadata,
 )
 from backend.services.metastable import recompute_metastable_states
+from backend.services.metastable_clusters import generate_metastable_cluster_npz
 from backend.services.preprocessing import DescriptorPreprocessor
 from backend.services.descriptors import save_descriptor_npz, load_descriptor_npz
 
@@ -754,6 +755,60 @@ async def list_metastable_states(project_id: str, system_id: str):
         "metastable_states": system_meta.metastable_states or [],
         "model_dir": system_meta.metastable_model_dir,
     }
+
+
+@api_router.post(
+    "/projects/{project_id}/systems/{system_id}/metastable/cluster_vectors",
+    summary="Cluster residue angles inside selected metastable states and download NPZ",
+)
+async def build_metastable_cluster_vectors(
+    project_id: str,
+    system_id: str,
+    payload: Dict[str, Any],
+):
+    try:
+        project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    metastable_ids_raw = (payload or {}).get("metastable_ids") or []
+    if not isinstance(metastable_ids_raw, list):
+        raise HTTPException(status_code=400, detail="metastable_ids must be a list.")
+    metastable_ids = [str(mid).strip() for mid in metastable_ids_raw if str(mid).strip()]
+    if not metastable_ids:
+        raise HTTPException(status_code=400, detail="Provide at least one metastable_id.")
+
+    try:
+        max_clusters = int((payload or {}).get("max_clusters_per_residue", 6))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="max_clusters_per_residue must be an integer.")
+    if max_clusters < 1:
+        raise HTTPException(status_code=400, detail="max_clusters_per_residue must be >= 1.")
+
+    try:
+        random_state = int((payload or {}).get("random_state", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="random_state must be an integer.")
+
+    try:
+        npz_path, _ = await run_in_threadpool(
+            generate_metastable_cluster_npz,
+            project_id,
+            system_id,
+            metastable_ids,
+            max_clusters_per_residue=max_clusters,
+            random_state=random_state,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to build metastable clusters: {exc}") from exc
+
+    return FileResponse(
+        npz_path,
+        filename=npz_path.name,
+        media_type="application/octet-stream",
+    )
 
 
 @api_router.get(

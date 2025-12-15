@@ -12,6 +12,7 @@ import {
   fetchMetastableStates,
   recomputeMetastableStates,
   renameMetastableState,
+  downloadMetastableClusters,
 } from '../api/projects';
 import { submitStaticJob, submitDynamicJob, submitQuboJob, fetchResults, fetchResult } from '../api/jobs';
 import StaticAnalysisForm from '../components/analysis/StaticAnalysisForm';
@@ -49,6 +50,10 @@ export default function SystemDetailPage() {
     tica_dim: 5,
     random_state: 0,
   });
+  const [selectedMetastableIds, setSelectedMetastableIds] = useState([]);
+  const [clusterError, setClusterError] = useState(null);
+  const [clusterLoading, setClusterLoading] = useState(false);
+  const [maxClustersPerResidue, setMaxClustersPerResidue] = useState(6);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -97,6 +102,17 @@ export default function SystemDetailPage() {
   const states = useMemo(() => Object.values(system?.states || {}), [system]);
   const descriptorStates = useMemo(() => states.filter((s) => s.descriptor_file), [states]);
   const metastableStates = useMemo(() => metastable.states || [], [metastable.states]);
+
+  useEffect(() => {
+    setSelectedMetastableIds((prev) =>
+      prev.filter((id) =>
+        metastableStates.some((m) => {
+          const metaId = m.metastable_id || `${m.macro_state}-${m.metastable_index}`;
+          return metaId === id;
+        })
+      )
+    );
+  }, [metastableStates]);
 
   const analysisStateOptions = useMemo(() => {
     const macroOpts = descriptorStates.map((s) => ({
@@ -343,6 +359,40 @@ export default function SystemDetailPage() {
     }
   };
 
+  const toggleMetastableSelection = (metastableId) => {
+    setClusterError(null);
+    setSelectedMetastableIds((prev) =>
+      prev.includes(metastableId) ? prev.filter((id) => id !== metastableId) : [...prev, metastableId]
+    );
+  };
+
+  const handleDownloadClusters = async () => {
+    if (!selectedMetastableIds.length) {
+      setClusterError('Select at least one metastable state to cluster.');
+      return;
+    }
+    setClusterError(null);
+    setClusterLoading(true);
+    try {
+      const blob = await downloadMetastableClusters(projectId, systemId, selectedMetastableIds, {
+        max_clusters_per_residue: maxClustersPerResidue,
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      const stamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+      link.href = url;
+      link.download = `${system?.name || systemId}_metastable_clusters_${stamp}.npz`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setClusterError(err.message);
+    } finally {
+      setClusterLoading(false);
+    }
+  };
+
   return (
     <div className="space-y-8">
       <div>
@@ -457,12 +507,80 @@ export default function SystemDetailPage() {
             Run metastable analysis after uploading trajectories and building descriptors.
           </p>
         )}
-        {!metaLoading && metastable.states.length > 0 && (
-          <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-3">
-            {metastable.states.map((m) => (
-              <MetastableCard key={m.metastable_id || `${m.macro_state}-${m.metastable_index}`} meta={m} onRename={handleRenameMetastable} />
-            ))}
-          </div>
+        {!metaLoading && metastableStates.length > 0 && (
+          <>
+            <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-3">
+              {metastableStates.map((m) => (
+                <MetastableCard key={m.metastable_id || `${m.macro_state}-${m.metastable_index}`} meta={m} onRename={handleRenameMetastable} />
+              ))}
+            </div>
+            <div className="bg-gray-900 border border-gray-700 rounded-md p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-semibold text-white">Residue cluster NPZ</h3>
+                  <p className="text-xs text-gray-400">
+                    Cluster phi/psi/chi1 per residue for selected metastable states and download the labels.
+                  </p>
+                </div>
+                <button
+                  onClick={handleDownloadClusters}
+                  disabled={clusterLoading || selectedMetastableIds.length === 0}
+                  className="text-xs px-3 py-1 rounded-md border border-emerald-500 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
+                >
+                  {clusterLoading ? 'Generating…' : 'Download NPZ'}
+                </button>
+              </div>
+              {clusterError && <ErrorMessage message={clusterError} />}
+              <div className="flex flex-wrap gap-2">
+                {metastableStates.map((m) => {
+                  const metaId = m.metastable_id || `${m.macro_state}-${m.metastable_index}`;
+                  const label = m.name || m.default_name || metaId;
+                  const checked = selectedMetastableIds.includes(metaId);
+                  return (
+                    <label
+                      key={metaId}
+                      className={`flex items-center space-x-2 px-3 py-2 rounded-md border cursor-pointer ${
+                        checked ? 'border-emerald-400 bg-emerald-500/10' : 'border-gray-700 bg-gray-800/60'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleMetastableSelection(metaId)}
+                        className="accent-emerald-400"
+                      />
+                      <span className="text-sm text-gray-200">{label}</span>
+                    </label>
+                  );
+                })}
+              </div>
+              <div className="grid md:grid-cols-3 gap-3 text-xs text-gray-300">
+                <label className="space-y-1">
+                  <span className="block text-gray-400">Max clusters / residue</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={12}
+                    value={maxClustersPerResidue}
+                    onChange={(e) =>
+                      setMaxClustersPerResidue(Math.max(1, Number(e.target.value) || 1))
+                    }
+                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+                  />
+                </label>
+                <div className="flex items-center">
+                  <p className="text-gray-300">
+                    Selected:{' '}
+                    <span className="text-white font-semibold">{selectedMetastableIds.length}</span> /{' '}
+                    {metastableStates.length}
+                  </p>
+                </div>
+                <p className="text-gray-400">
+                  NPZ includes per-metastable and merged cluster vectors plus a metadata JSON blob.
+                </p>
+              </div>
+            </div>
+          </>
         )}
       </section>
 

@@ -1,4 +1,4 @@
-import { requestJSON, requestBlob, API_BASE } from './client';
+import { requestJSON, requestBlob, requestBlobWithBody, API_BASE } from './client';
 
 export function fetchProjects() {
   return requestJSON('/projects');
@@ -255,4 +255,19 @@ export function metastablePdbUrl(projectId, systemId, metastableId) {
   return `${API_BASE}/projects/${projectId}/systems/${systemId}/metastable/${encodeURIComponent(
     metastableId
   )}/pdb`;
+}
+
+export function downloadMetastableClusters(projectId, systemId, metastableIds, params = {}) {
+  const payload = {
+    metastable_ids: metastableIds,
+  };
+  if (params.max_clusters_per_residue) payload.max_clusters_per_residue = params.max_clusters_per_residue;
+  if (params.random_state !== undefined) payload.random_state = params.random_state;
+  return requestBlobWithBody(
+    `/projects/${projectId}/systems/${systemId}/metastable/cluster_vectors`,
+    {
+      method: 'POST',
+      body: payload,
+    }
+  );
 }
