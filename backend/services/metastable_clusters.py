@@ -6,11 +6,13 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.metrics import silhouette_score
+from scipy.spatial import KDTree
+import MDAnalysis as mda
 
 from backend.services.descriptors import load_descriptor_npz
 from backend.services.project_store import DescriptorState, ProjectStore, SystemMetadata
@@ -22,11 +24,21 @@ def _slug(value: str) -> str:
 
 
 def _cluster_residue_samples(
-    samples: np.ndarray, max_k: int, random_state: int
-) -> Tuple[np.ndarray, int]:
-    """Pick k via silhouette (k>=1) and return labels + cluster count."""
+    samples: np.ndarray,
+    max_k: int,
+    random_state: int,
+    *,
+    algorithm: str = "tomato",
+    dbscan_eps: float = 0.5,
+    dbscan_min_samples: int = 5,
+    hierarchical_n_clusters: Optional[int] = None,
+    hierarchical_linkage: str = "ward",
+    tomato_k: int = 15,
+    tomato_tau: float = 0.5,
+) -> Tuple[np.ndarray, int, Dict[str, Any]]:
+    """Cluster angles with periodic distance. Returns labels, cluster count, diagnostics."""
     if samples.size == 0:
-        return np.array([], dtype=np.int32), 0
+        return np.array([], dtype=np.int32), 0, {}
 
     if samples.ndim == 1:
         samples = samples.reshape(1, -1)
@@ -38,31 +50,243 @@ def _cluster_residue_samples(
     emb = np.concatenate([np.sin(angles), np.cos(angles)], axis=1)
     emb = np.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
 
-    upper_k = max(1, min(int(max_k), emb.shape[0]))
-    best_k = 1
-    best_score = -np.inf
+    algo = (algorithm or "tomato").lower()
+    diagnostics: Dict[str, Any] = {}
 
-    for k in range(1, upper_k + 1):
-        if k == 1:
-            score = 0.0
-        else:
-            km = KMeans(n_clusters=k, n_init="auto", random_state=random_state)
-            labels = km.fit_predict(emb)
-            if len(np.unique(labels)) < 2:
-                score = -np.inf
+    if algo == "kmeans":
+        upper_k = max(1, min(int(max_k), emb.shape[0]))
+        best_k = 1
+        best_score = -np.inf
+
+        for k in range(1, upper_k + 1):
+            if k == 1:
+                score = 0.0
             else:
-                score = silhouette_score(emb, labels)
-        if score > best_score:
-            best_score = score
-            best_k = k
+                km = KMeans(n_clusters=k, n_init="auto", random_state=random_state)
+                labels = km.fit_predict(emb)
+                if len(np.unique(labels)) < 2:
+                    score = -np.inf
+                else:
+                    score = silhouette_score(emb, labels)
+            if score > best_score:
+                best_score = score
+                best_k = k
 
-    if best_k == 1:
-        final_labels = np.zeros(emb.shape[0], dtype=np.int32)
-    else:
-        km = KMeans(n_clusters=best_k, n_init="auto", random_state=random_state)
-        final_labels = km.fit_predict(emb).astype(np.int32)
+        if best_k == 1:
+            final_labels = np.zeros(emb.shape[0], dtype=np.int32)
+        else:
+            km = KMeans(n_clusters=best_k, n_init="auto", random_state=random_state)
+            final_labels = km.fit_predict(emb).astype(np.int32)
 
-    return final_labels, int(best_k)
+        return final_labels, int(best_k), diagnostics
+
+    if algo == "hierarchical":
+        n_clusters = hierarchical_n_clusters or max_k
+        n_clusters = max(1, min(int(n_clusters), emb.shape[0]))
+        linkage = (hierarchical_linkage or "ward").lower()
+        if linkage not in {"ward", "complete", "average", "single"}:
+            linkage = "ward"
+        model = AgglomerativeClustering(n_clusters=n_clusters, linkage=linkage)
+        labels = model.fit_predict(emb).astype(np.int32)
+        k = len(np.unique(labels))
+        return labels, int(k), diagnostics
+
+    if algo == "density_peaks":
+        n = emb.shape[0]
+        if n == 1:
+            return np.zeros(1, dtype=np.int32), 1, diagnostics
+        # Pairwise distances
+        diff = emb[:, None, :] - emb[None, :, :]
+        dist = np.linalg.norm(diff, axis=2)
+        mask = ~np.isclose(dist, 0.0)
+        valid = dist[mask]
+        dc = float(np.median(valid)) if valid.size else 1.0
+        if dc <= 0:
+            dc = 1.0
+        rho = np.sum(np.exp(-(dist / dc) ** 2), axis=1) - 1.0
+        order = np.argsort(-rho)
+        delta = np.zeros(n, dtype=float)
+        nearest_higher = np.full(n, -1, dtype=int)
+        for i, idx in enumerate(order):
+            if i == 0:
+                delta[idx] = dist[idx].max()
+                nearest_higher[idx] = -1
+            else:
+                higher = order[:i]
+                dists = dist[idx, higher]
+                j = higher[np.argmin(dists)]
+                delta[idx] = dist[idx, j]
+                nearest_higher[idx] = j
+        gamma = rho * delta
+        k_candidates = max(1, min(int(max_k), n))
+        centers = np.argsort(-gamma)[:k_candidates]
+        labels = np.full(n, -1, dtype=np.int32)
+        for ci, center_idx in enumerate(centers):
+            labels[center_idx] = ci
+        for idx in order:
+            if labels[idx] >= 0:
+                continue
+            parent = nearest_higher[idx]
+            labels[idx] = labels[parent] if parent >= 0 else 0
+        diagnostics["density_peaks_centers"] = centers.tolist()
+        return labels, int(len(centers)), diagnostics
+
+        if algo == "tomato":
+            n = emb.shape[0]
+            if n == 1:
+                return np.zeros(1, dtype=np.int32), 1, diagnostics
+            k_nn = max(1, min(int(tomato_k if tomato_k is not None else max_k), n - 1))
+        tree = KDTree(emb)
+        dists, idxs = tree.query(emb, k=k_nn + 1)
+        # remove self
+        knn_dists = dists[:, 1:]
+        knn_idxs = idxs[:, 1:]
+        d_k = knn_dists[:, -1] + 1e-8
+        dim = emb.shape[1]
+        rho = 1.0 / (d_k ** max(dim, 1))
+        # mode seeking parents
+        local_max = np.zeros(n, dtype=bool)
+        parent = np.full(n, -1, dtype=int)
+        for i in range(n):
+            neigh = knn_idxs[i]
+            best_j = -1
+            best_rho = rho[i]
+            for j in neigh:
+                if rho[j] > best_rho:
+                    best_rho = rho[j]
+                    best_j = j
+            if best_j == -1:
+                local_max[i] = True
+            else:
+                parent[i] = best_j
+        order = sorted(range(n), key=lambda idx: (-rho[idx], idx))
+        uf_parent = np.arange(n, dtype=int)
+        root_density = rho.copy()
+        processed = np.zeros(n, dtype=bool)
+        transitions: List[Dict[str, Any]] = []
+        events: List[Dict[str, Any]] = []
+
+        def find(x: int) -> int:
+            while uf_parent[x] != x:
+                uf_parent[x] = uf_parent[uf_parent[x]]
+                x = uf_parent[x]
+            return x
+
+        def union(a: int, b: int):
+            ra, rb = find(a), find(b)
+            if ra == rb:
+                return ra
+            # keep the one with higher peak density
+            if root_density[ra] >= root_density[rb]:
+                uf_parent[rb] = ra
+                return ra
+            uf_parent[ra] = rb
+            return rb
+
+        tau = float(tomato_tau if tomato_tau is not None else 0.5)
+        diagnostics["tau"] = tau
+        diagnostics["k_neighbors"] = k_nn
+
+        for idx in order:
+            if local_max[idx]:
+                processed[idx] = True
+                continue
+            processed[idx] = True
+            neigh = [j for j in knn_idxs[idx] if processed[j] and rho[j] > rho[idx]]
+            if not neigh:
+                continue
+            roots = []
+            for j in neigh:
+                rj = find(j)
+                if rj not in roots:
+                    roots.append(rj)
+            if len(roots) == 1:
+                union(idx, roots[0])
+                continue
+
+            # Multiple roots -> saddle
+            roots_sorted = sorted(roots, key=lambda r: (-root_density[r], r))
+            r_max = roots_sorted[0]
+            for r_other in roots_sorted[1:]:
+                persistence = float(root_density[r_other] - rho[idx])
+                events.append(
+                    {
+                        "peak_density": float(root_density[r_other]),
+                        "persistence": persistence,
+                        "saddle_density": float(rho[idx]),
+                    }
+                )
+                if persistence < tau:
+                    union(r_other, r_max)
+                else:
+                    transitions.append(
+                        {
+                            "root_a": int(r_max),
+                            "root_b": int(r_other),
+                            "saddle_index": int(idx),
+                            "saddle_density": float(rho[idx]),
+                            "persistence": persistence,
+                        }
+                    )
+            union(idx, r_max)
+
+        # flatten labels
+        root_map: Dict[int, int] = {}
+        labels = np.full(n, -1, dtype=np.int32)
+        next_id = 0
+        for i in range(n):
+            r = find(i)
+            if r not in root_map:
+                root_map[r] = next_id
+                next_id += 1
+            labels[i] = root_map[r]
+
+        diagnostics["persistence_events"] = events
+        diagnostics["transitions"] = transitions
+        diagnostics["peak_densities"] = [float(root_density[r]) for r in root_map.keys()]
+        if next_id > max_k or next_id > t_k_max:
+            # Build candidate merges using lowest persistence barrier first
+            merge_candidates: Dict[Tuple[int, int], float] = {}
+            for tr in transitions:
+                ra = find(tr["root_a"])
+                rb = find(tr["root_b"])
+                if ra == rb:
+                    continue
+                key = tuple(sorted((ra, rb)))
+                pers = float(tr.get("persistence", 0.0))
+                if key not in merge_candidates or pers < merge_candidates[key]:
+                    merge_candidates[key] = pers
+            forced_merges: List[Dict[str, Any]] = []
+            for (ra, rb), pers in sorted(merge_candidates.items(), key=lambda kv: kv[1]):
+                if len({find(i) for i in range(n)}) <= min(max_k, t_k_max):
+                    break
+                union(ra, rb)
+                forced_merges.append({"roots": (int(ra), int(rb)), "persistence": pers})
+            # Re-label after forced merges
+            root_map = {}
+            labels = np.full(n, -1, dtype=np.int32)
+            next_id = 0
+            for i in range(n):
+                r = find(i)
+                if r not in root_map:
+                    root_map[r] = next_id
+                    next_id += 1
+                labels[i] = root_map[r]
+            diagnostics["forced_merges"] = forced_merges
+            diagnostics["peak_densities"] = [float(root_density[r]) for r in root_map.keys()]
+        return labels, int(next_id), diagnostics
+
+    # Default: DBSCAN
+    eps = float(dbscan_eps) if dbscan_eps is not None else 0.5
+    min_s = int(dbscan_min_samples) if dbscan_min_samples is not None else 5
+    min_s = max(1, min_s)
+    db = DBSCAN(eps=eps, min_samples=min_s, metric="euclidean")
+    labels = db.fit_predict(emb).astype(np.int32)
+    unique_clusters = sorted([int(v) for v in np.unique(labels) if v != -1])
+    mapping = {old: idx for idx, old in enumerate(unique_clusters)}
+    remapped = np.array([mapping.get(int(v), -1) for v in labels], dtype=np.int32)
+    diagnostics["dbscan_unique"] = unique_clusters
+    return remapped, int(len(unique_clusters)), diagnostics
 
 
 def _resolve_states_for_meta(meta: Dict[str, Any], system: SystemMetadata) -> List[DescriptorState]:
@@ -105,8 +329,71 @@ def _coerce_residue_keys(
     if residue_keys:
         return residue_keys
     if state.residue_keys:
-        return list(state.residue_keys)
-    return [k for k in features.keys() if k != "metastable_labels"]
+        return _sort_residue_keys(state.residue_keys)
+    feature_keys = [k for k in features.keys() if k != "metastable_labels"]
+    return _sort_residue_keys(feature_keys)
+
+
+def _sort_residue_keys(keys: List[str]) -> List[str]:
+    """Sort keys by numeric resid extracted from patterns like 'res_123'."""
+    def _extract_num(k: str) -> int:
+        m = re.search(r"(\d+)$", k)
+        return int(m.group(1)) if m else 0
+    return sorted(keys, key=_extract_num)
+
+
+def _extract_residue_positions(
+    pdb_path: Path,
+    residue_keys: List[str],
+    residue_mapping: Dict[str, str],
+    contact_mode: str,
+) -> List[Optional[np.ndarray]]:
+    """Return per-residue positions (CA or center-of-mass) for contact computation."""
+    positions: List[Optional[np.ndarray]] = []
+    u = mda.Universe(str(pdb_path))
+    for key in residue_keys:
+        sel = residue_mapping.get(key) or key
+        try:
+            res_atoms = u.select_atoms(sel)
+        except Exception:
+            positions.append(None)
+            continue
+        if res_atoms.n_atoms == 0:
+            positions.append(None)
+            continue
+        if contact_mode == "CA":
+            ca_atoms = res_atoms.select_atoms("name CA")
+            if ca_atoms.n_atoms > 0:
+                positions.append(np.array(ca_atoms[0].position, dtype=float))
+            else:
+                positions.append(np.array(res_atoms.center_of_mass(), dtype=float))
+        else:
+            positions.append(np.array(res_atoms.center_of_mass(), dtype=float))
+    return positions
+
+
+def _compute_contact_edges(
+    pdb_path: Path,
+    residue_keys: List[str],
+    residue_mapping: Dict[str, str],
+    cutoff: float,
+    contact_mode: str,
+) -> set:
+    """Compute contact edges (i,j) for one PDB."""
+    positions = _extract_residue_positions(pdb_path, residue_keys, residue_mapping, contact_mode)
+    valid_indices = [i for i, pos in enumerate(positions) if pos is not None]
+    edges: set = set()
+    if len(valid_indices) < 2:
+        return edges
+    coords = np.stack([positions[i] for i in valid_indices], axis=0)
+    diff = coords[:, None, :] - coords[None, :, :]
+    dist = np.sqrt(np.sum(diff * diff, axis=-1))
+    for a_idx, i in enumerate(valid_indices):
+        for b_idx in range(a_idx + 1, len(valid_indices)):
+            j = valid_indices[b_idx]
+            if dist[a_idx, b_idx] < cutoff:
+                edges.add((min(i, j), max(i, j)))
+    return edges
 
 
 def generate_metastable_cluster_npz(
@@ -116,6 +403,16 @@ def generate_metastable_cluster_npz(
     *,
     max_clusters_per_residue: int = 6,
     random_state: int = 0,
+    contact_cutoff: float = 10.0,
+    contact_atom_mode: str = "CA",
+    cluster_algorithm: str = "tomato",
+    dbscan_eps: float = 0.5,
+    dbscan_min_samples: int = 5,
+    hierarchical_n_clusters: Optional[int] = None,
+    hierarchical_linkage: str = "ward",
+    tomato_k: int = 15,
+    tomato_tau: float = 0.5,
+    tomato_k_max: Optional[int] = None,
 ) -> Tuple[Path, Dict[str, Any]]:
     """
     Build per-residue cluster labels for selected metastable states and save NPZ.
@@ -126,6 +423,38 @@ def generate_metastable_cluster_npz(
         raise ValueError("At least one metastable_id is required.")
     if max_clusters_per_residue < 1:
         raise ValueError("max_clusters_per_residue must be >= 1.")
+    try:
+        cutoff_val = float(contact_cutoff)
+    except Exception as exc:
+        raise ValueError("contact_cutoff must be a number.") from exc
+    if cutoff_val <= 0:
+        raise ValueError("contact_cutoff must be > 0.")
+    contact_atom_mode = str(contact_atom_mode or "CA").upper()
+    if contact_atom_mode not in {"CA", "CM"}:
+        raise ValueError("contact_atom_mode must be 'CA' or 'CM'.")
+    algo = (cluster_algorithm or "dbscan").lower()
+    if algo not in {"tomato", "dbscan", "kmeans", "hierarchical", "density_peaks"}:
+        raise ValueError("cluster_algorithm must be one of: tomato, density_peaks, dbscan, kmeans, hierarchical.")
+    try:
+        db_eps_val = float(dbscan_eps)
+    except Exception as exc:
+        raise ValueError("dbscan_eps must be a number.") from exc
+    try:
+        db_min_samples_val = max(1, int(dbscan_min_samples))
+    except Exception as exc:
+        raise ValueError("dbscan_min_samples must be an integer >=1.") from exc
+    h_linkage = (hierarchical_linkage or "ward").lower()
+    if h_linkage not in {"ward", "complete", "average", "single"}:
+        h_linkage = "ward"
+    h_n_clusters_val = (
+        max_clusters_per_residue if hierarchical_n_clusters is None else max(1, int(hierarchical_n_clusters))
+    )
+    t_k = max(1, int(tomato_k))
+    t_k_max = max_clusters_per_residue if tomato_k_max is None else max(1, int(tomato_k_max))
+    try:
+        t_tau = float(tomato_tau)
+    except Exception as exc:
+        raise ValueError("tomato_tau must be a number.") from exc
 
     unique_meta_ids = list(dict.fromkeys([str(mid) for mid in metastable_ids]))
 
@@ -138,7 +467,12 @@ def generate_metastable_cluster_npz(
     merged_angles_per_residue: List[List[np.ndarray]] = []
     merged_frame_state_ids: List[str] = []
     merged_frame_meta_ids: List[str] = []
+    merged_frame_indices: List[int] = []
     per_meta_results: Dict[str, Dict[str, Any]] = {}
+    tomato_diag_meta: Optional[Dict[str, Any]] = None
+    tomato_diag_merged: Optional[Dict[str, Any]] = None
+    contact_edges: set = set()
+    contact_sources: List[str] = []
 
     for meta_id in unique_meta_ids:
         meta = metastable_lookup.get(meta_id)
@@ -154,6 +488,7 @@ def generate_metastable_cluster_npz(
 
         per_meta_angles: List[List[np.ndarray]] = []
         frame_state_ids: List[str] = []
+        frame_indices_for_meta: List[int] = []
 
         for state in candidate_states:
             if not state.descriptor_file:
@@ -183,8 +518,10 @@ def generate_metastable_cluster_npz(
             matched_indices = np.where(mask)[0]
             for idx in matched_indices:
                 frame_state_ids.append(state.state_id)
+                frame_indices_for_meta.append(int(idx))
                 merged_frame_state_ids.append(state.state_id)
                 merged_frame_meta_ids.append(meta_id)
+                merged_frame_indices.append(int(idx))
                 for col, key in enumerate(residue_keys):
                     arr = np.asarray(features.get(key))
                     if arr is None or arr.shape[0] != labels.shape[0]:
@@ -219,21 +556,57 @@ def generate_metastable_cluster_npz(
                 raise ValueError(
                     f"Residue '{residue_keys[col]}' for metastable '{meta_id}' has inconsistent frame count."
                 )
-            labels_arr, k = _cluster_residue_samples(sample_arr, max_clusters_per_residue, random_state)
+            labels_arr, k, diag = _cluster_residue_samples(
+                sample_arr,
+                max_clusters_per_residue,
+                random_state,
+                algorithm=algo,
+                dbscan_eps=db_eps_val,
+                dbscan_min_samples=db_min_samples_val,
+                hierarchical_n_clusters=h_n_clusters_val,
+                hierarchical_linkage=h_linkage,
+                tomato_k=t_k,
+                tomato_tau=t_tau,
+            )
             if labels_arr.size == 0:
                 labels_matrix[:, col] = -1
                 cluster_counts[col] = 0
             else:
+                if np.any(labels_arr < 0):
+                    labels_arr = np.where(labels_arr < 0, 0, labels_arr)
+                    k = max(k, int(labels_arr.max()) + 1)
                 labels_matrix[:, col] = labels_arr
                 cluster_counts[col] = k
+            if algo == "tomato" and col == 0 and diag and tomato_diag_meta is None:
+                tomato_diag_meta = diag
 
         per_meta_results[meta_id] = {
             "labels": labels_matrix,
             "cluster_counts": cluster_counts,
             "frame_state_ids": np.array(frame_state_ids),
+            "frame_indices": np.array(frame_indices_for_meta, dtype=np.int64),
             "macro_state": meta.get("macro_state"),
             "metastable_index": int(meta_index),
         }
+
+        # Contact map contribution from representative PDB (if present)
+        rep_rel = meta.get("representative_pdb")
+        if rep_rel:
+            rep_path = store.resolve_path(project_id, system_id, rep_rel)
+            if rep_path.exists():
+                contact_sources.append(str(rep_path))
+                try:
+                    edges = _compute_contact_edges(
+                        rep_path,
+                        residue_keys,
+                        residue_mapping,
+                        cutoff_val,
+                        contact_atom_mode,
+                    )
+                    contact_edges.update(edges)
+                except Exception:
+                    # keep robustness; ignore this PDB on failure
+                    pass
 
     # Build merged clusters
     if not merged_angles_per_residue:
@@ -246,13 +619,29 @@ def generate_metastable_cluster_npz(
         sample_arr = np.asarray(samples, dtype=float)
         if sample_arr.shape[0] != merged_frame_count:
             raise ValueError("Merged residue samples have inconsistent frame counts.")
-        labels_arr, k = _cluster_residue_samples(sample_arr, max_clusters_per_residue, random_state)
+        labels_arr, k, diag = _cluster_residue_samples(
+            sample_arr,
+            max_clusters_per_residue,
+            random_state,
+            algorithm=algo,
+            dbscan_eps=db_eps_val,
+            dbscan_min_samples=db_min_samples_val,
+            hierarchical_n_clusters=h_n_clusters_val,
+            hierarchical_linkage=h_linkage,
+            tomato_k=t_k,
+            tomato_tau=t_tau,
+        )
         if labels_arr.size == 0:
             merged_labels[:, col] = -1
             merged_counts[col] = 0
         else:
+            if np.any(labels_arr < 0):
+                labels_arr = np.where(labels_arr < 0, 0, labels_arr)
+                k = max(k, int(labels_arr.max()) + 1)
             merged_labels[:, col] = labels_arr
             merged_counts[col] = k
+        if algo == "tomato" and col == 0 and diag and tomato_diag_merged is None:
+            tomato_diag_merged = diag
 
     # Persist NPZ
     dirs = store.ensure_directories(project_id, system_id)
@@ -267,10 +656,25 @@ def generate_metastable_cluster_npz(
         "system_id": system_id,
         "generated_at": datetime.utcnow().isoformat(),
         "selected_metastable_ids": unique_meta_ids,
+        "cluster_algorithm": algo,
+        "cluster_params": {
+            "dbscan_eps": db_eps_val,
+            "dbscan_min_samples": db_min_samples_val,
+            "hierarchical_n_clusters": h_n_clusters_val,
+            "hierarchical_linkage": h_linkage,
+            "tomato_k": t_k,
+            "tomato_tau": t_tau,
+            "max_clusters_per_residue": max_clusters_per_residue,
+            "random_state": random_state,
+        },
         "residue_keys": residue_keys,
         "residue_mapping": residue_mapping,
         "max_clusters_per_residue": max_clusters_per_residue,
         "random_state": random_state,
+        "contact_mode": contact_atom_mode,
+        "contact_cutoff": cutoff_val,
+        "contact_sources": contact_sources,
+        "contact_edge_count": len(contact_edges),
         "per_metastable": {
             mid: {
                 "n_frames": res["labels"].shape[0],
@@ -281,6 +685,7 @@ def generate_metastable_cluster_npz(
                     "labels": f"{_slug(mid)}__labels",
                     "cluster_counts": f"{_slug(mid)}__cluster_counts",
                     "frame_state_ids": f"{_slug(mid)}__frame_state_ids",
+                    "frame_indices": f"{_slug(mid)}__frame_indices",
                 },
             }
             for mid, res in per_meta_results.items()
@@ -292,9 +697,17 @@ def generate_metastable_cluster_npz(
                 "cluster_counts": "merged__cluster_counts",
                 "frame_state_ids": "merged__frame_state_ids",
                 "frame_metastable_ids": "merged__frame_metastable_ids",
+                "frame_indices": "merged__frame_indices",
             },
         },
     }
+    if algo == "tomato":
+        tomato_meta = {}
+        if tomato_diag_meta:
+            tomato_meta["per_meta_example"] = tomato_diag_meta
+        if tomato_diag_merged:
+            tomato_meta["merged_example"] = tomato_diag_merged
+        metadata["cluster_params"]["tomato_diagnostics"] = tomato_meta
 
     payload: Dict[str, Any] = {
         "residue_keys": np.array(residue_keys),
@@ -303,12 +716,21 @@ def generate_metastable_cluster_npz(
         "merged__cluster_counts": merged_counts,
         "merged__frame_state_ids": np.array(merged_frame_state_ids),
         "merged__frame_metastable_ids": np.array(merged_frame_meta_ids),
+        "merged__frame_indices": np.array(merged_frame_indices, dtype=np.int64),
     }
+    if contact_edges:
+        edge_index = np.array(sorted(contact_edges), dtype=np.int64).T
+    else:
+        edge_index = np.zeros((2, 0), dtype=np.int64)
+    payload["contact_edge_index"] = edge_index
+    payload["contact_mode"] = np.array(contact_atom_mode)
+    payload["contact_cutoff"] = np.array(cutoff_val)
     for mid, res in per_meta_results.items():
         key = _slug(mid)
         payload[f"{key}__labels"] = res["labels"]
         payload[f"{key}__cluster_counts"] = res["cluster_counts"]
         payload[f"{key}__frame_state_ids"] = res["frame_state_ids"]
+        payload[f"{key}__frame_indices"] = res["frame_indices"]
 
     np.savez_compressed(out_path, **payload)
     return out_path, metadata

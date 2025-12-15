@@ -7,6 +7,7 @@ import shutil
 import functools
 import json, os
 from dataclasses import asdict
+import logging
 from fastapi import APIRouter, HTTPException, Depends, Request, UploadFile, File, Form, Response, Query
 from fastapi.responses import FileResponse
 from fastapi.concurrency import run_in_threadpool
@@ -16,6 +17,7 @@ from pathlib import Path
 from rq.job import Job
 from redis import RedisError
 import MDAnalysis as mda
+import numpy as np
 
 # Import the master task function
 from backend.tasks import run_analysis_job
@@ -135,6 +137,16 @@ def _refresh_system_metadata(system_meta: SystemMetadata) -> None:
         all_keys.update(state.residue_keys or [])
     system_meta.descriptor_keys = sorted(all_keys)
     _update_system_status(system_meta)
+
+
+def _ensure_not_macro_locked(system_meta: SystemMetadata):
+    if getattr(system_meta, "macro_locked", False):
+        raise HTTPException(status_code=400, detail="System macro-states are locked; no further edits allowed.")
+
+
+def _ensure_not_metastable_locked(system_meta: SystemMetadata):
+    if getattr(system_meta, "metastable_locked", False):
+        raise HTTPException(status_code=400, detail="Metastable states are locked; recomputation is disabled.")
 
 
 def _build_state_artifacts(
@@ -334,6 +346,18 @@ async def get_state_descriptors(
         None,
         description="Comma-separated residue keys to include; defaults to all keys for the state.",
     ),
+    metastable_ids: Optional[str] = Query(
+        None,
+        description="Comma-separated metastable IDs to filter frames; defaults to all frames.",
+    ),
+    cluster_id: Optional[str] = Query(
+        None,
+        description="ID of a saved cluster NPZ to use for coloring (optional).",
+    ),
+    cluster_mode: Optional[str] = Query(
+        "merged",
+        description="Cluster mode: 'merged' or 'per_meta' (only if cluster_id provided).",
+    ),
     max_points: int = Query(
         2000,
         ge=10,
@@ -387,18 +411,240 @@ async def get_state_descriptors(
         except Exception:
             resname_map = {}
 
+    # --- Metastable filtering ---
+    metastable_filter_ids = []
+    if metastable_ids:
+        metastable_filter_ids = [mid.strip() for mid in metastable_ids.split(",") if mid.strip()]
+    meta_id_to_index = {}
+    index_to_meta_id = {}
+    if system.metastable_states:
+        for m in system.metastable_states:
+            mid = m.get("metastable_id")
+            if mid is None:
+                continue
+            meta_id_to_index[mid] = m.get("metastable_index")
+            if m.get("metastable_index") is not None:
+                index_to_meta_id[m.get("metastable_index")] = mid
+
+    # --- Cluster NPZ (optional) ---
+    cluster_npz = None
+    cluster_meta = None
+    cluster_mode_final = None
+    merged_lookup = {}
+    per_meta_lookup: Dict[str, Dict[Tuple[str, int], int]] = {}
+    cluster_residue_indices: Dict[str, int] = {}
+    merged_labels_arr: Optional[np.ndarray] = None
+    per_meta_label_arrays: Dict[str, np.ndarray] = {}
+    cluster_legend: List[Dict[str, Any]] = []
+    cluster_color_ids: Dict[Tuple[str, int], int] = {}
+
+    def _build_lookup(entry_key: str, npz_dict, keys_dict):
+        """
+        Build a mapping (state_id, frame_idx) -> row index.
+        Falls back to sequential frame indices for backward-compatible NPZs that
+        lack the explicit frame_indices array.
+        """
+        if not keys_dict or "frame_state_ids" not in keys_dict:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cluster NPZ is missing frame index metadata for '{entry_key}'. Regenerate clusters.",
+            )
+        if keys_dict["frame_state_ids"] not in npz_dict:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cluster NPZ is missing array '{keys_dict['frame_state_ids']}'. Regenerate clusters.",
+            )
+
+        frame_states = np.asarray(npz_dict[keys_dict["frame_state_ids"]])
+        if "frame_indices" in keys_dict and keys_dict.get("frame_indices") in npz_dict:
+            frame_indices = np.asarray(npz_dict[keys_dict["frame_indices"]])
+        else:
+            # Backward compatibility: assume rows correspond to sequential frame indices.
+            frame_indices = np.arange(len(frame_states), dtype=int)
+
+        lookup = {}
+        for i, (sid, fidx) in enumerate(zip(frame_states, frame_indices)):
+            lookup[(str(sid), int(fidx))] = i
+        return lookup
+
+    logger = None
+    try:
+        import logging
+        logger = logging.getLogger("descriptor_debug")
+    except Exception:
+        logger = None
+    if logger:
+        logger.error(
+            "[desc] state=%s project=%s system=%s metastable_ids=%s cluster_id=%s cluster_mode=%s max_points=%s",
+            state_id,
+            project_id,
+            system_id,
+            metastable_ids,
+            cluster_id,
+            cluster_mode,
+            max_points,
+        )
+
+    if cluster_id:
+        entry = next((c for c in system.metastable_clusters or [] if c.get("cluster_id") == cluster_id), None)
+        if not entry:
+            raise HTTPException(status_code=404, detail="Cluster NPZ not found.")
+        rel_path = entry.get("path")
+        if not rel_path:
+            raise HTTPException(status_code=404, detail="Cluster NPZ path missing.")
+        cluster_path = project_store.resolve_path(project_id, system_id, rel_path)
+        if not cluster_path.exists():
+            raise HTTPException(status_code=404, detail="Cluster NPZ file missing.")
+        if logger:
+            logger.error("[desc] loading cluster npz: %s", cluster_path)
+        cluster_npz = np.load(cluster_path, allow_pickle=True)
+        try:
+            cluster_meta = json.loads(cluster_npz["metadata_json"].item())
+        except Exception:
+            cluster_meta = None
+        if not isinstance(cluster_meta, dict) or not cluster_meta:
+            raise HTTPException(status_code=400, detail="Cluster NPZ missing metadata_json. Regenerate clusters.")
+        cluster_mode_final = (cluster_mode or "merged").lower()
+        if cluster_mode_final not in {"merged", "per_meta"}:
+            raise HTTPException(status_code=400, detail="cluster_mode must be 'merged' or 'per_meta'.")
+        cluster_res_keys = list(cluster_meta.get("residue_keys", []))
+        cluster_residue_indices = {k: i for i, k in enumerate(cluster_res_keys)}
+
+        if cluster_mode_final == "merged":
+            merged_keys = cluster_meta.get("merged", {}).get("npz_keys", {})
+            if (
+                not merged_keys
+                or "labels" not in merged_keys
+                or "frame_state_ids" not in merged_keys
+                or "frame_indices" not in merged_keys
+            ):
+                raise HTTPException(status_code=400, detail="Cluster NPZ missing merged frame metadata. Regenerate clusters.")
+            merged_lookup = _build_lookup("merged", cluster_npz, merged_keys)
+            merged_labels_arr = cluster_npz[merged_keys.get("labels")]
+            unique_clusters = sorted({int(v) for v in np.unique(merged_labels_arr) if int(v) >= 0})
+            cluster_legend = [{"id": c, "label": f"Merged c{c}"} for c in unique_clusters]
+            if logger:
+                logger.error(
+                    "[desc] merged lookup ready rows=%d clusters=%s",
+                    merged_labels_arr.shape[0],
+                    unique_clusters,
+                )
+        else:
+            per_meta = cluster_meta.get("per_metastable", {})
+            global_counter = 0
+            legend_entries = []
+            for mid, info in per_meta.items():
+                keys_dict = info.get("npz_keys", {})
+                if (
+                    not keys_dict
+                    or "labels" not in keys_dict
+                    or "frame_state_ids" not in keys_dict
+                    or "frame_indices" not in keys_dict
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Cluster NPZ missing frame metadata for metastable '{mid}'. Regenerate clusters.",
+                    )
+                per_meta_lookup[mid] = _build_lookup(mid, cluster_npz, keys_dict)
+                labels_arr = cluster_npz[keys_dict.get("labels")]
+                per_meta_label_arrays[mid] = labels_arr
+                clusters_local = sorted({int(v) for v in np.unique(labels_arr) if int(v) >= 0})
+                meta_name = next((m.get("name") or m.get("default_name") for m in system.metastable_states or [] if m.get("metastable_id") == mid), mid)
+                for c in clusters_local:
+                    cluster_color_ids[(mid, c)] = global_counter
+                    legend_entries.append({"id": global_counter, "label": f"{meta_name} c{c}", "metastable_id": mid, "local_cluster": c})
+                    global_counter += 1
+            cluster_legend = legend_entries
+
+    # Shared frame selection (metastable filter + sampling) computed once
+    labels_meta = None
+    if metastable_filter_ids or cluster_mode_final == "per_meta":
+        labels_meta = feature_dict.get("metastable_labels")
+        if labels_meta is None and state_meta.metastable_labels_file:
+            label_path = project_store.resolve_path(project_id, system_id, state_meta.metastable_labels_file)
+            if label_path.exists():
+                labels_meta = np.load(label_path)
+        if labels_meta is None:
+            raise HTTPException(status_code=400, detail="Metastable labels missing for this state.")
+
+    first_arr = feature_dict[keys_to_use[0]]
+    total_frames = first_arr.shape[0] if hasattr(first_arr, "shape") else 0
+    indices = np.arange(total_frames)
+    if metastable_filter_ids:
+        selected_idx = {meta_id_to_index.get(mid) for mid in metastable_filter_ids if mid in meta_id_to_index}
+        if not selected_idx:
+            raise HTTPException(status_code=400, detail="Selected metastable IDs not found on this system.")
+        mask = np.isin(labels_meta, list(selected_idx))
+        indices = np.where(mask)[0]
+        if indices.size == 0:
+            raise HTTPException(status_code=400, detail="No frames match selected metastable states for this state.")
+
+    n_frames_filtered = indices.size
+    sample_stride = max(1, n_frames_filtered // max_points) if n_frames_filtered > max_points else 1
+    sample_indices = indices[::sample_stride]
+    n_frames_out = n_frames_filtered
+    if logger:
+        logger.error(
+            "[desc] frames_filtered=%d sampled=%d stride=%d",
+            n_frames_filtered,
+            len(sample_indices),
+            sample_stride,
+        )
+
+    # Precompute merged/per-meta row mappings for sampled frames
+    merged_rows_for_samples = None
+    if cluster_mode_final == "merged" and cluster_npz is not None and merged_lookup:
+        merged_rows_for_samples = np.array(
+            [merged_lookup.get((state_meta.state_id, int(f)), -1) for f in sample_indices], dtype=int
+        )
+
+    per_meta_rows_for_samples: Dict[str, np.ndarray] = {}
+    frame_meta_ids: Optional[np.ndarray] = None
+    if cluster_mode_final == "per_meta" and cluster_npz is not None and labels_meta is not None:
+        frame_meta_ids = np.array([index_to_meta_id.get(int(labels_meta[f]), None) for f in sample_indices], dtype=object)
+        for mid, lookup_dict in per_meta_lookup.items():
+            per_meta_rows_for_samples[mid] = np.array(
+                [lookup_dict.get((state_meta.state_id, int(f)), -1) for f in sample_indices], dtype=int
+            )
+
     for key in keys_to_use:
         arr = feature_dict[key]
         # Expected shape: (n_frames, 1, 3) in radians
         if arr.ndim != 3 or arr.shape[2] < 3:
             continue
-        n_frames = arr.shape[0]
-        sample_stride = max(1, n_frames // max_points) if n_frames > max_points else 1
-        sampled = arr[::sample_stride, 0, :]
+
+        sampled = arr[sample_indices, 0, :]
         phi = (sampled[:, 0] * 180.0 / 3.141592653589793).tolist()
         psi = (sampled[:, 1] * 180.0 / 3.141592653589793).tolist()
         chi1 = (sampled[:, 2] * 180.0 / 3.141592653589793).tolist()
         angles_payload[key] = {"phi": phi, "psi": psi, "chi1": chi1}
+        if logger:
+            logger.error("[desc] residue=%s frames=%d sampled=%d stride=%d", key, n_frames_filtered, len(sample_indices), sample_stride)
+
+        # Cluster labels (optional, vectorized)
+        if cluster_npz is not None:
+            res_idx = cluster_residue_indices.get(key, None)
+            if res_idx is not None:
+                if cluster_mode_final == "merged" and merged_rows_for_samples is not None:
+                    if merged_labels_arr is not None:
+                        safe_rows = np.clip(merged_rows_for_samples, 0, merged_labels_arr.shape[0] - 1)
+                        labels_for_res = merged_labels_arr[safe_rows, res_idx].astype(int)
+                        labels_for_res[merged_rows_for_samples < 0] = -1
+                        angles_payload[key]["cluster_labels"] = labels_for_res.tolist()
+                elif cluster_mode_final == "per_meta" and frame_meta_ids is not None:
+                    labels_for_res = np.full(sample_indices.shape[0], -1, dtype=int)
+                    for mid, rows in per_meta_rows_for_samples.items():
+                        mask = frame_meta_ids == mid
+                        if not np.any(mask):
+                            continue
+                        valid_mask = (rows >= 0) & mask
+                        if not np.any(valid_mask):
+                            continue
+                        labels_arr = per_meta_label_arrays.get(mid)
+                        if labels_arr is not None:
+                            labels_for_res[valid_mask] = labels_arr[rows[valid_mask], res_idx]
+                    angles_payload[key]["cluster_labels"] = labels_for_res.tolist()
+
         label = key
         selection = (state_meta.residue_mapping or {}).get(key) or ""
         resid_tokens = [
@@ -416,9 +662,12 @@ async def get_state_descriptors(
         "residue_keys": keys_to_use,
         "residue_mapping": state_meta.residue_mapping or {},
         "residue_labels": residue_labels,
-        "n_frames": n_frames,
+        "n_frames": n_frames_out,
         "sample_stride": sample_stride,
         "angles": angles_payload,
+        "cluster_mode": cluster_mode_final,
+        "cluster_legend": cluster_legend,
+        "metastable_filter_applied": bool(metastable_filter_ids),
     }
 
 
@@ -527,6 +776,7 @@ async def add_system_state(
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+    _ensure_not_macro_locked(system_meta)
 
     state_name = name.strip()
     if not state_name:
@@ -579,6 +829,7 @@ async def upload_state_trajectory(
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+    _ensure_not_macro_locked(system_meta)
 
     state_meta = _get_state_or_404(system_meta, state_id)
     stride_val = _normalize_stride(state_meta.name, stride)
@@ -638,6 +889,7 @@ async def delete_state_trajectory(project_id: str, system_id: str, state_id: str
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+    _ensure_not_macro_locked(system_meta)
 
     state_meta = _get_state_or_404(system_meta, state_id)
 
@@ -685,6 +937,7 @@ async def delete_state(project_id: str, system_id: str, state_id: str):
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+    _ensure_not_macro_locked(system_meta)
 
     state_meta = _get_state_or_404(system_meta, state_id)
 
@@ -719,9 +972,13 @@ async def recompute_metastable(
     random_state: int = Query(0),
 ):
     try:
-        project_store.get_system(project_id, system_id)
+        system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    if not getattr(system_meta, "macro_locked", False):
+        raise HTTPException(status_code=400, detail="Lock macro-states before running metastable analysis.")
+    _ensure_not_metastable_locked(system_meta)
 
     try:
         result = await run_in_threadpool(
@@ -758,6 +1015,51 @@ async def list_metastable_states(project_id: str, system_id: str):
 
 
 @api_router.post(
+    "/projects/{project_id}/systems/{system_id}/states/confirm",
+    summary="Lock macro-states to proceed to metastable analysis",
+)
+async def confirm_macro_states(project_id: str, system_id: str):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    if getattr(system_meta, "macro_locked", False):
+        return _serialize_system(system_meta)
+
+    if not system_meta.states:
+        raise HTTPException(status_code=400, detail="Add at least one state before locking.")
+
+    system_meta.macro_locked = True
+    project_store.save_system(system_meta)
+    return _serialize_system(system_meta)
+
+
+@api_router.post(
+    "/projects/{project_id}/systems/{system_id}/metastable/confirm",
+    summary="Lock metastable states to proceed to clustering and analysis",
+)
+async def confirm_metastable_states(project_id: str, system_id: str):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    if not getattr(system_meta, "macro_locked", False):
+        raise HTTPException(status_code=400, detail="Lock macro-states first.")
+
+    if getattr(system_meta, "metastable_locked", False):
+        return _serialize_system(system_meta)
+
+    if not (system_meta.metastable_states or []):
+        raise HTTPException(status_code=400, detail="Run metastable recompute before locking.")
+
+    system_meta.metastable_locked = True
+    project_store.save_system(system_meta)
+    return _serialize_system(system_meta)
+
+
+@api_router.post(
     "/projects/{project_id}/systems/{system_id}/metastable/cluster_vectors",
     summary="Cluster residue angles inside selected metastable states and download NPZ",
 )
@@ -766,10 +1068,16 @@ async def build_metastable_cluster_vectors(
     system_id: str,
     payload: Dict[str, Any],
 ):
+    logger = logging.getLogger("cluster_build")
     try:
-        project_store.get_system(project_id, system_id)
+        system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    if not getattr(system_meta, "macro_locked", False):
+        raise HTTPException(status_code=400, detail="Lock macro-states before clustering.")
+    if not getattr(system_meta, "metastable_locked", False):
+        raise HTTPException(status_code=400, detail="Lock metastable states before clustering.")
 
     metastable_ids_raw = (payload or {}).get("metastable_ids") or []
     if not isinstance(metastable_ids_raw, list):
@@ -789,26 +1097,188 @@ async def build_metastable_cluster_vectors(
         random_state = int((payload or {}).get("random_state", 0))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="random_state must be an integer.")
+    try:
+        contact_cutoff = float((payload or {}).get("contact_cutoff", 10.0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="contact_cutoff must be a number.")
+    contact_atom_mode = str((payload or {}).get("contact_atom_mode", payload.get("contact_mode", "CA") if isinstance(payload, dict) else "CA") or "CA").upper()
+    if contact_atom_mode not in {"CA", "CM"}:
+        raise HTTPException(status_code=400, detail="contact_atom_mode must be 'CA' or 'CM'.")
+
+    algo_raw = (payload or {}).get("cluster_algorithm", "tomato")
+    cluster_algorithm = str(algo_raw or "tomato").lower()
+    if cluster_algorithm not in {"tomato", "density_peaks", "dbscan", "kmeans", "hierarchical"}:
+        raise HTTPException(
+            status_code=400,
+            detail="cluster_algorithm must be tomato, density_peaks, dbscan, kmeans, or hierarchical.",
+        )
+    algo_params = (payload or {}).get("algorithm_params", {}) or {}
+    try:
+        dbscan_eps = float(algo_params.get("eps", (payload or {}).get("dbscan_eps", 0.5)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="dbscan eps must be a number.")
+    try:
+        dbscan_min_samples = int(algo_params.get("min_samples", (payload or {}).get("dbscan_min_samples", 5)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="dbscan min_samples must be an integer.")
+    try:
+        hierarchical_n_clusters = algo_params.get("n_clusters")
+        if hierarchical_n_clusters is not None:
+            hierarchical_n_clusters = int(hierarchical_n_clusters)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="hierarchical n_clusters must be an integer.")
+    hierarchical_linkage = str(algo_params.get("linkage", (payload or {}).get("hierarchical_linkage", "ward")) or "ward").lower()
+    try:
+        tomato_k = int(algo_params.get("k_neighbors", (payload or {}).get("tomato_k", 15)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="tomato k_neighbors must be an integer.")
+    try:
+        tomato_tau = float(algo_params.get("tau", (payload or {}).get("tomato_tau", 0.5)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="tomato tau must be a number.")
+    try:
+        tomato_k_max = int(algo_params.get("k_max", (payload or {}).get("tomato_k_max", max_clusters)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="tomato k_max must be an integer.")
 
     try:
-        npz_path, _ = await run_in_threadpool(
+        if logger:
+            logger.error(
+                "[cluster_build] project=%s system=%s meta_ids=%s algo=%s params=%s",
+                project_id,
+                system_id,
+                metastable_ids,
+                cluster_algorithm,
+                {
+                    "max_clusters": max_clusters,
+                    "random_state": random_state,
+                    "contact_cutoff": contact_cutoff,
+                    "contact_atom_mode": contact_atom_mode,
+                    "dbscan_eps": dbscan_eps,
+                    "dbscan_min_samples": dbscan_min_samples,
+                    "hierarchical_n_clusters": hierarchical_n_clusters,
+                    "hierarchical_linkage": hierarchical_linkage,
+                    "tomato_k": tomato_k,
+                    "tomato_tau": tomato_tau,
+                },
+            )
+        npz_path, meta = await run_in_threadpool(
             generate_metastable_cluster_npz,
             project_id,
             system_id,
             metastable_ids,
             max_clusters_per_residue=max_clusters,
             random_state=random_state,
+            contact_cutoff=contact_cutoff,
+            contact_atom_mode=contact_atom_mode,
+            cluster_algorithm=cluster_algorithm,
+            dbscan_eps=dbscan_eps,
+            dbscan_min_samples=dbscan_min_samples,
+            hierarchical_n_clusters=hierarchical_n_clusters,
+            hierarchical_linkage=hierarchical_linkage,
+            tomato_k=tomato_k,
+            tomato_tau=tomato_tau,
+            tomato_k_max=tomato_k_max,
         )
     except ValueError as exc:
+        if logger:
+            logger.error("[cluster_build] validation error: %s", exc, exc_info=True)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+        if logger:
+            logger.error("[cluster_build] failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to build metastable clusters: {exc}") from exc
+
+    # Persist reference to the generated cluster NPZ
+    dirs = project_store.ensure_directories(project_id, system_id)
+    try:
+        rel_path = str(npz_path.relative_to(dirs["system_dir"]))
+    except Exception:
+        rel_path = str(npz_path)
+
+    cluster_entry = {
+        "cluster_id": str(uuid.uuid4()),
+        "path": rel_path,
+        "metastable_ids": metastable_ids,
+        "max_clusters_per_residue": max_clusters,
+        "random_state": random_state,
+        "generated_at": meta.get("generated_at") if isinstance(meta, dict) else None,
+        "contact_cutoff": contact_cutoff,
+        "contact_atom_mode": contact_atom_mode,
+        "contact_edge_count": meta.get("contact_edge_count") if isinstance(meta, dict) else None,
+        "cluster_algorithm": cluster_algorithm,
+        "algorithm_params": {
+            "eps": dbscan_eps,
+            "min_samples": dbscan_min_samples,
+            "n_clusters": hierarchical_n_clusters,
+            "linkage": hierarchical_linkage,
+            "k_neighbors": tomato_k,
+            "tau": tomato_tau,
+            "k_max": tomato_k_max,
+        },
+    }
+    system_meta.metastable_clusters = (system_meta.metastable_clusters or []) + [cluster_entry]
+    project_store.save_system(system_meta)
 
     return FileResponse(
         npz_path,
         filename=npz_path.name,
         media_type="application/octet-stream",
     )
+
+
+@api_router.get(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}",
+    summary="Download a previously generated metastable cluster NPZ",
+)
+async def download_metastable_cluster_npz(project_id: str, system_id: str, cluster_id: str):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    clusters = system_meta.metastable_clusters or []
+    entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Cluster NPZ not found.")
+    rel_path = entry.get("path")
+    if not rel_path:
+        raise HTTPException(status_code=404, detail="Cluster NPZ path missing.")
+    abs_path = project_store.resolve_path(project_id, system_id, rel_path)
+    if not abs_path.exists():
+        raise HTTPException(status_code=404, detail="Cluster NPZ file is missing on disk.")
+    return FileResponse(abs_path, filename=abs_path.name, media_type="application/octet-stream")
+
+
+@api_router.delete(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}",
+    summary="Delete a saved metastable cluster NPZ",
+)
+async def delete_metastable_cluster_npz(project_id: str, system_id: str, cluster_id: str):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    if not getattr(system_meta, "macro_locked", False) or not getattr(system_meta, "metastable_locked", False):
+        raise HTTPException(status_code=400, detail="Lock macro and metastable states before deleting cluster NPZ.")
+
+    clusters = system_meta.metastable_clusters or []
+    entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Cluster NPZ not found.")
+
+    rel_path = entry.get("path")
+    if rel_path:
+        abs_path = project_store.resolve_path(project_id, system_id, rel_path)
+        try:
+            abs_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    system_meta.metastable_clusters = [c for c in clusters if c.get("cluster_id") != cluster_id]
+    project_store.save_system(system_meta)
+    return {"status": "deleted", "cluster_id": cluster_id}
 
 
 @api_router.get(

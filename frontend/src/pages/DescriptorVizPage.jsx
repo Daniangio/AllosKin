@@ -28,8 +28,26 @@ export default function DescriptorVizPage() {
 
   const [selectedStates, setSelectedStates] = useState([]);
   const [residueFilter, setResidueFilter] = useState('');
-  const [selectedResidues, setSelectedResidues] = useState([]);
+  const [selectedResidue, setSelectedResidue] = useState('');
+  const [residueOptions, setResidueOptions] = useState([]);
+  const [residueLabelCache, setResidueLabelCache] = useState({});
+
+  const sortResidues = useCallback((keys) => {
+    const unique = Array.from(new Set(keys || [])).filter((k) => k.startsWith('res_'));
+    return unique.sort((a, b) => {
+      const pa = parseInt((a.split('_')[1] || '').replace(/\D+/g, ''), 10);
+      const pb = parseInt((b.split('_')[1] || '').replace(/\D+/g, ''), 10);
+      if (Number.isFinite(pa) && Number.isFinite(pb) && pa !== pb) {
+        return pa - pb;
+      }
+      return a.localeCompare(b);
+    });
+  }, []);
   const [maxPoints, setMaxPoints] = useState(2000);
+  const [selectedMetastables, setSelectedMetastables] = useState([]);
+  const [selectedClusterId, setSelectedClusterId] = useState('');
+  const [clusterMode, setClusterMode] = useState('merged');
+  const [clusterLegend, setClusterLegend] = useState([]);
 
   const [anglesByState, setAnglesByState] = useState({});
   const [metaByState, setMetaByState] = useState({});
@@ -60,17 +78,25 @@ export default function DescriptorVizPage() {
     () => Object.values(system?.states || {}).filter((s) => s.descriptor_file),
     [system]
   );
+  const metastableStates = useMemo(() => system?.metastable_states || [], [system]);
+  const clusterOptions = useMemo(() => system?.metastable_clusters || [], [system]);
 
-  const residueKeys = useMemo(() => {
-    const keys = new Set();
-    Object.values(metaByState).forEach((meta) =>
-      (meta?.residue_keys || []).forEach((key) => keys.add(key))
-    );
-    return Array.from(keys).sort();
-  }, [metaByState]);
+  // Default-select metastable states for initially selected macros (if user hasn't chosen yet)
+  useEffect(() => {
+    if (!selectedStates.length || selectedMetastables.length || !metastableStates.length) return;
+    const metas = metastableStates
+      .filter((m) => selectedStates.includes(m.macro_state_id))
+      .map((m) => m.metastable_id);
+    if (metas.length) {
+      setSelectedMetastables(Array.from(new Set(metas)));
+    }
+  }, [metastableStates, selectedMetastables.length, selectedStates]);
+
+  const residueKeys = useMemo(() => sortResidues(residueOptions), [residueOptions, sortResidues]);
 
   const residueLabel = useCallback(
     (key) => {
+      if (residueLabelCache[key]) return residueLabelCache[key];
       const metasInOrder = [
         ...selectedStates.map((stateId) => metaByState[stateId]).filter(Boolean),
         ...Object.values(metaByState),
@@ -90,7 +116,7 @@ export default function DescriptorVizPage() {
 
       return key;
     },
-    [metaByState, selectedStates]
+    [metaByState, residueLabelCache, selectedStates]
   );
 
   const filteredResidues = useMemo(() => {
@@ -115,6 +141,22 @@ export default function DescriptorVizPage() {
     return mapping;
   }, [selectedStates]);
 
+  const clusterColorMap = useMemo(() => {
+    const mapping = {};
+    clusterLegend.forEach((c, idx) => {
+      mapping[c.id] = colors[idx % colors.length];
+    });
+    return mapping;
+  }, [clusterLegend]);
+
+  const clusterLabelLookup = useMemo(() => {
+    const mapping = {};
+    clusterLegend.forEach((c) => {
+      mapping[c.id] = c.label;
+    });
+    return mapping;
+  }, [clusterLegend]);
+
   const residueSymbols = useMemo(() => {
     const symbols = [
       'circle',
@@ -137,27 +179,97 @@ export default function DescriptorVizPage() {
   }, [residueKeys]);
 
   const toggleState = (stateId) => {
-    setSelectedStates((prev) =>
-      prev.includes(stateId) ? prev.filter((id) => id !== stateId) : [...prev, stateId]
+    const isSelected = selectedStates.includes(stateId);
+    const nextStates = isSelected
+      ? selectedStates.filter((id) => id !== stateId)
+      : [...selectedStates, stateId];
+    setSelectedStates(nextStates);
+
+    // Macro-level metastable toggle: select/deselect all metastables belonging to this macro
+    const metasInMacro = metastableStates
+      .filter((m) => m.macro_state_id === stateId)
+      .map((m) => m.metastable_id);
+    if (metasInMacro.length) {
+      setSelectedMetastables((prev) => {
+        if (isSelected) {
+          // deselecting macro: drop its metastables
+          return prev.filter((id) => !metasInMacro.includes(id));
+        }
+        const merged = new Set([...prev, ...metasInMacro]);
+        return Array.from(merged);
+      });
+    }
+  };
+
+  const toggleMetastable = (metaId) => {
+    setSelectedMetastables((prev) =>
+      prev.includes(metaId) ? prev.filter((id) => id !== metaId) : [...prev, metaId]
     );
   };
 
-  const toggleResidue = (key) => {
-    setSelectedResidues((prev) =>
-      prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]
-    );
+  const selectResidue = (key) => {
+    setSelectedResidue(key);
   };
+
+  // Preload residue labels/resnames so the list keeps informative names even before a residue is loaded
+  useEffect(() => {
+    const bootstrapLabels = async () => {
+      if (!selectedStates.length) return;
+      try {
+        const stateId = selectedStates[0];
+        const data = await fetchStateDescriptors(projectId, systemId, stateId, { max_points: 1 });
+        const labels = data.residue_labels || {};
+        const mapping = data.residue_mapping || {};
+        const combined = { ...labels };
+        Object.entries(mapping).forEach(([k, raw]) => {
+          if (combined[k]) return;
+          const match = (raw || '').match(/\b([A-Z]{3})\b/);
+          const resname = match ? match[1].toUpperCase() : null;
+          if (resname) combined[k] = `${k}_${resname}`;
+        });
+        if (Object.keys(combined).length) {
+          setResidueLabelCache((prev) => ({ ...prev, ...combined }));
+        }
+        if (Array.isArray(data.residue_keys)) {
+          setResidueOptions((prev) => {
+            const merged = new Set([...(prev || []), ...data.residue_keys]);
+            return sortResidues(Array.from(merged));
+          });
+          if (!selectedResidue && data.residue_keys.length) {
+            setSelectedResidue(sortResidues(data.residue_keys)[0]);
+          }
+        }
+      } catch (err) {
+        // keep silent; fallback labels will be used
+      }
+    };
+    bootstrapLabels();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, systemId, selectedStates, sortResidues]);
 
   const loadAngles = useCallback(async () => {
     if (!selectedStates.length) {
       setAnglesByState({});
       setMetaByState({});
+      setClusterLegend([]);
+      setSelectedResidue('');
       return;
     }
     setLoadingAngles(true);
     setAnglesError(null);
     try {
-      const qs = { max_points: maxPoints };
+      const bootstrapOnly = !selectedResidue;
+      const qs = { max_points: bootstrapOnly ? Math.min(maxPoints, 500) : maxPoints };
+      if (selectedMetastables.length) {
+        qs.metastable_ids = selectedMetastables;
+      }
+      if (selectedClusterId) {
+        qs.cluster_id = selectedClusterId;
+        qs.cluster_mode = clusterMode;
+      }
+      if (selectedResidue) {
+        qs.residue_keys = selectedResidue;
+      }
 
       const responses = await Promise.all(
         selectedStates.map(async (stateId) => {
@@ -178,52 +290,98 @@ export default function DescriptorVizPage() {
           residue_labels: data.residue_labels || {},
           n_frames: data.n_frames,
           sample_stride: data.sample_stride,
+          cluster_legend: data.cluster_legend || [],
+          cluster_mode: data.cluster_mode,
         };
         (data.residue_keys || []).forEach((key) => unionResidues.add(key));
+        // Cache labels from this response to keep names informative in the list
+        const labels = data.residue_labels || {};
+        const mapping = data.residue_mapping || {};
+        const combined = {};
+        Object.entries(labels).forEach(([k, v]) => {
+          if (v) combined[k] = v;
+        });
+        Object.entries(mapping).forEach(([k, raw]) => {
+          if (combined[k]) return;
+          const match = (raw || '').match(/\b([A-Z]{3})\b/);
+          const resname = match ? match[1].toUpperCase() : null;
+          if (resname) combined[k] = `${k}_${resname}`;
+        });
+        if (Object.keys(combined).length) {
+          setResidueLabelCache((prev) => ({ ...prev, ...combined }));
+        }
       });
 
-      setAnglesByState(newAngles);
+      // Cluster legend: use from first response if present
+      const firstLegend = responses.find((r) => (r.data.cluster_legend || []).length);
+      setClusterLegend(firstLegend ? firstLegend.data.cluster_legend || [] : []);
       setMetaByState(newMeta);
 
-      if (unionResidues.size) {
-        if (!selectedResidues.length) {
-          const defaultKey = Array.from(unionResidues).sort()[0];
-          setSelectedResidues([defaultKey]);
-        } else {
-          const validResidues = selectedResidues.filter((key) => unionResidues.has(key));
-          if (validResidues.length !== selectedResidues.length) {
-            setSelectedResidues(validResidues);
-          }
-        }
+      const sortedResidues = sortResidues(Array.from(unionResidues));
+      setResidueOptions((prev) => {
+        const merged = [...(prev || []), ...sortedResidues];
+        return sortResidues(merged);
+      });
+      if (!selectedResidue && sortedResidues.length) {
+        setSelectedResidue(sortedResidues[0]);
+      } else if (selectedResidue && sortedResidues.length && !unionResidues.has(selectedResidue)) {
+        setSelectedResidue(sortedResidues[0]);
+      } else if (selectedResidue && !sortedResidues.length) {
+        setSelectedResidue('');
+      }
+
+      if (!bootstrapOnly && selectedResidue) {
+        setAnglesByState(newAngles);
       } else {
-        setSelectedResidues([]);
+        // During bootstrap, only populate residue options; a follow-up call will load the selected residue
+        setAnglesByState({});
       }
     } catch (err) {
       setAnglesError(err.message);
     } finally {
       setLoadingAngles(false);
     }
-  }, [maxPoints, projectId, selectedStates, systemId]);
+  }, [
+    clusterMode,
+    maxPoints,
+    projectId,
+    selectedClusterId,
+    selectedMetastables,
+    selectedResidue,
+    selectedStates,
+    systemId,
+  ]);
 
   useEffect(() => {
-    // Auto-load when state selection changes
-    setAnglesByState({});
-    setMetaByState({});
     if (selectedStates.length) {
       loadAngles();
     } else {
-      setSelectedResidues([]);
+      setAnglesByState({});
+      setMetaByState({});
+      setSelectedResidue('');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedStates]);
+  }, [selectedStates, selectedMetastables, selectedClusterId, clusterMode, selectedResidue]);
 
   const traces3d = useMemo(() => {
     const traces = [];
+    const residuesToPlot = selectedResidue ? [selectedResidue] : [];
     selectedStates.forEach((stateId) => {
       const perState = anglesByState[stateId] || {};
-      selectedResidues.forEach((key) => {
+      residuesToPlot.forEach((key) => {
         const data = perState[key];
         if (!data) return;
+        const clusterLabels = data.cluster_labels;
+        const clusterColors =
+          clusterLabels && clusterLegend.length
+            ? clusterLabels.map((c) => clusterColorMap[c] || '#9ca3af')
+            : null;
+        const clusterHover =
+          clusterLabels && clusterLabels.length
+            ? clusterLabels.map((c) =>
+                c >= 0 ? clusterLabelLookup[c] || `Cluster ${c}` : 'No cluster'
+              )
+            : null;
         traces.push({
           type: 'scatter3d',
           mode: 'markers',
@@ -235,18 +393,43 @@ export default function DescriptorVizPage() {
           marker: {
             size: 3,
             opacity: 0.75,
-            color: stateColors[stateId],
+            color: clusterColors || stateColors[stateId],
             symbol: residueSymbols[key] || 'circle',
           },
+          customdata: clusterHover,
+          hovertemplate:
+            `Residue: ${residueLabel(key)}<br>State: ${stateName(stateId)}` +
+            '<br>Phi: %{x:.2f}°<br>Psi: %{y:.2f}°<br>Chi1: %{z:.2f}°' +
+            (clusterHover ? '<br>Cluster: %{customdata}' : '') +
+            '<extra></extra>',
         });
       });
     });
+    // Add legend for clusters if present
+    if (clusterLegend.length) {
+      clusterLegend.forEach((c) => {
+        traces.push({
+          type: 'scatter3d',
+          mode: 'markers',
+          x: [null],
+          y: [null],
+          z: [null],
+          name: c.label,
+          showlegend: true,
+          marker: { color: clusterColorMap[c.id] || '#9ca3af' },
+          hoverinfo: 'none',
+        });
+      });
+    }
     return traces;
   }, [
     anglesByState,
+    clusterColorMap,
+    clusterLabelLookup,
+    clusterLegend,
     residueLabel,
     residueSymbols,
-    selectedResidues,
+    selectedResidue,
     selectedStates,
     stateColors,
     stateName,
@@ -257,9 +440,21 @@ export default function DescriptorVizPage() {
       selectedStates
         .map((stateId) => {
           const perState = anglesByState[stateId] || {};
-          return selectedResidues.map((key) => {
+          const residuesToPlot = selectedResidue ? [selectedResidue] : [];
+          return residuesToPlot.map((key) => {
             const data = perState[key];
             if (!data) return null;
+            const clusterLabels = data.cluster_labels;
+            const clusterColors =
+              clusterLabels && clusterLegend.length
+                ? clusterLabels.map((c) => clusterColorMap[c] || '#9ca3af')
+                : null;
+            const clusterHover =
+              clusterLabels && clusterLabels.length
+                ? clusterLabels.map((c) =>
+                    c >= 0 ? clusterLabelLookup[c] || `Cluster ${c}` : 'No cluster'
+                  )
+                : null;
             return {
               type: 'scattergl',
               mode: 'markers',
@@ -270,9 +465,15 @@ export default function DescriptorVizPage() {
               marker: {
                 size: 4,
                 opacity: 0.7,
-                color: stateColors[stateId],
+                color: clusterColors || stateColors[stateId],
                 symbol: residueSymbols[key] || 'circle',
               },
+              customdata: clusterHover,
+              hovertemplate:
+                `Residue: ${residueLabel(key)}<br>State: ${stateName(stateId)}` +
+                `<br>${axisX.toUpperCase()}: %{x:.2f}°<br>${axisY.toUpperCase()}: %{y:.2f}°` +
+                (clusterHover ? '<br>Cluster: %{customdata}' : '') +
+                '<extra></extra>',
             };
           });
         })
@@ -282,16 +483,21 @@ export default function DescriptorVizPage() {
       anglesByState,
       residueLabel,
       residueSymbols,
-      selectedResidues,
+      selectedResidue,
       selectedStates,
       stateColors,
       stateName,
+      clusterLegend,
+      clusterColorMap,
+      clusterLabelLookup,
     ]
   );
 
   const hasAngles = useMemo(
-    () => Object.values(anglesByState).some((residues) => Object.keys(residues || {}).length > 0),
-    [anglesByState]
+    () =>
+      !!selectedResidue &&
+      Object.values(anglesByState).some((residues) => Boolean((residues || {})[selectedResidue])),
+    [anglesByState, selectedResidue]
   );
 
   const stateSummaries = useMemo(
@@ -389,8 +595,80 @@ export default function DescriptorVizPage() {
             </div>
           </div>
 
+          <div className="grid md:grid-cols-3 gap-3">
+            <div className="md:col-span-2 space-y-2">
+              <label className="block text-xs text-gray-400 mb-1">Metastable states (filter)</label>
+              {metastableStates.length === 0 ? (
+                <p className="text-[11px] text-gray-500">No metastable states stored.</p>
+              ) : (
+                <div className="grid sm:grid-cols-2 gap-2 max-h-24 overflow-y-auto border border-gray-700 rounded-md p-2 bg-gray-900">
+                  {metastableStates.map((m) => (
+                    <label key={m.metastable_id} className="flex items-center space-x-2 text-sm text-gray-200">
+                      <input
+                        type="checkbox"
+                        checked={selectedMetastables.includes(m.metastable_id)}
+                        onChange={() => toggleMetastable(m.metastable_id)}
+                        className="accent-emerald-400"
+                      />
+                      <span>{m.name || m.default_name || m.metastable_id}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+              <p className="text-[11px] text-gray-500 mt-1">
+                Filters are applied only on metastable states. Toggle states above to include their metastables, or pick individual ones here.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <label className="block text-xs text-gray-400 mb-1">Cluster NPZ (optional coloring)</label>
+              <select
+                value={selectedClusterId}
+                onChange={(e) => setSelectedClusterId(e.target.value)}
+                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
+              >
+                <option value="">None</option>
+                {clusterOptions.map((c) => (
+                  <option key={c.cluster_id} value={c.cluster_id}>
+                    {c.path?.split('/').pop() || c.cluster_id}
+                  </option>
+                ))}
+              </select>
+              {selectedClusterId && (
+                <div className="flex items-center space-x-3 text-xs text-gray-300">
+                  <label className="flex items-center space-x-1">
+                    <input
+                      type="radio"
+                      name="cluster-mode"
+                      value="merged"
+                      checked={clusterMode === 'merged'}
+                      onChange={() => setClusterMode('merged')}
+                      className="accent-emerald-400"
+                    />
+                    <span>Merged</span>
+                  </label>
+                  <label className="flex items-center space-x-1">
+                    <input
+                      type="radio"
+                      name="cluster-mode"
+                      value="per_meta"
+                      checked={clusterMode === 'per_meta'}
+                      onChange={() => setClusterMode('per_meta')}
+                      className="accent-emerald-400"
+                    />
+                    <span>Per metastable</span>
+                  </label>
+                </div>
+              )}
+              {clusterLegend.length > 0 && (
+                <p className="text-[11px] text-gray-500">
+                  Clusters loaded: {clusterLegend.map((c) => c.label).join(' • ')}
+                </p>
+              )}
+            </div>
+          </div>
+
           <div className="mt-2">
-            <label className="block text-xs text-gray-400 mb-1">Filter residues</label>
+            <label className="block text-xs text-gray-400 mb-1">Choose residue (single selection)</label>
             <input
               type="text"
               value={residueFilter}
@@ -400,16 +678,17 @@ export default function DescriptorVizPage() {
             />
           </div>
 
-          <div className="grid sm:grid-cols-2 md:grid-cols-3 gap-2 max-h-48 overflow-y-auto border border-gray-700 rounded-md p-2 bg-gray-900">
+          <div className="grid sm:grid-cols-2 md:grid-cols-10 gap-2 max-h-48 overflow-y-auto border border-gray-700 rounded-md p-2 bg-gray-900">
             {filteredResidues.length === 0 && (
               <p className="text-sm text-gray-500 col-span-full">No residues match this filter.</p>
             )}
             {filteredResidues.map((key) => (
               <label key={key} className="flex items-center space-x-2 text-sm text-gray-200">
                 <input
-                  type="checkbox"
-                  checked={selectedResidues.includes(key)}
-                  onChange={() => toggleResidue(key)}
+                  type="radio"
+                  name="residue-select"
+                  checked={selectedResidue === key}
+                  onChange={() => selectResidue(key)}
                   className="accent-cyan-500"
                 />
                 <span>{residueLabel(key)}</span>
@@ -425,7 +704,7 @@ export default function DescriptorVizPage() {
       {!loadingAngles && !hasAngles && (
         <p className="text-sm text-gray-400">
           {selectedStates.length
-            ? 'Select residues to visualize.'
+            ? 'Pick a residue to load and color its angles.'
             : 'Select at least one state to load descriptor data.'}
         </p>
       )}
@@ -441,9 +720,10 @@ export default function DescriptorVizPage() {
                 plot_bgcolor: '#111827',
                 font: { color: '#e5e7eb' },
                 scene: {
-                  xaxis: { title: 'Phi (°)' },
-                  yaxis: { title: 'Psi (°)' },
-                  zaxis: { title: 'Chi1 (°)' },
+                  xaxis: { title: 'Phi (°)', range: [-180, 180] },
+                  yaxis: { title: 'Psi (°)', range: [-180, 180] },
+                  zaxis: { title: 'Chi1 (°)', range: [-180, 180] },
+                  aspectmode: 'cube',
                 },
                 margin: { l: 0, r: 0, t: 10, b: 0 },
                 legend: { bgcolor: 'rgba(0,0,0,0)' },
@@ -469,8 +749,8 @@ export default function DescriptorVizPage() {
                     plot_bgcolor: '#111827',
                     font: { color: '#e5e7eb' },
                     margin: { l: 40, r: 10, t: 30, b: 40 },
-                    xaxis: { title: `${axes.x.toUpperCase()} (°)` },
-                    yaxis: { title: `${axes.y.toUpperCase()} (°)` },
+                  xaxis: { title: `${axes.x.toUpperCase()} (°)`, range: [-180, 180] },
+                  yaxis: { title: `${axes.y.toUpperCase()} (°)`, range: [-180, 180] },
                     legend: { bgcolor: 'rgba(0,0,0,0)' },
                   }}
                   useResizeHandler

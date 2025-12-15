@@ -72,12 +72,15 @@ class SystemMetadata:
     description: Optional[str]
     created_at: str
     status: str = "processing"
+    macro_locked: bool = False
+    metastable_locked: bool = False
     residue_selections: Optional[SelectionInput] = None
     residue_selections_mapping: Dict[str, str] = field(default_factory=dict)
     descriptor_keys: List[str] = field(default_factory=list)
     descriptor_metadata_file: Optional[str] = None
     metastable_model_dir: Optional[str] = None
     metastable_states: List[Dict[str, Any]] = field(default_factory=list)
+    metastable_clusters: List[Dict[str, Any]] = field(default_factory=list)
     states: Dict[str, DescriptorState] = field(default_factory=dict)
 
 

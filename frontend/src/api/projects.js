@@ -222,6 +222,11 @@ export function fetchStateDescriptors(projectId, systemId, stateId, params = {})
   const qs = new URLSearchParams();
   if (params.residue_keys) qs.set('residue_keys', params.residue_keys);
   if (params.max_points) qs.set('max_points', params.max_points);
+  if (params.metastable_ids && params.metastable_ids.length) {
+    qs.set('metastable_ids', params.metastable_ids.join(','));
+  }
+  if (params.cluster_id) qs.set('cluster_id', params.cluster_id);
+  if (params.cluster_mode) qs.set('cluster_mode', params.cluster_mode);
   const suffix = qs.toString() ? `?${qs.toString()}` : '';
   return requestJSON(`/projects/${projectId}/systems/${systemId}/states/${stateId}/descriptors${suffix}`);
 }
@@ -263,6 +268,12 @@ export function downloadMetastableClusters(projectId, systemId, metastableIds, p
   };
   if (params.max_clusters_per_residue) payload.max_clusters_per_residue = params.max_clusters_per_residue;
   if (params.random_state !== undefined) payload.random_state = params.random_state;
+  if (params.contact_atom_mode) payload.contact_atom_mode = params.contact_atom_mode;
+  if (params.contact_cutoff) payload.contact_cutoff = params.contact_cutoff;
+  if (params.cluster_algorithm) payload.cluster_algorithm = params.cluster_algorithm;
+  if (params.algorithm_params) payload.algorithm_params = params.algorithm_params;
+  if (params.dbscan_eps) payload.dbscan_eps = params.dbscan_eps;
+  if (params.dbscan_min_samples) payload.dbscan_min_samples = params.dbscan_min_samples;
   return requestBlobWithBody(
     `/projects/${projectId}/systems/${systemId}/metastable/cluster_vectors`,
     {
@@ -270,4 +281,22 @@ export function downloadMetastableClusters(projectId, systemId, metastableIds, p
       body: payload,
     }
   );
+}
+
+export function confirmMacroStates(projectId, systemId) {
+  return requestJSON(`/projects/${projectId}/systems/${systemId}/states/confirm`, { method: 'POST' });
+}
+
+export function confirmMetastableStates(projectId, systemId) {
+  return requestJSON(`/projects/${projectId}/systems/${systemId}/metastable/confirm`, { method: 'POST' });
+}
+
+export function downloadSavedCluster(projectId, systemId, clusterId) {
+  return requestBlob(`/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}`);
+}
+
+export function deleteSavedCluster(projectId, systemId, clusterId) {
+  return requestJSON(`/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}`, {
+    method: 'DELETE',
+  });
 }
