@@ -60,7 +60,7 @@ export default function SystemDetailPage() {
   const [maxClustersPerResidue, setMaxClustersPerResidue] = useState(6);
   const [contactMode, setContactMode] = useState('CA');
   const [contactCutoff, setContactCutoff] = useState(10);
-  const [clusterAlgorithm, setClusterAlgorithm] = useState('TOMATO');
+  const [clusterAlgorithm, setClusterAlgorithm] = useState('DENSITY_PEAKS');
   const [dbscanEps, setDbscanEps] = useState(0.5);
   const [dbscanMinSamples, setDbscanMinSamples] = useState(5);
   const [hierClusters, setHierClusters] = useState(4);
@@ -69,6 +69,9 @@ export default function SystemDetailPage() {
   const [tomatoTauMode, setTomatoTauMode] = useState('auto');
   const [tomatoTauValue, setTomatoTauValue] = useState(0.5);
   const [tomatoKMax, setTomatoKMax] = useState(6);
+  const [densityZMode, setDensityZMode] = useState('auto');
+  const [densityZValue, setDensityZValue] = useState(1.65);
+  const [densityMaxk, setDensityMaxk] = useState(100);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -413,7 +416,7 @@ export default function SystemDetailPage() {
     setClusterError(null);
     setClusterLoading(true);
     try {
-      const algo = (clusterAlgorithm || 'TOMATO').toLowerCase();
+      const algo = (clusterAlgorithm || 'DENSITY_PEAKS').toLowerCase();
       const algorithmParams = {};
       if (algo === 'dbscan') {
         algorithmParams.eps = dbscanEps;
@@ -422,6 +425,13 @@ export default function SystemDetailPage() {
         algorithmParams.k_neighbors = tomatoK;
         algorithmParams.tau = tomatoTauMode === 'auto' ? 'auto' : tomatoTauValue;
         algorithmParams.k_max = tomatoKMax;
+      } else if (algo === 'density_peaks') {
+        if (densityZMode === 'manual') {
+          algorithmParams.Z = densityZValue;
+        } else {
+          algorithmParams.Z = 'auto';
+        }
+        algorithmParams.maxk = densityMaxk;
       } else if (algo === 'hierarchical') {
         algorithmParams.n_clusters = hierClusters;
         algorithmParams.linkage = hierLinkage;
@@ -768,7 +778,48 @@ export default function SystemDetailPage() {
                 </label>
               </>
             )}
-            {(clusterAlgorithm === 'KMEANS' || clusterAlgorithm === 'DENSITY_PEAKS') && (
+            {clusterAlgorithm === 'DENSITY_PEAKS' && (
+              <>
+                <label className="space-y-1">
+                  <span className="block text-gray-400">DADApy Z (merge factor)</span>
+                  <div className="space-y-2">
+                    <select
+                      value={densityZMode}
+                      onChange={(e) => setDensityZMode(e.target.value)}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+                    >
+                      <option value="auto">Auto (package default)</option>
+                      <option value="manual">Manual</option>
+                    </select>
+                    {densityZMode === 'manual' ? (
+                      <input
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        value={densityZValue}
+                        onChange={(e) => setDensityZValue(Number(e.target.value) || 0)}
+                        className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+                      />
+                    ) : (
+                      <p className="text-[11px] text-gray-400 leading-snug">Use DADApy's default Z if left on auto.</p>
+                    )}
+                  </div>
+                </label>
+                <label className="space-y-1">
+                  <span className="block text-gray-400">Max neighbors (maxk)</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={1000}
+                    value={densityMaxk}
+                    onChange={(e) => setDensityMaxk(Math.max(1, Number(e.target.value) || 1))}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+                  />
+                  <p className="text-[11px] text-gray-400 leading-snug">Caps neighbor search; not a cluster count.</p>
+                </label>
+              </>
+            )}
+            {(clusterAlgorithm === 'KMEANS') && (
               <label className="space-y-1">
                 <span className="block text-gray-400">Max clusters / residue</span>
                 <input
@@ -919,6 +970,18 @@ export default function SystemDetailPage() {
                             className="text-emerald-300 border border-emerald-500 px-2 py-1 rounded-md hover:bg-emerald-500/10"
                           >
                             Download
+                          </button>
+                          <button
+                            onClick={() =>
+                              navigate(
+                                `/projects/${projectId}/systems/${systemId}/descriptors/visualize?cluster_id=${encodeURIComponent(
+                                  run.cluster_id
+                                )}&cluster_mode=merged`
+                              )
+                            }
+                            className="text-cyan-300 border border-cyan-500 px-2 py-1 rounded-md hover:bg-cyan-500/10"
+                          >
+                            Visualize
                           </button>
                           <button
                             onClick={() => handleDeleteSavedCluster(run.cluster_id)}

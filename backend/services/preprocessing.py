@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
+
+import numpy as np
 
 from alloskin.features.extraction import FeatureDict, FeatureExtractor
 from alloskin.io.readers import MDAnalysisReader
@@ -45,6 +47,22 @@ class DescriptorPreprocessor:
         self.extractor = extractor
         self.builder = DatasetBuilder(reader, extractor)
 
+    @staticmethod
+    def _filter_degenerate_features(features: FeatureDict) -> Tuple[FeatureDict, List[str]]:
+        """
+        Drop residue features that are empty, non-finite, or all-zero to avoid degenerate descriptors.
+        Returns the cleaned features and a list of dropped residue keys.
+        """
+        cleaned: FeatureDict = {}
+        dropped: List[str] = []
+        for key, arr in features.items():
+            arr_np = np.asarray(arr)
+            if arr_np.size == 0 or not np.all(np.isfinite(arr_np)) or np.allclose(arr_np, 0.0):
+                dropped.append(key)
+                continue
+            cleaned[key] = arr
+        return cleaned, dropped
+
     def build(
         self,
         active_traj: str,
@@ -70,19 +88,31 @@ class DescriptorPreprocessor:
             inactive_slice=inactive_slice,
         )
 
-        if not common_keys:
-            raise ValueError("No overlapping residues found between active and inactive states.")
+        # Remove degenerate residues before proceeding
+        features_active, dropped_active = self._filter_degenerate_features(features_active)
+        features_inactive, dropped_inactive = self._filter_degenerate_features(features_inactive)
 
-        active_common = {k: features_active[k] for k in common_keys}
-        inactive_common = {k: features_inactive[k] for k in common_keys}
+        filtered_common = (
+            set(features_active.keys())
+            & set(features_inactive.keys())
+            & set(common_keys)
+        )
+        if not filtered_common:
+            raise ValueError(
+                f"No valid residues after filtering degenerate features "
+                f"(dropped active: {len(dropped_active)}, dropped inactive: {len(dropped_inactive)})."
+            )
+
+        active_common = {k: features_active[k] for k in filtered_common}
+        inactive_common = {k: features_inactive[k] for k in filtered_common}
 
         return DescriptorBuildResult(
             active_features=active_common,
             inactive_features=inactive_common,
             n_frames_active=n_frames_active,
             n_frames_inactive=n_frames_inactive,
-            residue_keys=sorted(common_keys),
-            residue_mapping=mapping,
+            residue_keys=sorted(filtered_common),
+            residue_mapping={k: v for k, v in mapping.items() if k in filtered_common},
         )
 
     def build_single(
@@ -107,6 +137,10 @@ class DescriptorPreprocessor:
         features, n_frames = extractor.extract_all_features(universe, slice_obj)
         if not features or n_frames == 0:
             raise ValueError("Descriptor extraction returned no frames.")
+
+        features, dropped = self._filter_degenerate_features(features)
+        if not features:
+            raise ValueError("All residue descriptors are degenerate (nan/inf/zero).")
 
         residue_keys = sorted(features.keys())
         residue_mapping = {key: selections[key] for key in residue_keys}

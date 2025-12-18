@@ -1105,8 +1105,8 @@ async def build_metastable_cluster_vectors(
     if contact_atom_mode not in {"CA", "CM"}:
         raise HTTPException(status_code=400, detail="contact_atom_mode must be 'CA' or 'CM'.")
 
-    algo_raw = (payload or {}).get("cluster_algorithm", "tomato")
-    cluster_algorithm = str(algo_raw or "tomato").lower()
+    algo_raw = (payload or {}).get("cluster_algorithm", "density_peaks")
+    cluster_algorithm = str(algo_raw or "density_peaks").lower()
     if cluster_algorithm not in {"tomato", "density_peaks", "dbscan", "kmeans", "hierarchical"}:
         raise HTTPException(
             status_code=400,
@@ -1128,6 +1128,26 @@ async def build_metastable_cluster_vectors(
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="hierarchical n_clusters must be an integer.")
     hierarchical_linkage = str(algo_params.get("linkage", (payload or {}).get("hierarchical_linkage", "ward")) or "ward").lower()
+    density_z_raw = algo_params.get("Z")
+    try:
+        density_maxk = algo_params.get("maxk", (payload or {}).get("density_maxk"))
+        if density_maxk is not None:
+            density_maxk = int(density_maxk)
+        else:
+            density_maxk = 100
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="density maxk must be an integer >=1.")
+    density_z = None
+    if cluster_algorithm == "density_peaks":
+        if density_z_raw is None:
+            density_z = "auto"
+        elif isinstance(density_z_raw, str) and density_z_raw.lower() == "auto":
+            density_z = "auto"
+        else:
+            try:
+                density_z = float(density_z_raw)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="density_peaks Z must be a number or 'auto'.")
     try:
         tomato_k = int(algo_params.get("k_neighbors", (payload or {}).get("tomato_k", 15)))
     except (TypeError, ValueError):
@@ -1164,6 +1184,8 @@ async def build_metastable_cluster_vectors(
                     "dbscan_min_samples": dbscan_min_samples,
                     "hierarchical_n_clusters": hierarchical_n_clusters,
                     "hierarchical_linkage": hierarchical_linkage,
+                    "density_peaks_maxk": density_maxk,
+                    "density_peaks_Z": density_z,
                     "tomato_k": tomato_k,
                     "tomato_tau": tomato_tau,
                 },
@@ -1182,6 +1204,8 @@ async def build_metastable_cluster_vectors(
             dbscan_min_samples=dbscan_min_samples,
             hierarchical_n_clusters=hierarchical_n_clusters,
             hierarchical_linkage=hierarchical_linkage,
+            density_maxk=density_maxk,
+            density_z=density_z,
             tomato_k=tomato_k,
             tomato_tau=tomato_tau,
             tomato_k_max=tomato_k_max,

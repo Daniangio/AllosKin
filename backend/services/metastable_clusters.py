@@ -13,6 +13,7 @@ from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.metrics import silhouette_score
 from scipy.spatial import KDTree
 import MDAnalysis as mda
+from dadapy import Data
 
 from backend.services.descriptors import load_descriptor_npz
 from backend.services.project_store import DescriptorState, ProjectStore, SystemMetadata
@@ -77,6 +78,8 @@ def _cluster_residue_samples(
     random_state: int,
     *,
     algorithm: str = "tomato",
+    density_z: float | str | None = None,
+    density_maxk: Optional[int] = None,
     dbscan_eps: float = 0.5,
     dbscan_min_samples: int = 5,
     hierarchical_n_clusters: Optional[int] = None,
@@ -100,6 +103,13 @@ def _cluster_residue_samples(
 
     algo = (algorithm or "tomato").lower()
     diagnostics: Dict[str, Any] = {}
+    density_z_val: float | str = "auto"
+    if density_z is not None and not (isinstance(density_z, str) and density_z.lower() == "auto"):
+        try:
+            density_z_val = float(density_z)
+        except Exception:
+            density_z_val = "auto"
+    density_maxk_val: int = max(1, int(density_maxk)) if density_maxk is not None else 100
 
     # --- Standard KMeans ---
     if algo == "kmeans":
@@ -123,44 +133,31 @@ def _cluster_residue_samples(
         n = emb.shape[0]
         if n == 1:
             return np.zeros(1, dtype=np.int32), 1, diagnostics
-        diff = emb[:, None, :] - emb[None, :, :]
-        dist = np.linalg.norm(diff, axis=2)
-        mask = ~np.isclose(dist, 0.0)
-        valid = dist[mask]
-        dc = float(np.median(valid)) if valid.size else 1.0
-        if dc <= 0:
-            dc = 1.0
-        rho = np.sum(np.exp(-(dist / dc) ** 2), axis=1) - 1.0
-        order = np.argsort(-rho)
-        delta = np.zeros(n, dtype=float)
-        nearest_higher = np.full(n, -1, dtype=int)
-        for i, idx in enumerate(order):
-            if i == 0:
-                delta[idx] = dist[idx].max()
-                nearest_higher[idx] = -1
+
+        # Use DADApy for density peak clustering (adaptive density peak).
+        try:
+            dp_maxk = max(1, min(density_maxk_val, n - 1))
+            dp_data = Data(coordinates=emb, maxk=dp_maxk, verbose=False)
+            dp_data.compute_distances()
+            dp_data.compute_id_2NN()
+            dp_data.compute_density_kstarNN()
+            if density_z_val == "auto":
+                dp_data.compute_clustering_ADP()
+                diagnostics["density_peaks_Z"] = "auto"
             else:
-                higher = order[:i]
-                dists = dist[idx, higher]
-                j = higher[np.argmin(dists)]
-                delta[idx] = dist[idx, j]
-                nearest_higher[idx] = j
-        gamma = rho * delta
-        k_candidates = max(1, min(int(max_k), n))
-        centers = np.argsort(-gamma)[:k_candidates]
-        labels = np.full(n, -1, dtype=np.int32)
-        for ci, center_idx in enumerate(centers):
-            labels[center_idx] = ci
-        for idx in order:
-            if labels[idx] >= 0:
-                continue
-            parent = nearest_higher[idx]
-            # Assign -1 if no parent
-            labels[idx] = labels[parent] if parent >= 0 else -1
-        diagnostics["density_peaks_centers"] = centers.tolist()
+                dp_data.compute_clustering_ADP(Z=float(density_z_val))
+                diagnostics["density_peaks_Z"] = float(density_z_val)
+            labels = np.asarray(dp_data.cluster_assignment, dtype=np.int32)
+            k_final = int(dp_data.N_clusters) if hasattr(dp_data, "N_clusters") else int(
+                len([c for c in np.unique(labels) if c >= 0])
+            )
+            diagnostics["density_peaks_method"] = "dadapy_adp"
+            diagnostics["density_peaks_k"] = k_final
+            diagnostics["density_peaks_maxk"] = dp_maxk
+        except Exception as exc:
+            raise ValueError(f"DADApy density peaks failed: {exc}") from exc
         
-        # Post-processing will handle -1s
         final_labels = labels
-        k_final = len(centers)
 
     # --- ToMATo ---
     elif algo == "tomato":
@@ -537,7 +534,9 @@ def generate_metastable_cluster_npz(
     random_state: int = 0,
     contact_cutoff: float = 10.0,
     contact_atom_mode: str = "CA",
-    cluster_algorithm: str = "tomato",
+    cluster_algorithm: str = "density_peaks",
+    density_maxk: Optional[int] = 100,
+    density_z: float | str | None = None,
     dbscan_eps: float = 0.5,
     dbscan_min_samples: int = 5,
     hierarchical_n_clusters: Optional[int] = None,
@@ -575,6 +574,20 @@ def generate_metastable_cluster_npz(
         db_min_samples_val = max(1, int(dbscan_min_samples))
     except Exception as exc:
         raise ValueError("dbscan_min_samples must be an integer >=1.") from exc
+    if density_maxk is None:
+        density_maxk_val = 100
+    else:
+        try:
+            density_maxk_val = max(1, int(density_maxk))
+        except Exception as exc:
+            raise ValueError("density_maxk must be an integer >=1.") from exc
+    if density_z is None or (isinstance(density_z, str) and density_z.lower() == "auto"):
+        density_z_val: float | str = "auto"
+    else:
+        try:
+            density_z_val = float(density_z)
+        except Exception as exc:
+            raise ValueError("density_z must be a number or 'auto'.") from exc
     h_linkage = (hierarchical_linkage or "ward").lower()
     if h_linkage not in {"ward", "complete", "average", "single"}:
         h_linkage = "ward"
@@ -696,6 +709,8 @@ def generate_metastable_cluster_npz(
                 max_clusters_per_residue,
                 random_state,
                 algorithm=algo,
+                density_maxk=density_maxk_val,
+                density_z=density_z_val,
                 dbscan_eps=db_eps_val,
                 dbscan_min_samples=db_min_samples_val,
                 hierarchical_n_clusters=h_n_clusters_val,
@@ -759,6 +774,8 @@ def generate_metastable_cluster_npz(
             max_clusters_per_residue,
             random_state,
             algorithm=algo,
+            density_maxk=density_maxk_val,
+            density_z=density_z_val,
             dbscan_eps=db_eps_val,
             dbscan_min_samples=db_min_samples_val,
             hierarchical_n_clusters=h_n_clusters_val,
@@ -798,6 +815,8 @@ def generate_metastable_cluster_npz(
             "hierarchical_linkage": h_linkage,
             "tomato_k": t_k,
             "tomato_tau": t_tau,
+            "density_maxk": density_maxk_val,
+            "density_z": density_z_val,
             "max_clusters_per_residue": max_clusters_per_residue,
             "random_state": random_state,
         },

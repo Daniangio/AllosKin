@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import Plot from 'react-plotly.js';
 import Loader from '../components/common/Loader';
 import ErrorMessage from '../components/common/ErrorMessage';
@@ -20,6 +20,7 @@ const colors = [
 
 export default function DescriptorVizPage() {
   const { projectId, systemId } = useParams();
+  const location = useLocation();
   const navigate = useNavigate();
 
   const [system, setSystem] = useState(null);
@@ -63,7 +64,7 @@ export default function DescriptorVizPage() {
         setSystem(data);
         const descriptorStates = Object.values(data.states || {}).filter((s) => s.descriptor_file);
         if (descriptorStates.length) {
-          setSelectedStates([descriptorStates[0].state_id]);
+          setSelectedStates((prev) => (prev.length ? prev : descriptorStates.map((s) => s.state_id)));
         }
       } catch (err) {
         setError(err.message);
@@ -80,6 +81,19 @@ export default function DescriptorVizPage() {
   );
   const metastableStates = useMemo(() => system?.metastable_states || [], [system]);
   const clusterOptions = useMemo(() => system?.metastable_clusters || [], [system]);
+
+  // Hydrate from query params (cluster selection) whenever search changes.
+  useEffect(() => {
+    const params = new URLSearchParams(location.search || '');
+    const clusterId = params.get('cluster_id');
+    const mode = params.get('cluster_mode');
+    if (clusterId) {
+      setSelectedClusterId(clusterId);
+    }
+    if (mode && (mode === 'merged' || mode === 'per_meta')) {
+      setClusterMode(mode);
+    }
+  }, [location.search]);
 
   // Default-select metastable states for initially selected macros (if user hasn't chosen yet)
   useEffect(() => {
