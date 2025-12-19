@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -140,6 +141,8 @@ def replica_exchange_gibbs_potts(
       1) do 'sweeps_per_round' Gibbs sweeps in each replica at its own beta,
       2) attempt swaps between adjacent betas.
 
+    Local Gibbs sweeps are parallelized across replicas (thread pool).
+
     Returns a dict:
       - "betas": list[float]
       - "samples_by_beta": dict[float -> np.ndarray shape (S,N)]
@@ -154,15 +157,19 @@ def replica_exchange_gibbs_potts(
     if any(b <= 0 for b in betas):
         raise ValueError("All betas must be > 0")
 
-    rng = np.random.default_rng(seed)
+    n_rep = len(betas)
+    seed_seq = np.random.SeedSequence(seed)
+    child_seqs = seed_seq.spawn(n_rep + 1)
+    rngs = [np.random.default_rng(s) for s in child_seqs[:-1]]  # one RNG per replica
+    rng_swaps = np.random.default_rng(child_seqs[-1])  # dedicated RNG for swap decisions
     N = len(model.h)
     K_list = model.K_list()
 
     # Initialize replicas (states)
     replicas: List[np.ndarray] = []
     if x0 is None:
-        for _ in betas:
-            replicas.append(np.array([rng.integers(0, K_list[r]) for r in range(N)], dtype=int))
+        for i in range(n_rep):
+            replicas.append(np.array([rngs[i].integers(0, K_list[r]) for r in range(N)], dtype=int))
     else:
         x0 = np.array(x0, dtype=int).copy()
         for _ in betas:
@@ -174,40 +181,48 @@ def replica_exchange_gibbs_potts(
     # Storage
     samples_by_beta: Dict[float, List[np.ndarray]] = {b: [] for b in betas}
     energy_traces: Dict[float, List[float]] = {b: [] for b in betas}
-    accept = np.zeros(len(betas) - 1, dtype=int)
-    trials = np.zeros(len(betas) - 1, dtype=int)
+    accept = np.zeros(n_rep - 1, dtype=int)
+    trials = np.zeros(n_rep - 1, dtype=int)
+
+    def _update_replica(idx: int) -> Tuple[int, float]:
+        # Run local Gibbs sweeps for a single replica; returns (idx, energy)
+        x = replicas[idx]
+        b = betas[idx]
+        rng = rngs[idx]
+        for _ in range(sweeps_per_round):
+            _gibbs_one_sweep(model, x, beta=b, rng=rng)
+        return idx, model.energy(x)
 
     round_iter = _progress_iterator(n_rounds, "Replica-exchange rounds", progress)
-    for rnd in round_iter:
-        # 1) local updates
-        for i, b in enumerate(betas):
-            for _ in range(sweeps_per_round):
-                _gibbs_one_sweep(model, replicas[i], beta=b, rng=rng)
-            energies[i] = model.energy(replicas[i])
+    with ThreadPoolExecutor(max_workers=n_rep) as executor:
+        for rnd in round_iter:
+            # 1) local updates (parallel across replicas)
+            for idx, e in executor.map(_update_replica, range(n_rep)):
+                energies[idx] = e
 
-        # 2) swap attempts (adjacent)
-        # We attempt swaps in alternating pattern to reduce bias:
-        # even pairs on even rounds, odd pairs on odd rounds.
-        start = 0 if (rnd % 2 == 0) else 1
-        for i in range(start, len(betas) - 1, 2):
-            b_i, b_j = betas[i], betas[i + 1]
-            e_i, e_j = energies[i], energies[i + 1]
+            # 2) swap attempts (adjacent)
+            # We attempt swaps in alternating pattern to reduce bias:
+            # even pairs on even rounds, odd pairs on odd rounds.
+            start = 0 if (rnd % 2 == 0) else 1
+            for i in range(start, n_rep - 1, 2):
+                b_i, b_j = betas[i], betas[i + 1]
+                e_i, e_j = energies[i], energies[i + 1]
 
-            # acceptance prob for swapping configurations between betas
-            # alpha = min(1, exp((beta_i - beta_j) * (E(x_i) - E(x_j))))
-            d = (b_i - b_j) * (e_i - e_j)
-            trials[i] += 1
-            if d >= 0 or rng.random() < np.exp(d):
-                # swap states and energies
-                replicas[i], replicas[i + 1] = replicas[i + 1], replicas[i]
-                energies[i], energies[i + 1] = energies[i + 1], energies[i]
-                accept[i] += 1
+                # acceptance prob for swapping configurations between betas
+                # alpha = min(1, exp((beta_i - beta_j) * (E(x_i) - E(x_j))))
+                d = (b_i - b_j) * (e_i - e_j)
+                trials[i] += 1
+                if d >= 0 or rng_swaps.random() < np.exp(d):
+                    # swap states and energies
+                    replicas[i], replicas[i + 1] = replicas[i + 1], replicas[i]
+                    energies[i], energies[i + 1] = energies[i + 1], energies[i]
+                    accept[i] += 1
 
-        # Save after burn-in, with thinning
-        if rnd >= burn_in_rounds and ((rnd - burn_in_rounds) % thinning_rounds == 0):
-            for i, b in enumerate(betas):
-                samples_by_beta[b].append(replicas[i].copy())
-                energy_traces[b].append(float(energies[i]))
+            # Save after burn-in, with thinning
+            if rnd >= burn_in_rounds and ((rnd - burn_in_rounds) % thinning_rounds == 0):
+                for i, b in enumerate(betas):
+                    samples_by_beta[b].append(replicas[i].copy())
+                    energy_traces[b].append(float(energies[i]))
 
     # Convert lists to arrays
     samples_by_beta_arr: Dict[float, np.ndarray] = {}
