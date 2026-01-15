@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,7 @@ from alloskin.simulation.metrics import (
     per_residue_js,
     combined_distance,
 )
+from alloskin.simulation.plotting import plot_marginal_summary_from_npz
 
 
 def _parse_float_list(s: str) -> list[float]:
@@ -27,13 +29,103 @@ def _parse_float_list(s: str) -> list[float]:
     return [float(p) for p in parts]
 
 
+def _ensure_results_dir(path: str | Path) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _pad_marginals_for_save(margs: Sequence[np.ndarray]) -> np.ndarray:
+    """
+    Pad variable-length marginal arrays into a dense matrix with NaN fill.
+    This avoids object dtypes so summaries can be loaded with allow_pickle=False.
+    """
+    if len(margs) == 0:
+        return np.zeros((0, 0), dtype=float)
+    max_k = max(len(p) for p in margs)
+    out = np.full((len(margs), max_k), np.nan, dtype=float)
+    for i, p in enumerate(margs):
+        out[i, : len(p)] = p
+    return out
+
+
+def _save_run_summary(
+    results_dir: Path,
+    args: argparse.Namespace,
+    *,
+    K: np.ndarray,
+    edges: np.ndarray,
+    residue_labels: np.ndarray,
+    betas: list[float],
+    X_gibbs: np.ndarray,
+    X_sa: np.ndarray,
+    p_md: np.ndarray,
+    p_gibbs: np.ndarray,
+    p_sa: np.ndarray,
+    js_gibbs: np.ndarray,
+    js_sa: np.ndarray,
+    swap_accept_rate: np.ndarray | None,
+    sa_valid_counts: np.ndarray,
+    sa_invalid_mask: np.ndarray,
+    beta_eff_grid: list[float] | None = None,
+    beta_eff_distances: list[float] | None = None,
+    beta_eff_value: float | None = None,
+) -> Path:
+    """
+    Save a compact summary bundle of inputs + sampling results into results_dir/run_summary.npz,
+    plus metadata JSON for quick inspection.
+    """
+    results_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = results_dir / "run_summary.npz"
+    meta_path = results_dir / "run_metadata.json"
+
+    np.savez_compressed(
+        summary_path,
+        K=np.asarray(K, dtype=int),
+        edges=np.asarray(edges, dtype=int),
+        residue_labels=np.asarray(residue_labels, dtype=str),
+        betas=np.asarray(betas, dtype=float),
+        target_beta=np.array([float(args.beta)], dtype=float),
+        gibbs_method=np.array([args.gibbs_method], dtype=str),
+        X_gibbs=X_gibbs,
+        X_sa=X_sa,
+        p_md=p_md,
+        p_gibbs=p_gibbs,
+        p_sa=p_sa,
+        js_gibbs=js_gibbs,
+        js_sa=js_sa,
+        swap_accept_rate=swap_accept_rate if swap_accept_rate is not None else np.array([], dtype=float),
+        sa_valid_counts=np.asarray(sa_valid_counts, dtype=int),
+        sa_invalid_mask=np.asarray(sa_invalid_mask, dtype=bool),
+        beta_eff_grid=np.asarray(beta_eff_grid, dtype=float) if beta_eff_grid is not None else np.array([], dtype=float),
+        beta_eff_distances=np.asarray(beta_eff_distances, dtype=float) if beta_eff_distances is not None else np.array([], dtype=float),
+        beta_eff=np.array([beta_eff_value], dtype=float) if beta_eff_value is not None else np.array([], dtype=float),
+        data_npz=np.array([args.npz], dtype=str),
+    )
+
+    metadata = {
+        "args": vars(args),
+        "summary_file": summary_path.name,
+        "data_npz": args.npz,
+    }
+    if swap_accept_rate is not None and len(swap_accept_rate):
+        metadata["swap_accept_rate_mean"] = float(np.mean(swap_accept_rate))
+    if beta_eff_value is not None:
+        metadata["beta_eff"] = float(beta_eff_value)
+    meta_path.write_text(json.dumps(metadata, indent=2))
+    return summary_path
+
+
 def main():
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--npz", required=True)
+    ap.add_argument("--npz", default="", help="Input dataset (.npz). Required unless --plot-only is set.")
+    ap.add_argument("--results-dir", required=True, help="Directory where summaries/plots are stored.")
+    ap.add_argument("--plot-only", action="store_true", help="Skip sampling; load run_summary.npz from results-dir (or --summary-file) and emit plots.")
+    ap.add_argument("--summary-file", default="", help="Optional explicit path to a summary npz (defaults to results-dir/run_summary.npz).")
     ap.add_argument("--unassigned-policy", default="drop_frames", choices=["drop_frames", "treat_as_state", "error"])
 
-    ap.add_argument("--fit", default="pmi", choices=["pmi", "plm", "pmi+plm"])
+    ap.add_argument("--fit", default="pmi+plm", choices=["pmi", "plm", "pmi+plm"])
     ap.add_argument("--beta", type=float, default=1.0)
 
     # Gibbs / REX-Gibbs
@@ -65,16 +157,30 @@ def main():
     ap.add_argument("--beta-eff-grid", type=str, default="", help="Comma-separated betas to scan. Default: use rex-betas/ladder.")
     ap.add_argument("--beta-eff-w-marg", type=float, default=1.0, help="Weight of marginal-distribution mismatch (per-residue JS divergence) in the distance function.")
     ap.add_argument("--beta-eff-w-pair", type=float, default=1.0, help="Weight of pairwise-on-edges mismatch in the distance function.")
-    ap.add_argument("--beta-eff-plot", type=str, default="", help="If set, writes an HTML plot of the distance curve D(β) to this path.")
 
-    # plotting
-    ap.add_argument("--plot-path", type=str, default="", help="If provided, writes an HTML “marginals comparison” dashboard (MD vs Gibbs vs SA).")
     ap.add_argument("--annotate-plots", action="store_true", help="If set, adds extra annotations to plots (depends on your plotting helper).")
-
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--progress", action="store_true")
 
     args = ap.parse_args()
+
+    results_dir = _ensure_results_dir(args.results_dir)
+    default_summary_path = Path(args.summary_file) if args.summary_file else results_dir / "run_summary.npz"
+    default_plot_path = results_dir / "marginals.html"
+
+    if args.plot_only:
+        if not default_summary_path.exists():
+            raise FileNotFoundError(f"Summary file not found: {default_summary_path}")
+        out_path = plot_marginal_summary_from_npz(
+            summary_path=default_summary_path,
+            out_path=default_plot_path,
+            annotate=args.annotate_plots,
+        )
+        print(f"[plot] loaded summary from {default_summary_path} -> {out_path}")
+        return
+
+    if not args.npz:
+        ap.error("--npz is required unless --plot-only is set.")
 
     ds = load_npz(args.npz, unassigned_policy=args.unassigned_policy)
     labels = ds.labels
@@ -104,6 +210,12 @@ def main():
 
     assert model is not None
 
+    betas: list[float] = []
+    beta_eff_grid_result: list[float] | None = None
+    beta_eff_distances_result: list[float] | None = None
+    beta_eff_value: float | None = None
+    swap_accept_rate: np.ndarray | None = None
+
     # --- Sampling baseline: Gibbs or REX-Gibbs at beta=args.beta ---
     if args.gibbs_method == "single":
         X_gibbs = gibbs_sample_potts(
@@ -116,6 +228,7 @@ def main():
             progress=args.progress,
         )
         rex_info = None
+        betas = [float(args.beta)]
     else:
         if args.rex_betas.strip():
             betas = _parse_float_list(args.rex_betas)
@@ -145,6 +258,7 @@ def main():
         X_gibbs = samples_by_beta[float(args.beta)]
 
         acc = rex_info["swap_accept_rate"]  # type: ignore
+        swap_accept_rate = acc
         print(f"[rex] betas={betas}")
         print(f"[rex] swap_accept_rate (adjacent): mean={float(np.mean(acc)):.3f}, min={float(np.min(acc)):.3f}, max={float(np.max(acc)):.3f}")
 
@@ -197,6 +311,40 @@ def main():
 
     # --- Estimate beta_eff for SA (optional) ---
     if args.estimate_beta_eff:
+        if rex_info is None:
+            print("[beta_eff] warning: beta_eff scan requires --gibbs-method rex (reusing REX samples). Skipping beta_eff.")
+            summary_path = _save_run_summary(
+                results_dir,
+                args,
+                K=np.asarray(K),
+                edges=np.asarray(edges),
+                residue_labels=np.asarray(residue_labels),
+                betas=betas,
+                X_gibbs=X_gibbs,
+                X_sa=X_sa,
+                p_md=_pad_marginals_for_save(p_md),
+                p_gibbs=_pad_marginals_for_save(p_g),
+                p_sa=_pad_marginals_for_save(p_sa),
+                js_gibbs=js_g,
+                js_sa=js_sa,
+                swap_accept_rate=swap_accept_rate,
+                sa_valid_counts=valid_counts,
+                sa_invalid_mask=viol,
+                beta_eff_grid=beta_eff_grid_result,
+                beta_eff_distances=beta_eff_distances_result,
+                beta_eff_value=beta_eff_value,
+            )
+            print(f"[results] summary saved to {summary_path}")
+            out_path = plot_marginal_summary_from_npz(
+                summary_path=summary_path,
+                out_path=default_plot_path,
+                annotate=args.annotate_plots,
+            )
+            print(f"[plot] saved marginal comparison to {out_path}")
+            print("[done]")
+            return
+
+        beta_eff_plot_path = results_dir / "beta_scan.html"
         if args.beta_eff_grid.strip():
             grid = _parse_float_list(args.beta_eff_grid)
             grid = sorted(set(grid))
@@ -216,19 +364,26 @@ def main():
 
         print(f"[beta_eff] scanning betas={grid}")
 
-        # Get reference Gibbs samples for each beta in grid:
-        # Use replica exchange across 'grid' for efficiency.
-        rex_scan = replica_exchange_gibbs_potts(
-            model,
-            betas=grid,
-            sweeps_per_round=args.rex_sweeps_per_round,
-            n_rounds=args.rex_rounds,
-            burn_in_rounds=args.rex_burnin_rounds,
-            thinning_rounds=args.rex_thin_rounds,
-            seed=args.seed + 123,
-            progress=args.progress,
-        )
-        ref = rex_scan["samples_by_beta"]  # type: ignore
+        # Try to reuse the baseline REX run; only rerun if grid has unseen betas.
+        rex_betas_available = set(map(float, rex_info["betas"]))  # type: ignore
+        missing = sorted(set(grid) - rex_betas_available)
+
+        if not missing:
+            print("[beta_eff] reusing baseline REX samples for beta_eff scan.")
+            ref = rex_info["samples_by_beta"]  # type: ignore
+        else:
+            print(f"[beta_eff] baseline REX missing betas {missing}; running additional REX for beta_eff scan.")
+            rex_scan = replica_exchange_gibbs_potts(
+                model,
+                betas=grid,
+                sweeps_per_round=args.rex_sweeps_per_round,
+                n_rounds=args.rex_rounds,
+                burn_in_rounds=args.rex_burnin_rounds,
+                thinning_rounds=args.rex_thin_rounds,
+                seed=args.seed + 123,
+                progress=args.progress,
+            )
+            ref = rex_scan["samples_by_beta"]  # type: ignore
 
         distances = []
         for b in grid:
@@ -244,32 +399,50 @@ def main():
             distances.append(d)
 
         b_eff = grid[int(np.argmin(distances))]
+        beta_eff_grid_result = grid
+        beta_eff_distances_result = distances
+        beta_eff_value = float(b_eff)
         print(f"[beta_eff] beta_eff={b_eff:.6g}  (min distance={min(distances):.6g})")
         # print a compact table
         for b, d in zip(grid, distances):
             mark = "*" if abs(b - b_eff) < 1e-12 else " "
             print(f"[beta_eff] {mark} beta={b:10.6g}  D={d:.6g}")
 
-        if args.beta_eff_plot.strip():
-            from alloskin.simulation.plotting import plot_beta_scan_curve
-            outp = plot_beta_scan_curve(betas=grid, distances=distances, out_path=args.beta_eff_plot)
-            print(f"[beta_eff] saved D(beta) plot to {outp}")
+        from alloskin.simulation.plotting import plot_beta_scan_curve
+        outp = plot_beta_scan_curve(betas=grid, distances=distances, out_path=beta_eff_plot_path)
+        print(f"[beta_eff] saved D(beta) plot to {outp}")
 
-    # --- Plot marginals dashboard (optional) ---
-    if args.plot_path:
-        from alloskin.simulation.plotting import plot_marginal_summary
+    residue_labels = getattr(ds, "residue_keys", np.arange(len(p_md)))
+    summary_path = _save_run_summary(
+        results_dir,
+        args,
+        K=np.asarray(K),
+        edges=np.asarray(edges),
+        residue_labels=np.asarray(residue_labels),
+        betas=betas,
+        X_gibbs=X_gibbs,
+        X_sa=X_sa,
+        p_md=_pad_marginals_for_save(p_md),
+        p_gibbs=_pad_marginals_for_save(p_g),
+        p_sa=_pad_marginals_for_save(p_sa),
+        js_gibbs=js_g,
+        js_sa=js_sa,
+        swap_accept_rate=swap_accept_rate,
+        sa_valid_counts=valid_counts,
+        sa_invalid_mask=viol,
+        beta_eff_grid=beta_eff_grid_result,
+        beta_eff_distances=beta_eff_distances_result,
+        beta_eff_value=beta_eff_value,
+    )
+    print(f"[results] summary saved to {summary_path}")
 
-        out_path = plot_marginal_summary(
-            p_md=p_md,
-            p_gibbs=p_g,
-            p_sa=p_sa,
-            js_gibbs=js_g,
-            js_sa=js_sa,
-            residue_labels=getattr(ds, "residue_keys", np.arange(len(p_md))),
-            out_path=args.plot_path,
-            annotate=args.annotate_plots,
-        )
-        print(f"[plot] saved marginal comparison to {out_path}")
+    # --- Plot marginals dashboard ---
+    out_path = plot_marginal_summary_from_npz(
+        summary_path=summary_path,
+        out_path=default_plot_path,
+        annotate=args.annotate_plots,
+    )
+    print(f"[plot] saved marginal comparison to {out_path}")
 
     print("[done]")
 

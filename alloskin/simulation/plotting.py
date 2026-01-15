@@ -258,6 +258,40 @@ def plot_marginal_summary(
 
 
 
+def plot_marginal_summary_from_npz(
+    *,
+    summary_path: str | Path,
+    out_path: str | Path,
+    annotate: bool = True,  # unused, kept for symmetry with plot_marginal_summary
+) -> Path:
+    """
+    Convenience loader: read a run_summary.npz bundle and render the marginal dashboard from it.
+    """
+    with np.load(summary_path, allow_pickle=False) as data:
+        required = ["p_md", "p_gibbs", "p_sa", "js_gibbs", "js_sa", "residue_labels"]
+        missing = [k for k in required if k not in data]
+        if missing:
+            raise KeyError(f"Missing keys in summary file {summary_path}: {missing}")
+
+        p_md = data["p_md"]
+        p_gibbs = data["p_gibbs"]
+        p_sa = data["p_sa"]
+        js_gibbs = data["js_gibbs"]
+        js_sa = data["js_sa"]
+        residue_labels = data["residue_labels"]
+
+    return plot_marginal_summary(
+        p_md=p_md,
+        p_gibbs=p_gibbs,
+        p_sa=p_sa,
+        js_gibbs=js_gibbs,
+        js_sa=js_sa,
+        residue_labels=residue_labels,
+        out_path=out_path,
+        annotate=annotate,
+    )
+
+
 def plot_beta_scan_curve(
     *,
     betas: Sequence[float],
