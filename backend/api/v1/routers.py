@@ -20,12 +20,13 @@ import MDAnalysis as mda
 import numpy as np
 
 # Import the master task function
-from backend.tasks import run_analysis_job
+from backend.tasks import run_analysis_job, run_simulation_job
 from backend.api.v1.schemas import (
     ProjectCreateRequest,
     StaticJobRequest,
     DynamicJobRequest,
     QUBOJobRequest,
+    SimulationJobRequest,
 )
 from backend.services.project_store import (
     ProjectStore,
@@ -254,6 +255,14 @@ def _ensure_system_ready(project_id: str, system_id: str, state_a_id: Optional[s
     if not state_a.residue_keys or not state_b.residue_keys:
         raise HTTPException(status_code=400, detail="Selected states are missing descriptor metadata.")
     return system, state_a, state_b
+
+
+def _get_cluster_entry(system: SystemMetadata, cluster_id: str) -> Dict[str, Any]:
+    clusters = system.metastable_clusters or []
+    entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Cluster NPZ not found.")
+    return entry
 
 
 # --- Project & System Management ---
@@ -1546,6 +1555,78 @@ async def submit_qubo_job(
         params,
         task_queue,
     )
+
+
+@api_router.post("/submit/simulation", summary="Submit a Potts sampling simulation")
+async def submit_simulation_job(
+    payload: SimulationJobRequest,
+    task_queue: get_queue = Depends(),
+):
+    try:
+        system_meta = project_store.get_system(payload.project_id, payload.system_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"System '{payload.system_id}' not found in project '{payload.project_id}'.",
+        )
+
+    _get_cluster_entry(system_meta, payload.cluster_id)
+
+    rex_betas = payload.rex_betas
+    if isinstance(rex_betas, str) and not rex_betas.strip():
+        rex_betas = None
+    if isinstance(rex_betas, list) and len(rex_betas) == 0:
+        rex_betas = None
+
+    if rex_betas is None:
+        rex_params = [payload.rex_beta_min, payload.rex_beta_max, payload.rex_spacing]
+        if any(val is not None for val in rex_params) and not all(val is not None for val in rex_params):
+            raise HTTPException(
+                status_code=400,
+                detail="Provide rex_beta_min, rex_beta_max, rex_spacing together or rex_betas.",
+            )
+
+    if payload.rex_spacing is not None and payload.rex_spacing not in {"geom", "lin"}:
+        raise HTTPException(status_code=400, detail="rex_spacing must be 'geom' or 'lin'.")
+
+    for name, value in {
+        "rex_samples": payload.rex_samples,
+        "rex_burnin": payload.rex_burnin,
+        "rex_thin": payload.rex_thin,
+        "sa_reads": payload.sa_reads,
+        "sa_sweeps": payload.sa_sweeps,
+    }.items():
+        if value is not None and int(value) < 1:
+            raise HTTPException(status_code=400, detail=f"{name} must be >= 1.")
+
+    try:
+        project_meta = project_store.get_project(payload.project_id)
+        project_name = project_meta.name
+    except Exception:
+        project_name = None
+
+    dataset_ref = {
+        "project_id": payload.project_id,
+        "project_name": project_name,
+        "system_id": payload.system_id,
+        "system_name": system_meta.name,
+        "cluster_id": payload.cluster_id,
+    }
+
+    params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
+
+    try:
+        job_uuid = str(uuid.uuid4())
+        job = task_queue.enqueue(
+            run_simulation_job,
+            args=(job_uuid, dataset_ref, params),
+            job_timeout="2h",
+            result_ttl=86400,
+            job_id=f"simulation-{job_uuid}",
+        )
+        return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"Job submission failed: {exc}") from exc
 
 # --- Results Endpoints ---
 

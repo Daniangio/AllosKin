@@ -67,6 +67,9 @@ def _save_run_summary(
     swap_accept_rate: np.ndarray | None,
     sa_valid_counts: np.ndarray,
     sa_invalid_mask: np.ndarray,
+    p_gibbs_by_beta: np.ndarray | None = None,
+    js_gibbs_by_beta: np.ndarray | None = None,
+    js_pair_gibbs_by_beta: np.ndarray | None = None,
     beta_eff_grid: list[float] | None = None,
     beta_eff_distances: list[float] | None = None,
     beta_eff_value: float | None = None,
@@ -97,6 +100,9 @@ def _save_run_summary(
         swap_accept_rate=swap_accept_rate if swap_accept_rate is not None else np.array([], dtype=float),
         sa_valid_counts=np.asarray(sa_valid_counts, dtype=int),
         sa_invalid_mask=np.asarray(sa_invalid_mask, dtype=bool),
+        p_gibbs_by_beta=p_gibbs_by_beta if p_gibbs_by_beta is not None else np.array([], dtype=float),
+        js_gibbs_by_beta=js_gibbs_by_beta if js_gibbs_by_beta is not None else np.array([], dtype=float),
+        js_pair_gibbs_by_beta=js_pair_gibbs_by_beta if js_pair_gibbs_by_beta is not None else np.array([], dtype=float),
         beta_eff_grid=np.asarray(beta_eff_grid, dtype=float) if beta_eff_grid is not None else np.array([], dtype=float),
         beta_eff_distances=np.asarray(beta_eff_distances, dtype=float) if beta_eff_distances is not None else np.array([], dtype=float),
         beta_eff=np.array([beta_eff_value], dtype=float) if beta_eff_value is not None else np.array([], dtype=float),
@@ -116,7 +122,7 @@ def _save_run_summary(
     return summary_path
 
 
-def main():
+def _build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--npz", default="", help="Input dataset (.npz). Required unless --plot-only is set.")
@@ -162,11 +168,22 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--progress", action="store_true")
 
-    args = ap.parse_args()
+    return ap
 
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return _build_arg_parser().parse_args(argv)
+
+
+def run_pipeline(
+    args: argparse.Namespace,
+    *,
+    parser: argparse.ArgumentParser | None = None,
+) -> dict[str, object]:
     results_dir = _ensure_results_dir(args.results_dir)
     default_summary_path = Path(args.summary_file) if args.summary_file else results_dir / "run_summary.npz"
     default_plot_path = results_dir / "marginals.html"
+    beta_scan_plot_path = None
 
     if args.plot_only:
         if not default_summary_path.exists():
@@ -177,15 +194,25 @@ def main():
             annotate=args.annotate_plots,
         )
         print(f"[plot] loaded summary from {default_summary_path} -> {out_path}")
-        return
+        return {
+            "summary_path": default_summary_path,
+            "metadata_path": results_dir / "run_metadata.json",
+            "plot_path": out_path,
+            "beta_scan_path": None,
+            "beta_eff": None,
+        }
 
     if not args.npz:
-        ap.error("--npz is required unless --plot-only is set.")
+        msg = "--npz is required unless --plot-only is set."
+        if parser is not None:
+            parser.error(msg)
+        raise ValueError(msg)
 
     ds = load_npz(args.npz, unassigned_policy=args.unassigned_policy)
     labels = ds.labels
     K = ds.cluster_counts
     edges = ds.edges
+    residue_labels = getattr(ds, "residue_keys", np.arange(labels.shape[1]))
 
     print(f"[data] T={labels.shape[0]}  N={labels.shape[1]}  edges={len(edges)}")
 
@@ -215,6 +242,7 @@ def main():
     beta_eff_distances_result: list[float] | None = None
     beta_eff_value: float | None = None
     swap_accept_rate: np.ndarray | None = None
+    samples_by_beta: dict[float, np.ndarray] | None = None
 
     # --- Sampling baseline: Gibbs or REX-Gibbs at beta=args.beta ---
     if args.gibbs_method == "single":
@@ -293,8 +321,43 @@ def main():
     js_g = per_residue_js(p_md, p_g)
     js_sa = per_residue_js(p_md, p_sa)
 
-    print(f"[marginals] JS(MD, Gibbs@beta={args.beta}): mean={js_g.mean():.4f}  median={np.median(js_g):.4f}  max={js_g.max():.4f}")
     print(f"[marginals] JS(MD, SA-QUBO):          mean={js_sa.mean():.4f}  median={np.median(js_sa):.4f}  max={js_sa.max():.4f}")
+
+    p_gibbs_by_beta: np.ndarray | None = None
+    js_gibbs_by_beta: np.ndarray | None = None
+    js_pair_gibbs_by_beta: np.ndarray | None = None
+
+    if args.gibbs_method == "single":
+        print(
+            f"[marginals] JS(MD, Gibbs@beta={args.beta}): "
+            f"mean={js_g.mean():.4f}  median={np.median(js_g):.4f}  max={js_g.max():.4f}"
+        )
+    elif samples_by_beta is not None:
+        p_gibbs_by_beta_list = []
+        js_gibbs_by_beta_list = []
+        js_pair_gibbs_by_beta_list: list[float] = []
+
+        for b in betas:
+            X_b = samples_by_beta[float(b)]
+            p_b = marginals(X_b, K)
+            js_b = per_residue_js(p_md, p_b)
+            p_gibbs_by_beta_list.append(_pad_marginals_for_save(p_b))
+            js_gibbs_by_beta_list.append(js_b)
+            print(
+                f"[marginals] JS(MD, Gibbs@beta={b}): "
+                f"mean={js_b.mean():.4f}  median={np.median(js_b):.4f}  max={js_b.max():.4f}"
+            )
+
+            if len(edges) > 0:
+                js_pair_gibbs_by_beta_list.append(
+                    combined_distance(labels, X_b, K=K, edges=edges, w_marg=0.0, w_pair=1.0)
+                )
+
+        if p_gibbs_by_beta_list:
+            p_gibbs_by_beta = np.stack(p_gibbs_by_beta_list, axis=0)
+            js_gibbs_by_beta = np.stack(js_gibbs_by_beta_list, axis=0)
+        if js_pair_gibbs_by_beta_list:
+            js_pair_gibbs_by_beta = np.asarray(js_pair_gibbs_by_beta_list, dtype=float)
 
     # Optional: pairwise summary
     if len(edges) > 0:
@@ -306,8 +369,12 @@ def main():
         # (reuse combined_distance with only pair term by passing w_marg=0)
         js_pair_g = combined_distance(labels, X_gibbs, K=K, edges=edges, w_marg=0.0, w_pair=1.0)
         js_pair_sa = combined_distance(labels, X_sa, K=K, edges=edges, w_marg=0.0, w_pair=1.0)
-        print(f"[pairs]   JS(MD, Gibbs) over edges: {js_pair_g:.4f}")
+        if js_pair_gibbs_by_beta is None:
+            print(f"[pairs]   JS(MD, Gibbs) over edges: {js_pair_g:.4f}")
         print(f"[pairs]   JS(MD, SA-QUBO) over edges: {js_pair_sa:.4f}")
+        if js_pair_gibbs_by_beta is not None:
+            for b, js_pair in zip(betas, js_pair_gibbs_by_beta):
+                print(f"[pairs]   JS(MD, Gibbs@beta={b}) over edges: {js_pair:.4f}")
 
     # --- Estimate beta_eff for SA (optional) ---
     if args.estimate_beta_eff:
@@ -330,6 +397,9 @@ def main():
                 swap_accept_rate=swap_accept_rate,
                 sa_valid_counts=valid_counts,
                 sa_invalid_mask=viol,
+                p_gibbs_by_beta=p_gibbs_by_beta,
+                js_gibbs_by_beta=js_gibbs_by_beta,
+                js_pair_gibbs_by_beta=js_pair_gibbs_by_beta,
                 beta_eff_grid=beta_eff_grid_result,
                 beta_eff_distances=beta_eff_distances_result,
                 beta_eff_value=beta_eff_value,
@@ -342,7 +412,13 @@ def main():
             )
             print(f"[plot] saved marginal comparison to {out_path}")
             print("[done]")
-            return
+            return {
+                "summary_path": summary_path,
+                "metadata_path": results_dir / "run_metadata.json",
+                "plot_path": out_path,
+                "beta_scan_path": None,
+                "beta_eff": beta_eff_value,
+            }
 
         beta_eff_plot_path = results_dir / "beta_scan.html"
         if args.beta_eff_grid.strip():
@@ -411,8 +487,8 @@ def main():
         from alloskin.simulation.plotting import plot_beta_scan_curve
         outp = plot_beta_scan_curve(betas=grid, distances=distances, out_path=beta_eff_plot_path)
         print(f"[beta_eff] saved D(beta) plot to {outp}")
+        beta_scan_plot_path = outp
 
-    residue_labels = getattr(ds, "residue_keys", np.arange(len(p_md)))
     summary_path = _save_run_summary(
         results_dir,
         args,
@@ -430,6 +506,9 @@ def main():
         swap_accept_rate=swap_accept_rate,
         sa_valid_counts=valid_counts,
         sa_invalid_mask=viol,
+        p_gibbs_by_beta=p_gibbs_by_beta,
+        js_gibbs_by_beta=js_gibbs_by_beta,
+        js_pair_gibbs_by_beta=js_pair_gibbs_by_beta,
         beta_eff_grid=beta_eff_grid_result,
         beta_eff_distances=beta_eff_distances_result,
         beta_eff_value=beta_eff_value,
@@ -445,6 +524,19 @@ def main():
     print(f"[plot] saved marginal comparison to {out_path}")
 
     print("[done]")
+    return {
+        "summary_path": summary_path,
+        "metadata_path": results_dir / "run_metadata.json",
+        "plot_path": out_path,
+        "beta_scan_path": beta_scan_plot_path,
+        "beta_eff": beta_eff_value,
+    }
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    run_pipeline(args, parser=parser)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@ Pydantic Schemas for API request/response models.
 """
 
 from pydantic import BaseModel
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Union
 
 class AnalysisPaths(BaseModel):
     """Input model for file paths."""
@@ -86,3 +86,18 @@ class QUBOJobRequest(AnalysisJobBase):
     filter_top_total: int = 120
     filter_top_jsd: int = 20
     filter_min_id: float = 1.5
+
+
+class SimulationJobRequest(BaseModel):
+    project_id: str
+    system_id: str
+    cluster_id: str
+    rex_betas: Optional[Union[str, List[float]]] = None
+    rex_beta_min: Optional[float] = None
+    rex_beta_max: Optional[float] = None
+    rex_spacing: Optional[str] = None
+    rex_samples: Optional[int] = None
+    rex_burnin: Optional[int] = None
+    rex_thin: Optional[int] = None
+    sa_reads: Optional[int] = None
+    sa_sweeps: Optional[int] = None

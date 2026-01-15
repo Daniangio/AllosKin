@@ -137,11 +137,13 @@ python main.py \
 * `--estimate-beta-eff`: enable calibration
 * `--beta-eff-grid`: comma-separated betas to scan (otherwise uses ladder)
 * `--beta-eff-w-marg`, `--beta-eff-w-pair`: weights for distance function
-* `--beta-eff-plot`: output HTML of D(β) curve
+* requires `--gibbs-method rex`; reuses the baseline REX samples when the scan grid is contained in the baseline ladder, otherwise runs one extra REX over the requested grid
+* output plot is always written to `beta_scan.html` inside `--results-dir` when enabled
 
 ### Plotting / misc
 
-* `--plot-path`: output HTML dashboard for marginals
+* `--results-dir` (required): directory to store run artifacts (summary npz, metadata, plots)
+* `--plot-only`: skip sampling and render plots from an existing summary (defaults to `run_summary.npz` in `--results-dir`)
 * `--annotate-plots`: more plot annotation (if supported)
 * `--seed`: RNG seed
 * `--progress`: progress bars
@@ -179,7 +181,7 @@ python main.py --npz data.npz \
   --gibbs-method single --gibbs-samples 5000 --gibbs-burnin 2000 --gibbs-thin 2 \
   --sa-reads 1000 --sa-sweeps 2000 \
   --penalty-safety 3.0 --repair none \
-  --plot-path results/marginals_beta1.html --progress
+  --results-dir results/run_beta1 --progress
 ```
 
 Interpretation:
@@ -201,7 +203,7 @@ python main.py --npz data.npz \
   --rex-rounds 4000 --rex-burnin-rounds 1000 --rex-sweeps-per-round 2 --rex-thin-rounds 1 \
   --sa-reads 1000 --sa-sweeps 2000 \
   --penalty-safety 3.0 --repair none \
-  --progress
+  --results-dir results/run_rex --progress
 ```
 
 Watch:
@@ -223,7 +225,7 @@ python main.py --npz data.npz \
   --sa-reads 2000 --sa-sweeps 2000 \
   --estimate-beta-eff \
   --beta-eff-w-marg 1.0 --beta-eff-w-pair 1.0 \
-  --beta-eff-plot results/beta_scan.html \
+  --results-dir results/run_beta_eff \
   --progress
 ```
 
@@ -231,7 +233,8 @@ What you get:
 
 * a printed table of `D(beta)` values
 * `beta_eff` = beta minimizing the distance between SA samples and Gibbs reference samples
-* optional HTML plot of the distance curve
+* REX reuse: if the scan grid is already in the baseline ladder, the scan reuses those samples; otherwise an extra REX across the grid is run
+* HTML plots: `marginals.html` and `beta_scan.html` inside `--results-dir`
 
 ---
 

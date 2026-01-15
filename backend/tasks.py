@@ -6,12 +6,16 @@ from datetime import datetime
 from rq import get_current_job
 from typing import Dict, Any
 from alloskin.pipeline.runner import run_analysis
+from alloskin.simulation.main import parse_args as parse_simulation_args
+from alloskin.simulation.main import run_pipeline as run_simulation_pipeline
 from backend.services.project_store import ProjectStore
 
 # Define the persistent results directory (aligned with ALLOSKIN_DATA_ROOT).
 DATA_ROOT = Path(os.getenv("ALLOSKIN_DATA_ROOT", "/app/data"))
 RESULTS_DIR = DATA_ROOT / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+SIMULATION_RESULTS_DIR = RESULTS_DIR / "simulation"
+SIMULATION_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 project_store = ProjectStore()
 
 # Helper to convert NaN to None for JSON serialization
@@ -33,6 +37,13 @@ def _convert_nan_to_none(obj):
     elif isinstance(obj, float) and not np.isfinite(obj):
         return None # Convert nan, inf, -inf to None (JSON null)
     return obj
+
+
+def _relativize_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(DATA_ROOT))
+    except Exception:
+        return str(path)
 
 
 # --- Master Analysis Job ---
@@ -201,4 +212,178 @@ def run_analysis_job(
     # This is the value returned to RQ and shown on the status page
     # --- FIX: Return the sanitized payload ---
     save_progress("Analysis completed", 100)
+    return sanitized_payload
+
+
+def run_simulation_job(
+    job_uuid: str,
+    dataset_ref: Dict[str, str],
+    params: Dict[str, Any],
+):
+    """
+    Run the Potts simulation pipeline using a saved cluster NPZ as input.
+    """
+    job = get_current_job()
+    start_time = datetime.utcnow()
+    rq_job_id = job.id if job else f"analysis-{job_uuid}"
+
+    result_payload = {
+        "job_id": job_uuid,
+        "rq_job_id": rq_job_id,
+        "analysis_type": "simulation",
+        "status": "started",
+        "created_at": start_time.isoformat(),
+        "params": params,
+        "results": None,
+        "system_reference": {
+            "project_id": dataset_ref.get("project_id"),
+            "system_id": dataset_ref.get("system_id"),
+            "project_name": dataset_ref.get("project_name"),
+            "system_name": dataset_ref.get("system_name"),
+            "structures": {},
+            "states": {},
+            "cluster_id": dataset_ref.get("cluster_id"),
+        },
+        "error": None,
+        "completed_at": None,
+    }
+
+    result_filepath = RESULTS_DIR / f"{job_uuid}.json"
+
+    def save_progress(status_msg: str, progress: int):
+        if job:
+            job.meta["status"] = status_msg
+            job.meta["progress"] = progress
+            job.save_meta()
+        print(f"[Simulation {job_uuid}] {status_msg}")
+
+    def write_result_to_disk(payload: Dict[str, Any]):
+        try:
+            with open(result_filepath, "w") as f:
+                json.dump(payload, f, indent=2)
+            print(f"Saved result to {result_filepath}")
+        except Exception as e:
+            print(f"CRITICAL: Failed to save result file {result_filepath}: {e}")
+            payload["status"] = "failed"
+            payload["error"] = f"Failed to save result file: {e}"
+
+    try:
+        save_progress("Initializing...", 0)
+        write_result_to_disk(result_payload)
+
+        project_id = dataset_ref.get("project_id")
+        system_id = dataset_ref.get("system_id")
+        cluster_id = dataset_ref.get("cluster_id")
+        if not project_id or not system_id or not cluster_id:
+            raise ValueError("Simulation dataset reference missing project_id/system_id/cluster_id.")
+
+        system_meta = project_store.get_system(project_id, system_id)
+        clusters = system_meta.metastable_clusters or []
+        entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+        if not entry:
+            raise FileNotFoundError(f"Cluster NPZ not found for cluster_id='{cluster_id}'.")
+        rel_path = entry.get("path")
+        if not rel_path:
+            raise FileNotFoundError("Cluster NPZ path missing in system metadata.")
+        cluster_path = Path(rel_path)
+        if not cluster_path.is_absolute():
+            cluster_path = project_store.resolve_path(project_id, system_id, rel_path)
+        if not cluster_path.exists():
+            raise FileNotFoundError(f"Cluster NPZ file is missing on disk: {cluster_path}")
+
+        results_dir = SIMULATION_RESULTS_DIR / job_uuid
+        results_dir.mkdir(parents=True, exist_ok=True)
+
+        sim_params = dict(params or {})
+        rex_betas = sim_params.get("rex_betas")
+        if isinstance(rex_betas, (list, tuple)):
+            rex_betas = ",".join(str(float(b)) for b in rex_betas)
+        if isinstance(rex_betas, str) and not rex_betas.strip():
+            rex_betas = None
+
+        args_list = [
+            "--npz",
+            str(cluster_path),
+            "--results-dir",
+            str(results_dir),
+            "--gibbs-method",
+            "rex",
+            "--estimate-beta-eff",
+        ]
+
+        if isinstance(rex_betas, str) and rex_betas.strip():
+            args_list += ["--rex-betas", rex_betas.strip()]
+        else:
+            rex_beta_min = sim_params.get("rex_beta_min")
+            rex_beta_max = sim_params.get("rex_beta_max")
+            rex_spacing = sim_params.get("rex_spacing")
+            if rex_beta_min is not None:
+                args_list += ["--rex-beta-min", str(float(rex_beta_min))]
+            if rex_beta_max is not None:
+                args_list += ["--rex-beta-max", str(float(rex_beta_max))]
+            if rex_spacing is not None:
+                args_list += ["--rex-spacing", str(rex_spacing)]
+
+        rex_samples = sim_params.get("rex_samples")
+        if rex_samples is not None:
+            args_list += ["--rex-rounds", str(int(rex_samples))]
+        rex_burnin = sim_params.get("rex_burnin")
+        if rex_burnin is not None:
+            args_list += ["--rex-burnin-rounds", str(int(rex_burnin))]
+        rex_thin = sim_params.get("rex_thin")
+        if rex_thin is not None:
+            args_list += ["--rex-thin-rounds", str(int(rex_thin))]
+
+        sa_reads = sim_params.get("sa_reads")
+        if sa_reads is not None:
+            args_list += ["--sa-reads", str(int(sa_reads))]
+        sa_sweeps = sim_params.get("sa_sweeps")
+        if sa_sweeps is not None:
+            args_list += ["--sa-sweeps", str(int(sa_sweeps))]
+
+        save_progress("Running Potts simulation", 20)
+        try:
+            sim_args = parse_simulation_args(args_list)
+        except SystemExit as exc:
+            raise ValueError("Invalid simulation arguments.") from exc
+
+        run_result = run_simulation_pipeline(sim_args)
+
+        def _coerce_path(value: object) -> Path | None:
+            if value is None:
+                return None
+            if isinstance(value, Path):
+                return value
+            return Path(str(value))
+
+        summary_path = _coerce_path(run_result.get("summary_path"))
+        plot_path = _coerce_path(run_result.get("plot_path"))
+        meta_path = _coerce_path(run_result.get("metadata_path"))
+        beta_scan_path = _coerce_path(run_result.get("beta_scan_path"))
+
+        result_payload["status"] = "finished"
+        result_payload["results"] = {
+            "results_dir": _relativize_path(results_dir),
+            "summary_npz": _relativize_path(summary_path) if summary_path else None,
+            "metadata_json": _relativize_path(meta_path) if meta_path else None,
+            "marginals_plot": _relativize_path(plot_path) if plot_path else None,
+            "beta_scan_plot": _relativize_path(beta_scan_path) if beta_scan_path else None,
+            "cluster_npz": _relativize_path(cluster_path),
+            "beta_eff": run_result.get("beta_eff"),
+        }
+
+    except Exception as e:
+        print(f"[Simulation {job_uuid}] FAILED: {e}")
+        traceback.print_exc()
+        result_payload["status"] = "failed"
+        result_payload["error"] = str(e)
+        raise e
+
+    finally:
+        save_progress("Saving final result", 95)
+        result_payload["completed_at"] = datetime.utcnow().isoformat()
+        sanitized_payload = _convert_nan_to_none(result_payload)
+        write_result_to_disk(sanitized_payload)
+
+    save_progress("Simulation completed", 100)
     return sanitized_payload

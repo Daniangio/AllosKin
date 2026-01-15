@@ -34,10 +34,15 @@ pip install -r backend/requirements.txt
   --inactive_traj /path/to/inactive.xtc \
   --inactive_topo /path/to/inactive.pdb \
   --config config/residue_selections.yml
+
 3. Running with Docker (Recommended)
 This is the simplest way to run the backend and frontend.# From the root AllosKin/ directory
 docker-compose up --build
-API will be available at http://127.0.0.1:8000/docsFrontend will be available at http://127.0.0.1:30004. Running the Web Server Manually# From the root AllosKin/ directory
+API will be available at http://127.0.0.1:8000/docs
+Frontend will be available at http://127.0.0.1:3000
+
+4. Running the Web Server Manually
+# From the root AllosKin/ directory
 uvicorn backend.main:app --reload
 
 ## Project & System Workflow
