@@ -3,7 +3,7 @@ Pydantic Schemas for API request/response models.
 """
 
 from pydantic import BaseModel
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List, Union, Tuple
 
 class AnalysisPaths(BaseModel):
     """Input model for file paths."""
@@ -99,5 +99,16 @@ class SimulationJobRequest(BaseModel):
     rex_samples: Optional[int] = None
     rex_burnin: Optional[int] = None
     rex_thin: Optional[int] = None
+    rex_max_workers: Optional[int] = None
     sa_reads: Optional[int] = None
     sa_sweeps: Optional[int] = None
+    sa_beta_hot: Optional[float] = None
+    sa_beta_cold: Optional[float] = None
+    sa_beta_schedules: Optional[List[Tuple[float, float]]] = None
+    plm_epochs: Optional[int] = None
+    plm_lr: Optional[float] = None
+    plm_lr_min: Optional[float] = None
+    plm_lr_schedule: Optional[str] = None
+    plm_l2: Optional[float] = None
+    plm_batch_size: Optional[int] = None
+    plm_progress_every: Optional[int] = None

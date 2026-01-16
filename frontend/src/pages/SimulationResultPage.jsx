@@ -3,7 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { Download, ExternalLink, BarChart3, ArrowLeftRight } from 'lucide-react';
 import Loader from '../components/common/Loader';
 import ErrorMessage from '../components/common/ErrorMessage';
-import { fetchResult, downloadResultArtifact, resultArtifactUrl } from '../api/jobs';
+import { fetchResult, downloadResultArtifact } from '../api/jobs';
 
 const artifactButtons = [
   { key: 'summary_npz', label: 'Summary NPZ' },
@@ -24,6 +24,8 @@ export default function SimulationResultPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [downloadError, setDownloadError] = useState(null);
+  const [marginalsHtml, setMarginalsHtml] = useState('');
+  const [betaHtml, setBetaHtml] = useState('');
 
   useEffect(() => {
     const load = async () => {
@@ -44,9 +46,33 @@ export default function SimulationResultPage() {
     load();
   }, [jobId]);
 
+  useEffect(() => {
+    let alive = true;
+    const loadHtml = async () => {
+      try {
+        const blob = await downloadResultArtifact(jobId, 'marginals_plot');
+        const text = await blob.text();
+        if (alive) setMarginalsHtml(text);
+      } catch (err) {
+        if (alive) setMarginalsHtml('');
+      }
+      try {
+        const blob = await downloadResultArtifact(jobId, 'beta_scan_plot');
+        const text = await blob.text();
+        if (alive) setBetaHtml(text);
+      } catch (err) {
+        if (alive) setBetaHtml('');
+      }
+    };
+    loadHtml();
+    return () => {
+      alive = false;
+    };
+  }, [jobId]);
+
   const artifacts = useMemo(() => result?.results || {}, [result]);
-  const hasMarginals = Boolean(artifacts?.marginals_plot);
-  const hasBetaScan = Boolean(artifacts?.beta_scan_plot);
+  const hasMarginals = Boolean(marginalsHtml);
+  const hasBetaScan = Boolean(betaHtml);
   const betaEff = artifacts?.beta_eff;
   const clusterId = result?.system_reference?.cluster_id || '—';
 
@@ -157,22 +183,27 @@ export default function SimulationResultPage() {
               Marginal comparison
             </h2>
             {hasMarginals && (
-              <a
-                href={resultArtifactUrl(jobId, 'marginals_plot')}
-                target="_blank"
-                rel="noreferrer"
+              <button
+                type="button"
+                onClick={() => {
+                  const blob = new Blob([marginalsHtml], { type: 'text/html' });
+                  const url = URL.createObjectURL(blob);
+                  window.open(url, '_blank', 'noopener,noreferrer');
+                  setTimeout(() => URL.revokeObjectURL(url), 10000);
+                }}
                 className="text-xs text-cyan-300 hover:text-cyan-200 flex items-center gap-1"
               >
                 <ExternalLink className="h-3 w-3" />
                 Open in new tab
-              </a>
+              </button>
             )}
           </div>
           {hasMarginals ? (
             <iframe
               title="Marginal comparison"
-              src={resultArtifactUrl(jobId, 'marginals_plot')}
+              srcDoc={marginalsHtml}
               className="w-full h-[680px] rounded-md border border-gray-700 bg-gray-900"
+              sandbox="allow-scripts allow-same-origin"
             />
           ) : (
             <p className="text-sm text-gray-400">No marginal comparison plot available.</p>
@@ -186,22 +217,27 @@ export default function SimulationResultPage() {
               beta_eff scan
             </h2>
             {hasBetaScan && (
-              <a
-                href={resultArtifactUrl(jobId, 'beta_scan_plot')}
-                target="_blank"
-                rel="noreferrer"
+              <button
+                type="button"
+                onClick={() => {
+                  const blob = new Blob([betaHtml], { type: 'text/html' });
+                  const url = URL.createObjectURL(blob);
+                  window.open(url, '_blank', 'noopener,noreferrer');
+                  setTimeout(() => URL.revokeObjectURL(url), 10000);
+                }}
                 className="text-xs text-cyan-300 hover:text-cyan-200 flex items-center gap-1"
               >
                 <ExternalLink className="h-3 w-3" />
                 Open in new tab
-              </a>
+              </button>
             )}
           </div>
           {hasBetaScan ? (
             <iframe
               title="beta_eff scan"
-              src={resultArtifactUrl(jobId, 'beta_scan_plot')}
+              srcDoc={betaHtml}
               className="w-full h-[520px] rounded-md border border-gray-700 bg-gray-900"
+              sandbox="allow-scripts allow-same-origin"
             />
           ) : (
             <p className="text-sm text-gray-400">No beta_eff scan plot available.</p>

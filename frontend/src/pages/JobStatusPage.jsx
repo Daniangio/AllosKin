@@ -45,7 +45,18 @@ export default function JobStatusPage() {
             {status.status}
           </span>
         </p>
-        <p className="text-sm text-gray-400">Progress: {status.meta?.progress ?? 0}%</p>
+        <div className="mt-3 space-y-1">
+          <div className="flex items-center justify-between text-sm text-gray-400">
+            <span>Progress</span>
+            <span>{status.meta?.progress ?? 0}%</span>
+          </div>
+          <div className="h-2 bg-gray-900 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-cyan-500 transition-all"
+              style={{ width: `${status.meta?.progress ?? 0}%` }}
+            />
+          </div>
+        </div>
         {status.meta?.status && <p className="text-sm text-gray-400 mt-1">{status.meta.status}</p>}
         {status.status === 'finished' && status.result?.job_id && (
           <button

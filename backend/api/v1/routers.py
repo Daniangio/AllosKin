@@ -1593,11 +1593,42 @@ async def submit_simulation_job(
         "rex_samples": payload.rex_samples,
         "rex_burnin": payload.rex_burnin,
         "rex_thin": payload.rex_thin,
+        "rex_max_workers": payload.rex_max_workers,
         "sa_reads": payload.sa_reads,
         "sa_sweeps": payload.sa_sweeps,
+        "plm_epochs": payload.plm_epochs,
+        "plm_batch_size": payload.plm_batch_size,
+        "plm_progress_every": payload.plm_progress_every,
     }.items():
         if value is not None and int(value) < 1:
             raise HTTPException(status_code=400, detail=f"{name} must be >= 1.")
+
+    if payload.plm_lr is not None and float(payload.plm_lr) <= 0:
+        raise HTTPException(status_code=400, detail="plm_lr must be > 0.")
+    if payload.plm_lr_min is not None and float(payload.plm_lr_min) < 0:
+        raise HTTPException(status_code=400, detail="plm_lr_min must be >= 0.")
+    if payload.plm_l2 is not None and float(payload.plm_l2) < 0:
+        raise HTTPException(status_code=400, detail="plm_l2 must be >= 0.")
+    if payload.plm_lr_schedule is not None and payload.plm_lr_schedule not in {"cosine", "none"}:
+        raise HTTPException(status_code=400, detail="plm_lr_schedule must be 'cosine' or 'none'.")
+    if payload.sa_beta_hot is not None and float(payload.sa_beta_hot) <= 0:
+        raise HTTPException(status_code=400, detail="sa_beta_hot must be > 0.")
+    if payload.sa_beta_cold is not None and float(payload.sa_beta_cold) <= 0:
+        raise HTTPException(status_code=400, detail="sa_beta_cold must be > 0.")
+    if (payload.sa_beta_hot is None) != (payload.sa_beta_cold is None):
+        raise HTTPException(status_code=400, detail="Provide both sa_beta_hot and sa_beta_cold, or neither.")
+    if payload.sa_beta_hot is not None and payload.sa_beta_cold is not None:
+        if float(payload.sa_beta_hot) > float(payload.sa_beta_cold):
+            raise HTTPException(status_code=400, detail="sa_beta_hot must be <= sa_beta_cold.")
+    if payload.sa_beta_schedules:
+        for idx, schedule in enumerate(payload.sa_beta_schedules):
+            if schedule is None or len(schedule) != 2:
+                raise HTTPException(status_code=400, detail=f"sa_beta_schedules[{idx}] must be a (hot, cold) pair.")
+            hot, cold = schedule
+            if float(hot) <= 0 or float(cold) <= 0:
+                raise HTTPException(status_code=400, detail=f"sa_beta_schedules[{idx}] values must be > 0.")
+            if float(hot) > float(cold):
+                raise HTTPException(status_code=400, detail=f"sa_beta_schedules[{idx}] must satisfy hot <= cold.")
 
     try:
         project_meta = project_store.get_project(payload.project_id)

@@ -61,6 +61,8 @@ def gibbs_sample_potts(
     seed: int = 0,
     x0: Optional[np.ndarray] = None,
     progress: bool = False,
+    progress_callback: Optional[callable] = None,
+    progress_every: int = 100,
 ) -> np.ndarray:
     """
     Single-site Gibbs sampler for Potts model.
@@ -76,6 +78,7 @@ def gibbs_sample_potts(
         x = np.array(x0, dtype=int).copy()
 
     total_steps = burn_in + n_samples * thinning
+    progress_every = max(1, int(progress_every))
     out = np.zeros((n_samples, N), dtype=int)
     oi = 0
 
@@ -89,6 +92,8 @@ def gibbs_sample_potts(
 
         if oi >= n_samples:
             break
+        if progress_callback and (step == 0 or step + 1 == total_steps or (step + 1) % progress_every == 0):
+            progress_callback(step + 1, total_steps)
 
     return out
 
@@ -132,6 +137,9 @@ def replica_exchange_gibbs_potts(
     seed: int = 0,
     x0: Optional[np.ndarray] = None,
     progress: bool = False,
+    progress_callback: Optional[callable] = None,
+    progress_every: int = 50,
+    max_workers: Optional[int] = None,
 ) -> Dict[str, object]:
     """
     Parallel tempering (replica exchange) for the Potts model.
@@ -183,6 +191,7 @@ def replica_exchange_gibbs_potts(
     energy_traces: Dict[float, List[float]] = {b: [] for b in betas}
     accept = np.zeros(n_rep - 1, dtype=int)
     trials = np.zeros(n_rep - 1, dtype=int)
+    progress_every = max(1, int(progress_every))
 
     def _update_replica(idx: int) -> Tuple[int, float]:
         # Run local Gibbs sweeps for a single replica; returns (idx, energy)
@@ -194,11 +203,18 @@ def replica_exchange_gibbs_potts(
         return idx, model.energy(x)
 
     round_iter = _progress_iterator(n_rounds, "Replica-exchange rounds", progress)
-    with ThreadPoolExecutor(max_workers=n_rep) as executor:
+    use_parallel = max_workers is None or max_workers > 1
+    executor_ctx = ThreadPoolExecutor(max_workers=max_workers or n_rep) if use_parallel else None
+    try:
         for rnd in round_iter:
-            # 1) local updates (parallel across replicas)
-            for idx, e in executor.map(_update_replica, range(n_rep)):
-                energies[idx] = e
+            # 1) local updates (parallel across replicas when enabled)
+            if executor_ctx:
+                for idx, e in executor_ctx.map(_update_replica, range(n_rep)):
+                    energies[idx] = e
+            else:
+                for idx in range(n_rep):
+                    _, e = _update_replica(idx)
+                    energies[idx] = e
 
             # 2) swap attempts (adjacent)
             # We attempt swaps in alternating pattern to reduce bias:
@@ -224,6 +240,14 @@ def replica_exchange_gibbs_potts(
                     samples_by_beta[b].append(replicas[i].copy())
                     energy_traces[b].append(float(energies[i]))
 
+            if progress_callback and (
+                rnd == 0 or rnd + 1 == n_rounds or (rnd + 1) % progress_every == 0
+            ):
+                progress_callback(rnd + 1, n_rounds)
+    finally:
+        if executor_ctx:
+            executor_ctx.shutdown(wait=True)
+
     # Convert lists to arrays
     samples_by_beta_arr: Dict[float, np.ndarray] = {}
     energy_traces_arr: Dict[float, np.ndarray] = {}
@@ -247,6 +271,7 @@ def sa_sample_qubo_neal(
     sweeps: int = 2000,
     seed: int = 0,
     progress: bool = False,
+    beta_range: Optional[Tuple[float, float]] = None,
 ) -> np.ndarray:
     """
     Use neal (if installed) to sample a QUBO/BQM.
@@ -269,12 +294,15 @@ def sa_sample_qubo_neal(
         print(f"[neal] sampling QUBO: reads={n_reads}, sweeps={sweeps}, vars={qubo.num_vars()}")
 
     sampler = neal.SimulatedAnnealingSampler()
-    ss = sampler.sample(
-        bqm,
-        num_reads=n_reads,
-        num_sweeps=sweeps,
-        seed=seed,
-    )
+    kwargs = {
+        "num_reads": n_reads,
+        "num_sweeps": sweeps,
+        "seed": seed,
+    }
+    if beta_range is not None:
+        kwargs["beta_range"] = beta_range
+
+    ss = sampler.sample(bqm, **kwargs)
 
     arr = np.zeros((n_reads, qubo.num_vars()), dtype=int)
     for idx, sample in enumerate(ss.samples()):

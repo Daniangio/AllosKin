@@ -333,6 +333,11 @@ def run_simulation_job(
         rex_thin = sim_params.get("rex_thin")
         if rex_thin is not None:
             args_list += ["--rex-thin-rounds", str(int(rex_thin))]
+        rex_max_workers = sim_params.get("rex_max_workers")
+        if rex_max_workers is None:
+            rex_max_workers = 1
+        if rex_max_workers is not None:
+            args_list += ["--rex-max-workers", str(int(rex_max_workers))]
 
         sa_reads = sim_params.get("sa_reads")
         if sa_reads is not None:
@@ -340,6 +345,52 @@ def run_simulation_job(
         sa_sweeps = sim_params.get("sa_sweeps")
         if sa_sweeps is not None:
             args_list += ["--sa-sweeps", str(int(sa_sweeps))]
+        sa_beta_schedules = []
+        raw_schedules = sim_params.get("sa_beta_schedules") or []
+        for schedule in raw_schedules:
+            if schedule is None:
+                continue
+            if isinstance(schedule, dict):
+                hot = schedule.get("beta_hot")
+                cold = schedule.get("beta_cold")
+            else:
+                try:
+                    hot, cold = schedule
+                except Exception:
+                    continue
+            if hot is None or cold is None:
+                continue
+            sa_beta_schedules.append((float(hot), float(cold)))
+
+        sa_beta_hot = sim_params.get("sa_beta_hot")
+        sa_beta_cold = sim_params.get("sa_beta_cold")
+        if sa_beta_hot is not None and sa_beta_cold is not None:
+            sa_beta_schedules.append((float(sa_beta_hot), float(sa_beta_cold)))
+
+        for hot, cold in sa_beta_schedules:
+            args_list += ["--sa-beta-schedule", f"{float(hot)},{float(cold)}"]
+
+        plm_epochs = sim_params.get("plm_epochs")
+        if plm_epochs is not None:
+            args_list += ["--plm-epochs", str(int(plm_epochs))]
+        plm_lr = sim_params.get("plm_lr")
+        if plm_lr is not None:
+            args_list += ["--plm-lr", str(float(plm_lr))]
+        plm_lr_min = sim_params.get("plm_lr_min")
+        if plm_lr_min is not None:
+            args_list += ["--plm-lr-min", str(float(plm_lr_min))]
+        plm_lr_schedule = sim_params.get("plm_lr_schedule")
+        if plm_lr_schedule is not None:
+            args_list += ["--plm-lr-schedule", str(plm_lr_schedule)]
+        plm_l2 = sim_params.get("plm_l2")
+        if plm_l2 is not None:
+            args_list += ["--plm-l2", str(float(plm_l2))]
+        plm_batch_size = sim_params.get("plm_batch_size")
+        if plm_batch_size is not None:
+            args_list += ["--plm-batch-size", str(int(plm_batch_size))]
+        plm_progress_every = sim_params.get("plm_progress_every")
+        if plm_progress_every is not None:
+            args_list += ["--plm-progress-every", str(int(plm_progress_every))]
 
         save_progress("Running Potts simulation", 20)
         try:
@@ -347,7 +398,7 @@ def run_simulation_job(
         except SystemExit as exc:
             raise ValueError("Invalid simulation arguments.") from exc
 
-        run_result = run_simulation_pipeline(sim_args)
+        run_result = run_simulation_pipeline(sim_args, progress_callback=save_progress)
 
         def _coerce_path(value: object) -> Path | None:
             if value is None:

@@ -28,6 +28,14 @@ def _coerce_labels(residue_keys: Iterable[object], n: int) -> List[str]:
     return labels
 
 
+def _ensure_matrix(marginals: Sequence[np.ndarray] | np.ndarray) -> np.ndarray:
+    if isinstance(marginals, np.ndarray):
+        if marginals.ndim != 2:
+            raise ValueError("Expected 2D array for marginals.")
+        return marginals.astype(float)
+    return _to_matrix(marginals)
+
+
 def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") -> str:
     """
     Compose an interactive HTML page with a residue selector that updates Plotly subplots.
@@ -45,6 +53,7 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
     .controls h2 { margin-top: 0; font-size: 18px; }
     .controls button { margin: 4px 4px 4px 0; padding: 6px 10px; }
     .control-row { margin: 6px 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .control-row select { max-width: 280px; }
     #residue-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 6px; max-height: 60vh; overflow-y: auto; border: 1px solid #ccc; padding: 6px; }
     #residue-grid label { display: flex; align-items: center; gap: 6px; font-size: 13px; padding: 2px 4px; }
     #status { margin-top: 8px; font-size: 12px; color: #444; }
@@ -61,13 +70,16 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
         <button id="btn-clear" type="button">Clear</button>
       </div>
       <div class="control-row">
+        <label for="sampler-select">Sampler:</label>
+        <select id="sampler-select"></select>
+      </div>
+      <div class="control-row">
         <label for="top-n">Top N:</label>
         <input id="top-n" type="number" min="1" value="30" style="width:70px;" />
         <label for="top-metric">by</label>
         <select id="top-metric">
-          <option value="js">JS divergence</option>
-          <option value="err_g">|Gibbs - MD|</option>
-          <option value="err_sa">|SA-QUBO - MD|</option>
+          <option value="js">JS divergence (max)</option>
+          <option value="err">|Sample - MD|</option>
         </select>
         <button id="btn-top" type="button">Select top</button>
       </div>
@@ -89,6 +101,7 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
     const grid = document.getElementById("residue-grid");
     const topNInput = document.getElementById("top-n");
     const topMetric = document.getElementById("top-metric");
+    const samplerSelect = document.getElementById("sampler-select");
 
     // populate selector as checkboxes in a responsive grid
     const checkboxes = [];
@@ -105,6 +118,14 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
       checkboxes.push(cb);
     });
 
+    payload.sources.forEach((src, idx) => {
+      const opt = document.createElement("option");
+      opt.value = src.id;
+      opt.textContent = src.label;
+      if (idx === 0) opt.selected = true;
+      samplerSelect.appendChild(opt);
+    });
+
     function sliceRows(mat, idxs) {
       return idxs.map(i => mat[i]);
     }
@@ -112,25 +133,36 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
       return idxs.map(i => vec[i]);
     }
 
+    function getActiveSource() {
+      const id = samplerSelect.value || (payload.sources[0] && payload.sources[0].id);
+      return payload.sources.find(src => src.id === id) || payload.sources[0];
+    }
+
     function buildTraces(idxs) {
       const yLabels = idxs.map(i => payload.labels[i]);
       const md = sliceRows(payload.md, idxs);
-      const gibbs = sliceRows(payload.gibbs, idxs);
-      const sa = sliceRows(payload.sa, idxs);
-      const errG = sliceRows(payload.err_g, idxs);
-      const errSA = sliceRows(payload.err_sa, idxs);
-      const jsG = sliceVec(payload.js_g, idxs);
-      const jsSA = sliceVec(payload.js_sa, idxs);
-
-      return [
-        {type: "heatmap", x: stateLabels, y: yLabels, z: md, xaxis: "x1", yaxis: "y1", zmin: 0, zmax: 1, colorscale: "Viridis", colorbar: {title: "p(state)", len: 0.25, y: 0.83, thickness: 12} , name: "MD"},
-        {type: "heatmap", x: stateLabels, y: yLabels, z: gibbs, xaxis: "x2", yaxis: "y2", zmin: 0, zmax: 1, colorscale: "Viridis", showscale: false, name: "Gibbs"},
-        {type: "heatmap", x: stateLabels, y: yLabels, z: sa, xaxis: "x3", yaxis: "y3", zmin: 0, zmax: 1, colorscale: "Viridis", showscale: false, name: "SA-QUBO"},
-        {type: "heatmap", x: stateLabels, y: yLabels, z: errG, xaxis: "x4", yaxis: "y4", zmin: 0, zmax: payload.vmax_err, colorscale: "Magma", colorbar: {title: "|Gibbs-MD|", len: 0.22, y: 0.48, thickness: 12} , name: "Err Gibbs"},
-        {type: "heatmap", x: stateLabels, y: yLabels, z: errSA, xaxis: "x5", yaxis: "y5", zmin: 0, zmax: payload.vmax_err, colorscale: "Magma", showscale: false, name: "Err SA-QUBO"},
-        {type: "bar", x: yLabels, y: jsG, xaxis: "x6", yaxis: "y6", name: "JS Gibbs", marker: {color: "#4472c4"}},
-        {type: "bar", x: yLabels, y: jsSA, xaxis: "x6", yaxis: "y6", name: "JS SA-QUBO", marker: {color: "#ed7d31"}},
+      const active = getActiveSource();
+      const sample = sliceRows(active.matrix, idxs);
+      const errSample = sliceRows(active.err, idxs);
+      const traces = [
+        {type: "heatmap", x: stateLabels, y: yLabels, z: md, xaxis: "x1", yaxis: "y1", zmin: 0, zmax: 1, colorscale: "Viridis", colorbar: {title: "p(state)", len: 0.35, y: 0.82, thickness: 12} , name: "MD"},
+        {type: "heatmap", x: stateLabels, y: yLabels, z: sample, xaxis: "x2", yaxis: "y2", zmin: 0, zmax: 1, colorscale: "Viridis", showscale: false, name: active.label},
+        {type: "heatmap", x: stateLabels, y: yLabels, z: errSample, xaxis: "x3", yaxis: "y3", zmin: 0, zmax: payload.vmax_err, colorscale: "Magma", colorbar: {title: "|Sample-MD|", len: 0.25, y: 0.45, thickness: 12} , name: "Error"},
       ];
+
+      payload.js_series.forEach((series, idx) => {
+        const jsVals = sliceVec(series.values, idxs);
+        traces.push({
+          type: "bar",
+          x: yLabels,
+          y: jsVals,
+          xaxis: "x4",
+          yaxis: "y4",
+          name: series.label,
+          marker: {color: series.color || undefined},
+        });
+      });
+      return traces;
     }
 
     function setStatus(idxs) {
@@ -156,6 +188,10 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
       const idxs = checkboxes.filter(cb => cb.checked).map(cb => parseInt(cb.value, 10));
       applySelection(idxs);
     });
+    samplerSelect.addEventListener("change", () => {
+      const idxs = checkboxes.filter(cb => cb.checked).map(cb => parseInt(cb.value, 10));
+      applySelection(idxs);
+    });
 
     document.getElementById("btn-all").addEventListener("click", () => setSelected(allIdx));
     document.getElementById("btn-clear").addEventListener("click", () => setSelected([]));
@@ -163,10 +199,9 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
       const n = Math.max(1, parseInt(topNInput.value || "30", 10));
       const metric = topMetric.value;
       let scores;
-      if (metric === "err_g") {
-        scores = payload.err_g_max;
-      } else if (metric === "err_sa") {
-        scores = payload.err_sa_max;
+      if (metric === "err") {
+        const active = getActiveSource();
+        scores = active.err_max;
       } else {
         scores = payload.js_max;
       }
@@ -192,6 +227,12 @@ def plot_marginal_summary(
     p_sa: Sequence[np.ndarray],
     js_gibbs: np.ndarray,
     js_sa: np.ndarray,
+    betas: Sequence[float] | None = None,
+    p_gibbs_by_beta: np.ndarray | None = None,
+    js_gibbs_by_beta: np.ndarray | None = None,
+    sa_schedule_labels: Sequence[str] | None = None,
+    p_sa_by_schedule: np.ndarray | None = None,
+    js_sa_by_schedule: np.ndarray | None = None,
     residue_labels: Iterable[object],
     out_path: str | Path,
     annotate: bool = True,  # kept for backward compatibility; unused
@@ -200,52 +241,129 @@ def plot_marginal_summary(
     Save an interactive Plotly HTML comparing marginals from MD vs sampled models.
     Includes a multi-select to filter which residues are shown.
     """
-    md_mat = _to_matrix(p_md)
-    g_mat = _to_matrix(p_gibbs)
-    sa_mat = _to_matrix(p_sa)
-    err_g = np.abs(g_mat - md_mat)
-    err_sa = np.abs(sa_mat - md_mat)
-
+    md_mat = _ensure_matrix(p_md)
     res_labels = _coerce_labels(residue_labels, md_mat.shape[0])
-    vmax_err = float(np.nanmax([err_g, err_sa]))
+
+    sources = []
+    js_series = []
+
+    def _add_source(src_id: str, label: str, matrix: np.ndarray, js_vec: np.ndarray, color: str | None = None) -> None:
+        err = np.abs(matrix - md_mat)
+        sources.append({
+            "id": src_id,
+            "label": label,
+            "matrix": matrix.tolist(),
+            "err": err.tolist(),
+            "err_max": np.nanmax(err, axis=1).tolist(),
+            "js": np.asarray(js_vec, dtype=float).tolist(),
+        })
+        if color:
+            js_series.append({"label": label, "values": np.asarray(js_vec, dtype=float).tolist(), "color": color})
+        else:
+            js_series.append({"label": label, "values": np.asarray(js_vec, dtype=float).tolist()})
+
+    has_sa_grid = (
+        p_sa_by_schedule is not None
+        and js_sa_by_schedule is not None
+        and sa_schedule_labels is not None
+        and len(sa_schedule_labels)
+        and np.size(p_sa_by_schedule) > 0
+        and np.size(js_sa_by_schedule) > 0
+    )
+    if has_sa_grid:
+        sa_palette = [
+            "#f97316",
+            "#fb923c",
+            "#f59e0b",
+            "#facc15",
+            "#fbbf24",
+        ]
+        for i, label in enumerate(sa_schedule_labels):
+            if i >= len(p_sa_by_schedule) or i >= len(js_sa_by_schedule):
+                break
+            color = sa_palette[i % len(sa_palette)]
+            _add_source(
+                f"sa_{i}",
+                str(label),
+                np.asarray(p_sa_by_schedule[i], dtype=float),
+                js_sa_by_schedule[i],
+                color=color,
+            )
+    else:
+        sa_mat = _ensure_matrix(p_sa)
+        _add_source("sa", "SA-QUBO", sa_mat, js_sa, color="#ed7d31")
+
+    has_beta_grid = (
+        p_gibbs_by_beta is not None
+        and js_gibbs_by_beta is not None
+        and betas is not None
+        and len(betas)
+        and np.size(p_gibbs_by_beta) > 0
+        and np.size(js_gibbs_by_beta) > 0
+    )
+    if has_beta_grid:
+        beta_palette = [
+            "#2563eb",
+            "#16a34a",
+            "#f59e0b",
+            "#db2777",
+            "#06b6d4",
+            "#7c3aed",
+            "#f97316",
+            "#0ea5e9",
+            "#84cc16",
+            "#e11d48",
+        ]
+        for i, b in enumerate(betas):
+            if i >= len(p_gibbs_by_beta) or i >= len(js_gibbs_by_beta):
+                break
+            label = f"Gibbs β={float(b):g}"
+            color = beta_palette[i % len(beta_palette)]
+            _add_source(
+                f"gibbs_{i}",
+                label,
+                np.asarray(p_gibbs_by_beta[i], dtype=float),
+                js_gibbs_by_beta[i],
+                color=color,
+            )
+    else:
+        g_mat = _ensure_matrix(p_gibbs)
+        label = "Gibbs"
+        if betas:
+            label = f"Gibbs β={float(betas[0]):g}"
+        _add_source("gibbs", label, g_mat, js_gibbs, color="#4472c4")
+
+    js_max = np.zeros(md_mat.shape[0], dtype=float)
+    for src in sources:
+        js_max = np.maximum(js_max, np.asarray(src["js"], dtype=float))
 
     payload = {
         "labels": res_labels,
         "stateCount": int(md_mat.shape[1]),
         "md": md_mat.tolist(),
-        "gibbs": g_mat.tolist(),
-        "sa": sa_mat.tolist(),
-        "err_g": err_g.tolist(),
-        "err_sa": err_sa.tolist(),
-        "err_g_max": np.nanmax(err_g, axis=1).tolist(),
-        "err_sa_max": np.nanmax(err_sa, axis=1).tolist(),
-        "js_g": np.asarray(js_gibbs, dtype=float).tolist(),
-        "js_sa": np.asarray(js_sa, dtype=float).tolist(),
-        "js_max": np.maximum(js_gibbs, js_sa).tolist(),
-        "vmax_err": vmax_err,
+        "sources": sources,
+        "js_series": js_series,
+        "js_max": js_max.tolist(),
+        "vmax_err": float(np.nanmax([np.nanmax(np.asarray(src["err"], dtype=float)) for src in sources])),
     }
 
-    # Custom layout with 3 rows: top row (MD/Gibbs/SA), middle row (errors), bottom row (JS bars)
+    # Custom layout with 3 rows: top row (MD + selected sampler), middle row (error), bottom row (JS bars)
     layout = {
         "title": {"text": "Marginal comparison: MD vs sampled models", "x": 0.5},
-        "height": 980,
+        "height": 920,
         "margin": {"l": 70, "r": 20, "t": 60, "b": 60},
         "barmode": "group",
         # Row 1 domains
-        "xaxis": {"domain": [0.0, 0.32], "anchor": "y", "title": "state"},
+        "xaxis": {"domain": [0.0, 0.48], "anchor": "y", "title": "state"},
         "yaxis": {"domain": [0.67, 1.0], "title": "residue", "automargin": True},
-        "xaxis2": {"domain": [0.34, 0.66], "anchor": "y2", "title": "state"},
+        "xaxis2": {"domain": [0.52, 1.0], "anchor": "y2", "title": "state"},
         "yaxis2": {"domain": [0.67, 1.0], "showticklabels": False},
-        "xaxis3": {"domain": [0.68, 1.0], "anchor": "y3", "title": "state"},
-        "yaxis3": {"domain": [0.67, 1.0], "showticklabels": False},
         # Row 2 domains
-        "xaxis4": {"domain": [0.0, 0.32], "anchor": "y4", "title": "state"},
-        "yaxis4": {"domain": [0.34, 0.64], "title": "residue", "automargin": True},
-        "xaxis5": {"domain": [0.34, 0.66], "anchor": "y5", "title": "state"},
-        "yaxis5": {"domain": [0.34, 0.64], "showticklabels": False},
+        "xaxis3": {"domain": [0.0, 1.0], "anchor": "y3", "title": "state"},
+        "yaxis3": {"domain": [0.34, 0.64], "title": "residue", "automargin": True},
         # Row 3 (JS bars across full width)
-        "xaxis6": {"domain": [0.0, 1.0], "anchor": "y6", "title": "residue"},
-        "yaxis6": {"domain": [0.0, 0.28], "title": "JS divergence", "automargin": True},
+        "xaxis4": {"domain": [0.0, 1.0], "anchor": "y4", "title": "residue"},
+        "yaxis4": {"domain": [0.0, 0.28], "title": "JS divergence", "automargin": True},
         "legend": {"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.08},
     }
 
@@ -279,6 +397,19 @@ def plot_marginal_summary_from_npz(
         js_gibbs = data["js_gibbs"]
         js_sa = data["js_sa"]
         residue_labels = data["residue_labels"]
+        betas = data["betas"] if "betas" in data else []
+        p_gibbs_by_beta = data["p_gibbs_by_beta"] if "p_gibbs_by_beta" in data else None
+        js_gibbs_by_beta = data["js_gibbs_by_beta"] if "js_gibbs_by_beta" in data else None
+        sa_schedule_labels = data["sa_schedule_labels"] if "sa_schedule_labels" in data else None
+        p_sa_by_schedule = data["p_sa_by_schedule"] if "p_sa_by_schedule" in data else None
+        js_sa_by_schedule = data["js_sa_by_schedule"] if "js_sa_by_schedule" in data else None
+
+        if isinstance(sa_schedule_labels, np.ndarray) and sa_schedule_labels.size == 0:
+            sa_schedule_labels = None
+        if isinstance(p_sa_by_schedule, np.ndarray) and p_sa_by_schedule.size == 0:
+            p_sa_by_schedule = None
+        if isinstance(js_sa_by_schedule, np.ndarray) and js_sa_by_schedule.size == 0:
+            js_sa_by_schedule = None
 
     return plot_marginal_summary(
         p_md=p_md,
@@ -286,6 +417,12 @@ def plot_marginal_summary_from_npz(
         p_sa=p_sa,
         js_gibbs=js_gibbs,
         js_sa=js_sa,
+        betas=betas,
+        p_gibbs_by_beta=p_gibbs_by_beta,
+        js_gibbs_by_beta=js_gibbs_by_beta,
+        sa_schedule_labels=sa_schedule_labels,
+        p_sa_by_schedule=p_sa_by_schedule,
+        js_sa_by_schedule=js_sa_by_schedule,
         residue_labels=residue_labels,
         out_path=out_path,
         annotate=annotate,
@@ -295,21 +432,31 @@ def plot_marginal_summary_from_npz(
 def plot_beta_scan_curve(
     *,
     betas: Sequence[float],
-    distances: Sequence[float],
+    distances: Sequence[float] | Sequence[Sequence[float]],
     out_path: str | Path,
     title: str = "Effective temperature calibration: distance vs beta",
+    labels: Sequence[str] | None = None,
 ) -> Path:
     """
     Save a small interactive HTML plot of D(beta), used to pick beta_eff.
+    Supports multiple curves (one per SA schedule).
 
     This keeps dependencies minimal by reusing the same Plotly-in-HTML pattern
     used by plot_marginal_summary.
     """
     betas = [float(b) for b in betas]
-    distances = [float(d) for d in distances]
+    if len(distances) and isinstance(distances[0], (list, tuple, np.ndarray)):
+        series = [list(map(float, seq)) for seq in distances]  # type: ignore[arg-type]
+    else:
+        series = [list(map(float, distances))]  # type: ignore[list-item]
+
+    if labels is None or len(labels) != len(series):
+        labels = [f"SA {i + 1}" for i in range(len(series))]
+
     payload = {
         "betas": betas,
-        "distances": distances,
+        "series": series,
+        "labels": list(labels),
         "title": title,
     }
 
@@ -331,21 +478,19 @@ def plot_beta_scan_curve(
 <body>
   <div class="wrap">
     <h2>{title}</h2>
-    <div class="note">We pick \\(\\beta_\\mathrm{{eff}}\\) as the minimizer of the distance curve.</div>
+    <div class="note">We pick \\(\\beta_\\mathrm{{eff}}\\) per schedule as the minimizer of each distance curve.</div>
     <div id="plot"></div>
   </div>
 
   <script>
     const payload = {json.dumps(payload)};
     const x = payload.betas;
-    const y = payload.distances;
-
-    const trace = {{
+    const traces = payload.series.map((y, idx) => ({{
       x: x,
       y: y,
       mode: "lines+markers",
-      name: "D(beta)"
-    }};
+      name: payload.labels[idx] || ("SA " + (idx + 1))
+    }}));
 
     const layout = {{
       xaxis: {{ title: "beta", type: "linear" }},
@@ -353,7 +498,7 @@ def plot_beta_scan_curve(
       margin: {{ l: 60, r: 20, t: 30, b: 50 }},
     }};
 
-    Plotly.newPlot("plot", [trace], layout, {{responsive: true}});
+    Plotly.newPlot("plot", traces, layout, {{responsive: true}});
   </script>
 </body>
 </html>

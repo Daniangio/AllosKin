@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { ArrowLeftRight, ExternalLink } from 'lucide-react';
 import Loader from '../components/common/Loader';
 import ErrorMessage from '../components/common/ErrorMessage';
-import { fetchResult, fetchResults, resultArtifactUrl } from '../api/jobs';
+import { fetchResult, fetchResults, downloadResultArtifact } from '../api/jobs';
 
 function formatTime(ts) {
   if (!ts) return '—';
@@ -15,6 +15,34 @@ function formatTime(ts) {
 }
 
 function SimulationPanel({ label, job, jobId }) {
+  const [marginalsHtml, setMarginalsHtml] = useState('');
+  const [betaHtml, setBetaHtml] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    const loadHtml = async () => {
+      if (!jobId) return;
+      try {
+        const blob = await downloadResultArtifact(jobId, 'marginals_plot');
+        const text = await blob.text();
+        if (alive) setMarginalsHtml(text);
+      } catch (err) {
+        if (alive) setMarginalsHtml('');
+      }
+      try {
+        const blob = await downloadResultArtifact(jobId, 'beta_scan_plot');
+        const text = await blob.text();
+        if (alive) setBetaHtml(text);
+      } catch (err) {
+        if (alive) setBetaHtml('');
+      }
+    };
+    loadHtml();
+    return () => {
+      alive = false;
+    };
+  }, [jobId]);
+
   if (!jobId) {
     return (
       <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 text-sm text-gray-400">
@@ -30,8 +58,8 @@ function SimulationPanel({ label, job, jobId }) {
     );
   }
   const artifacts = job.results || {};
-  const hasMarginals = Boolean(artifacts.marginals_plot);
-  const hasBetaScan = Boolean(artifacts.beta_scan_plot);
+  const hasMarginals = Boolean(marginalsHtml);
+  const hasBetaScan = Boolean(betaHtml);
 
   return (
     <div className="space-y-4">
@@ -64,22 +92,27 @@ function SimulationPanel({ label, job, jobId }) {
         <div className="flex items-center justify-between gap-2 mb-2">
           <h3 className="text-sm font-semibold text-white">Marginal comparison</h3>
           {hasMarginals && (
-            <a
-              href={resultArtifactUrl(jobId, 'marginals_plot')}
-              target="_blank"
-              rel="noreferrer"
+            <button
+              type="button"
+              onClick={() => {
+                const blob = new Blob([marginalsHtml], { type: 'text/html' });
+                const url = URL.createObjectURL(blob);
+                window.open(url, '_blank', 'noopener,noreferrer');
+                setTimeout(() => URL.revokeObjectURL(url), 10000);
+              }}
               className="text-xs text-cyan-300 hover:text-cyan-200 flex items-center gap-1"
             >
               <ExternalLink className="h-3 w-3" />
               Open
-            </a>
+            </button>
           )}
         </div>
         {hasMarginals ? (
           <iframe
             title={`Marginal comparison ${label}`}
-            src={resultArtifactUrl(jobId, 'marginals_plot')}
+            srcDoc={marginalsHtml}
             className="w-full h-[520px] rounded-md border border-gray-700 bg-gray-900"
+            sandbox="allow-scripts allow-same-origin"
           />
         ) : (
           <p className="text-sm text-gray-400">No marginal comparison plot available.</p>
@@ -90,22 +123,27 @@ function SimulationPanel({ label, job, jobId }) {
         <div className="flex items-center justify-between gap-2 mb-2">
           <h3 className="text-sm font-semibold text-white">beta_eff scan</h3>
           {hasBetaScan && (
-            <a
-              href={resultArtifactUrl(jobId, 'beta_scan_plot')}
-              target="_blank"
-              rel="noreferrer"
+            <button
+              type="button"
+              onClick={() => {
+                const blob = new Blob([betaHtml], { type: 'text/html' });
+                const url = URL.createObjectURL(blob);
+                window.open(url, '_blank', 'noopener,noreferrer');
+                setTimeout(() => URL.revokeObjectURL(url), 10000);
+              }}
               className="text-xs text-cyan-300 hover:text-cyan-200 flex items-center gap-1"
             >
               <ExternalLink className="h-3 w-3" />
               Open
-            </a>
+            </button>
           )}
         </div>
         {hasBetaScan ? (
           <iframe
             title={`beta_eff scan ${label}`}
-            src={resultArtifactUrl(jobId, 'beta_scan_plot')}
+            srcDoc={betaHtml}
             className="w-full h-[380px] rounded-md border border-gray-700 bg-gray-900"
+            sandbox="allow-scripts allow-same-origin"
           />
         ) : (
           <p className="text-sm text-gray-400">No beta_eff scan plot available.</p>

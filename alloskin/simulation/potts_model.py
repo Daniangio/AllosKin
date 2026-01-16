@@ -122,11 +122,16 @@ def fit_potts_pseudolikelihood_torch(
     *,
     l2: float = 1e-3,
     lr: float = 1e-3,
+    lr_min: float = 1e-3,
+    lr_schedule: str = "cosine",
     epochs: int = 200,
     batch_size: int = 512,
     seed: int = 0,
     verbose: bool = True,
     init_from_pmi: bool = True,
+    progress_callback: "callable | None" = None,
+    progress_every: int = 10,
+    device: str | None = None,
 ) -> PottsModel:
     """
     True symmetric Potts fit by minimizing negative pseudolikelihood:
@@ -148,6 +153,11 @@ def fit_potts_pseudolikelihood_torch(
     T, N = labels.shape
     K = list(map(int, K))
     edges = sorted((min(r, s), max(r, s)) for r, s in edges if r != s)
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_device = torch.device(device)
+    if verbose:
+        print(f"[plm] using device={torch_device}")
 
     # adjacency lists by residue
     neigh = [[] for _ in range(N)]
@@ -165,18 +175,25 @@ def fit_potts_pseudolikelihood_torch(
     h_params = torch.nn.ParameterList([
         torch.nn.Parameter(torch.tensor(
             -pmi_model.h[r] if pmi_model is not None else np.zeros(K[r]),
-            dtype=torch.float32
+            dtype=torch.float32,
+            device=torch_device,
         )) for r in range(N)
     ])
     J_params = torch.nn.ParameterDict()
     for r, s in edges:
         key = f"{r}_{s}"
         init_val = np.zeros((K[r], K[s])) if pmi_model is None else -pmi_model.coupling(r, s)
-        J_params[key] = torch.nn.Parameter(torch.tensor(init_val, dtype=torch.float32))
+        J_params[key] = torch.nn.Parameter(torch.tensor(init_val, dtype=torch.float32, device=torch_device))
 
-    X = torch.tensor(labels, dtype=torch.long)  # (T,N)
+    X = torch.tensor(labels, dtype=torch.long, device=torch_device)  # (T,N)
 
     opt = torch.optim.Adam(list(h_params) + list(J_params.values()), lr=lr, weight_decay=l2)
+    schedule = lr_schedule.lower() if lr_schedule else "none"
+    scheduler = None
+    if schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr_min)
+    elif schedule != "none":
+        raise ValueError(f"Unknown lr_schedule={lr_schedule!r}")
 
     def _logits_for_residue(x_batch: "torch.Tensor", r: int) -> "torch.Tensor":
         # returns logits shape (B, K_r)
@@ -201,6 +218,7 @@ def fit_potts_pseudolikelihood_torch(
     loss_fn = torch.nn.CrossEntropyLoss()
 
     idx = np.arange(T)
+    progress_every = max(1, int(progress_every))
     for ep in range(1, epochs + 1):
         rng.shuffle(idx)
         total = 0.0
@@ -224,8 +242,13 @@ def fit_potts_pseudolikelihood_torch(
             total += float(loss.item()) * len(bidx)
             nobs += len(bidx)
 
+        avg_loss = total / max(1, nobs)
         if verbose and (ep == 1 or ep % max(1, epochs // 10) == 0):
-            print(f"[plm] epoch {ep:4d}/{epochs}  avg_loss={total / max(1,nobs):.6f}")
+            print(f"[plm] epoch {ep:4d}/{epochs}  avg_loss={avg_loss:.6f}")
+        if progress_callback and (ep == 1 or ep == epochs or ep % progress_every == 0):
+            progress_callback(ep, epochs, float(avg_loss))
+        if scheduler is not None:
+            scheduler.step()
 
     # Export to numpy PottsModel (store couplings consistently as (r<s))
     h = [-hp.detach().cpu().numpy().astype(float) for hp in h_params]
