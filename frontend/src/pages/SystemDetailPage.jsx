@@ -24,7 +24,14 @@ import {
   deletePottsModel,
   deleteSavedCluster,
 } from '../api/projects';
-import { fetchResults, submitPottsFitJob, submitStaticJob, submitSimulationJob, fetchJobStatus } from '../api/jobs';
+import {
+  fetchResults,
+  submitPottsFitJob,
+  submitStaticJob,
+  submitSimulationJob,
+  fetchJobStatus,
+  resultArtifactUrl,
+} from '../api/jobs';
 import StaticAnalysisForm from '../components/analysis/StaticAnalysisForm';
 import SimulationAnalysisForm from '../components/analysis/SimulationAnalysisForm';
 import { Download, Eye, Info, Plus, X, Pencil, SlidersHorizontal } from 'lucide-react';
@@ -185,6 +192,7 @@ const DOC_FILES = {
   pcca: '/docs/pcca.md',
   potts_overview: '/docs/potts_overview.md',
   potts_model: '/docs/potts_model.md',
+  potts_pmi_plm: '/docs/potts_pmi_plm.md',
   potts_gibbs: '/docs/potts_gibbs.md',
   potts_sa_qubo: '/docs/potts_sa_qubo.md',
   potts_beta_eff: '/docs/potts_beta_eff.md',
@@ -193,6 +201,12 @@ const DOC_FILES = {
 function getClusterDisplayName(run) {
   if (!run) return 'Cluster';
   return run.name || run.path?.split('/').pop() || run.cluster_id || 'Cluster';
+}
+
+function getArtifactDisplayName(pathValue) {
+  if (typeof pathValue !== 'string' || !pathValue) return '—';
+  const parts = pathValue.split('/');
+  return parts[parts.length - 1] || pathValue;
 }
 
 function formatClusterAlgorithm(run) {
@@ -400,6 +414,16 @@ export default function SystemDetailPage() {
   const metastableLocked = system?.metastable_locked;
   const analysisMode = system?.analysis_mode || null;
   const clusterRuns = useMemo(() => system?.metastable_clusters || [], [system]);
+  const clusterNameById = useMemo(() => {
+    const mapping = new Map();
+    clusterRuns.forEach((run) => {
+      const name = run.name || run.path?.split('/').pop() || run.cluster_id;
+      if (run.cluster_id) {
+        mapping.set(run.cluster_id, name);
+      }
+    });
+    return mapping;
+  }, [clusterRuns]);
   const readyClusterRuns = useMemo(
     () => clusterRuns.filter((run) => run.path && run.status !== 'failed'),
     [clusterRuns]
@@ -408,6 +432,10 @@ export default function SystemDetailPage() {
     () => readyClusterRuns.filter((run) => run.potts_model_path),
     [readyClusterRuns]
   );
+  const selectedClusterName = useMemo(() => {
+    if (!pottsFitClusterId) return null;
+    return clusterNameById.get(pottsFitClusterId) || pottsFitClusterId;
+  }, [pottsFitClusterId, clusterNameById]);
   const systemResults = useMemo(
     () => resultsList.filter((result) => result.system_id === systemId && result.project_id === projectId),
     [resultsList, projectId, systemId]
@@ -423,6 +451,18 @@ export default function SystemDetailPage() {
   const pottsFitResults = useMemo(
     () => systemResults.filter((result) => result.analysis_type === 'potts_fit'),
     [systemResults]
+  );
+  const pottsFitResultsWithClusters = useMemo(
+    () =>
+      pottsFitResults.map((result) => {
+        if (result.cluster_name) {
+          return { ...result, cluster_label: result.cluster_name };
+        }
+        const clusterId = result.cluster_id;
+        const label = clusterId ? clusterNameById.get(clusterId) : null;
+        return label ? { ...result, cluster_label: label } : result;
+      }),
+    [pottsFitResults, clusterNameById]
   );
   const descriptorsReady = useMemo(
     () => states.length > 0 && states.every((state) => state.descriptor_file),
@@ -1741,7 +1781,12 @@ export default function SystemDetailPage() {
                     {pottsFitSubmitting ? 'Submitting…' : 'Run Potts fit'}
                   </button>
                   <div className="border border-gray-700 rounded-md p-3 space-y-2">
-                    <p className="text-xs text-gray-400">Upload a fitted model from an external machine.</p>
+                    <p className="text-xs text-gray-400">
+                      Upload a fitted model for the selected cluster.
+                    </p>
+                    {selectedClusterName && (
+                      <p className="text-[11px] text-gray-500">Selected cluster: {selectedClusterName}</p>
+                    )}
                     <input
                       type="file"
                       accept=".npz"
@@ -1825,7 +1870,7 @@ export default function SystemDetailPage() {
                     <div className="border-t border-gray-800 pt-3 space-y-2">
                       <h4 className="text-xs font-semibold text-gray-300">Recent fit jobs</h4>
                       <AnalysisResultsList
-                        results={pottsFitResults}
+                        results={pottsFitResultsWithClusters}
                         emptyLabel="No fit results yet."
                         onOpen={(result) => navigate(`/results/${result.job_id}`)}
                       />
@@ -1989,6 +2034,19 @@ function AnalysisResultsList({ results, emptyLabel, onOpen, onOpenSimulation }) 
                 Job {result.job_id?.slice(0, 8)} · {result.status}
                 {result.created_at ? ` · ${new Date(result.created_at).toLocaleString()}` : ''}
               </p>
+              {result.cluster_label && (
+                <p className="text-xs text-gray-500">Cluster: {result.cluster_label}</p>
+              )}
+              {result.analysis_type === 'simulation' && (
+                <>
+                  <p className="text-xs text-gray-500">
+                    Cluster NPZ: {getArtifactDisplayName(result.cluster_npz)}
+                  </p>
+                  <p className="text-xs text-gray-500">
+                    Potts model: {getArtifactDisplayName(result.potts_model)}
+                  </p>
+                </>
+              )}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -2000,6 +2058,16 @@ function AnalysisResultsList({ results, emptyLabel, onOpen, onOpenSimulation }) 
               >
                 View
               </button>
+            )}
+            {result.analysis_type === 'simulation' && result.status === 'finished' && (
+              <a
+                href={resultArtifactUrl(result.job_id, 'summary_npz')}
+                download={`${result.job_id}-samples.npz`}
+                className="text-xs text-cyan-300 hover:text-cyan-200 flex items-center gap-1"
+              >
+                <Download className="h-3 w-3" />
+                Samples
+              </a>
             )}
             <button
               type="button"

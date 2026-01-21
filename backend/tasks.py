@@ -3,6 +3,7 @@ import os
 import time
 import traceback
 import shutil
+import re
 from pathlib import Path
 from datetime import datetime
 from rq import Queue, Worker, get_current_job
@@ -16,6 +17,8 @@ from backend.services.metastable_clusters import (
     prepare_cluster_workspace,
     reduce_cluster_workspace,
     run_cluster_chunk,
+    assign_cluster_labels_to_states,
+    update_cluster_metadata_with_assignments,
 )
 from backend.services.project_store import ProjectStore
 
@@ -55,6 +58,12 @@ def _relativize_path(path: Path) -> str:
         return str(path)
 
 
+def _sanitize_model_filename(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    safe = safe.strip("._-")
+    return safe or "potts_model"
+
+
 def _update_cluster_entry(
     project_id: str,
     system_id: str,
@@ -83,21 +92,57 @@ def _persist_potts_model(
     *,
     source: str,
 ) -> str:
+    entry = None
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+        clusters = system_meta.metastable_clusters or []
+        entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+    except Exception:
+        entry = None
+
     dirs = project_store.ensure_directories(project_id, system_id)
     system_dir = dirs["system_dir"]
     model_dir = dirs["potts_models_dir"]
     model_dir.mkdir(parents=True, exist_ok=True)
-    dest_path = model_dir / f"{cluster_id}_potts_model.npz"
+    existing_name = entry.get("potts_model_name") if isinstance(entry, dict) else None
+    existing_path = entry.get("potts_model_path") if isinstance(entry, dict) else None
+    cluster_name = entry.get("name") if isinstance(entry, dict) else None
+    display_name = (
+        existing_name
+        or (f"{cluster_name} Potts Model" if isinstance(cluster_name, str) and cluster_name.strip() else None)
+        or f"{cluster_id} Potts Model"
+    )
+
+    dest_path = None
+    if isinstance(existing_path, str) and existing_path:
+        try:
+            dest_path = project_store.resolve_path(project_id, system_id, existing_path)
+        except Exception:
+            dest_path = None
+    if dest_path is None:
+        base_name = _sanitize_model_filename(display_name)
+        filename = f"{base_name}.npz"
+        dest_path = model_dir / filename
+        if dest_path.exists():
+            suffix = cluster_id[:8]
+            dest_path = model_dir / f"{base_name}-{suffix}.npz"
+            counter = 2
+            while dest_path.exists():
+                dest_path = model_dir / f"{base_name}-{suffix}-{counter}.npz"
+                counter += 1
     if model_path.resolve() != dest_path.resolve():
         shutil.copy2(model_path, dest_path)
-    rel_path = str(dest_path.relative_to(system_dir))
+    try:
+        rel_path = str(dest_path.relative_to(system_dir))
+    except Exception:
+        rel_path = str(dest_path)
     _update_cluster_entry(
         project_id,
         system_id,
         cluster_id,
         {
             "potts_model_path": rel_path,
-            "potts_model_name": dest_path.stem,
+            "potts_model_name": display_name,
             "potts_model_updated_at": datetime.utcnow().isoformat(),
             "potts_model_source": source,
             "potts_model_params": params,
@@ -364,11 +409,57 @@ def run_simulation_job(
         model_rel = None
         if sim_params.get("use_potts_model", True):
             model_rel = sim_params.get("potts_model_path") or entry.get("potts_model_path")
-        rex_betas = sim_params.get("rex_betas")
-        if isinstance(rex_betas, (list, tuple)):
-            rex_betas = ",".join(str(float(b)) for b in rex_betas)
-        if isinstance(rex_betas, str) and not rex_betas.strip():
+        rex_betas_raw = sim_params.get("rex_betas")
+        rex_betas_list = []
+        if isinstance(rex_betas_raw, (list, tuple)):
+            for b in rex_betas_raw:
+                if b is None:
+                    continue
+                try:
+                    rex_betas_list.append(float(b))
+                except (TypeError, ValueError):
+                    continue
+        elif isinstance(rex_betas_raw, str):
+            for part in rex_betas_raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    rex_betas_list.append(float(part))
+                except (TypeError, ValueError):
+                    continue
+
+        rex_betas = ",".join(str(float(b)) for b in rex_betas_list) if rex_betas_list else None
+
+        gibbs_method = "rex"
+        beta_override = None
+        if len(rex_betas_list) == 1:
+            gibbs_method = "single"
+            beta_override = rex_betas_list[0]
             rex_betas = None
+        elif not rex_betas_list:
+            rex_beta_min = sim_params.get("rex_beta_min")
+            rex_beta_max = sim_params.get("rex_beta_max")
+            rex_n_replicas = sim_params.get("rex_n_replicas")
+            try:
+                if rex_beta_min is not None and rex_beta_max is not None:
+                    min_b = float(rex_beta_min)
+                    max_b = float(rex_beta_max)
+                    if abs(min_b - max_b) < 1e-12:
+                        gibbs_method = "single"
+                        beta_override = min_b
+            except (TypeError, ValueError):
+                pass
+            try:
+                if rex_n_replicas is not None and int(rex_n_replicas) <= 1:
+                    gibbs_method = "single"
+                    if beta_override is None:
+                        if rex_beta_max is not None:
+                            beta_override = float(rex_beta_max)
+                        elif rex_beta_min is not None:
+                            beta_override = float(rex_beta_min)
+            except (TypeError, ValueError):
+                pass
 
         args_list = [
             "--npz",
@@ -376,9 +467,11 @@ def run_simulation_job(
             "--results-dir",
             str(results_dir),
             "--gibbs-method",
-            "rex",
+            gibbs_method,
             "--estimate-beta-eff",
         ]
+        if beta_override is not None:
+            args_list += ["--beta", str(float(beta_override))]
 
         model_path = None
         if model_rel:
@@ -390,18 +483,19 @@ def run_simulation_job(
             else:
                 model_path = None
 
-        if isinstance(rex_betas, str) and rex_betas.strip():
-            args_list += ["--rex-betas", rex_betas.strip()]
-        else:
-            rex_beta_min = sim_params.get("rex_beta_min")
-            rex_beta_max = sim_params.get("rex_beta_max")
-            rex_spacing = sim_params.get("rex_spacing")
-            if rex_beta_min is not None:
-                args_list += ["--rex-beta-min", str(float(rex_beta_min))]
-            if rex_beta_max is not None:
-                args_list += ["--rex-beta-max", str(float(rex_beta_max))]
-            if rex_spacing is not None:
-                args_list += ["--rex-spacing", str(rex_spacing)]
+        if gibbs_method == "rex":
+            if isinstance(rex_betas, str) and rex_betas.strip():
+                args_list += ["--rex-betas", rex_betas.strip()]
+            else:
+                rex_beta_min = sim_params.get("rex_beta_min")
+                rex_beta_max = sim_params.get("rex_beta_max")
+                rex_spacing = sim_params.get("rex_spacing")
+                if rex_beta_min is not None:
+                    args_list += ["--rex-beta-min", str(float(rex_beta_min))]
+                if rex_beta_max is not None:
+                    args_list += ["--rex-beta-max", str(float(rex_beta_max))]
+                if rex_spacing is not None:
+                    args_list += ["--rex-spacing", str(rex_spacing)]
 
         rex_samples = sim_params.get("rex_samples")
         if rex_samples is not None:
@@ -484,6 +578,7 @@ def run_simulation_job(
 
         summary_path = _coerce_path(run_result.get("summary_path"))
         plot_path = _coerce_path(run_result.get("plot_path"))
+        report_path = _coerce_path(run_result.get("report_path"))
         meta_path = _coerce_path(run_result.get("metadata_path"))
         beta_scan_path = _coerce_path(run_result.get("beta_scan_path"))
         model_artifact = _coerce_path(run_result.get("model_path"))
@@ -502,12 +597,17 @@ def run_simulation_job(
                     source="simulation",
                 )
 
+        cluster_name = entry.get("name") if isinstance(entry, dict) else None
+        if cluster_name:
+            result_payload["system_reference"]["cluster_name"] = cluster_name
+
         result_payload["status"] = "finished"
         result_payload["results"] = {
             "results_dir": _relativize_path(results_dir),
             "summary_npz": _relativize_path(summary_path) if summary_path else None,
             "metadata_json": _relativize_path(meta_path) if meta_path else None,
             "marginals_plot": _relativize_path(plot_path) if plot_path else None,
+            "sampling_report": _relativize_path(report_path) if report_path else None,
             "beta_scan_plot": _relativize_path(beta_scan_path) if beta_scan_path else None,
             "cluster_npz": _relativize_path(cluster_path),
             "potts_model": potts_model_rel or (_relativize_path(model_path) if model_path else None),
@@ -854,6 +954,10 @@ def run_cluster_job(
         except Exception:
             rel_path = str(npz_path)
 
+        save_progress("Assigning clusters to MD states...", 92)
+        assignments = assign_cluster_labels_to_states(npz_path, project_id, system_id)
+        update_cluster_metadata_with_assignments(npz_path, assignments)
+
         _update_cluster_entry(
             project_id,
             system_id,
@@ -862,6 +966,8 @@ def run_cluster_job(
                 "status": "finished",
                 "progress": 100,
                 "path": rel_path,
+                "assigned_state_paths": assignments.get("assigned_state_paths", {}),
+                "assigned_metastable_paths": assignments.get("assigned_metastable_paths", {}),
                 "generated_at": meta.get("generated_at") if isinstance(meta, dict) else None,
                 "contact_edge_count": meta.get("contact_edge_count") if isinstance(meta, dict) else None,
                 "error": None,

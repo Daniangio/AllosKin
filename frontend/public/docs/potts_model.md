@@ -39,12 +39,13 @@ To fit on a separate machine, run the setup once, then activate the venv and use
 interactive fitter:
 
 ```bash
-./scripts/potts_setup_uv.sh
+./scripts/potts_setup.sh
 source .venv-potts-fit/bin/activate
-./scripts/potts_fit_uv.sh
+./scripts/potts_fit.sh
 ```
 
 ## Related docs
 - [Potts analysis overview](doc:potts_overview)
 - [Gibbs and replica exchange](doc:potts_gibbs)
 - [SA/QUBO sampling](doc:potts_sa_qubo)
+- [PMI and PLM basics](doc:potts_pmi_plm)

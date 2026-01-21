@@ -32,7 +32,7 @@ else
   if [ -x "${DEFAULT_ENV}/bin/python" ]; then
     echo "Activate it with: source ${DEFAULT_ENV}/bin/activate"
   else
-    echo "Create one first: scripts/potts_setup_uv.sh"
+    echo "Create one first: scripts/potts_setup.sh"
   fi
   exit 1
 fi

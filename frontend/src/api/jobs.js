@@ -43,6 +43,11 @@ export function healthCheck() {
   return requestJSON('/health/check');
 }
 
+export function cleanupResults(includeTmp = true) {
+  const query = includeTmp ? '?include_tmp=true' : '?include_tmp=false';
+  return requestJSON(`/results/cleanup${query}`, { method: 'POST' });
+}
+
 export function downloadResultArtifact(jobId, artifact) {
   return requestBlob(`/results/${jobId}/artifacts/${artifact}`);
 }

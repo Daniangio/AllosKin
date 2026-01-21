@@ -107,3 +107,69 @@ def combined_distance(
         js_p = 0.0
 
     return w_marg * js_m + w_pair * js_p
+
+
+def pad_pairwise_joints(
+    P: Dict[Tuple[int, int], np.ndarray],
+    edges: Sequence[Tuple[int, int]],
+    K: Sequence[int],
+    *,
+    pad_value: float = np.nan,
+) -> np.ndarray:
+    if not edges:
+        return np.zeros((0, 0, 0), dtype=float)
+    max_k = max(map(int, K)) if len(K) else 0
+    out = np.full((len(edges), max_k, max_k), pad_value, dtype=float)
+    for idx, (r, s) in enumerate(edges):
+        mat = P[(r, s)]
+        out[idx, : mat.shape[0], : mat.shape[1]] = mat
+    return out
+
+
+def pairwise_joints_padded(
+    labels: np.ndarray,
+    K: Sequence[int],
+    edges: Sequence[Tuple[int, int]],
+    *,
+    pad_value: float = np.nan,
+) -> np.ndarray:
+    P = pairwise_joints_on_edges(labels, K, edges)
+    return pad_pairwise_joints(P, edges, K, pad_value=pad_value)
+
+
+def per_residue_js_from_padded(
+    p_a: np.ndarray,
+    p_b: np.ndarray,
+    K: Sequence[int],
+) -> np.ndarray:
+    K = list(map(int, K))
+    if p_a.shape != p_b.shape or p_a.ndim != 2:
+        raise ValueError("Expected matching 2D padded marginal matrices.")
+    out = np.zeros(len(K), dtype=float)
+    for r, Kr in enumerate(K):
+        if Kr <= 0:
+            out[r] = float("nan")
+            continue
+        out[r] = js_divergence(p_a[r, :Kr], p_b[r, :Kr])
+    return out
+
+
+def per_edge_js_from_padded(
+    p2_a: np.ndarray,
+    p2_b: np.ndarray,
+    edges: Sequence[Tuple[int, int]],
+    K: Sequence[int],
+) -> np.ndarray:
+    if p2_a.shape != p2_b.shape or p2_a.ndim != 3:
+        raise ValueError("Expected matching 3D padded pairwise matrices.")
+    K = list(map(int, K))
+    out = np.zeros(len(edges), dtype=float)
+    for idx, (r, s) in enumerate(edges):
+        Kr, Ks = K[r], K[s]
+        if Kr <= 0 or Ks <= 0:
+            out[idx] = float("nan")
+            continue
+        a = p2_a[idx, :Kr, :Ks].ravel()
+        b = p2_b[idx, :Kr, :Ks].ravel()
+        out[idx] = js_divergence(a, b)
+    return out

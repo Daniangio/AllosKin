@@ -113,15 +113,15 @@ python main.py \
 * `--model-npz`: reuse a pre-fit Potts model and skip fitting
 * `--plm-device`: device for PLM training (`auto`, `cpu`, `cuda`, or torch device string)
 
-### Local fitting with uv
+### Local fitting
 
 To fit on a separate machine, run the setup once, activate the venv, then run the
 interactive fitter:
 
 ```bash
-./scripts/potts_setup_uv.sh
+./scripts/potts_setup.sh
 source .venv-potts-fit/bin/activate
-./scripts/potts_fit_uv.sh
+./scripts/potts_fit.sh
 ```
 
 ### Gibbs sampling

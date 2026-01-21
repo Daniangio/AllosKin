@@ -9,7 +9,11 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
 from backend.api.v1.common import get_queue, project_store, stream_upload
-from backend.services.metastable_clusters import generate_metastable_cluster_npz
+from backend.services.metastable_clusters import (
+    generate_metastable_cluster_npz,
+    assign_cluster_labels_to_states,
+    update_cluster_metadata_with_assignments,
+)
 from backend.tasks import run_cluster_job
 
 
@@ -265,6 +269,9 @@ async def build_metastable_cluster_vectors(
     except Exception:
         rel_path = str(npz_path)
 
+    assignments = assign_cluster_labels_to_states(npz_path, project_id, system_id)
+    update_cluster_metadata_with_assignments(npz_path, assignments)
+
     cluster_id = str(uuid.uuid4())
     cluster_entry = _build_cluster_entry(parsed, cluster_id, "finished", 100, "Complete")
     cluster_entry.update(
@@ -272,6 +279,8 @@ async def build_metastable_cluster_vectors(
             "path": rel_path,
             "generated_at": meta.get("generated_at") if isinstance(meta, dict) else None,
             "contact_edge_count": meta.get("contact_edge_count") if isinstance(meta, dict) else None,
+            "assigned_state_paths": assignments.get("assigned_state_paths", {}),
+            "assigned_metastable_paths": assignments.get("assigned_metastable_paths", {}),
         }
     )
     system_meta.metastable_clusters = (system_meta.metastable_clusters or []) + [cluster_entry]

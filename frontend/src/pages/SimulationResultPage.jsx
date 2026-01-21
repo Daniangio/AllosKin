@@ -9,6 +9,7 @@ const artifactButtons = [
   { key: 'summary_npz', label: 'Summary NPZ' },
   { key: 'metadata_json', label: 'Run metadata' },
   { key: 'cluster_npz', label: 'Cluster NPZ' },
+  { key: 'potts_model', label: 'Potts model' },
 ];
 
 function getFilename(pathValue, fallback) {
@@ -24,6 +25,7 @@ export default function SimulationResultPage() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [downloadError, setDownloadError] = useState(null);
+  const [reportHtml, setReportHtml] = useState('');
   const [marginalsHtml, setMarginalsHtml] = useState('');
   const [betaHtml, setBetaHtml] = useState('');
 
@@ -50,6 +52,13 @@ export default function SimulationResultPage() {
     let alive = true;
     const loadHtml = async () => {
       try {
+        const blob = await downloadResultArtifact(jobId, 'sampling_report');
+        const text = await blob.text();
+        if (alive) setReportHtml(text);
+      } catch (err) {
+        if (alive) setReportHtml('');
+      }
+      try {
         const blob = await downloadResultArtifact(jobId, 'marginals_plot');
         const text = await blob.text();
         if (alive) setMarginalsHtml(text);
@@ -71,10 +80,13 @@ export default function SimulationResultPage() {
   }, [jobId]);
 
   const artifacts = useMemo(() => result?.results || {}, [result]);
+  const hasReport = Boolean(reportHtml);
   const hasMarginals = Boolean(marginalsHtml);
   const hasBetaScan = Boolean(betaHtml);
   const betaEff = artifacts?.beta_eff;
   const clusterId = result?.system_reference?.cluster_id || '—';
+  const clusterNpName = getFilename(artifacts?.cluster_npz, '—');
+  const pottsModelName = getFilename(artifacts?.potts_model, '—');
 
   const handleDownload = async (key) => {
     setDownloadError(null);
@@ -133,8 +145,16 @@ export default function SimulationResultPage() {
             <dd className="truncate">{clusterId}</dd>
           </div>
           <div>
+            <dt className="text-gray-400">Cluster NPZ</dt>
+            <dd className="truncate">{clusterNpName}</dd>
+          </div>
+          <div>
             <dt className="text-gray-400">Created</dt>
             <dd>{new Date(result.created_at).toLocaleString()}</dd>
+          </div>
+          <div>
+            <dt className="text-gray-400">Potts model</dt>
+            <dd className="truncate">{pottsModelName}</dd>
           </div>
           <div>
             <dt className="text-gray-400">Completed</dt>
@@ -176,6 +196,39 @@ export default function SimulationResultPage() {
       </section>
 
       <section className="space-y-4">
+        <div className="bg-gray-800 border border-gray-700 rounded-lg p-4">
+          <div className="flex items-center justify-between gap-2 mb-3">
+            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+              <BarChart3 className="h-4 w-4 text-cyan-400" />
+              Sampling report
+            </h2>
+            {hasReport && (
+              <button
+                type="button"
+                onClick={() => {
+                  const blob = new Blob([reportHtml], { type: 'text/html' });
+                  const url = URL.createObjectURL(blob);
+                  window.open(url, '_blank', 'noopener,noreferrer');
+                  setTimeout(() => URL.revokeObjectURL(url), 10000);
+                }}
+                className="text-xs text-cyan-300 hover:text-cyan-200 flex items-center gap-1"
+              >
+                <ExternalLink className="h-3 w-3" />
+                Open in new tab
+              </button>
+            )}
+          </div>
+          {hasReport ? (
+            <iframe
+              title="Sampling report"
+              srcDoc={reportHtml}
+              className="w-full h-[820px] rounded-md border border-gray-700 bg-gray-900"
+              sandbox="allow-scripts allow-same-origin"
+            />
+          ) : (
+            <p className="text-sm text-gray-400">No sampling report available.</p>
+          )}
+        </div>
         <div className="bg-gray-800 border border-gray-700 rounded-lg p-4">
           <div className="flex items-center justify-between gap-2 mb-3">
             <h2 className="text-lg font-semibold text-white flex items-center gap-2">

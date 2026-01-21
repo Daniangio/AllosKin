@@ -28,8 +28,11 @@ from phase.simulation.metrics import (
     pairwise_joints_on_edges,
     per_residue_js,
     combined_distance,
+    pairwise_joints_padded,
+    per_residue_js_from_padded,
+    per_edge_js_from_padded,
 )
-from phase.simulation.plotting import plot_marginal_summary_from_npz
+from phase.simulation.plotting import plot_marginal_summary_from_npz, plot_sampling_report_from_npz
 
 
 def _parse_float_list(s: str) -> list[float]:
@@ -73,6 +76,261 @@ def _pad_marginals_for_save(margs: Sequence[np.ndarray]) -> np.ndarray:
     return out
 
 
+def _load_assigned_labels(path: Path) -> np.ndarray | None:
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if "assigned__labels" in data:
+                return np.asarray(data["assigned__labels"], dtype=int)
+    except Exception:
+        return None
+    return None
+
+
+def _build_md_sources(
+    labels: np.ndarray,
+    K: Sequence[int],
+    edges: Sequence[tuple[int, int]],
+    frame_state_ids: np.ndarray | None,
+    frame_metastable_ids: np.ndarray | None,
+    metadata: dict | None,
+    npz_path: str | Path,
+) -> list[dict]:
+    sources: list[dict] = []
+    meta = metadata or {}
+    state_labels = meta.get("state_labels") or {}
+    metastable_labels = meta.get("metastable_labels") or {}
+    assigned_state_paths = meta.get("assigned_state_paths") or {}
+    assigned_meta_paths = meta.get("assigned_metastable_paths") or {}
+    metastable_kinds = meta.get("metastable_kinds") or {}
+    analysis_mode = meta.get("analysis_mode")
+
+    base_dir = Path(npz_path).resolve().parent
+
+    def add_source(source_id: str, label: str, source_type: str, subset: np.ndarray) -> None:
+        if subset.size == 0:
+            return
+        sources.append(
+            {
+                "id": source_id,
+                "label": label,
+                "type": source_type,
+                "count": int(subset.shape[0]),
+                "labels": subset,
+                "p": _pad_marginals_for_save(marginals(subset, K)),
+                "p2": pairwise_joints_padded(subset, K, edges),
+            }
+        )
+
+    for state_id, rel_path in assigned_state_paths.items():
+        abs_path = Path(rel_path)
+        if not abs_path.is_absolute():
+            abs_path = base_dir / rel_path
+        assigned = _load_assigned_labels(abs_path)
+        if assigned is None:
+            continue
+        label = state_labels.get(str(state_id), str(state_id))
+        add_source(f"state:{state_id}", f"Macro: {label}", "macro", assigned)
+
+    if analysis_mode != "macro":
+        for meta_id, rel_path in assigned_meta_paths.items():
+            if metastable_kinds.get(str(meta_id)) == "macro":
+                continue
+            abs_path = Path(rel_path)
+            if not abs_path.is_absolute():
+                abs_path = base_dir / rel_path
+            assigned = _load_assigned_labels(abs_path)
+            if assigned is None:
+                continue
+            label = metastable_labels.get(str(meta_id), str(meta_id))
+            add_source(f"meta:{meta_id}", f"Metastable: {label}", "metastable", assigned)
+
+    if not sources:
+        fallback = labels
+        add_source("md_clustered", "MD (clustered frames)", "merged", fallback)
+        state_id_set = set()
+        if frame_state_ids is not None and frame_state_ids.shape[0] == labels.shape[0]:
+            state_id_set = set(map(str, np.unique(frame_state_ids)))
+            for state_id in np.unique(frame_state_ids):
+                label = state_labels.get(str(state_id), str(state_id))
+                mask = frame_state_ids == state_id
+                add_source(f"state:{state_id}", f"Macro: {label}", "macro", labels[mask])
+
+        if analysis_mode != "macro" and frame_metastable_ids is not None and frame_metastable_ids.shape[0] == labels.shape[0]:
+            for meta_id in np.unique(frame_metastable_ids):
+                if metastable_kinds.get(str(meta_id)) == "macro":
+                    continue
+                if str(meta_id) in state_id_set:
+                    continue
+                label = metastable_labels.get(str(meta_id), str(meta_id))
+                mask = frame_metastable_ids == meta_id
+                add_source(f"meta:{meta_id}", f"Metastable: {label}", "metastable", labels[mask])
+
+    return sources
+
+
+def _build_sample_sources(
+    X_gibbs: np.ndarray,
+    sa_samples: Sequence[np.ndarray],
+    sa_schedule_labels: Sequence[str] | None,
+    K: Sequence[int],
+    edges: Sequence[tuple[int, int]],
+    *,
+    gibbs_label: str,
+) -> list[dict]:
+    sources: list[dict] = []
+
+    def add_source(source_id: str, label: str, source_type: str, X: np.ndarray) -> None:
+        if X.size == 0:
+            return
+        sources.append(
+            {
+                "id": source_id,
+                "label": label,
+                "type": source_type,
+                "count": int(X.shape[0]),
+                "X": X,
+                "p": _pad_marginals_for_save(marginals(X, K)),
+                "p2": pairwise_joints_padded(X, K, edges),
+            }
+        )
+
+    add_source("gibbs", gibbs_label, "gibbs", X_gibbs)
+
+    for idx, X_sa in enumerate(sa_samples):
+        label = (
+            str(sa_schedule_labels[idx])
+            if sa_schedule_labels is not None and idx < len(sa_schedule_labels)
+            else f"SA {idx + 1}"
+        )
+        add_source(f"sa_{idx}", label, "sa", X_sa)
+
+    return sources
+
+
+def _compute_energy_histograms(
+    *,
+    model,
+    md_sources: Sequence[dict],
+    sample_sources: Sequence[dict],
+    n_bins: int = 40,
+) -> dict:
+    if model is None:
+        return {
+            "bins": np.array([], dtype=float),
+            "hist_md": np.zeros((0, 0), dtype=float),
+            "cdf_md": np.zeros((0, 0), dtype=float),
+            "hist_sample": np.zeros((0, 0), dtype=float),
+            "cdf_sample": np.zeros((0, 0), dtype=float),
+        }
+
+    md_energies = [model.energy_batch(src["labels"]) for src in md_sources]
+    sample_energies = [model.energy_batch(src["X"]) for src in sample_sources]
+    if not sample_energies:
+        return {
+            "bins": np.array([], dtype=float),
+            "hist_md": np.zeros((0, 0), dtype=float),
+            "cdf_md": np.zeros((0, 0), dtype=float),
+            "hist_sample": np.zeros((0, 0), dtype=float),
+            "cdf_sample": np.zeros((0, 0), dtype=float),
+        }
+
+    min_e = float(min([e.min() for e in md_energies] + [e.min() for e in sample_energies]))
+    max_e = float(max([e.max() for e in md_energies] + [e.max() for e in sample_energies]))
+    if not np.isfinite(min_e) or not np.isfinite(max_e) or min_e == max_e:
+        bins = np.linspace(min_e - 1.0, max_e + 1.0, n_bins + 1)
+    else:
+        pad = 0.05 * (max_e - min_e)
+        bins = np.linspace(min_e - pad, max_e + pad, n_bins + 1)
+
+    hist_md = []
+    cdf_md = []
+    for energies in md_energies:
+        counts, _ = np.histogram(energies, bins=bins, density=True)
+        hist_md.append(counts)
+        cdf = np.cumsum(counts)
+        cdf = cdf / cdf[-1] if cdf.size and cdf[-1] > 0 else cdf
+        cdf_md.append(cdf)
+
+    hist_sample = []
+    cdf_sample = []
+    for energies in sample_energies:
+        counts, _ = np.histogram(energies, bins=bins, density=True)
+        hist_sample.append(counts)
+        cdf = np.cumsum(counts)
+        cdf = cdf / cdf[-1] if cdf.size and cdf[-1] > 0 else cdf
+        cdf_sample.append(cdf)
+
+    return {
+        "bins": bins,
+        "hist_md": np.asarray(hist_md, dtype=float),
+        "cdf_md": np.asarray(cdf_md, dtype=float),
+        "hist_sample": np.asarray(hist_sample, dtype=float),
+        "cdf_sample": np.asarray(cdf_sample, dtype=float),
+    }
+
+
+def _subsample_rows(X: np.ndarray, max_rows: int, rng: np.random.Generator) -> np.ndarray:
+    if X.shape[0] <= max_rows:
+        return X
+    idx = rng.choice(X.shape[0], size=max_rows, replace=False)
+    return X[idx]
+
+
+def _min_hamming_distances(A: np.ndarray, B: np.ndarray, *, block_size: int = 256) -> np.ndarray:
+    if A.size == 0 or B.size == 0:
+        return np.array([], dtype=int)
+    mins = np.full(A.shape[0], np.iinfo(np.int32).max, dtype=int)
+    for start in range(0, B.shape[0], block_size):
+        chunk = B[start : start + block_size]
+        dists = np.sum(A[:, None, :] != chunk[None, :, :], axis=2)
+        mins = np.minimum(mins, dists.min(axis=1))
+    return mins
+
+
+def _compute_nn_cdfs(
+    *,
+    md_sources: Sequence[dict],
+    sample_sources: Sequence[dict],
+    max_md: int = 2000,
+    max_sample: int = 1000,
+    block_size: int = 256,
+) -> dict:
+    if not md_sources or not sample_sources:
+        return {
+            "bins": np.array([], dtype=int),
+            "cdf_sample_to_md": np.zeros((0, 0, 0), dtype=float),
+            "cdf_md_to_sample": np.zeros((0, 0, 0), dtype=float),
+        }
+
+    rng = np.random.default_rng(0)
+    n_res = md_sources[0]["labels"].shape[1]
+    bins = np.arange(n_res + 1, dtype=int)
+
+    cdf_sample_to_md = np.zeros((len(md_sources), len(sample_sources), len(bins)), dtype=float)
+    cdf_md_to_sample = np.zeros((len(md_sources), len(sample_sources), len(bins)), dtype=float)
+
+    for i, md in enumerate(md_sources):
+        X_md = md["labels"]
+        X_md = _subsample_rows(X_md, max_md, rng)
+        for j, sample in enumerate(sample_sources):
+            X_samp = _subsample_rows(sample["X"], max_sample, rng)
+            if X_md.size == 0 or X_samp.size == 0:
+                continue
+            d_sm = _min_hamming_distances(X_samp, X_md, block_size=block_size)
+            d_ms = _min_hamming_distances(X_md, X_samp, block_size=block_size)
+
+            hist_sm = np.bincount(d_sm, minlength=len(bins))
+            hist_ms = np.bincount(d_ms, minlength=len(bins))
+            cdf_sample_to_md[i, j] = np.cumsum(hist_sm) / max(1, hist_sm.sum())
+            cdf_md_to_sample[i, j] = np.cumsum(hist_ms) / max(1, hist_ms.sum())
+
+    return {
+        "bins": bins,
+        "cdf_sample_to_md": cdf_sample_to_md,
+        "cdf_md_to_sample": cdf_md_to_sample,
+    }
+
+
 def _save_run_summary(
     results_dir: Path,
     args: argparse.Namespace,
@@ -105,6 +363,37 @@ def _save_run_summary(
     beta_eff_by_schedule: list[float] | None = None,
     beta_eff_distances_by_schedule: np.ndarray | None = None,
     model_path: Path | None = None,
+    p2_md: np.ndarray | None = None,
+    p2_gibbs: np.ndarray | None = None,
+    p2_sa: np.ndarray | None = None,
+    js2_gibbs: np.ndarray | None = None,
+    js2_sa: np.ndarray | None = None,
+    js2_sa_vs_gibbs: np.ndarray | None = None,
+    md_source_ids: list[str] | None = None,
+    md_source_labels: list[str] | None = None,
+    md_source_types: list[str] | None = None,
+    md_source_counts: np.ndarray | None = None,
+    p_md_by_source: np.ndarray | None = None,
+    p2_md_by_source: np.ndarray | None = None,
+    sample_source_ids: list[str] | None = None,
+    sample_source_labels: list[str] | None = None,
+    sample_source_types: list[str] | None = None,
+    sample_source_counts: np.ndarray | None = None,
+    p_sample_by_source: np.ndarray | None = None,
+    p2_sample_by_source: np.ndarray | None = None,
+    js_md_sample: np.ndarray | None = None,
+    js2_md_sample: np.ndarray | None = None,
+    js_gibbs_sample: np.ndarray | None = None,
+    js2_gibbs_sample: np.ndarray | None = None,
+    energy_bins: np.ndarray | None = None,
+    energy_hist_md: np.ndarray | None = None,
+    energy_cdf_md: np.ndarray | None = None,
+    energy_hist_sample: np.ndarray | None = None,
+    energy_cdf_sample: np.ndarray | None = None,
+    nn_bins: np.ndarray | None = None,
+    nn_cdf_sample_to_md: np.ndarray | None = None,
+    nn_cdf_md_to_sample: np.ndarray | None = None,
+    edge_strength: np.ndarray | None = None,
 ) -> Path:
     """
     Save a compact summary bundle of inputs + sampling results into results_dir/run_summary.npz,
@@ -148,6 +437,37 @@ def _save_run_summary(
             np.asarray(beta_eff_distances_by_schedule, dtype=float) if beta_eff_distances_by_schedule is not None else np.array([], dtype=float)
         ),
         data_npz=np.array([args.npz], dtype=str),
+        p2_md=p2_md if p2_md is not None else np.zeros((0, 0, 0), dtype=float),
+        p2_gibbs=p2_gibbs if p2_gibbs is not None else np.zeros((0, 0, 0), dtype=float),
+        p2_sa=p2_sa if p2_sa is not None else np.zeros((0, 0, 0), dtype=float),
+        js2_gibbs=js2_gibbs if js2_gibbs is not None else np.array([], dtype=float),
+        js2_sa=js2_sa if js2_sa is not None else np.array([], dtype=float),
+        js2_sa_vs_gibbs=js2_sa_vs_gibbs if js2_sa_vs_gibbs is not None else np.array([], dtype=float),
+        md_source_ids=np.asarray(md_source_ids, dtype=str) if md_source_ids is not None else np.array([], dtype=str),
+        md_source_labels=np.asarray(md_source_labels, dtype=str) if md_source_labels is not None else np.array([], dtype=str),
+        md_source_types=np.asarray(md_source_types, dtype=str) if md_source_types is not None else np.array([], dtype=str),
+        md_source_counts=np.asarray(md_source_counts, dtype=int) if md_source_counts is not None else np.array([], dtype=int),
+        p_md_by_source=p_md_by_source if p_md_by_source is not None else np.zeros((0, 0, 0), dtype=float),
+        p2_md_by_source=p2_md_by_source if p2_md_by_source is not None else np.zeros((0, 0, 0, 0), dtype=float),
+        sample_source_ids=np.asarray(sample_source_ids, dtype=str) if sample_source_ids is not None else np.array([], dtype=str),
+        sample_source_labels=np.asarray(sample_source_labels, dtype=str) if sample_source_labels is not None else np.array([], dtype=str),
+        sample_source_types=np.asarray(sample_source_types, dtype=str) if sample_source_types is not None else np.array([], dtype=str),
+        sample_source_counts=np.asarray(sample_source_counts, dtype=int) if sample_source_counts is not None else np.array([], dtype=int),
+        p_sample_by_source=p_sample_by_source if p_sample_by_source is not None else np.zeros((0, 0, 0), dtype=float),
+        p2_sample_by_source=p2_sample_by_source if p2_sample_by_source is not None else np.zeros((0, 0, 0, 0), dtype=float),
+        js_md_sample=js_md_sample if js_md_sample is not None else np.zeros((0, 0, 0), dtype=float),
+        js2_md_sample=js2_md_sample if js2_md_sample is not None else np.zeros((0, 0, 0), dtype=float),
+        js_gibbs_sample=js_gibbs_sample if js_gibbs_sample is not None else np.zeros((0, 0), dtype=float),
+        js2_gibbs_sample=js2_gibbs_sample if js2_gibbs_sample is not None else np.zeros((0, 0), dtype=float),
+        energy_bins=energy_bins if energy_bins is not None else np.array([], dtype=float),
+        energy_hist_md=energy_hist_md if energy_hist_md is not None else np.zeros((0, 0), dtype=float),
+        energy_cdf_md=energy_cdf_md if energy_cdf_md is not None else np.zeros((0, 0), dtype=float),
+        energy_hist_sample=energy_hist_sample if energy_hist_sample is not None else np.zeros((0, 0), dtype=float),
+        energy_cdf_sample=energy_cdf_sample if energy_cdf_sample is not None else np.zeros((0, 0), dtype=float),
+        nn_bins=nn_bins if nn_bins is not None else np.array([], dtype=int),
+        nn_cdf_sample_to_md=nn_cdf_sample_to_md if nn_cdf_sample_to_md is not None else np.zeros((0, 0, 0), dtype=float),
+        nn_cdf_md_to_sample=nn_cdf_md_to_sample if nn_cdf_md_to_sample is not None else np.zeros((0, 0, 0), dtype=float),
+        edge_strength=edge_strength if edge_strength is not None else np.array([], dtype=float),
     )
 
     metadata = {
@@ -287,11 +607,16 @@ def run_pipeline(
             out_path=default_plot_path,
             annotate=args.annotate_plots,
         )
+        report_path = plot_sampling_report_from_npz(
+            summary_path=default_summary_path,
+            out_path=results_dir / "sampling_report.html",
+        )
         print(f"[plot] loaded summary from {default_summary_path} -> {out_path}")
         return {
             "summary_path": default_summary_path,
             "metadata_path": results_dir / "run_metadata.json",
             "plot_path": out_path,
+            "report_path": report_path,
             "beta_scan_path": None,
             "beta_eff": None,
             "model_path": None,
@@ -652,6 +977,88 @@ def run_pipeline(
             for b, js_pair in zip(betas, js_pair_gibbs_by_beta):
                 print(f"[pairs]   JS(MD, Gibbs@beta={b}) over edges: {js_pair:.4f}")
 
+    # Build per-source stats for dynamic comparisons
+    md_sources = _build_md_sources(
+        labels,
+        K,
+        edges,
+        getattr(ds, "frame_state_ids", None),
+        getattr(ds, "frame_metastable_ids", None),
+        getattr(ds, "metadata", None),
+        args.npz,
+    )
+    gibbs_label = f"Gibbs β={float(args.beta):g}"
+    sample_sources = _build_sample_sources(
+        X_gibbs,
+        sa_samples,
+        sa_schedule_labels,
+        K,
+        edges,
+        gibbs_label=gibbs_label,
+    )
+
+    md_source_ids = [src["id"] for src in md_sources]
+    md_source_labels = [src["label"] for src in md_sources]
+    md_source_types = [src["type"] for src in md_sources]
+    md_source_counts = np.asarray([src["count"] for src in md_sources], dtype=int)
+    p_md_by_source = np.stack([src["p"] for src in md_sources], axis=0) if md_sources else np.zeros((0, 0, 0), dtype=float)
+    p2_md_by_source = np.stack([src["p2"] for src in md_sources], axis=0) if md_sources else np.zeros((0, 0, 0, 0), dtype=float)
+
+    sample_source_ids = [src["id"] for src in sample_sources]
+    sample_source_labels = [src["label"] for src in sample_sources]
+    sample_source_types = [src["type"] for src in sample_sources]
+    sample_source_counts = np.asarray([src["count"] for src in sample_sources], dtype=int)
+    p_sample_by_source = np.stack([src["p"] for src in sample_sources], axis=0) if sample_sources else np.zeros((0, 0, 0), dtype=float)
+    p2_sample_by_source = np.stack([src["p2"] for src in sample_sources], axis=0) if sample_sources else np.zeros((0, 0, 0, 0), dtype=float)
+
+    js_md_sample = np.zeros((len(md_sources), len(sample_sources), len(K)), dtype=float)
+    js2_md_sample = np.zeros((len(md_sources), len(sample_sources), len(edges)), dtype=float)
+    for i, md in enumerate(md_sources):
+        for j, sample in enumerate(sample_sources):
+            js_md_sample[i, j] = per_residue_js_from_padded(md["p"], sample["p"], K)
+            if len(edges) > 0:
+                js2_md_sample[i, j] = per_edge_js_from_padded(md["p2"], sample["p2"], edges, K)
+
+    gibbs_idx = next((i for i, src in enumerate(sample_sources) if src["id"] == "gibbs"), None)
+    js_gibbs_sample = np.zeros((len(sample_sources), len(K)), dtype=float)
+    js2_gibbs_sample = np.zeros((len(sample_sources), len(edges)), dtype=float)
+    if gibbs_idx is not None:
+        gibbs_p = sample_sources[gibbs_idx]["p"]
+        gibbs_p2 = sample_sources[gibbs_idx]["p2"]
+        for j, sample in enumerate(sample_sources):
+            js_gibbs_sample[j] = per_residue_js_from_padded(gibbs_p, sample["p"], K)
+            if len(edges) > 0:
+                js2_gibbs_sample[j] = per_edge_js_from_padded(gibbs_p2, sample["p2"], edges, K)
+
+    p2_md = md_sources[0]["p2"] if md_sources else np.zeros((0, 0, 0), dtype=float)
+    p2_gibbs = sample_sources[gibbs_idx]["p2"] if gibbs_idx is not None else np.zeros((0, 0, 0), dtype=float)
+    sa_idx = next((i for i, src in enumerate(sample_sources) if src["type"] == "sa"), None)
+    p2_sa = sample_sources[sa_idx]["p2"] if sa_idx is not None else np.zeros((0, 0, 0), dtype=float)
+    js2_gibbs = js2_md_sample[0, gibbs_idx] if md_sources and gibbs_idx is not None else np.array([], dtype=float)
+    js2_sa = js2_md_sample[0, sa_idx] if md_sources and sa_idx is not None else np.array([], dtype=float)
+    js2_sa_vs_gibbs = js2_gibbs_sample[sa_idx] if sa_idx is not None else np.array([], dtype=float)
+
+    edge_strength = np.array([], dtype=float)
+    if model is not None and len(edges) > 0:
+        strengths = []
+        for r, s in edges:
+            strengths.append(float(np.linalg.norm(model.coupling(int(r), int(s)))))
+        edge_strength = np.asarray(strengths, dtype=float)
+
+    energy_payload = _compute_energy_histograms(
+        model=model,
+        md_sources=md_sources,
+        sample_sources=sample_sources,
+        n_bins=40,
+    )
+    nn_payload = _compute_nn_cdfs(
+        md_sources=md_sources,
+        sample_sources=sample_sources,
+        max_md=2000,
+        max_sample=1000,
+        block_size=256,
+    )
+
     beta_eff_grid_result = None
     beta_eff_distances_result = None
     beta_eff_value = None
@@ -694,6 +1101,37 @@ def run_pipeline(
                 beta_eff_by_schedule=beta_eff_by_schedule,
                 beta_eff_distances_by_schedule=None,
                 model_path=model_out_path,
+                p2_md=p2_md,
+                p2_gibbs=p2_gibbs,
+                p2_sa=p2_sa,
+                js2_gibbs=js2_gibbs,
+                js2_sa=js2_sa,
+                js2_sa_vs_gibbs=js2_sa_vs_gibbs,
+                md_source_ids=md_source_ids,
+                md_source_labels=md_source_labels,
+                md_source_types=md_source_types,
+                md_source_counts=md_source_counts,
+                p_md_by_source=p_md_by_source,
+                p2_md_by_source=p2_md_by_source,
+                sample_source_ids=sample_source_ids,
+                sample_source_labels=sample_source_labels,
+                sample_source_types=sample_source_types,
+                sample_source_counts=sample_source_counts,
+                p_sample_by_source=p_sample_by_source,
+                p2_sample_by_source=p2_sample_by_source,
+                js_md_sample=js_md_sample,
+                js2_md_sample=js2_md_sample,
+                js_gibbs_sample=js_gibbs_sample,
+                js2_gibbs_sample=js2_gibbs_sample,
+                energy_bins=energy_payload["bins"],
+                energy_hist_md=energy_payload["hist_md"],
+                energy_cdf_md=energy_payload["cdf_md"],
+                energy_hist_sample=energy_payload["hist_sample"],
+                energy_cdf_sample=energy_payload["cdf_sample"],
+                nn_bins=nn_payload["bins"],
+                nn_cdf_sample_to_md=nn_payload["cdf_sample_to_md"],
+                nn_cdf_md_to_sample=nn_payload["cdf_md_to_sample"],
+                edge_strength=edge_strength,
             )
             print(f"[results] summary saved to {summary_path}")
             out_path = plot_marginal_summary_from_npz(
@@ -701,12 +1139,17 @@ def run_pipeline(
                 out_path=default_plot_path,
                 annotate=args.annotate_plots,
             )
+            report_path = plot_sampling_report_from_npz(
+                summary_path=summary_path,
+                out_path=results_dir / "sampling_report.html",
+            )
             print(f"[plot] saved marginal comparison to {out_path}")
             print("[done]")
             return {
                 "summary_path": summary_path,
                 "metadata_path": results_dir / "run_metadata.json",
                 "plot_path": out_path,
+                "report_path": report_path,
                 "beta_scan_path": None,
                 "beta_eff": beta_eff_value,
                 "beta_eff_by_schedule": beta_eff_by_schedule,
@@ -826,6 +1269,37 @@ def run_pipeline(
             np.asarray(distances_by_schedule, dtype=float) if distances_by_schedule is not None else None
         ),
         model_path=model_out_path,
+        p2_md=p2_md,
+        p2_gibbs=p2_gibbs,
+        p2_sa=p2_sa,
+        js2_gibbs=js2_gibbs,
+        js2_sa=js2_sa,
+        js2_sa_vs_gibbs=js2_sa_vs_gibbs,
+        md_source_ids=md_source_ids,
+        md_source_labels=md_source_labels,
+        md_source_types=md_source_types,
+        md_source_counts=md_source_counts,
+        p_md_by_source=p_md_by_source,
+        p2_md_by_source=p2_md_by_source,
+        sample_source_ids=sample_source_ids,
+        sample_source_labels=sample_source_labels,
+        sample_source_types=sample_source_types,
+        sample_source_counts=sample_source_counts,
+        p_sample_by_source=p_sample_by_source,
+        p2_sample_by_source=p2_sample_by_source,
+        js_md_sample=js_md_sample,
+        js2_md_sample=js2_md_sample,
+        js_gibbs_sample=js_gibbs_sample,
+        js2_gibbs_sample=js2_gibbs_sample,
+        energy_bins=energy_payload["bins"],
+        energy_hist_md=energy_payload["hist_md"],
+        energy_cdf_md=energy_payload["cdf_md"],
+        energy_hist_sample=energy_payload["hist_sample"],
+        energy_cdf_sample=energy_payload["cdf_sample"],
+        nn_bins=nn_payload["bins"],
+        nn_cdf_sample_to_md=nn_payload["cdf_sample_to_md"],
+        nn_cdf_md_to_sample=nn_payload["cdf_md_to_sample"],
+        edge_strength=edge_strength,
     )
     print(f"[results] summary saved to {summary_path}")
 
@@ -836,6 +1310,10 @@ def run_pipeline(
         out_path=default_plot_path,
         annotate=args.annotate_plots,
     )
+    report_path = plot_sampling_report_from_npz(
+        summary_path=summary_path,
+        out_path=results_dir / "sampling_report.html",
+    )
     print(f"[plot] saved marginal comparison to {out_path}")
 
     print("[done]")
@@ -844,6 +1322,7 @@ def run_pipeline(
         "summary_path": summary_path,
         "metadata_path": results_dir / "run_metadata.json",
         "plot_path": out_path,
+        "report_path": report_path,
         "beta_scan_path": beta_scan_plot_path,
         "beta_eff": beta_eff_value,
         "beta_eff_by_schedule": beta_eff_by_schedule,

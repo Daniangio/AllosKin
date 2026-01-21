@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import Loader from '../components/common/Loader';
 import ErrorMessage from '../components/common/ErrorMessage';
 import EmptyState from '../components/common/EmptyState';
-import { fetchResults, deleteResult } from '../api/jobs';
+import { fetchResults, deleteResult, resultArtifactUrl } from '../api/jobs';
 import { Download, Trash2, AlertTriangle, CheckCircle, Loader2 } from 'lucide-react';
 
 export default function ResultsPage() {
@@ -101,6 +101,15 @@ export default function ResultsPage() {
               >
                 Simulation
               </button>
+            )}
+            {result.analysis_type === 'simulation' && result.status === 'finished' && (
+              <a
+                href={resultArtifactUrl(result.job_id, 'summary_npz')}
+                download={`${result.job_id}-samples.npz`}
+                className="text-sm text-cyan-400 hover:text-cyan-300"
+              >
+                Samples
+              </a>
             )}
             <a
               href={`/api/v1/results/${result.job_id}`}

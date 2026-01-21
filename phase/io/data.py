@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Literal, Optional, Sequence, Tuple
+import json
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Any
 
 import numpy as np
 
@@ -15,6 +16,10 @@ class TorsionDataset:
     labels: np.ndarray                # (T, N) in {0..K_r-1} (and maybe -1 pre-sanitize)
     cluster_counts: np.ndarray        # (N,) K_r per residue (excluding -1 unless treat_as_state)
     edges: List[Tuple[int, int]]      # unique undirected (r<s)
+    frame_state_ids: Optional[np.ndarray] = None
+    frame_metastable_ids: Optional[np.ndarray] = None
+    frame_indices: Optional[np.ndarray] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 def _dedup_edges(edge_index: np.ndarray, n_res: int) -> List[Tuple[int, int]]:
@@ -55,11 +60,35 @@ def load_npz(
         raise KeyError("contact_edge_index not found in npz.")
     edges = _dedup_edges(np.asarray(data["contact_edge_index"]), n_res=labels.shape[1])
 
+    frame_state_ids = None
+    if "merged__frame_state_ids" in data:
+        frame_state_ids = np.asarray(data["merged__frame_state_ids"])
+    frame_metastable_ids = None
+    if "merged__frame_metastable_ids" in data:
+        frame_metastable_ids = np.asarray(data["merged__frame_metastable_ids"])
+    frame_indices = None
+    if "merged__frame_indices" in data:
+        frame_indices = np.asarray(data["merged__frame_indices"])
+
+    metadata = None
+    if "metadata_json" in data:
+        try:
+            raw = data["metadata_json"]
+            if isinstance(raw, np.ndarray):
+                raw = raw.item()
+            metadata = json.loads(str(raw))
+        except Exception:
+            metadata = None
+
     ds = TorsionDataset(
         residue_keys=residue_keys,
         labels=labels,
         cluster_counts=cluster_counts,
         edges=edges,
+        frame_state_ids=frame_state_ids,
+        frame_metastable_ids=frame_metastable_ids,
+        frame_indices=frame_indices,
+        metadata=metadata,
     )
     return sanitize_dataset(ds, unassigned_policy=unassigned_policy)
 
@@ -113,4 +142,8 @@ def sanitize_dataset(
         labels=labels,
         cluster_counts=K,
         edges=ds.edges,
+        frame_state_ids=ds.frame_state_ids,
+        frame_metastable_ids=ds.frame_metastable_ids,
+        frame_indices=ds.frame_indices,
+        metadata=ds.metadata,
     )

@@ -24,6 +24,35 @@ def _slug(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_") or "metastable"
 
 
+def _build_state_name_maps(system_meta: SystemMetadata) -> tuple[Dict[str, str], Dict[str, str]]:
+    state_labels = {}
+    for state_id, state in (system_meta.states or {}).items():
+        label = getattr(state, "name", None) or state_id
+        state_labels[str(state_id)] = str(label)
+
+    metastable_labels = {}
+    for meta in system_meta.metastable_states or []:
+        meta_id = meta.get("metastable_id") or meta.get("id")
+        if not meta_id:
+            continue
+        label = meta.get("name") or meta.get("default_name") or meta_id
+        metastable_labels[str(meta_id)] = str(label)
+
+    return state_labels, metastable_labels
+
+
+def _build_metastable_kind_map(system_meta: SystemMetadata) -> Dict[str, str]:
+    kinds: Dict[str, str] = {}
+    for meta in system_meta.metastable_states or []:
+        meta_id = meta.get("metastable_id") or meta.get("id")
+        if not meta_id:
+            continue
+        kinds[str(meta_id)] = "metastable"
+    for state_id in (system_meta.states or {}).keys():
+        kinds.setdefault(str(state_id), "macro")
+    return kinds
+
+
 def _kmeans_sweep(
     samples: np.ndarray, max_k: int, random_state: int
 ) -> Tuple[np.ndarray, int, float]:
@@ -658,6 +687,290 @@ def _compute_contact_edges(
     return edges
 
 
+def _extract_angles_array(features: Dict[str, Any], key: str) -> Optional[np.ndarray]:
+    arr = features.get(key)
+    if arr is None:
+        return None
+    arr = np.asarray(arr)
+    if arr.ndim >= 3:
+        arr = arr[:, 0, :3]
+    elif arr.ndim == 2:
+        arr = arr[:, :3]
+    elif arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    if arr.shape[1] < 3:
+        padded = np.zeros((arr.shape[0], 3), dtype=float)
+        padded[:, : arr.shape[1]] = arr
+        arr = padded
+    return np.asarray(arr, dtype=float)
+
+
+def _assign_labels_from_reference(
+    target_emb: np.ndarray,
+    ref_tree: KDTree,
+    ref_labels: np.ndarray,
+    k_neighbors: int,
+) -> np.ndarray:
+    if target_emb.size == 0 or ref_labels.size == 0:
+        return np.full(target_emb.shape[0], -1, dtype=np.int32)
+    k_eff = min(int(k_neighbors), ref_labels.shape[0])
+    _, idxs = ref_tree.query(target_emb, k=k_eff)
+    if idxs.ndim == 1:
+        idxs = idxs[:, None]
+    out = np.full(target_emb.shape[0], -1, dtype=np.int32)
+    for i in range(target_emb.shape[0]):
+        neigh = ref_labels[idxs[i]]
+        vals, counts = np.unique(neigh, return_counts=True)
+        if vals.size:
+            out[i] = int(vals[np.argmax(counts)])
+    return out
+
+
+def assign_cluster_labels_to_states(
+    cluster_path: Path,
+    project_id: str,
+    system_id: str,
+    *,
+    k_neighbors: int = 10,
+) -> Dict[str, Dict[str, str]]:
+    store = ProjectStore()
+    system = store.get_system(project_id, system_id)
+    data = np.load(cluster_path, allow_pickle=True)
+
+    residue_keys = [str(k) for k in data["residue_keys"]]
+    merged_labels = np.asarray(data["merged__labels"], dtype=np.int32)
+    merged_counts = np.asarray(data["merged__cluster_counts"], dtype=np.int32)
+    merged_state_ids = np.asarray(data["merged__frame_state_ids"]).astype(str)
+    merged_frame_indices = np.asarray(data["merged__frame_indices"]).astype(int)
+
+    meta = {}
+    if "metadata_json" in data:
+        try:
+            meta_raw = data["metadata_json"]
+            meta_val = meta_raw.item() if hasattr(meta_raw, "item") else meta_raw
+            meta = json.loads(str(meta_val))
+        except Exception:
+            meta = {}
+    analysis_mode = meta.get("analysis_mode") or getattr(system, "analysis_mode", None)
+    metastable_kinds = meta.get("metastable_kinds") or _build_metastable_kind_map(system)
+
+    state_cache: Dict[str, Dict[str, Any]] = {}
+
+    grouped: Dict[str, Dict[str, np.ndarray]] = {}
+    for row_idx, (state_id, frame_idx) in enumerate(zip(merged_state_ids, merged_frame_indices)):
+        entry = grouped.setdefault(state_id, {"rows": [], "frames": []})
+        entry["rows"].append(int(row_idx))
+        entry["frames"].append(int(frame_idx))
+    for state_id, entry in grouped.items():
+        entry["rows"] = np.asarray(entry["rows"], dtype=int)
+        entry["frames"] = np.asarray(entry["frames"], dtype=int)
+
+    ref_trees: List[Optional[KDTree]] = []
+    ref_labels_list: List[np.ndarray] = []
+
+    for key_idx, key in enumerate(residue_keys):
+        emb_list = []
+        label_list = []
+        for state_id, entry in grouped.items():
+            state = system.states.get(state_id)
+            if not state or not state.descriptor_file:
+                continue
+            cached = state_cache.get(state_id)
+            if cached is None:
+                desc_path = store.resolve_path(project_id, system_id, state.descriptor_file)
+                features = load_descriptor_npz(desc_path)
+                cached = {
+                    "features": features,
+                    "angles": {},
+                    "metastable_labels": None,
+                }
+                state_cache[state_id] = cached
+            angles = cached["angles"].get(key)
+            if angles is None:
+                angles = _extract_angles_array(cached["features"], key)
+                cached["angles"][key] = angles
+            if angles is None:
+                continue
+            frames = entry["frames"]
+            rows = entry["rows"]
+            if frames.size == 0 or rows.size == 0:
+                continue
+            emb_list.append(_angles_to_embedding(angles[frames]))
+            label_list.append(merged_labels[rows, key_idx])
+
+        if emb_list:
+            ref_emb = np.concatenate(emb_list, axis=0)
+            ref_labels = np.concatenate(label_list, axis=0).astype(np.int32)
+            ref_trees.append(KDTree(ref_emb))
+            ref_labels_list.append(ref_labels)
+        else:
+            ref_trees.append(None)
+            ref_labels_list.append(np.array([], dtype=np.int32))
+
+    assign_dir = cluster_path.parent / f"{cluster_path.stem}_assigned"
+    assign_dir.mkdir(parents=True, exist_ok=True)
+
+    assigned_state_paths: Dict[str, str] = {}
+    for state_id, state in system.states.items():
+        if not state.descriptor_file:
+            continue
+        cached = state_cache.get(state_id)
+        if cached is None:
+            desc_path = store.resolve_path(project_id, system_id, state.descriptor_file)
+            features = load_descriptor_npz(desc_path)
+            cached = {
+                "features": features,
+                "angles": {},
+                "metastable_labels": None,
+            }
+            state_cache[state_id] = cached
+
+        angles_by_key = {}
+        frame_count = 0
+        for key in residue_keys:
+            angles = _extract_angles_array(cached["features"], key)
+            angles_by_key[key] = angles
+            if angles is not None and angles.shape[0] > frame_count:
+                frame_count = angles.shape[0]
+        if frame_count <= 0:
+            continue
+
+        labels_out = np.full((frame_count, len(residue_keys)), -1, dtype=np.int32)
+        for idx, key in enumerate(residue_keys):
+            angles = angles_by_key.get(key)
+            tree = ref_trees[idx]
+            ref_labels = ref_labels_list[idx]
+            if angles is None or tree is None:
+                continue
+            emb = _angles_to_embedding(angles)
+            labels_out[:, idx] = _assign_labels_from_reference(emb, tree, ref_labels, k_neighbors)
+
+        payload = {
+            "residue_keys": np.asarray(residue_keys),
+            "assigned__labels": labels_out,
+            "assigned__cluster_counts": merged_counts,
+            "assigned__frame_state_id": np.array([state_id]),
+            "assigned__frame_indices": np.arange(frame_count, dtype=np.int64),
+            "metadata_json": np.array(
+                json.dumps(
+                    {
+                        "source_cluster": cluster_path.name,
+                        "state_id": state_id,
+                        "generated_at": datetime.utcnow().isoformat(),
+                    }
+                )
+            ),
+        }
+        out_path = assign_dir / f"state_{state_id}.npz"
+        np.savez_compressed(out_path, **payload)
+        assigned_state_paths[state_id] = str(out_path.relative_to(cluster_path.parent))
+
+    assigned_meta_paths: Dict[str, str] = {}
+    if analysis_mode != "macro":
+        meta_lookup = {m.get("metastable_id"): m for m in system.metastable_states or []}
+        for meta_id, meta in meta_lookup.items():
+            if metastable_kinds.get(str(meta_id)) == "macro":
+                continue
+            meta_index = meta.get("metastable_index")
+            if meta_index is None:
+                continue
+            labels_list = []
+            frame_state_ids = []
+            frame_indices = []
+            for state_id, state in system.states.items():
+                if not state.descriptor_file:
+                    continue
+                cached = state_cache.get(state_id)
+                if cached is None:
+                    desc_path = store.resolve_path(project_id, system_id, state.descriptor_file)
+                    features = load_descriptor_npz(desc_path)
+                    cached = {
+                        "features": features,
+                        "angles": {},
+                        "metastable_labels": None,
+                    }
+                    state_cache[state_id] = cached
+                if cached["metastable_labels"] is None:
+                    try:
+                        cached["metastable_labels"] = _extract_labels_for_state(
+                            store, project_id, system_id, state, cached["features"]
+                        )
+                    except Exception:
+                        cached["metastable_labels"] = None
+                labels_meta = cached["metastable_labels"]
+                if labels_meta is None or labels_meta.size == 0:
+                    continue
+                mask = labels_meta == int(meta_index)
+                if not np.any(mask):
+                    continue
+                idxs = np.where(mask)[0]
+                if idxs.size == 0:
+                    continue
+                local_labels = np.full((idxs.size, len(residue_keys)), -1, dtype=np.int32)
+                for res_idx, key in enumerate(residue_keys):
+                    angles = cached["angles"].get(key)
+                    if angles is None:
+                        angles = _extract_angles_array(cached["features"], key)
+                        cached["angles"][key] = angles
+                    tree = ref_trees[res_idx]
+                    ref_labels = ref_labels_list[res_idx]
+                    if angles is None or tree is None:
+                        continue
+                    emb = _angles_to_embedding(angles[idxs])
+                    local_labels[:, res_idx] = _assign_labels_from_reference(emb, tree, ref_labels, k_neighbors)
+                labels_list.append(local_labels)
+                frame_state_ids.extend([state_id] * idxs.size)
+                frame_indices.extend(idxs.tolist())
+            if labels_list:
+                labels_concat = np.concatenate(labels_list, axis=0)
+                payload = {
+                    "residue_keys": np.asarray(residue_keys),
+                    "assigned__labels": labels_concat,
+                    "assigned__cluster_counts": merged_counts,
+                    "assigned__frame_state_id": np.asarray(frame_state_ids, dtype=str),
+                    "assigned__frame_indices": np.asarray(frame_indices, dtype=np.int64),
+                    "assigned__frame_metastable_id": np.array([meta_id]),
+                    "metadata_json": np.array(
+                        json.dumps(
+                            {
+                                "source_cluster": cluster_path.name,
+                                "metastable_id": meta_id,
+                                "generated_at": datetime.utcnow().isoformat(),
+                            }
+                        )
+                    ),
+                }
+                out_path = assign_dir / f"meta_{meta_id}.npz"
+                np.savez_compressed(out_path, **payload)
+                assigned_meta_paths[str(meta_id)] = str(out_path.relative_to(cluster_path.parent))
+
+    return {
+        "assigned_state_paths": assigned_state_paths,
+        "assigned_metastable_paths": assigned_meta_paths,
+    }
+
+
+def update_cluster_metadata_with_assignments(
+    cluster_path: Path,
+    assignments: Dict[str, Dict[str, str]],
+) -> None:
+    data = np.load(cluster_path, allow_pickle=True)
+    payload: Dict[str, Any] = {}
+    for key in data.files:
+        payload[key] = data[key]
+    meta_raw = payload.get("metadata_json")
+    meta = {}
+    if meta_raw is not None:
+        try:
+            meta_val = meta_raw.item() if hasattr(meta_raw, "item") else meta_raw
+            meta = json.loads(str(meta_val))
+        except Exception:
+            meta = {}
+    meta.update(assignments or {})
+    payload["metadata_json"] = np.array(json.dumps(meta))
+    np.savez_compressed(cluster_path, **payload)
+
+
 def _collect_cluster_inputs(
     project_id: str,
     system_id: str,
@@ -906,6 +1219,10 @@ def generate_metastable_cluster_npz(
     if progress_callback:
         progress_callback("Clustering residues...", 0, total_residue_jobs)
     store = ProjectStore()
+    system_meta = store.get_system(project_id, system_id)
+    state_labels, metastable_labels = _build_state_name_maps(system_meta)
+    metastable_kinds = _build_metastable_kind_map(system_meta)
+    metastable_kinds = _build_metastable_kind_map(system_meta)
 
     # Build merged clusters
     if not merged_angles_per_residue:
@@ -972,6 +1289,10 @@ def generate_metastable_cluster_npz(
         "system_id": system_id,
         "generated_at": datetime.utcnow().isoformat(),
         "selected_metastable_ids": unique_meta_ids,
+        "analysis_mode": getattr(system_meta, "analysis_mode", None),
+        "state_labels": state_labels,
+        "metastable_labels": metastable_labels,
+        "metastable_kinds": metastable_kinds,
         "cluster_algorithm": algo,
         "cluster_params": {
             "dbscan_eps": db_eps_val,
@@ -1222,6 +1543,8 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
 
     store = ProjectStore()
     dirs = store.ensure_directories(project_id, system_id)
+    system_meta = store.get_system(project_id, system_id)
+    state_labels, metastable_labels = _build_state_name_maps(system_meta)
     cluster_dir = dirs["system_dir"] / "metastable" / "clusters"
     cluster_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
@@ -1241,6 +1564,10 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
         "system_id": system_id,
         "generated_at": datetime.utcnow().isoformat(),
         "selected_metastable_ids": selected_meta_ids,
+        "analysis_mode": getattr(system_meta, "analysis_mode", None),
+        "state_labels": state_labels,
+        "metastable_labels": metastable_labels,
+        "metastable_kinds": metastable_kinds,
         "cluster_algorithm": algo,
         "cluster_params": cluster_params,
         "residue_keys": residue_keys,

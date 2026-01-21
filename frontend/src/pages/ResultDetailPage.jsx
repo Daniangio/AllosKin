@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
+import { Download } from 'lucide-react';
 import Loader from '../components/common/Loader';
 import ErrorMessage from '../components/common/ErrorMessage';
-import { fetchResult } from '../api/jobs';
+import { fetchResult, resultArtifactUrl } from '../api/jobs';
 
 const metricNames = {
   auc: 'Logistic AUC',
@@ -45,6 +46,10 @@ export default function ResultDetailPage() {
     result.residue_selections_mapping && result.analysis_type === 'static' && typeof result.results === 'object';
   const canVisualizeSimulation =
     result.analysis_type === 'simulation' && Boolean(result.results?.marginals_plot);
+  const sampledConformationsUrl =
+    result.analysis_type === 'simulation' && result.results?.summary_npz
+      ? resultArtifactUrl(result.job_id, 'summary_npz')
+      : null;
 
   return (
     <div className="space-y-6">
@@ -100,22 +105,34 @@ export default function ResultDetailPage() {
       <section className="bg-gray-800 border border-gray-700 rounded-lg p-4">
         <div className="flex justify-between items-center mb-3">
           <h2 className="text-lg font-semibold text-white">Result Payload</h2>
-          {canVisualize && (
-            <button
-              onClick={() => navigate(`/visualize/${result.job_id}`)}
-              className="px-3 py-1 bg-cyan-600 rounded-md text-white text-sm"
-            >
-              Visualize
-            </button>
-          )}
-          {canVisualizeSimulation && (
-            <button
-              onClick={() => navigate(`/simulation/${result.job_id}`)}
-              className="px-3 py-1 bg-cyan-600 rounded-md text-white text-sm"
-            >
-              Simulation View
-            </button>
-          )}
+          <div className="flex items-center gap-2">
+            {canVisualize && (
+              <button
+                onClick={() => navigate(`/visualize/${result.job_id}`)}
+                className="px-3 py-1 bg-cyan-600 rounded-md text-white text-sm"
+              >
+                Visualize
+              </button>
+            )}
+            {canVisualizeSimulation && (
+              <button
+                onClick={() => navigate(`/simulation/${result.job_id}`)}
+                className="px-3 py-1 bg-cyan-600 rounded-md text-white text-sm"
+              >
+                Simulation View
+              </button>
+            )}
+            {sampledConformationsUrl && (
+              <a
+                href={sampledConformationsUrl}
+                download={`${result.job_id}-samples.npz`}
+                className="px-3 py-1 bg-gray-700 hover:bg-gray-600 rounded-md text-white text-sm flex items-center gap-2"
+              >
+                <Download className="h-4 w-4" />
+                Sampled conformations
+              </a>
+            )}
+          </div>
         </div>
         <pre className="bg-gray-900 rounded-md p-4 overflow-auto text-xs text-gray-200">
           {JSON.stringify(result.results, null, 2)}

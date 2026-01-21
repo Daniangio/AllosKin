@@ -42,14 +42,14 @@ If you use the webserver, you can upload a pre-fit model NPZ to the cluster via
 Run the setup script once to create the fitting environment and install dependencies:
 
 ```bash
-./scripts/potts_setup_uv.sh
+./scripts/potts_setup.sh
 source .venv-potts-fit/bin/activate
 ```
 
 Then run the interactive fitting script (requires an active venv):
 
 ```bash
-./scripts/potts_fit_uv.sh
+./scripts/potts_fit.sh
 ```
 
 The fitting script prompts for the PLM device (auto/cuda/cpu) and hyperparameters.
