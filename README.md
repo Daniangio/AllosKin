@@ -70,9 +70,11 @@ Note: more workers increases CPU and memory usage. If you only run one worker, t
 Python 3.11+ recommended.
 
 ```bash
-pip install -r requirements.txt
-pip install -r backend/requirements.txt
-pip install -e .
+uv venv .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+uv pip install -r backend/requirements.txt
+uv pip install -e .
 
 # Backend
 uvicorn backend.main:app --reload
