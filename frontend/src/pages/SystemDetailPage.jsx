@@ -19,12 +19,15 @@ import {
   confirmMetastableStates,
   clearMetastableStates,
   downloadSavedCluster,
+  uploadPottsModel,
+  renamePottsModel,
+  deletePottsModel,
   deleteSavedCluster,
 } from '../api/projects';
-import { submitStaticJob, submitSimulationJob, fetchJobStatus } from '../api/jobs';
+import { fetchResults, submitPottsFitJob, submitStaticJob, submitSimulationJob, fetchJobStatus } from '../api/jobs';
 import StaticAnalysisForm from '../components/analysis/StaticAnalysisForm';
 import SimulationAnalysisForm from '../components/analysis/SimulationAnalysisForm';
-import { Download, Eye, Info, Plus, X, Pencil } from 'lucide-react';
+import { Download, Eye, Info, Plus, X, Pencil, SlidersHorizontal } from 'lucide-react';
 
 function StateCard({ state, onDownload, onUpload, onDeleteTrajectory, onDeleteState, uploading, progress, processing }) {
   const [file, setFile] = useState(null);
@@ -330,10 +333,37 @@ export default function SystemDetailPage() {
   const [densityZValue, setDensityZValue] = useState(1.65);
   const [densityMaxk, setDensityMaxk] = useState(100);
   const [metaChoice, setMetaChoice] = useState(null);
+  const [analysisFocus, setAnalysisFocus] = useState('');
   const [showMetastableInfo, setShowMetastableInfo] = useState(false);
   const [docId, setDocId] = useState('metastable_states');
   const [macroChoiceLoading, setMacroChoiceLoading] = useState(false);
   const [infoOverlayState, setInfoOverlayState] = useState(null); // New state for info overlay
+  const [resultsList, setResultsList] = useState([]);
+  const [resultsLoading, setResultsLoading] = useState(false);
+  const [resultsError, setResultsError] = useState(null);
+  const [pottsFitClusterId, setPottsFitClusterId] = useState('');
+  const [pottsFitMethod, setPottsFitMethod] = useState('pmi+plm');
+  const [pottsFitAdvanced, setPottsFitAdvanced] = useState(false);
+  const [pottsFitParams, setPottsFitParams] = useState({
+    plm_epochs: '',
+    plm_lr: '',
+    plm_lr_min: '',
+    plm_lr_schedule: 'cosine',
+    plm_l2: '',
+    plm_batch_size: '',
+    plm_progress_every: '',
+  });
+  const [pottsFitError, setPottsFitError] = useState(null);
+  const [pottsFitSubmitting, setPottsFitSubmitting] = useState(false);
+  const [pottsUploadFile, setPottsUploadFile] = useState(null);
+  const [pottsUploadError, setPottsUploadError] = useState(null);
+  const [pottsUploadBusy, setPottsUploadBusy] = useState(false);
+  const [pottsUploadProgress, setPottsUploadProgress] = useState(null);
+  const [pottsRenameValues, setPottsRenameValues] = useState({});
+  const [pottsRenameBusy, setPottsRenameBusy] = useState({});
+  const [pottsRenameError, setPottsRenameError] = useState(null);
+  const [pottsDeleteBusy, setPottsDeleteBusy] = useState({});
+  const [pottsDeleteError, setPottsDeleteError] = useState(null);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -374,6 +404,26 @@ export default function SystemDetailPage() {
     () => clusterRuns.filter((run) => run.path && run.status !== 'failed'),
     [clusterRuns]
   );
+  const pottsModels = useMemo(
+    () => readyClusterRuns.filter((run) => run.potts_model_path),
+    [readyClusterRuns]
+  );
+  const systemResults = useMemo(
+    () => resultsList.filter((result) => result.system_id === systemId && result.project_id === projectId),
+    [resultsList, projectId, systemId]
+  );
+  const staticResults = useMemo(
+    () => systemResults.filter((result) => result.analysis_type === 'static'),
+    [systemResults]
+  );
+  const simulationResults = useMemo(
+    () => systemResults.filter((result) => result.analysis_type === 'simulation'),
+    [systemResults]
+  );
+  const pottsFitResults = useMemo(
+    () => systemResults.filter((result) => result.analysis_type === 'potts_fit'),
+    [systemResults]
+  );
   const descriptorsReady = useMemo(
     () => states.length > 0 && states.every((state) => state.descriptor_file),
     [states]
@@ -383,7 +433,6 @@ export default function SystemDetailPage() {
   const effectiveChoice = analysisMode || metaChoice;
   const clustersUnlocked = macroReady && (analysisMode === 'macro' || metastableLocked);
   const analysisUnlocked = macroReady && (metastableLocked || effectiveChoice === 'macro');
-  const showPottsPanel = metastableLocked || effectiveChoice === 'macro';
   const analysisNote =
     metastableLocked || effectiveChoice === 'macro'
       ? 'Static needs two descriptor-ready states; Potts uses saved cluster NPZ files.'
@@ -442,6 +491,17 @@ export default function SystemDetailPage() {
       )
     );
   }, [clusterSelectableStates]);
+
+  useEffect(() => {
+    if (!readyClusterRuns.length) {
+      setPottsFitClusterId('');
+      return;
+    }
+    const exists = readyClusterRuns.some((run) => run.cluster_id === pottsFitClusterId);
+    if (!pottsFitClusterId || !exists) {
+      setPottsFitClusterId(readyClusterRuns[readyClusterRuns.length - 1].cluster_id);
+    }
+  }, [readyClusterRuns, pottsFitClusterId]);
 
   useEffect(() => {
     if (!activeClusterJobs.length) return;
@@ -557,6 +617,24 @@ export default function SystemDetailPage() {
     }
   };
 
+  const loadResults = async () => {
+    setResultsLoading(true);
+    setResultsError(null);
+    try {
+      const data = await fetchResults();
+      setResultsList(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setResultsError(err.message || 'Failed to load results.');
+    } finally {
+      setResultsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadResults();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectId, systemId]);
+
   const enqueueStaticJob = async (runner, params) => {
     const stateAId = statePair.a?.macroId;
     const stateBId = statePair.b?.macroId;
@@ -577,6 +655,7 @@ export default function SystemDetailPage() {
       state_b_id: stateB.state_id,
       ...extraParams,
     });
+    loadResults();
     navigate(`/jobs/${response.job_id}`, { state: { analysis_uuid: response.analysis_uuid } });
   };
 
@@ -587,7 +666,113 @@ export default function SystemDetailPage() {
       system_id: systemId,
       ...params,
     });
+    loadResults();
     navigate(`/jobs/${response.job_id}`, { state: { analysis_uuid: response.analysis_uuid } });
+  };
+
+  const enqueuePottsFitJob = async () => {
+    if (!pottsFitClusterId) {
+      setPottsFitError('Select a cluster NPZ to fit.');
+      return;
+    }
+    setPottsFitSubmitting(true);
+    setPottsFitError(null);
+    try {
+      const payload = {
+        project_id: projectId,
+        system_id: systemId,
+        cluster_id: pottsFitClusterId,
+        fit_method: pottsFitMethod,
+      };
+      const numericKeys = new Set([
+        'plm_epochs',
+        'plm_lr',
+        'plm_lr_min',
+        'plm_l2',
+        'plm_batch_size',
+        'plm_progress_every',
+      ]);
+      Object.entries(pottsFitParams).forEach(([key, value]) => {
+        if (value === '' || value === null || value === undefined) return;
+        if (numericKeys.has(key)) {
+          const num = Number(value);
+          if (Number.isFinite(num)) payload[key] = num;
+          return;
+        }
+        payload[key] = value;
+      });
+      const response = await submitPottsFitJob(payload);
+      loadResults();
+      navigate(`/jobs/${response.job_id}`, { state: { analysis_uuid: response.analysis_uuid } });
+    } catch (err) {
+      setPottsFitError(err.message || 'Failed to submit Potts fit job.');
+    } finally {
+      setPottsFitSubmitting(false);
+    }
+  };
+
+  const handleUploadPottsModel = async () => {
+    if (!pottsFitClusterId || !pottsUploadFile) {
+      setPottsUploadError('Select a cluster and choose a model file to upload.');
+      return;
+    }
+    setPottsUploadBusy(true);
+    setPottsUploadError(null);
+    setPottsUploadProgress(0);
+    try {
+      await uploadPottsModel(projectId, systemId, pottsFitClusterId, pottsUploadFile, {
+        onUploadProgress: (percent) => setPottsUploadProgress(percent),
+      });
+      setPottsUploadFile(null);
+      await refreshSystem();
+    } catch (err) {
+      setPottsUploadError(err.message || 'Failed to upload Potts model.');
+    } finally {
+      setPottsUploadBusy(false);
+      setPottsUploadProgress(null);
+    }
+  };
+
+  const formatPottsModelName = (run) => {
+    const raw =
+      run.potts_model_name ||
+      (run.potts_model_path ? run.potts_model_path.split('/').pop() : '') ||
+      'Potts model';
+    return raw.replace(/\.npz$/i, '');
+  };
+
+  const handleRenamePottsModel = async (clusterId) => {
+    const name = (pottsRenameValues[clusterId] || '').trim();
+    if (!name) {
+      setPottsRenameError('Provide a model name.');
+      return;
+    }
+    setPottsRenameError(null);
+    setPottsRenameBusy((prev) => ({ ...prev, [clusterId]: true }));
+    try {
+      await renamePottsModel(projectId, systemId, clusterId, name);
+      await refreshSystem();
+    } catch (err) {
+      setPottsRenameError(err.message || 'Failed to rename Potts model.');
+    } finally {
+      setPottsRenameBusy((prev) => ({ ...prev, [clusterId]: false }));
+    }
+  };
+
+  const handleDeletePottsModel = async (clusterId) => {
+    if (!window.confirm('Delete this fitted Potts model?')) {
+      return;
+    }
+    setPottsDeleteError(null);
+    setPottsDeleteBusy((prev) => ({ ...prev, [clusterId]: true }));
+    try {
+      await deletePottsModel(projectId, systemId, clusterId);
+      await refreshSystem();
+    } catch (err) {
+      setPottsDeleteError(err.message || 'Failed to delete Potts model.');
+    } finally {
+      setPottsDeleteBusy((prev) => ({ ...prev, [clusterId]: false }));
+    }
   };
 
   const handleUploadTrajectory = async (stateId, file, stride) => {
@@ -1359,12 +1544,56 @@ export default function SystemDetailPage() {
 
       {analysisUnlocked && (
         <section className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-4">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-white">Run Analysis</h2>
-            <p className="text-xs text-gray-400">{analysisNote}</p>
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold text-white">Run Analysis</h2>
+              <p className="text-xs text-gray-400">{analysisNote}</p>
+            </div>
+            {analysisFocus && (
+              <button
+                type="button"
+                onClick={() => setAnalysisFocus('')}
+                className="text-xs px-3 py-1 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60"
+              >
+                Back to analyses
+              </button>
+            )}
           </div>
           {analysisError && <ErrorMessage message={analysisError} />}
-          <div className={showPottsPanel ? 'grid lg:grid-cols-2 gap-6' : ''}>
+          {!analysisFocus && (
+            <div className="grid lg:grid-cols-2 gap-6">
+              <button
+                type="button"
+                onClick={() => setAnalysisFocus('static')}
+                className="bg-gray-900 border border-gray-700 rounded-lg p-4 text-left hover:border-cyan-500/60 transition-colors"
+              >
+                <h3 className="text-md font-semibold text-white">Static Reporters</h3>
+                <p className="text-xs text-gray-500 mt-1">Compare two descriptor-ready states.</p>
+                <p className="text-xs text-gray-400 mt-3">
+                  Results: {staticResults.length || 0}
+                </p>
+              </button>
+              <button
+                type="button"
+                onClick={() => setAnalysisFocus('potts')}
+                className="bg-gray-900 border border-gray-700 rounded-lg p-4 text-left hover:border-cyan-500/60 transition-colors"
+              >
+                <div className="flex items-center gap-2">
+                  <h3 className="text-md font-semibold text-white">Potts Modeling</h3>
+                  <InfoTooltip
+                    ariaLabel="Potts analysis documentation"
+                    text="Open documentation for the Potts model, sampling, and diagnostics."
+                    onClick={() => openDoc('potts_overview')}
+                  />
+                </div>
+                <p className="text-xs text-gray-500 mt-1">Fit a model or reuse an uploaded one.</p>
+                <p className="text-xs text-gray-400 mt-3">
+                  Sampling runs: {simulationResults.length || 0}
+                </p>
+              </button>
+            </div>
+          )}
+          {analysisFocus === 'static' && (
             <div className="bg-gray-900 border border-gray-700 rounded-lg p-4 space-y-4">
               <div>
                 <h3 className="text-md font-semibold text-white">Static Reporters</h3>
@@ -1379,21 +1608,257 @@ export default function SystemDetailPage() {
                 }}
               />
               <StaticAnalysisForm onSubmit={(params) => enqueueStaticJob(submitStaticJob, params)} />
-            </div>
-            {showPottsPanel && (
-              <div className="bg-gray-900 border border-gray-700 rounded-lg p-4">
-                <div className="flex items-center gap-2 mb-2">
-                  <h3 className="text-md font-semibold text-white">Potts Sampling</h3>
-                  <InfoTooltip
-                    ariaLabel="Potts analysis documentation"
-                    text="Open documentation for the Potts model, sampling, and diagnostics."
-                    onClick={() => openDoc('potts_overview')}
+              <div className="border-t border-gray-700 pt-4 space-y-2">
+                <h4 className="text-sm font-semibold text-white">Previous static results</h4>
+                {resultsLoading && <p className="text-xs text-gray-500">Loading results…</p>}
+                {resultsError && <ErrorMessage message={resultsError} />}
+                {!resultsLoading && !resultsError && (
+                  <AnalysisResultsList
+                    results={staticResults}
+                    emptyLabel="No static results for this system yet."
+                    onOpen={(result) => navigate(`/results/${result.job_id}`)}
                   />
-                </div>
-                <SimulationAnalysisForm clusterRuns={readyClusterRuns} onSubmit={enqueueSimulationJob} />
+                )}
               </div>
-            )}
-          </div>
+            </div>
+          )}
+          {analysisFocus === 'potts' && (
+            <div className="space-y-4">
+              <div className="grid lg:grid-cols-2 gap-6">
+                <div className="bg-gray-900 border border-gray-700 rounded-lg p-4 space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 className="text-md font-semibold text-white">Potts Model Fitting</h3>
+                      <p className="text-xs text-gray-500 mt-1">
+                        Fit on the webserver or download the cluster NPZ for offline fitting.
+                      </p>
+                    </div>
+                    <InfoTooltip
+                      ariaLabel="Potts model fitting documentation"
+                      text="Fit a Potts model once and reuse it for sampling."
+                      onClick={() => openDoc('potts_model')}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-300 mb-1">Cluster NPZ</label>
+                    <select
+                      value={pottsFitClusterId}
+                      onChange={(event) => setPottsFitClusterId(event.target.value)}
+                      disabled={!readyClusterRuns.length}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500 disabled:opacity-60"
+                    >
+                      {!readyClusterRuns.length && <option value="">No saved clusters</option>}
+                      {readyClusterRuns.map((run) => {
+                        const name = run.name || run.path?.split('/').pop() || run.cluster_id;
+                        return (
+                          <option key={run.cluster_id} value={run.cluster_id}>
+                            {name}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!pottsFitClusterId) return;
+                        const entry = readyClusterRuns.find((run) => run.cluster_id === pottsFitClusterId);
+                        const filename = entry?.path?.split('/').pop();
+                        handleDownloadSavedCluster(pottsFitClusterId, filename);
+                      }}
+                      disabled={!pottsFitClusterId}
+                      className="text-xs px-3 py-2 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60 disabled:opacity-50"
+                    >
+                      Download cluster NPZ
+                    </button>
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-300 mb-1">Fit method</label>
+                    <select
+                      value={pottsFitMethod}
+                      onChange={(event) => setPottsFitMethod(event.target.value)}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                    >
+                      <option value="pmi+plm">PMI + PLM</option>
+                      <option value="plm">PLM only</option>
+                      <option value="pmi">PMI only</option>
+                    </select>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setPottsFitAdvanced((prev) => !prev)}
+                    className="flex items-center gap-2 text-xs text-cyan-300 hover:text-cyan-200"
+                  >
+                    <SlidersHorizontal className="h-4 w-4" />
+                    {pottsFitAdvanced ? 'Hide' : 'Show'} fit hyperparams
+                  </button>
+                  {pottsFitAdvanced && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                      {[
+                        { key: 'plm_epochs', label: 'PLM epochs', placeholder: '200' },
+                        { key: 'plm_lr', label: 'PLM lr', placeholder: '1e-2' },
+                        { key: 'plm_lr_min', label: 'PLM lr min', placeholder: '1e-3' },
+                        { key: 'plm_l2', label: 'PLM L2', placeholder: '1e-5' },
+                        { key: 'plm_batch_size', label: 'Batch size', placeholder: '512' },
+                        { key: 'plm_progress_every', label: 'Progress every', placeholder: '10' },
+                      ].map((field) => (
+                        <label key={field.key} className="space-y-1">
+                          <span className="text-xs text-gray-400">{field.label}</span>
+                          <input
+                            type="text"
+                            placeholder={field.placeholder}
+                            value={pottsFitParams[field.key]}
+                            onChange={(event) =>
+                              setPottsFitParams((prev) => ({ ...prev, [field.key]: event.target.value }))
+                            }
+                            className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                          />
+                        </label>
+                      ))}
+                      <label className="space-y-1">
+                        <span className="text-xs text-gray-400">LR schedule</span>
+                        <select
+                          value={pottsFitParams.plm_lr_schedule}
+                          onChange={(event) =>
+                            setPottsFitParams((prev) => ({ ...prev, plm_lr_schedule: event.target.value }))
+                          }
+                          className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                        >
+                          <option value="cosine">Cosine</option>
+                          <option value="none">None</option>
+                        </select>
+                      </label>
+                    </div>
+                  )}
+                  {pottsFitError && <ErrorMessage message={pottsFitError} />}
+                  <button
+                    type="button"
+                    onClick={enqueuePottsFitJob}
+                    disabled={pottsFitSubmitting || !pottsFitClusterId}
+                    className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-semibold py-2 rounded-md transition-colors disabled:opacity-50"
+                  >
+                    {pottsFitSubmitting ? 'Submitting…' : 'Run Potts fit'}
+                  </button>
+                  <div className="border border-gray-700 rounded-md p-3 space-y-2">
+                    <p className="text-xs text-gray-400">Upload a fitted model from an external machine.</p>
+                    <input
+                      type="file"
+                      accept=".npz"
+                      onChange={(event) => setPottsUploadFile(event.target.files?.[0] || null)}
+                      className="w-full text-xs text-gray-200"
+                    />
+                    {pottsUploadProgress !== null && (
+                      <div>
+                        <div className="flex items-center justify-between text-xs text-gray-500 mb-1">
+                          <span>Uploading model</span>
+                          <span>{pottsUploadProgress}%</span>
+                        </div>
+                        <div className="h-2 bg-gray-700 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-cyan-500 transition-all duration-200"
+                            style={{ width: `${pottsUploadProgress}%` }}
+                          />
+                        </div>
+                      </div>
+                    )}
+                    {pottsUploadError && <ErrorMessage message={pottsUploadError} />}
+                    <button
+                      type="button"
+                      onClick={handleUploadPottsModel}
+                      disabled={!pottsUploadFile || !pottsFitClusterId || pottsUploadBusy}
+                      className="text-xs px-3 py-2 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60 disabled:opacity-50"
+                    >
+                      {pottsUploadBusy ? 'Uploading…' : 'Upload model'}
+                    </button>
+                  </div>
+                  {pottsModels.length > 0 && (
+                    <div className="border border-gray-700 rounded-md p-3 space-y-3">
+                      <p className="text-xs text-gray-400">Uploaded models</p>
+                      {pottsModels.map((run) => {
+                        const displayName = formatPottsModelName(run);
+                        const value = pottsRenameValues[run.cluster_id] ?? displayName;
+                        const isBusy = pottsRenameBusy[run.cluster_id];
+                        const isDeleting = pottsDeleteBusy[run.cluster_id];
+                        return (
+                          <div key={run.cluster_id} className="flex items-center gap-2">
+                            <div className="flex-1">
+                              <p className="text-[11px] text-gray-500">
+                                {run.name || run.cluster_id}
+                              </p>
+                              <input
+                                type="text"
+                                value={value}
+                                onChange={(event) =>
+                                  setPottsRenameValues((prev) => ({
+                                    ...prev,
+                                    [run.cluster_id]: event.target.value,
+                                  }))
+                                }
+                                className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-xs text-white focus:ring-cyan-500"
+                              />
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleRenamePottsModel(run.cluster_id)}
+                              disabled={isBusy || isDeleting}
+                              className="text-xs px-3 py-2 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60 disabled:opacity-50"
+                            >
+                              {isBusy ? 'Saving…' : 'Rename'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleDeletePottsModel(run.cluster_id)}
+                              disabled={isDeleting || isBusy}
+                              className="text-xs px-3 py-2 rounded-md border border-red-500/40 text-red-200 hover:bg-red-500/10 disabled:opacity-50"
+                            >
+                              {isDeleting ? 'Deleting…' : 'Delete'}
+                            </button>
+                          </div>
+                        );
+                      })}
+                      {pottsRenameError && <ErrorMessage message={pottsRenameError} />}
+                      {pottsDeleteError && <ErrorMessage message={pottsDeleteError} />}
+                    </div>
+                  )}
+                  {pottsFitResults.length > 0 && (
+                    <div className="border-t border-gray-800 pt-3 space-y-2">
+                      <h4 className="text-xs font-semibold text-gray-300">Recent fit jobs</h4>
+                      <AnalysisResultsList
+                        results={pottsFitResults}
+                        emptyLabel="No fit results yet."
+                        onOpen={(result) => navigate(`/results/${result.job_id}`)}
+                      />
+                    </div>
+                  )}
+                </div>
+                <div className="bg-gray-900 border border-gray-700 rounded-lg p-4">
+                  <div className="flex items-center gap-2 mb-2">
+                    <h3 className="text-md font-semibold text-white">Potts Sampling</h3>
+                    <InfoTooltip
+                      ariaLabel="Potts analysis documentation"
+                      text="Run sampling with a selected fitted model."
+                      onClick={() => openDoc('potts_overview')}
+                    />
+                  </div>
+                  <SimulationAnalysisForm clusterRuns={readyClusterRuns} onSubmit={enqueueSimulationJob} />
+                </div>
+              </div>
+              <div className="bg-gray-900 border border-gray-700 rounded-lg p-4 space-y-2">
+                <h4 className="text-sm font-semibold text-white">Sampling results</h4>
+                {resultsLoading && <p className="text-xs text-gray-500">Loading results…</p>}
+                {resultsError && <ErrorMessage message={resultsError} />}
+                {!resultsLoading && !resultsError && (
+                  <AnalysisResultsList
+                    results={simulationResults}
+                    emptyLabel="No Potts sampling results for this system yet."
+                    onOpen={(result) => navigate(`/results/${result.job_id}`)}
+                    onOpenSimulation={(result) => navigate(`/simulation/${result.job_id}`)}
+                  />
+                )}
+              </div>
+            </div>
+          )}
         </section>
       )}
       {clusterPanelOpen && (
@@ -1495,6 +1960,58 @@ function InfoTooltip({ text, ariaLabel, onClick }) {
         {text}
       </span>
     </span>
+  );
+}
+
+function StatusBadge({ status }) {
+  let className = 'bg-amber-400';
+  if (status === 'finished') className = 'bg-emerald-400';
+  if (status === 'failed') className = 'bg-red-400';
+  return <span className={`inline-block h-2 w-2 rounded-full ${className}`} />;
+}
+
+function AnalysisResultsList({ results, emptyLabel, onOpen, onOpenSimulation }) {
+  if (!results.length) {
+    return <p className="text-xs text-gray-500">{emptyLabel}</p>;
+  }
+  return (
+    <div className="space-y-2">
+      {results.map((result) => (
+        <div
+          key={result.job_id}
+          className="flex items-center justify-between gap-3 rounded-md border border-gray-800 bg-gray-950/40 px-3 py-2"
+        >
+          <div className="flex items-center gap-3">
+            <StatusBadge status={result.status} />
+            <div>
+              <p className="text-sm text-gray-200">{result.analysis_type.toUpperCase()}</p>
+              <p className="text-xs text-gray-500">
+                Job {result.job_id?.slice(0, 8)} · {result.status}
+                {result.created_at ? ` · ${new Date(result.created_at).toLocaleString()}` : ''}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {onOpenSimulation && result.analysis_type === 'simulation' && result.status === 'finished' && (
+              <button
+                type="button"
+                onClick={() => onOpenSimulation(result)}
+                className="text-xs text-cyan-300 hover:text-cyan-200"
+              >
+                View
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => onOpen(result)}
+              className="text-xs text-cyan-300 hover:text-cyan-200"
+            >
+              Details
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }
 

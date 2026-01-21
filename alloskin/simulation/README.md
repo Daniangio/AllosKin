@@ -109,6 +109,20 @@ python main.py \
   * `plm`: pseudolikelihood fit (requires torch)
   * `pmi+plm`: fast heuristic from co-occurrences as initial guess + pseudolikelihood fit (recommended baseline; requires torch)
 * `--beta`: target inverse temperature for sampling
+* `--fit-only`: fit and save `potts_model.npz` then exit
+* `--model-npz`: reuse a pre-fit Potts model and skip fitting
+* `--plm-device`: device for PLM training (`auto`, `cpu`, `cuda`, or torch device string)
+
+### Local fitting with uv
+
+To fit on a separate machine, run the setup once, activate the venv, then run the
+interactive fitter:
+
+```bash
+./scripts/potts_setup_uv.sh
+source .venv-potts-fit/bin/activate
+./scripts/potts_fit_uv.sh
+```
 
 ### Gibbs sampling
 

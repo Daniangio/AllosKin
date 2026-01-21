@@ -42,6 +42,8 @@ class SimulationJobRequest(BaseModel):
     project_id: str
     system_id: str
     cluster_id: str
+    use_potts_model: Optional[bool] = True
+    potts_model_path: Optional[str] = None
     rex_betas: Optional[Union[str, List[float]]] = None
     rex_beta_min: Optional[float] = None
     rex_beta_max: Optional[float] = None
@@ -62,3 +64,19 @@ class SimulationJobRequest(BaseModel):
     plm_l2: Optional[float] = None
     plm_batch_size: Optional[int] = None
     plm_progress_every: Optional[int] = None
+    plm_device: Optional[str] = None
+
+
+class PottsFitJobRequest(BaseModel):
+    project_id: str
+    system_id: str
+    cluster_id: str
+    fit_method: Optional[str] = None
+    plm_epochs: Optional[int] = None
+    plm_lr: Optional[float] = None
+    plm_lr_min: Optional[float] = None
+    plm_lr_schedule: Optional[str] = None
+    plm_l2: Optional[float] = None
+    plm_batch_size: Optional[int] = None
+    plm_progress_every: Optional[int] = None
+    plm_device: Optional[str] = None

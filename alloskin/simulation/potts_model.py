@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -60,6 +61,53 @@ class PottsModel:
         else:
             # stored as (s,r), so transpose
             return self.J[(s, r)].T
+
+
+def save_potts_model(
+    model: PottsModel,
+    path: str | "os.PathLike[str]",
+    *,
+    metadata: Optional[dict] = None,
+) -> None:
+    """
+    Save a PottsModel to NPZ without pickled objects.
+    """
+    payload: Dict[str, np.ndarray] = {}
+    n_res = len(model.h)
+    payload["n_residues"] = np.array([n_res], dtype=int)
+    payload["edges"] = np.asarray(model.edges, dtype=int)
+    payload["K_list"] = np.asarray(model.K_list(), dtype=int)
+
+    for idx, h in enumerate(model.h):
+        payload[f"h_{idx}"] = np.asarray(h, dtype=float)
+    for (r, s), mat in model.J.items():
+        payload[f"J_{r}_{s}"] = np.asarray(mat, dtype=float)
+
+    if metadata:
+        payload["metadata_json"] = np.array([json.dumps(metadata)], dtype=str)
+
+    np.savez_compressed(path, **payload)
+
+
+def load_potts_model(path: str | "os.PathLike[str]") -> PottsModel:
+    """
+    Load a PottsModel from NPZ saved by save_potts_model.
+    """
+    npz = np.load(path, allow_pickle=False)
+    n_res = int(npz["n_residues"][0]) if "n_residues" in npz else None
+    edges = [tuple(map(int, e)) for e in npz["edges"]] if "edges" in npz else []
+    if n_res is None:
+        n_res = len({int(k.split("_", 1)[1]) for k in npz.files if k.startswith("h_")})
+
+    h = [npz[f"h_{i}"] for i in range(n_res)]
+    J = {}
+    for r, s in edges:
+        key = f"J_{r}_{s}"
+        if key not in npz.files:
+            raise ValueError(f"Missing coupling {key} in model NPZ.")
+        J[(int(r), int(s))] = npz[key]
+
+    return PottsModel(h=h, J=J, edges=[(int(r), int(s)) for r, s in edges])
 
 
 def fit_potts_pmi(
@@ -129,8 +177,11 @@ def fit_potts_pseudolikelihood_torch(
     seed: int = 0,
     verbose: bool = True,
     init_from_pmi: bool = True,
+    init_model: "PottsModel | None" = None,
+    report_init_loss: bool = True,
     progress_callback: "callable | None" = None,
     progress_every: int = 10,
+    batch_progress_callback: "callable | None" = None,
     device: str | None = None,
 ) -> PottsModel:
     """
@@ -166,8 +217,8 @@ def fit_potts_pseudolikelihood_torch(
         neigh[s].append(r)
 
     # Optional initialization from PMI heuristic
-    pmi_model: PottsModel | None = None
-    if init_from_pmi:
+    pmi_model: PottsModel | None = init_model
+    if pmi_model is None and init_from_pmi:
         pmi_model = fit_potts_pmi(labels, K, edges, center=True)
 
     # Parameters: h_r and J_rs
@@ -219,6 +270,29 @@ def fit_potts_pseudolikelihood_torch(
 
     idx = np.arange(T)
     progress_every = max(1, int(progress_every))
+    total_batches = max(1, (T + batch_size - 1) // batch_size)
+
+    def _evaluate_avg_loss() -> float:
+        total = 0.0
+        nobs = 0
+        with torch.no_grad():
+            for start in range(0, T, batch_size):
+                bidx = idx[start:start + batch_size]
+                xb = X[bidx]
+                loss = 0.0
+                for r in range(N):
+                    logits = _logits_for_residue(xb, r)
+                    y = xb[:, r]
+                    loss = loss + loss_fn(logits, y)
+                total += float(loss.item()) * len(bidx)
+                nobs += len(bidx)
+        return total / max(1, nobs)
+
+    if verbose and report_init_loss:
+        init_loss = _evaluate_avg_loss()
+        label = "PMI init" if pmi_model is not None else "init"
+        print(f"[plm] {label} avg_loss={init_loss:.6f}")
+
     for ep in range(1, epochs + 1):
         rng.shuffle(idx)
         total = 0.0
@@ -241,6 +315,9 @@ def fit_potts_pseudolikelihood_torch(
 
             total += float(loss.item()) * len(bidx)
             nobs += len(bidx)
+            if batch_progress_callback:
+                batch_num = start // batch_size + 1
+                batch_progress_callback(ep, epochs, batch_num, total_batches)
 
         avg_loss = total / max(1, nobs)
         if verbose and (ep == 1 or ep % max(1, epochs // 10) == 0):
@@ -258,3 +335,75 @@ def fit_potts_pseudolikelihood_torch(
         J[(r, s)] = -J_params[key].detach().cpu().numpy().astype(float)
 
     return PottsModel(h=h, J=J, edges=list(edges))
+
+
+def compute_pseudolikelihood_loss_torch(
+    model: PottsModel,
+    labels: np.ndarray,
+    *,
+    batch_size: int = 512,
+    device: str | None = None,
+) -> float:
+    """
+    Compute average pseudolikelihood loss for a fixed Potts model.
+    """
+    try:
+        import torch
+    except Exception as e:
+        raise RuntimeError("PyTorch is required for pseudolikelihood loss evaluation.") from e
+
+    labels = np.asarray(labels, dtype=int)
+    T, N = labels.shape
+    if N != len(model.h):
+        raise ValueError("Labels shape does not match Potts model size.")
+    edges = sorted((min(r, s), max(r, s)) for r, s in model.edges if r != s)
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_device = torch.device(device)
+
+    neigh = [[] for _ in range(N)]
+    for r, s in edges:
+        neigh[r].append(s)
+        neigh[s].append(r)
+
+    h_params = [
+        torch.tensor(-model.h[r], dtype=torch.float32, device=torch_device)
+        for r in range(N)
+    ]
+    J_params = {}
+    for r, s in edges:
+        key = f"{r}_{s}"
+        J_params[key] = torch.tensor(-model.J[(r, s)], dtype=torch.float32, device=torch_device)
+
+    X = torch.tensor(labels, dtype=torch.long, device=torch_device)
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    def _logits_for_residue(x_batch: "torch.Tensor", r: int) -> "torch.Tensor":
+        B = x_batch.shape[0]
+        logits = h_params[r].unsqueeze(0).expand(B, -1)
+        for s in neigh[r]:
+            rr, ss = (r, s) if r < s else (s, r)
+            key = f"{rr}_{ss}"
+            Jmat = J_params[key]
+            xs = x_batch[:, s]
+            if r < s:
+                logits = logits + Jmat[:, xs].T
+            else:
+                logits = logits + Jmat[xs, :]
+        return logits
+
+    total = 0.0
+    nobs = 0
+    with torch.no_grad():
+        for start in range(0, T, batch_size):
+            xb = X[start:start + batch_size]
+            loss = 0.0
+            for r in range(N):
+                logits = _logits_for_residue(xb, r)
+                y = xb[:, r]
+                loss = loss + loss_fn(logits, y)
+            total += float(loss.item()) * xb.shape[0]
+            nobs += xb.shape[0]
+
+    return total / max(1, nobs)

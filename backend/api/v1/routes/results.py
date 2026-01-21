@@ -102,7 +102,7 @@ async def get_result_detail(job_uuid: str):
 @router.get("/results/{job_uuid}/artifacts/{artifact}", summary="Download a result artifact")
 async def download_result_artifact(job_uuid: str, artifact: str, download: bool = Query(False)):
     """
-    Download stored analysis artifacts by name (summary_npz, metadata_json, marginals_plot, beta_scan_plot).
+    Download stored analysis artifacts by name (summary_npz, metadata_json, marginals_plot, beta_scan_plot, potts_model).
     """
     result_file = RESULTS_DIR / f"{job_uuid}.json"
     if not result_file.exists() or not result_file.is_file():
@@ -120,6 +120,7 @@ async def download_result_artifact(job_uuid: str, artifact: str, download: bool 
         "marginals_plot": "marginals_plot",
         "beta_scan_plot": "beta_scan_plot",
         "cluster_npz": "cluster_npz",
+        "potts_model": "potts_model",
     }
     key = allowed.get(artifact)
     if not key:

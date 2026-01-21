@@ -342,3 +342,90 @@ export function deleteSavedCluster(projectId, systemId, clusterId) {
     method: 'DELETE',
   });
 }
+
+export function uploadPottsModel(projectId, systemId, clusterId, file, options = {}) {
+  const { onUploadProgress } = options;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(
+      'POST',
+      `${API_BASE}/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/potts_model`
+    );
+    xhr.responseType = 'json';
+
+    if (xhr.upload) {
+      xhr.upload.addEventListener('loadstart', () => {
+        if (typeof onUploadProgress === 'function') onUploadProgress(0);
+      });
+      xhr.upload.addEventListener('progress', (event) => {
+        if (typeof onUploadProgress !== 'function') return;
+        if (!event.lengthComputable) return;
+        const percent = Math.round((event.loaded / event.total) * 100);
+        onUploadProgress(Math.min(100, percent));
+      });
+      xhr.upload.addEventListener('loadend', () => {
+        if (typeof onUploadProgress === 'function') onUploadProgress(100);
+      });
+    }
+
+    const parseResponseJSON = () => {
+      if (xhr.response !== null && xhr.response !== undefined) {
+        return xhr.response;
+      }
+      try {
+        return xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch (err) {
+        return null;
+      }
+    };
+
+    xhr.onreadystatechange = () => {
+      if (xhr.readyState !== XMLHttpRequest.DONE) return;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(parseResponseJSON());
+      } else {
+        const response = parseResponseJSON() || {};
+        const message =
+          response.detail ||
+          response.error ||
+          (typeof response === 'string' ? response : '') ||
+          xhr.statusText ||
+          'Failed to upload Potts model.';
+        reject(new Error(message));
+      }
+    };
+
+    xhr.onerror = () => {
+      reject(new Error('Network error while uploading Potts model.'));
+    };
+
+    const payload = new FormData();
+    payload.append('model', file);
+    xhr.send(payload);
+  });
+}
+
+export function downloadPottsModel(projectId, systemId, clusterId) {
+  return requestBlob(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/potts_model`
+  );
+}
+
+export function renamePottsModel(projectId, systemId, clusterId, name) {
+  return requestJSON(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/potts_model`,
+    {
+      method: 'PATCH',
+      body: { name },
+    }
+  );
+}
+
+export function deletePottsModel(projectId, systemId, clusterId) {
+  return requestJSON(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/potts_model`,
+    {
+      method: 'DELETE',
+    }
+  );
+}

@@ -4,8 +4,8 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, HTTPException
 
 from backend.api.v1.common import ensure_system_ready, get_cluster_entry, get_queue, project_store
-from backend.api.v1.schemas import SimulationJobRequest, StaticJobRequest
-from backend.tasks import run_analysis_job, run_simulation_job
+from backend.api.v1.schemas import PottsFitJobRequest, SimulationJobRequest, StaticJobRequest
+from backend.tasks import run_analysis_job, run_potts_fit_job, run_simulation_job
 
 
 router = APIRouter()
@@ -172,6 +172,71 @@ async def submit_simulation_job(
             job_timeout="2h",
             result_ttl=86400,
             job_id=f"simulation-{job_uuid}",
+        )
+        return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"Job submission failed: {exc}") from exc
+
+
+@router.post("/submit/potts_fit", summary="Submit a Potts model fitting job")
+async def submit_potts_fit_job(
+    payload: PottsFitJobRequest,
+    task_queue: Any = Depends(get_queue),
+):
+    try:
+        system_meta = project_store.get_system(payload.project_id, payload.system_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"System '{payload.system_id}' not found in project '{payload.project_id}'.",
+        )
+
+    get_cluster_entry(system_meta, payload.cluster_id)
+
+    if payload.fit_method is not None and payload.fit_method not in {"pmi", "plm", "pmi+plm"}:
+        raise HTTPException(status_code=400, detail="fit_method must be 'pmi', 'plm', or 'pmi+plm'.")
+
+    for name, value in {
+        "plm_epochs": payload.plm_epochs,
+        "plm_batch_size": payload.plm_batch_size,
+        "plm_progress_every": payload.plm_progress_every,
+    }.items():
+        if value is not None and int(value) < 1:
+            raise HTTPException(status_code=400, detail=f"{name} must be >= 1.")
+
+    if payload.plm_lr is not None and float(payload.plm_lr) <= 0:
+        raise HTTPException(status_code=400, detail="plm_lr must be > 0.")
+    if payload.plm_lr_min is not None and float(payload.plm_lr_min) < 0:
+        raise HTTPException(status_code=400, detail="plm_lr_min must be >= 0.")
+    if payload.plm_l2 is not None and float(payload.plm_l2) < 0:
+        raise HTTPException(status_code=400, detail="plm_l2 must be >= 0.")
+    if payload.plm_lr_schedule is not None and payload.plm_lr_schedule not in {"cosine", "none"}:
+        raise HTTPException(status_code=400, detail="plm_lr_schedule must be 'cosine' or 'none'.")
+
+    try:
+        project_meta = project_store.get_project(payload.project_id)
+        project_name = project_meta.name
+    except Exception:
+        project_name = None
+
+    dataset_ref = {
+        "project_id": payload.project_id,
+        "project_name": project_name,
+        "system_id": payload.system_id,
+        "system_name": system_meta.name,
+        "cluster_id": payload.cluster_id,
+    }
+
+    params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
+
+    try:
+        job_uuid = str(uuid.uuid4())
+        job = task_queue.enqueue(
+            run_potts_fit_job,
+            args=(job_uuid, dataset_ref, params),
+            job_timeout="2h",
+            result_ttl=86400,
+            job_id=f"potts-fit-{job_uuid}",
         )
         return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
     except Exception as exc:  # pragma: no cover

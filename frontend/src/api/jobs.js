@@ -14,6 +14,13 @@ export function submitSimulationJob(payload) {
   });
 }
 
+export function submitPottsFitJob(payload) {
+  return requestJSON('/submit/potts_fit', {
+    method: 'POST',
+    body: payload,
+  });
+}
+
 export function fetchResults() {
   return requestJSON('/results');
 }

@@ -260,16 +260,19 @@ class ProjectStore:
         structures_dir = system_dir / "structures"
         descriptors_dir = system_dir / "descriptors"
         trajectories_dir = system_dir / "trajectories"
+        potts_models_dir = system_dir / "potts_models"
         tmp_dir = system_dir / "tmp"
         structures_dir.mkdir(parents=True, exist_ok=True)
         descriptors_dir.mkdir(parents=True, exist_ok=True)
         trajectories_dir.mkdir(parents=True, exist_ok=True)
+        potts_models_dir.mkdir(parents=True, exist_ok=True)
         tmp_dir.mkdir(parents=True, exist_ok=True)
         return {
             "system_dir": system_dir,
             "structures_dir": structures_dir,
             "descriptors_dir": descriptors_dir,
             "trajectories_dir": trajectories_dir,
+            "potts_models_dir": potts_models_dir,
             "tmp_dir": tmp_dir,
         }
 

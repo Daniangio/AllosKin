@@ -14,6 +14,7 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
   const [saReads, setSaReads] = useState('');
   const [saSweeps, setSaSweeps] = useState('');
   const [saSchedules, setSaSchedules] = useState([]);
+  const [pottsModelPath, setPottsModelPath] = useState('');
   const [plmEpochs, setPlmEpochs] = useState('');
   const [plmLr, setPlmLr] = useState('');
   const [plmLrMin, setPlmLrMin] = useState('');
@@ -30,6 +31,17 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
     () => clusterOptions.find((run) => run.cluster_id === clusterId),
     [clusterOptions, clusterId]
   );
+  const modelOptions = useMemo(() => {
+    if (!selectedCluster) return [];
+    const modelPath = selectedCluster.potts_model_path;
+    if (!modelPath) return [];
+    const rawLabel =
+      selectedCluster.potts_model_name ||
+      modelPath.split('/').pop() ||
+      'Potts model';
+    const label = rawLabel.replace(/\.npz$/i, '');
+    return [{ value: modelPath, label }];
+  }, [selectedCluster]);
 
   useEffect(() => {
     if (!clusterOptions.length) {
@@ -41,6 +53,16 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
       setClusterId(clusterOptions[clusterOptions.length - 1].cluster_id);
     }
   }, [clusterOptions, clusterId]);
+
+  useEffect(() => {
+    if (!modelOptions.length) {
+      setPottsModelPath('');
+      return;
+    }
+    if (!pottsModelPath || !modelOptions.some((opt) => opt.value === pottsModelPath)) {
+      setPottsModelPath(modelOptions[0].value);
+    }
+  }, [modelOptions, pottsModelPath]);
 
   const parseBetaList = (raw) =>
     raw
@@ -63,7 +85,12 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
       if (!clusterId) {
         throw new Error('Select a saved cluster NPZ to run Potts analysis.');
       }
+      if (!pottsModelPath) {
+        throw new Error('Select a fitted Potts model before sampling.');
+      }
       const payload = { cluster_id: clusterId };
+      payload.use_potts_model = true;
+      payload.potts_model_path = pottsModelPath;
       const betasRaw = rexBetas.trim();
       if (betasRaw) {
         payload.rex_betas = parseBetaList(betasRaw);
@@ -148,6 +175,26 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
             {selectedCluster.contact_cutoff ?? 10} Å
           </p>
         )}
+      </div>
+
+      <div>
+        <label className="block text-sm text-gray-300 mb-1">Potts model</label>
+        <select
+          value={pottsModelPath}
+          onChange={(event) => setPottsModelPath(event.target.value)}
+          disabled={!modelOptions.length}
+          className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500 disabled:opacity-60"
+        >
+          {!modelOptions.length && <option value="">No fitted models available</option>}
+          {modelOptions.map((opt) => (
+            <option key={opt.value} value={opt.value}>
+              {opt.label}
+            </option>
+          ))}
+        </select>
+        <p className="text-xs text-gray-500 mt-1">
+          Select a pre-fit model (webserver or uploaded) to run sampling.
+        </p>
       </div>
 
       <div className="border border-gray-700 rounded-md p-3 space-y-3">
@@ -277,7 +324,7 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
               <input
                 type="number"
                 step="0.0001"
-                placeholder="Default: 1e-3"
+                placeholder="Default: 1e-5"
                 value={plmL2}
                 onChange={(event) => setPlmL2(event.target.value)}
                 className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
@@ -432,7 +479,7 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
       <ErrorMessage message={error} />
       <button
         type="submit"
-        disabled={isSubmitting || !clusterOptions.length}
+        disabled={isSubmitting || !clusterOptions.length || !pottsModelPath}
         className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-semibold py-2 rounded-md transition-colors disabled:opacity-50"
       >
         {isSubmitting ? 'Submitting…' : 'Run Potts Sampling'}

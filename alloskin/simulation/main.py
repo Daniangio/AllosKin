@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 
 from alloskin.io.data import load_npz
-from alloskin.simulation.potts_model import fit_potts_pmi, fit_potts_pseudolikelihood_torch
+from alloskin.simulation.potts_model import (
+    compute_pseudolikelihood_loss_torch,
+    fit_potts_pmi,
+    fit_potts_pseudolikelihood_torch,
+    load_potts_model,
+    save_potts_model,
+)
 from alloskin.simulation.qubo import potts_to_qubo_onehot, decode_onehot
 from alloskin.simulation.sampling import (
     gibbs_sample_potts,
@@ -96,6 +104,7 @@ def _save_run_summary(
     beta_eff_value: float | None = None,
     beta_eff_by_schedule: list[float] | None = None,
     beta_eff_distances_by_schedule: np.ndarray | None = None,
+    model_path: Path | None = None,
 ) -> Path:
     """
     Save a compact summary bundle of inputs + sampling results into results_dir/run_summary.npz,
@@ -146,6 +155,8 @@ def _save_run_summary(
         "summary_file": summary_path.name,
         "data_npz": args.npz,
     }
+    if model_path is not None:
+        metadata["potts_model_file"] = model_path.name
     if swap_accept_rate is not None and len(swap_accept_rate):
         metadata["swap_accept_rate_mean"] = float(np.mean(swap_accept_rate))
     if beta_eff_value is not None:
@@ -166,6 +177,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--plot-only", action="store_true", help="Skip sampling; load run_summary.npz from results-dir (or --summary-file) and emit plots.")
     ap.add_argument("--summary-file", default="", help="Optional explicit path to a summary npz (defaults to results-dir/run_summary.npz).")
     ap.add_argument("--unassigned-policy", default="drop_frames", choices=["drop_frames", "treat_as_state", "error"])
+    ap.add_argument("--fit-only", action="store_true", help="Fit and save the Potts model, then exit.")
+    ap.add_argument("--model-npz", default="", help="Optional pre-fit Potts model npz to skip fitting.")
+    ap.add_argument("--model-out", default="", help="Where to save potts_model.npz (defaults to results-dir/potts_model.npz).")
 
     ap.add_argument("--fit", default="pmi+plm", choices=["pmi", "plm", "pmi+plm"])
     ap.add_argument("--beta", type=float, default=1.0)
@@ -176,6 +190,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--plm-l2", type=float, default=1e-5)
     ap.add_argument("--plm-batch-size", type=int, default=512)
     ap.add_argument("--plm-progress-every", type=int, default=10)
+    ap.add_argument(
+        "--plm-device",
+        type=str,
+        default="auto",
+        help="Device for PLM training (auto/cpu/cuda or torch device string).",
+    )
 
     # Gibbs / REX-Gibbs
     ap.add_argument("--gibbs-method", default="single", choices=["single", "rex"])
@@ -257,6 +277,7 @@ def run_pipeline(
     default_summary_path = Path(args.summary_file) if args.summary_file else results_dir / "run_summary.npz"
     default_plot_path = results_dir / "marginals.html"
     beta_scan_plot_path = None
+    model_out_path = Path(args.model_out) if args.model_out else results_dir / "potts_model.npz"
 
     if args.plot_only:
         if not default_summary_path.exists():
@@ -273,6 +294,7 @@ def run_pipeline(
             "plot_path": out_path,
             "beta_scan_path": None,
             "beta_eff": None,
+            "model_path": None,
         }
 
     if not args.npz:
@@ -281,6 +303,9 @@ def run_pipeline(
             parser.error(msg)
         raise ValueError(msg)
 
+    if args.fit_only and args.model_npz:
+        raise ValueError("Use --fit-only without --model-npz.")
+
     ds = load_npz(args.npz, unassigned_policy=args.unassigned_policy)
     report("Loaded dataset", 8)
     labels = ds.labels
@@ -288,50 +313,126 @@ def run_pipeline(
     edges = ds.edges
     residue_labels = getattr(ds, "residue_keys", np.arange(labels.shape[1]))
 
-    print(f"[data] T={labels.shape[0]}  N={labels.shape[1]}  edges={len(edges)}")
+    train_points = int(labels.shape[0] * labels.shape[1])
+    print(f"[data] T={labels.shape[0]}  N={labels.shape[1]}  edges={len(edges)}  train_points={train_points}")
+    plm_device = (args.plm_device or "").strip()
+    if plm_device.lower() == "auto":
+        plm_device = ""
+    plm_device = plm_device or None
 
     # Fit model(s)
     model = None
     model_pmi = None
-    if args.fit in ("pmi", "pmi+plm"):
-        report("Fitting Potts model (PMI)", 15)
-        model_pmi = fit_potts_pmi(labels, K, edges)
-        model = model_pmi
-    if args.fit in ("plm", "pmi+plm"):
-        try:
-            def _plm_progress(ep: int, total: int, avg_loss: float) -> None:
-                base = 20.0
-                span = 30.0
-                report(f"Fitting Potts model (PLM) {ep}/{total} loss={avg_loss:.4f}", base + span * ep / max(1, total))
+    pmi_loss = None
+    if args.model_npz:
+        report("Loading Potts model", 15)
+        model = load_potts_model(args.model_npz)
+    else:
+        if args.fit in ("pmi", "pmi+plm", "plm"):
+            report("Fitting Potts model (PMI)", 15)
+            model_pmi = fit_potts_pmi(labels, K, edges)
+            model = model_pmi if args.fit == "pmi" else None
+            try:
+                pmi_loss = compute_pseudolikelihood_loss_torch(
+                    model_pmi,
+                    labels,
+                    batch_size=args.plm_batch_size,
+                    device=plm_device,
+                )
+                print(f"[pmi] avg_pseudolikelihood_loss={pmi_loss:.6f}")
+            except RuntimeError:
+                print("[pmi] pseudolikelihood loss unavailable (torch missing).")
+        if args.fit in ("plm", "pmi+plm"):
+            try:
+                show_batch_progress = not callbacks and (args.progress or sys.stdout.isatty())
+                plm_batch_progress = None
+                report_init_loss = pmi_loss is None
+                if show_batch_progress:
+                    last_epoch = {"val": None}
 
-            model_plm = fit_potts_pseudolikelihood_torch(
-                labels,
-                K,
-                edges,
-                l2=args.plm_l2,
-                lr=args.plm_lr,
-                lr_min=args.plm_lr_min,
-                lr_schedule=args.plm_lr_schedule,
-                epochs=args.plm_epochs,
-                batch_size=args.plm_batch_size,
-                seed=args.seed,
-                verbose=True,
-                progress_callback=_plm_progress,
-                progress_every=args.plm_progress_every,
-            )
-            model = model_plm
-        except RuntimeError as exc:
-            if "PyTorch is required" not in str(exc):
-                raise
-            if model_pmi is None:
-                model_pmi = fit_potts_pmi(labels, K, edges)
-            model = model_pmi
-            args.fit = "pmi"
-            print("[fit] warning: PyTorch missing; falling back to PMI fit.")
-            report("PyTorch missing; falling back to PMI fit", 35)
+                    def _plm_batch_progress(ep: int, total_ep: int, batch: int, total_batches: int) -> None:
+                        if last_epoch["val"] is None:
+                            last_epoch["val"] = ep
+                        if ep != last_epoch["val"]:
+                            print()
+                            last_epoch["val"] = ep
+                        bar_len = 28
+                        filled = int(bar_len * batch / max(1, total_batches))
+                        bar = "#" * filled + "-" * (bar_len - filled)
+                        end = "\n" if batch >= total_batches else ""
+                        print(
+                            f"\r[plm] epoch {ep}/{total_ep} batch {batch}/{total_batches} [{bar}]",
+                            end=end,
+                            flush=True,
+                        )
+
+                    plm_batch_progress = _plm_batch_progress
+
+                def _plm_progress(ep: int, total: int, avg_loss: float) -> None:
+                    base = 20.0
+                    span = 30.0
+                    report(f"Fitting Potts model (PLM) {ep}/{total} loss={avg_loss:.4f}", base + span * ep / max(1, total))
+                    if show_batch_progress:
+                        print(f"[plm] epoch {ep}/{total} avg_loss={avg_loss:.6f}")
+
+                model_plm = fit_potts_pseudolikelihood_torch(
+                    labels,
+                    K,
+                    edges,
+                    l2=args.plm_l2,
+                    lr=args.plm_lr,
+                    lr_min=args.plm_lr_min,
+                    lr_schedule=args.plm_lr_schedule,
+                    epochs=args.plm_epochs,
+                    batch_size=args.plm_batch_size,
+                    seed=args.seed,
+                    verbose=not show_batch_progress,
+                    init_model=model_pmi,
+                    report_init_loss=report_init_loss,
+                    device=plm_device,
+                    progress_callback=_plm_progress,
+                    progress_every=args.plm_progress_every,
+                    batch_progress_callback=plm_batch_progress,
+                )
+                model = model_plm
+            except RuntimeError as exc:
+                if "PyTorch is required" not in str(exc):
+                    raise
+                if model_pmi is None:
+                    model_pmi = fit_potts_pmi(labels, K, edges)
+                model = model_pmi
+                args.fit = "pmi"
+                print("[fit] warning: PyTorch missing; falling back to PMI fit.")
+                report("PyTorch missing; falling back to PMI fit", 35)
 
     assert model is not None
+    save_potts_model(
+        model,
+        model_out_path,
+        metadata={
+            "data_npz": args.npz,
+            "fit_method": args.fit,
+            "source_model": args.model_npz or None,
+        },
+    )
     report("Potts model fit complete", 40)
+
+    if args.fit_only:
+        meta_path = results_dir / "potts_model_metadata.json"
+        meta_path.write_text(
+            json.dumps(
+                {
+                    "args": vars(args),
+                    "model_file": model_out_path.name,
+                    "data_npz": args.npz,
+                },
+                indent=2,
+            )
+        )
+        return {
+            "model_path": model_out_path,
+            "metadata_path": meta_path,
+        }
 
     betas: list[float] = []
     beta_eff_grid_result: list[float] | None = None
@@ -592,6 +693,7 @@ def run_pipeline(
                 beta_eff_value=beta_eff_value,
                 beta_eff_by_schedule=beta_eff_by_schedule,
                 beta_eff_distances_by_schedule=None,
+                model_path=model_out_path,
             )
             print(f"[results] summary saved to {summary_path}")
             out_path = plot_marginal_summary_from_npz(
@@ -608,6 +710,7 @@ def run_pipeline(
                 "beta_scan_path": None,
                 "beta_eff": beta_eff_value,
                 "beta_eff_by_schedule": beta_eff_by_schedule,
+                "model_path": model_out_path,
             }
 
         beta_eff_plot_path = results_dir / "beta_scan.html"
@@ -722,6 +825,7 @@ def run_pipeline(
         beta_eff_distances_by_schedule=(
             np.asarray(distances_by_schedule, dtype=float) if distances_by_schedule is not None else None
         ),
+        model_path=model_out_path,
     )
     print(f"[results] summary saved to {summary_path}")
 
@@ -743,6 +847,7 @@ def run_pipeline(
         "beta_scan_path": beta_scan_plot_path,
         "beta_eff": beta_eff_value,
         "beta_eff_by_schedule": beta_eff_by_schedule,
+        "model_path": model_out_path,
     }
 
 

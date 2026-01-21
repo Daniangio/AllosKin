@@ -86,6 +86,28 @@ npm install
 npm start
 ```
 
+## Local Potts Model Fitting (Optional)
+
+You can fit Potts models on a separate machine (e.g., with CUDA) and upload the
+`potts_model.npz` back to the web UI.
+
+1) Create a dedicated uv environment once:
+
+```bash
+./scripts/potts_setup_uv.sh
+source .venv-potts-fit/bin/activate
+```
+
+2) Run the interactive fitter (requires an active venv):
+
+```bash
+./scripts/potts_fit_uv.sh
+```
+
+The script prompts for the input Cluster NPZ, PLM hyperparameters, and device
+(`auto`, `cuda`, or `cpu`). The fitted model is saved as `potts_model.npz` in the
+chosen results directory.
+
 ## Repository Structure
 
 ```
@@ -100,3 +122,4 @@ docs/                    Documentation
 - The backend uses Redis to queue jobs. In Docker, Redis is started automatically.
 - Results are persisted to `ALLOSKIN_DATA_ROOT/results` and referenced in run metadata.
 - For API details, use the OpenAPI docs at `/docs`.
+- Potts models can be fit once and reused for sampling. See `docs/potts_overview.md` for CLI examples.

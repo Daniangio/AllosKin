@@ -2,6 +2,7 @@ import json
 import os
 import time
 import traceback
+import shutil
 from pathlib import Path
 from datetime import datetime
 from rq import Queue, Worker, get_current_job
@@ -71,6 +72,38 @@ def _update_cluster_entry(
     entry.update(updates)
     system_meta.metastable_clusters = clusters
     project_store.save_system(system_meta)
+
+
+def _persist_potts_model(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    model_path: Path,
+    params: Dict[str, Any],
+    *,
+    source: str,
+) -> str:
+    dirs = project_store.ensure_directories(project_id, system_id)
+    system_dir = dirs["system_dir"]
+    model_dir = dirs["potts_models_dir"]
+    model_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = model_dir / f"{cluster_id}_potts_model.npz"
+    if model_path.resolve() != dest_path.resolve():
+        shutil.copy2(model_path, dest_path)
+    rel_path = str(dest_path.relative_to(system_dir))
+    _update_cluster_entry(
+        project_id,
+        system_id,
+        cluster_id,
+        {
+            "potts_model_path": rel_path,
+            "potts_model_name": dest_path.stem,
+            "potts_model_updated_at": datetime.utcnow().isoformat(),
+            "potts_model_source": source,
+            "potts_model_params": params,
+        },
+    )
+    return rel_path
 
 
 # --- Master Analysis Job ---
@@ -328,6 +361,9 @@ def run_simulation_job(
         results_dir.mkdir(parents=True, exist_ok=True)
 
         sim_params = dict(params or {})
+        model_rel = None
+        if sim_params.get("use_potts_model", True):
+            model_rel = sim_params.get("potts_model_path") or entry.get("potts_model_path")
         rex_betas = sim_params.get("rex_betas")
         if isinstance(rex_betas, (list, tuple)):
             rex_betas = ",".join(str(float(b)) for b in rex_betas)
@@ -343,6 +379,16 @@ def run_simulation_job(
             "rex",
             "--estimate-beta-eff",
         ]
+
+        model_path = None
+        if model_rel:
+            model_path = Path(model_rel)
+            if not model_path.is_absolute():
+                model_path = project_store.resolve_path(project_id, system_id, model_rel)
+            if model_path.exists():
+                args_list += ["--model-npz", str(model_path)]
+            else:
+                model_path = None
 
         if isinstance(rex_betas, str) and rex_betas.strip():
             args_list += ["--rex-betas", rex_betas.strip()]
@@ -440,6 +486,21 @@ def run_simulation_job(
         plot_path = _coerce_path(run_result.get("plot_path"))
         meta_path = _coerce_path(run_result.get("metadata_path"))
         beta_scan_path = _coerce_path(run_result.get("beta_scan_path"))
+        model_artifact = _coerce_path(run_result.get("model_path"))
+
+        potts_model_rel = None
+        if model_artifact and model_artifact.exists():
+            if model_path and model_path.exists() and model_artifact.resolve() == model_path.resolve():
+                potts_model_rel = str(model_rel)
+            else:
+                potts_model_rel = _persist_potts_model(
+                    project_id,
+                    system_id,
+                    cluster_id,
+                    model_artifact,
+                    params,
+                    source="simulation",
+                )
 
         result_payload["status"] = "finished"
         result_payload["results"] = {
@@ -449,6 +510,7 @@ def run_simulation_job(
             "marginals_plot": _relativize_path(plot_path) if plot_path else None,
             "beta_scan_plot": _relativize_path(beta_scan_path) if beta_scan_path else None,
             "cluster_npz": _relativize_path(cluster_path),
+            "potts_model": potts_model_rel or (_relativize_path(model_path) if model_path else None),
             "beta_eff": run_result.get("beta_eff"),
         }
 
@@ -466,6 +528,165 @@ def run_simulation_job(
         write_result_to_disk(sanitized_payload)
 
     save_progress("Simulation completed", 100)
+    return sanitized_payload
+
+
+def run_potts_fit_job(
+    job_uuid: str,
+    dataset_ref: Dict[str, str],
+    params: Dict[str, Any],
+):
+    """
+    Fit a Potts model for a cluster NPZ and store the model for reuse.
+    """
+    job = get_current_job()
+    start_time = datetime.utcnow()
+    rq_job_id = job.id if job else f"potts-fit-{job_uuid}"
+
+    result_payload = {
+        "job_id": job_uuid,
+        "rq_job_id": rq_job_id,
+        "analysis_type": "potts_fit",
+        "status": "started",
+        "created_at": start_time.isoformat(),
+        "params": params,
+        "results": None,
+        "system_reference": {
+            "project_id": dataset_ref.get("project_id"),
+            "system_id": dataset_ref.get("system_id"),
+            "project_name": dataset_ref.get("project_name"),
+            "system_name": dataset_ref.get("system_name"),
+            "cluster_id": dataset_ref.get("cluster_id"),
+        },
+        "error": None,
+        "completed_at": None,
+    }
+
+    result_filepath = RESULTS_DIR / f"{job_uuid}.json"
+
+    def force_single_thread():
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        os.environ["NUMEXPR_NUM_THREADS"] = "1"
+        try:
+            import torch
+
+            torch.set_num_threads(1)
+            torch.set_num_interop_threads(1)
+        except Exception:
+            pass
+
+    def save_progress(status_msg: str, progress: int):
+        if job:
+            job.meta["status"] = status_msg
+            job.meta["progress"] = progress
+            job.save_meta()
+        print(f"[PottsFit {job_uuid}] {status_msg}")
+
+    def write_result_to_disk(payload: Dict[str, Any]):
+        try:
+            with open(result_filepath, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            print(f"CRITICAL: Failed to save result file {result_filepath}: {e}")
+            payload["status"] = "failed"
+            payload["error"] = f"Failed to save result file: {e}"
+
+    try:
+        force_single_thread()
+        save_progress("Initializing...", 0)
+        write_result_to_disk(result_payload)
+
+        project_id = dataset_ref.get("project_id")
+        system_id = dataset_ref.get("system_id")
+        cluster_id = dataset_ref.get("cluster_id")
+        if not project_id or not system_id or not cluster_id:
+            raise ValueError("Potts fit requires project_id/system_id/cluster_id.")
+
+        system_meta = project_store.get_system(project_id, system_id)
+        clusters = system_meta.metastable_clusters or []
+        entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+        if not entry:
+            raise FileNotFoundError(f"Cluster NPZ not found for cluster_id='{cluster_id}'.")
+        rel_path = entry.get("path")
+        if not rel_path:
+            raise FileNotFoundError("Cluster NPZ path missing in system metadata.")
+        cluster_path = Path(rel_path)
+        if not cluster_path.is_absolute():
+            cluster_path = project_store.resolve_path(project_id, system_id, rel_path)
+        if not cluster_path.exists():
+            raise FileNotFoundError(f"Cluster NPZ file is missing on disk: {cluster_path}")
+
+        dirs = project_store.ensure_directories(project_id, system_id)
+        model_path = dirs["potts_models_dir"] / f"{cluster_id}_potts_model.npz"
+
+        fit_params = dict(params or {})
+        args_list = [
+            "--npz",
+            str(cluster_path),
+            "--results-dir",
+            str(SIMULATION_RESULTS_DIR / job_uuid),
+            "--fit-only",
+            "--model-out",
+            str(model_path),
+        ]
+
+        fit_method = fit_params.get("fit_method")
+        if fit_method is not None:
+            args_list += ["--fit", str(fit_method)]
+
+        for key, flag in (
+            ("plm_epochs", "--plm-epochs"),
+            ("plm_lr", "--plm-lr"),
+            ("plm_lr_min", "--plm-lr-min"),
+            ("plm_lr_schedule", "--plm-lr-schedule"),
+            ("plm_l2", "--plm-l2"),
+            ("plm_batch_size", "--plm-batch-size"),
+            ("plm_progress_every", "--plm-progress-every"),
+            ("plm_device", "--plm-device"),
+        ):
+            val = fit_params.get(key)
+            if val is not None:
+                args_list += [flag, str(val)]
+
+        save_progress("Fitting Potts model", 20)
+        try:
+            sim_args = parse_simulation_args(args_list)
+        except SystemExit as exc:
+            raise ValueError("Invalid potts fit arguments.") from exc
+        run_result = run_simulation_pipeline(sim_args, progress_callback=save_progress)
+
+        potts_model_rel = _persist_potts_model(
+            project_id,
+            system_id,
+            cluster_id,
+            Path(model_path),
+            fit_params,
+            source="potts_fit",
+        )
+
+        result_payload["status"] = "finished"
+        result_payload["results"] = {
+            "results_dir": _relativize_path(SIMULATION_RESULTS_DIR / job_uuid),
+            "potts_model": potts_model_rel,
+            "metadata_json": _relativize_path(run_result.get("metadata_path")) if run_result.get("metadata_path") else None,
+        }
+
+    except Exception as e:
+        print(f"[PottsFit {job_uuid}] FAILED: {e}")
+        traceback.print_exc()
+        result_payload["status"] = "failed"
+        result_payload["error"] = str(e)
+        raise e
+
+    finally:
+        save_progress("Saving final result", 95)
+        result_payload["completed_at"] = datetime.utcnow().isoformat()
+        sanitized_payload = _convert_nan_to_none(result_payload)
+        write_result_to_disk(sanitized_payload)
+
+    save_progress("Potts fit completed", 100)
     return sanitized_payload
 
 

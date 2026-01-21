@@ -1,13 +1,14 @@
 import logging
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 
-from backend.api.v1.common import get_queue, project_store
+from backend.api.v1.common import get_queue, project_store, stream_upload
 from backend.services.metastable_clusters import generate_metastable_cluster_npz
 from backend.tasks import run_cluster_job
 
@@ -412,5 +413,151 @@ async def delete_metastable_cluster_npz(project_id: str, system_id: str, cluster
             pass
 
     system_meta.metastable_clusters = [c for c in clusters if c.get("cluster_id") != cluster_id]
+    project_store.save_system(system_meta)
+    return {"status": "deleted", "cluster_id": cluster_id}
+
+
+@router.post(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/potts_model",
+    summary="Upload a Potts model NPZ for a cluster",
+)
+async def upload_potts_model_npz(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    model: UploadFile = File(...),
+):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    clusters = system_meta.metastable_clusters or []
+    entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Cluster NPZ not found.")
+
+    dirs = project_store.ensure_directories(project_id, system_id)
+    system_dir = dirs["system_dir"]
+    filename = model.filename or f"{cluster_id}_potts_model.npz"
+    dest_path = dirs["potts_models_dir"] / filename
+    await stream_upload(model, dest_path)
+    rel_path = str(dest_path.relative_to(system_dir))
+    display_name = Path(filename).stem
+    entry["potts_model_path"] = rel_path
+    entry["potts_model_updated_at"] = datetime.utcnow().isoformat()
+    entry["potts_model_source"] = "upload"
+    entry["potts_model_name"] = display_name
+    system_meta.metastable_clusters = clusters
+    project_store.save_system(system_meta)
+    return {"status": "uploaded", "cluster_id": cluster_id, "potts_model_path": rel_path}
+
+
+@router.patch(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/potts_model",
+    summary="Rename a Potts model NPZ",
+)
+async def rename_potts_model_npz(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    payload: Dict[str, Any],
+):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    name = (payload or {}).get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise HTTPException(status_code=400, detail="Potts model name is required.")
+    base = Path(name.strip()).name
+    if base.lower().endswith(".npz"):
+        base = base[:-4]
+    base = base.strip()
+    if not base:
+        raise HTTPException(status_code=400, detail="Potts model name is required.")
+
+    clusters = system_meta.metastable_clusters or []
+    entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Cluster NPZ not found.")
+    rel_path = entry.get("potts_model_path")
+    if not rel_path:
+        raise HTTPException(status_code=404, detail="Potts model not available.")
+
+    dirs = project_store.ensure_directories(project_id, system_id)
+    system_dir = dirs["system_dir"]
+    abs_path = project_store.resolve_path(project_id, system_id, rel_path)
+    if not abs_path.exists():
+        raise HTTPException(status_code=404, detail="Potts model file is missing on disk.")
+
+    new_filename = f"{base}.npz"
+    new_path = dirs["potts_models_dir"] / new_filename
+    if new_path.resolve() != abs_path.resolve():
+        if new_path.exists():
+            raise HTTPException(status_code=409, detail="Potts model name already exists.")
+        abs_path.rename(new_path)
+        rel_path = str(new_path.relative_to(system_dir))
+        entry["potts_model_path"] = rel_path
+
+    entry["potts_model_name"] = base
+    entry["potts_model_updated_at"] = datetime.utcnow().isoformat()
+    system_meta.metastable_clusters = clusters
+    project_store.save_system(system_meta)
+    return {"status": "renamed", "cluster_id": cluster_id, "name": base}
+
+
+@router.get(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/potts_model",
+    summary="Download a Potts model NPZ for a cluster",
+)
+async def download_potts_model_npz(project_id: str, system_id: str, cluster_id: str):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    clusters = system_meta.metastable_clusters or []
+    entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Cluster NPZ not found.")
+    rel_path = entry.get("potts_model_path")
+    if not rel_path:
+        raise HTTPException(status_code=404, detail="Potts model not available.")
+    abs_path = project_store.resolve_path(project_id, system_id, rel_path)
+    if not abs_path.exists():
+        raise HTTPException(status_code=404, detail="Potts model file missing on disk.")
+    return FileResponse(abs_path, filename=abs_path.name, media_type="application/octet-stream")
+
+
+@router.delete(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/potts_model",
+    summary="Delete a Potts model NPZ for a cluster",
+)
+async def delete_potts_model_npz(project_id: str, system_id: str, cluster_id: str):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    clusters = system_meta.metastable_clusters or []
+    entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+    if not entry:
+        raise HTTPException(status_code=404, detail="Cluster NPZ not found.")
+    rel_path = entry.get("potts_model_path")
+    if rel_path:
+        abs_path = project_store.resolve_path(project_id, system_id, rel_path)
+        try:
+            abs_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    entry.pop("potts_model_path", None)
+    entry.pop("potts_model_name", None)
+    entry.pop("potts_model_source", None)
+    entry.pop("potts_model_params", None)
+    entry.pop("potts_model_updated_at", None)
+    system_meta.metastable_clusters = clusters
     project_store.save_system(system_meta)
     return {"status": "deleted", "cluster_id": cluster_id}
