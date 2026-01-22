@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -11,6 +12,7 @@ import numpy as np
 from phase.io.data import load_npz
 from phase.simulation.potts_model import (
     compute_pseudolikelihood_loss_torch,
+    compute_pseudolikelihood_scores,
     fit_potts_pmi,
     fit_potts_pseudolikelihood_torch,
     load_potts_model,
@@ -84,6 +86,212 @@ def _load_assigned_labels(path: Path) -> np.ndarray | None:
     except Exception:
         return None
     return None
+
+
+def _tokenize_label(label: str) -> set[str]:
+    cleaned = re.sub(r"[^a-z0-9]+", " ", label.lower()).strip()
+    if not cleaned:
+        return set()
+    return set(cleaned.split())
+
+
+def _select_state_ids_by_token(state_labels: dict, token: str) -> list[str]:
+    matches: list[str] = []
+    for state_id, label in state_labels.items():
+        tokens = _tokenize_label(str(label))
+        if token in tokens:
+            matches.append(str(state_id))
+    return matches
+
+
+def _rankdata(values: np.ndarray) -> np.ndarray:
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty_like(order, dtype=float)
+    n = len(values)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg_rank = 0.5 * (i + j) + 1.0
+        ranks[order[i:j + 1]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _roc_auc_score(labels: np.ndarray, scores: np.ndarray) -> float:
+    labels = np.asarray(labels, dtype=int)
+    scores = np.asarray(scores, dtype=float)
+    n_pos = int(np.sum(labels == 1))
+    n_neg = int(np.sum(labels == 0))
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    ranks = _rankdata(scores)
+    rank_sum_pos = float(np.sum(ranks[labels == 1]))
+    auc = (rank_sum_pos - n_pos * (n_pos + 1) * 0.5) / (n_pos * n_neg)
+    return float(auc)
+
+
+def _roc_curve(labels: np.ndarray, scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    labels = np.asarray(labels, dtype=int)
+    scores = np.asarray(scores, dtype=float)
+    n_pos = int(np.sum(labels == 1))
+    n_neg = int(np.sum(labels == 0))
+    if n_pos == 0 or n_neg == 0:
+        return np.zeros((0,), dtype=float), np.zeros((0,), dtype=float)
+    order = np.argsort(scores, kind="mergesort")[::-1]
+    labels_sorted = labels[order]
+    tps = np.cumsum(labels_sorted == 1)
+    fps = np.cumsum(labels_sorted == 0)
+    tpr = tps / n_pos
+    fpr = fps / n_neg
+    tpr = np.concatenate([[0.0], tpr])
+    fpr = np.concatenate([[0.0], fpr])
+    return fpr, tpr
+
+
+def _pad_ragged(rows: Sequence[np.ndarray], *, pad_value: float = float("nan")) -> tuple[np.ndarray, np.ndarray]:
+    if not rows:
+        return np.zeros((0, 0), dtype=float), np.zeros((0,), dtype=int)
+    max_len = max(int(row.shape[0]) for row in rows)
+    out = np.full((len(rows), max_len), pad_value, dtype=float)
+    counts = np.zeros((len(rows),), dtype=int)
+    for i, row in enumerate(rows):
+        counts[i] = int(row.shape[0])
+        if row.size:
+            out[i, : row.shape[0]] = row
+    return out, counts
+
+
+def _compute_cross_likelihood_classification(
+    labels: np.ndarray,
+    md_sources: Sequence[dict] | None,
+    frame_state_ids: np.ndarray | None,
+    frame_metastable_ids: np.ndarray | None,
+    metadata: dict | None,
+    K: Sequence[int],
+    edges: Sequence[tuple[int, int]],
+    *,
+    batch_size: int,
+    min_frames: int = 10,
+) -> dict | None:
+    if md_sources is None:
+        return None
+
+    meta = metadata or {}
+    assigned_state_paths = meta.get("assigned_state_paths") or {}
+    assigned_meta_paths = meta.get("assigned_metastable_paths") or {}
+    if not assigned_state_paths and not assigned_meta_paths:
+        return None
+
+    selected_meta_ids = {str(v) for v in (meta.get("selected_metastable_ids") or [])}
+    assigned_state_ids = {str(k) for k in assigned_state_paths.keys()}
+    assigned_meta_ids = {str(k) for k in assigned_meta_paths.keys()}
+    fit_state_ids = set()
+    fit_meta_ids = set()
+    if frame_state_ids is not None and frame_state_ids.shape[0] == labels.shape[0]:
+        fit_state_ids = {str(v) for v in np.unique(frame_state_ids)}
+    if frame_metastable_ids is not None and frame_metastable_ids.shape[0] == labels.shape[0]:
+        fit_meta_ids = {str(v) for v in np.unique(frame_metastable_ids)}
+
+    other_sources = []
+    for src in md_sources:
+        src_id = str(src.get("id", ""))
+        if src_id.startswith("state:"):
+            state_id = src_id.split(":", 1)[1]
+            if state_id in assigned_state_ids and state_id not in fit_state_ids:
+                other_sources.append(src)
+        elif src_id.startswith("meta:"):
+            meta_id = src_id.split(":", 1)[1]
+            if meta_id in assigned_meta_ids and meta_id not in fit_meta_ids and meta_id not in selected_meta_ids:
+                other_sources.append(src)
+
+    model_fit = fit_potts_pmi(labels, K, edges)
+    score_fit_fit, _ = compute_pseudolikelihood_scores(
+        model_fit,
+        labels,
+        batch_size=batch_size,
+        use_torch=True,
+    )
+
+    delta_fit_list: list[np.ndarray] = []
+    delta_other_list: list[np.ndarray] = []
+    auc_list: list[float] = []
+    roc_fpr_list: list[np.ndarray] = []
+    roc_tpr_list: list[np.ndarray] = []
+    other_labels: list[str] = []
+    other_ids: list[str] = []
+
+    for src in other_sources:
+        X_other = src.get("labels")
+        if not isinstance(X_other, np.ndarray) or not X_other.size:
+            continue
+        X_other = np.asarray(X_other, dtype=int)
+        if X_other.shape[0] < min_frames or labels.shape[0] < min_frames:
+            continue
+        model_other = fit_potts_pmi(X_other, K, edges)
+        score_fit_other, _ = compute_pseudolikelihood_scores(
+            model_other,
+            labels,
+            batch_size=batch_size,
+            use_torch=True,
+        )
+        score_other_fit, _ = compute_pseudolikelihood_scores(
+            model_fit,
+            X_other,
+            batch_size=batch_size,
+            use_torch=True,
+        )
+        score_other_other, _ = compute_pseudolikelihood_scores(
+            model_other,
+            X_other,
+            batch_size=batch_size,
+            use_torch=True,
+        )
+
+        delta_fit = score_fit_fit - score_fit_other
+        delta_other = score_other_fit - score_other_other
+
+        labels_auc = np.concatenate([np.ones_like(delta_fit), np.zeros_like(delta_other)])
+        scores_auc = np.concatenate([delta_fit, delta_other])
+        auc = _roc_auc_score(labels_auc, scores_auc)
+        fpr, tpr = _roc_curve(labels_auc, scores_auc)
+
+        delta_fit_list.append(delta_fit)
+        delta_other_list.append(delta_other)
+        auc_list.append(auc)
+        roc_fpr_list.append(fpr)
+        roc_tpr_list.append(tpr)
+        other_labels.append(str(src.get("label") or src.get("id")))
+        other_ids.append(str(src.get("id")))
+
+    if not delta_fit_list:
+        return None
+
+    delta_fit_by_other = np.stack(delta_fit_list, axis=0)
+    delta_other_by_other, delta_other_counts = _pad_ragged(delta_other_list)
+    roc_fpr_by_other, roc_counts = _pad_ragged(roc_fpr_list)
+    roc_tpr_by_other, _ = _pad_ragged(roc_tpr_list)
+    auc_by_other = np.asarray(auc_list, dtype=float)
+
+    return {
+        "delta_active": delta_fit_list[0],
+        "delta_inactive": delta_other_list[0],
+        "auc": auc_by_other[0] if auc_by_other.size else float("nan"),
+        "active_state_ids": ["fit"],
+        "inactive_state_ids": [other_ids[0]] if other_ids else [],
+        "active_state_labels": ["Fit MD"],
+        "inactive_state_labels": [other_labels[0]] if other_labels else ["Other MDs"],
+        "delta_fit_by_other": delta_fit_by_other,
+        "delta_other_by_other": delta_other_by_other,
+        "delta_other_counts": delta_other_counts,
+        "other_state_ids": other_ids,
+        "other_state_labels": other_labels,
+        "auc_by_other": auc_by_other,
+        "roc_fpr_by_other": roc_fpr_by_other,
+        "roc_tpr_by_other": roc_tpr_by_other,
+        "roc_counts": roc_counts,
+    }
 
 
 def _build_md_sources(
@@ -394,6 +602,22 @@ def _save_run_summary(
     nn_cdf_sample_to_md: np.ndarray | None = None,
     nn_cdf_md_to_sample: np.ndarray | None = None,
     edge_strength: np.ndarray | None = None,
+    xlik_delta_active: np.ndarray | None = None,
+    xlik_delta_inactive: np.ndarray | None = None,
+    xlik_auc: float | None = None,
+    xlik_active_state_ids: Sequence[str] | None = None,
+    xlik_inactive_state_ids: Sequence[str] | None = None,
+    xlik_active_state_labels: Sequence[str] | None = None,
+    xlik_inactive_state_labels: Sequence[str] | None = None,
+    xlik_delta_fit_by_other: np.ndarray | None = None,
+    xlik_delta_other_by_other: np.ndarray | None = None,
+    xlik_delta_other_counts: np.ndarray | None = None,
+    xlik_other_state_ids: Sequence[str] | None = None,
+    xlik_other_state_labels: Sequence[str] | None = None,
+    xlik_auc_by_other: np.ndarray | None = None,
+    xlik_roc_fpr_by_other: np.ndarray | None = None,
+    xlik_roc_tpr_by_other: np.ndarray | None = None,
+    xlik_roc_counts: np.ndarray | None = None,
 ) -> Path:
     """
     Save a compact summary bundle of inputs + sampling results into results_dir/run_summary.npz,
@@ -468,6 +692,26 @@ def _save_run_summary(
         nn_cdf_sample_to_md=nn_cdf_sample_to_md if nn_cdf_sample_to_md is not None else np.zeros((0, 0, 0), dtype=float),
         nn_cdf_md_to_sample=nn_cdf_md_to_sample if nn_cdf_md_to_sample is not None else np.zeros((0, 0, 0), dtype=float),
         edge_strength=edge_strength if edge_strength is not None else np.array([], dtype=float),
+        xlik_delta_active=xlik_delta_active if xlik_delta_active is not None else np.array([], dtype=float),
+        xlik_delta_inactive=xlik_delta_inactive if xlik_delta_inactive is not None else np.array([], dtype=float),
+        xlik_auc=np.array([xlik_auc], dtype=float) if xlik_auc is not None else np.array([], dtype=float),
+        xlik_active_state_ids=np.asarray(xlik_active_state_ids, dtype=str) if xlik_active_state_ids is not None else np.array([], dtype=str),
+        xlik_inactive_state_ids=np.asarray(xlik_inactive_state_ids, dtype=str) if xlik_inactive_state_ids is not None else np.array([], dtype=str),
+        xlik_active_state_labels=np.asarray(xlik_active_state_labels, dtype=str) if xlik_active_state_labels is not None else np.array([], dtype=str),
+        xlik_inactive_state_labels=np.asarray(xlik_inactive_state_labels, dtype=str) if xlik_inactive_state_labels is not None else np.array([], dtype=str),
+        xlik_delta_fit_by_other=xlik_delta_fit_by_other if xlik_delta_fit_by_other is not None else np.zeros((0, 0), dtype=float),
+        xlik_delta_other_by_other=(
+            xlik_delta_other_by_other if xlik_delta_other_by_other is not None else np.zeros((0, 0), dtype=float)
+        ),
+        xlik_delta_other_counts=(
+            xlik_delta_other_counts if xlik_delta_other_counts is not None else np.array([], dtype=int)
+        ),
+        xlik_other_state_ids=np.asarray(xlik_other_state_ids, dtype=str) if xlik_other_state_ids is not None else np.array([], dtype=str),
+        xlik_other_state_labels=np.asarray(xlik_other_state_labels, dtype=str) if xlik_other_state_labels is not None else np.array([], dtype=str),
+        xlik_auc_by_other=xlik_auc_by_other if xlik_auc_by_other is not None else np.array([], dtype=float),
+        xlik_roc_fpr_by_other=xlik_roc_fpr_by_other if xlik_roc_fpr_by_other is not None else np.zeros((0, 0), dtype=float),
+        xlik_roc_tpr_by_other=xlik_roc_tpr_by_other if xlik_roc_tpr_by_other is not None else np.zeros((0, 0), dtype=float),
+        xlik_roc_counts=xlik_roc_counts if xlik_roc_counts is not None else np.array([], dtype=int),
     )
 
     metadata = {
@@ -485,6 +729,12 @@ def _save_run_summary(
         metadata["beta_eff_by_schedule"] = [float(v) for v in beta_eff_by_schedule]
     if sa_schedule_labels is not None:
         metadata["sa_schedule_labels"] = [str(v) for v in sa_schedule_labels]
+    if xlik_auc is not None:
+        metadata["cross_likelihood_auc"] = float(xlik_auc)
+    if xlik_active_state_labels is not None:
+        metadata["cross_likelihood_active_states"] = [str(v) for v in xlik_active_state_labels]
+    if xlik_inactive_state_labels is not None:
+        metadata["cross_likelihood_inactive_states"] = [str(v) for v in xlik_inactive_state_labels]
     meta_path.write_text(json.dumps(metadata, indent=2))
     return summary_path
 
@@ -1059,6 +1309,17 @@ def run_pipeline(
         block_size=256,
     )
 
+    cross_likelihood = _compute_cross_likelihood_classification(
+        labels,
+        md_sources,
+        getattr(ds, "frame_state_ids", None),
+        getattr(ds, "frame_metastable_ids", None),
+        getattr(ds, "metadata", None),
+        K,
+        edges,
+        batch_size=args.plm_batch_size,
+    )
+
     beta_eff_grid_result = None
     beta_eff_distances_result = None
     beta_eff_value = None
@@ -1132,7 +1393,23 @@ def run_pipeline(
                 nn_cdf_sample_to_md=nn_payload["cdf_sample_to_md"],
                 nn_cdf_md_to_sample=nn_payload["cdf_md_to_sample"],
                 edge_strength=edge_strength,
-            )
+            xlik_delta_active=cross_likelihood["delta_active"] if cross_likelihood else None,
+            xlik_delta_inactive=cross_likelihood["delta_inactive"] if cross_likelihood else None,
+            xlik_auc=cross_likelihood["auc"] if cross_likelihood else None,
+            xlik_active_state_ids=cross_likelihood["active_state_ids"] if cross_likelihood else None,
+            xlik_inactive_state_ids=cross_likelihood["inactive_state_ids"] if cross_likelihood else None,
+            xlik_active_state_labels=cross_likelihood["active_state_labels"] if cross_likelihood else None,
+            xlik_inactive_state_labels=cross_likelihood["inactive_state_labels"] if cross_likelihood else None,
+            xlik_delta_fit_by_other=cross_likelihood["delta_fit_by_other"] if cross_likelihood else None,
+            xlik_delta_other_by_other=cross_likelihood["delta_other_by_other"] if cross_likelihood else None,
+            xlik_delta_other_counts=cross_likelihood["delta_other_counts"] if cross_likelihood else None,
+            xlik_other_state_ids=cross_likelihood["other_state_ids"] if cross_likelihood else None,
+            xlik_other_state_labels=cross_likelihood["other_state_labels"] if cross_likelihood else None,
+            xlik_auc_by_other=cross_likelihood["auc_by_other"] if cross_likelihood else None,
+            xlik_roc_fpr_by_other=cross_likelihood["roc_fpr_by_other"] if cross_likelihood else None,
+            xlik_roc_tpr_by_other=cross_likelihood["roc_tpr_by_other"] if cross_likelihood else None,
+            xlik_roc_counts=cross_likelihood["roc_counts"] if cross_likelihood else None,
+        )
             print(f"[results] summary saved to {summary_path}")
             out_path = plot_marginal_summary_from_npz(
                 summary_path=summary_path,
@@ -1300,6 +1577,22 @@ def run_pipeline(
         nn_cdf_sample_to_md=nn_payload["cdf_sample_to_md"],
         nn_cdf_md_to_sample=nn_payload["cdf_md_to_sample"],
         edge_strength=edge_strength,
+        xlik_delta_active=cross_likelihood["delta_active"] if cross_likelihood else None,
+        xlik_delta_inactive=cross_likelihood["delta_inactive"] if cross_likelihood else None,
+        xlik_auc=cross_likelihood["auc"] if cross_likelihood else None,
+        xlik_active_state_ids=cross_likelihood["active_state_ids"] if cross_likelihood else None,
+        xlik_inactive_state_ids=cross_likelihood["inactive_state_ids"] if cross_likelihood else None,
+        xlik_active_state_labels=cross_likelihood["active_state_labels"] if cross_likelihood else None,
+        xlik_inactive_state_labels=cross_likelihood["inactive_state_labels"] if cross_likelihood else None,
+        xlik_delta_fit_by_other=cross_likelihood["delta_fit_by_other"] if cross_likelihood else None,
+        xlik_delta_other_by_other=cross_likelihood["delta_other_by_other"] if cross_likelihood else None,
+        xlik_delta_other_counts=cross_likelihood["delta_other_counts"] if cross_likelihood else None,
+        xlik_other_state_ids=cross_likelihood["other_state_ids"] if cross_likelihood else None,
+        xlik_other_state_labels=cross_likelihood["other_state_labels"] if cross_likelihood else None,
+        xlik_auc_by_other=cross_likelihood["auc_by_other"] if cross_likelihood else None,
+        xlik_roc_fpr_by_other=cross_likelihood["roc_fpr_by_other"] if cross_likelihood else None,
+        xlik_roc_tpr_by_other=cross_likelihood["roc_tpr_by_other"] if cross_likelihood else None,
+        xlik_roc_counts=cross_likelihood["roc_counts"] if cross_likelihood else None,
     )
     print(f"[results] summary saved to {summary_path}")
 

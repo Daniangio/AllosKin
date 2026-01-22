@@ -3,8 +3,10 @@ import { useNavigate } from 'react-router-dom';
 import Loader from '../components/common/Loader';
 import ErrorMessage from '../components/common/ErrorMessage';
 import EmptyState from '../components/common/EmptyState';
-import { fetchResults, deleteResult, resultArtifactUrl } from '../api/jobs';
-import { Download, Trash2, AlertTriangle, CheckCircle, Loader2 } from 'lucide-react';
+import IconButton from '../components/common/IconButton';
+import { fetchResults, resultArtifactUrl } from '../api/jobs';
+import { Download, AlertTriangle, CheckCircle, Loader2, Trash2 } from 'lucide-react';
+import { confirmAndDeleteResult } from '../utils/results';
 
 export default function ResultsPage() {
   const [results, setResults] = useState([]);
@@ -30,9 +32,10 @@ export default function ResultsPage() {
   }, []);
 
   const handleDelete = async (jobId) => {
-    if (!window.confirm('Delete this result?')) return;
-    await deleteResult(jobId);
-    loadResults();
+    await confirmAndDeleteResult(jobId, {
+      onSuccess: loadResults,
+      onError: (err) => setError(err.message || 'Failed to delete result.'),
+    });
   };
 
   if (isLoading) return <Loader message="Loading results..." />;
@@ -118,12 +121,12 @@ export default function ResultsPage() {
             >
               <Download className="h-5 w-5" />
             </a>
-            <button
+            <IconButton
+              icon={Trash2}
+              label="Delete result"
               onClick={() => handleDelete(result.job_id)}
               className="text-gray-400 hover:text-red-400"
-            >
-              <Trash2 className="h-5 w-5" />
-            </button>
+            />
           </div>
         </article>
       ))}

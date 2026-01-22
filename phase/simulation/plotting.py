@@ -83,6 +83,9 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
         </select>
         <button id="btn-top" type="button">Select top</button>
       </div>
+      <div class="control-row">
+        <label><input id="js-normalize" type="checkbox" /> Normalize JS by log(K)</label>
+      </div>
       <div id="residue-grid"></div>
       <div id="status"></div>
     </div>
@@ -102,6 +105,7 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
     const topNInput = document.getElementById("top-n");
     const topMetric = document.getElementById("top-metric");
     const samplerSelect = document.getElementById("sampler-select");
+    const jsNormalize = document.getElementById("js-normalize");
 
     // populate selector as checkboxes in a responsive grid
     const checkboxes = [];
@@ -132,6 +136,16 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
     function sliceVec(vec, idxs) {
       return idxs.map(i => vec[i]);
     }
+    function getKList() {
+      return payload.md.map(row => row.reduce((acc, v) => acc + (Number.isFinite(v) ? 1 : 0), 0));
+    }
+    function normalizeByLogK(values, idxs, kList) {
+      return values.map((v, i) => {
+        const k = kList[idxs[i]];
+        const denom = k > 1 ? Math.log(k) : 0;
+        return denom > 0 ? v / denom : 0;
+      });
+    }
 
     function getActiveSource() {
       const id = samplerSelect.value || (payload.sources[0] && payload.sources[0].id);
@@ -144,6 +158,8 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
       const active = getActiveSource();
       const sample = sliceRows(active.matrix, idxs);
       const errSample = sliceRows(active.err, idxs);
+      const kList = getKList();
+      const useNormalize = jsNormalize.checked;
       const traces = [
         {type: "heatmap", x: stateLabels, y: yLabels, z: md, xaxis: "x1", yaxis: "y1", zmin: 0, zmax: 1, colorscale: "Viridis", colorbar: {title: "p(state)", len: 0.35, y: 0.82, thickness: 12} , name: "MD"},
         {type: "heatmap", x: stateLabels, y: yLabels, z: sample, xaxis: "x2", yaxis: "y2", zmin: 0, zmax: 1, colorscale: "Viridis", showscale: false, name: active.label},
@@ -152,27 +168,40 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
 
       payload.js_series.forEach((series, idx) => {
         const jsVals = sliceVec(series.values, idxs);
+        const jsNorm = normalizeByLogK(jsVals, idxs, kList);
+        const yVals = useNormalize ? jsNorm : jsVals;
+        const customData = jsVals.map((v, i) => [v, jsNorm[i], kList[idxs[i]]]);
         traces.push({
           type: "bar",
           x: yLabels,
-          y: jsVals,
+          y: yVals,
           xaxis: "x4",
           yaxis: "y4",
           name: series.label,
           marker: {color: series.color || undefined},
+          customdata: customData,
+          hovertemplate: "Residue %{x}<br>JS: %{customdata[0]:.3f}<br>JS/logK: %{customdata[1]:.3f}<br>K=%{customdata[2]}<extra></extra>",
         });
       });
       return traces;
     }
 
     function setStatus(idxs) {
-      statusEl.textContent = `Showing ${idxs.length} / ${allIdx.length} residues`;
+      const mode = jsNormalize.checked ? "normalized JS" : "raw JS";
+      statusEl.textContent = `Showing ${idxs.length} / ${allIdx.length} residues | ${mode}`;
     }
 
     function applySelection(idxs) {
       const useIdxs = idxs.length ? idxs : allIdx;
       const traces = buildTraces(useIdxs);
-      Plotly.react(figId, traces, baseLayout, {responsive: true, displaylogo: false});
+      const layout = {
+        ...baseLayout,
+        yaxis4: {
+          ...baseLayout.yaxis4,
+          title: jsNormalize.checked ? "JS / ln(K)" : "JS divergence",
+        },
+      };
+      Plotly.react(figId, traces, layout, {responsive: true, displaylogo: false});
       setStatus(useIdxs);
     }
 
@@ -192,6 +221,10 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
       const idxs = checkboxes.filter(cb => cb.checked).map(cb => parseInt(cb.value, 10));
       applySelection(idxs);
     });
+    jsNormalize.addEventListener("change", () => {
+      const idxs = checkboxes.filter(cb => cb.checked).map(cb => parseInt(cb.value, 10));
+      applySelection(idxs);
+    });
 
     document.getElementById("btn-all").addEventListener("click", () => setSelected(allIdx));
     document.getElementById("btn-clear").addEventListener("click", () => setSelected([]));
@@ -203,7 +236,19 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
         const active = getActiveSource();
         scores = active.err_max;
       } else {
-        scores = payload.js_max;
+        if (!jsNormalize.checked) {
+          scores = payload.js_max;
+        } else {
+          const kList = getKList();
+          scores = payload.js_series.reduce((acc, series) => {
+            series.values.forEach((v, i) => {
+              const denom = kList[i] > 1 ? Math.log(kList[i]) : 0;
+              const score = denom > 0 ? v / denom : 0;
+              if (score > acc[i]) acc[i] = score;
+            });
+            return acc;
+          }, new Array(kList.length).fill(0));
+        }
       }
       const ranked = allIdx.slice().sort((a, b) => scores[b] - scores[a]);
       const pick = ranked.slice(0, Math.min(n, ranked.length));
@@ -211,8 +256,7 @@ def _html_template(fig_layout: str, payload: str, div_id: str = "marginal-fig") 
     });
 
     // initial render
-    Plotly.newPlot(figId, buildTraces(allIdx), baseLayout, {responsive: true, displaylogo: false});
-    setStatus(allIdx);
+    applySelection(allIdx);
   </script>
 </body>
 </html>
@@ -268,6 +312,9 @@ def _html_template_multi(fig_layout: str, payload: str, div_id: str = "marginal-
         </select>
         <button id="btn-top" type="button">Select top</button>
       </div>
+      <div class="control-row">
+        <label><input id="js-normalize" type="checkbox" /> Normalize JS by log(K)</label>
+      </div>
       <div id="residue-grid"></div>
       <div id="status"></div>
     </div>
@@ -288,6 +335,7 @@ def _html_template_multi(fig_layout: str, payload: str, div_id: str = "marginal-
     const topMetric = document.getElementById("top-metric");
     const mdSelect = document.getElementById("md-select");
     const sampleSelect = document.getElementById("sample-select");
+    const jsNormalize = document.getElementById("js-normalize");
 
     const palette = [
       "#2563eb",
@@ -338,6 +386,16 @@ def _html_template_multi(fig_layout: str, payload: str, div_id: str = "marginal-
     function sliceVec(vec, idxs) {
       return idxs.map(i => vec[i]);
     }
+    function getKList() {
+      return getActiveMd().src.matrix.map(row => row.reduce((acc, v) => acc + (Number.isFinite(v) ? 1 : 0), 0));
+    }
+    function normalizeByLogK(values, idxs, kList) {
+      return values.map((v, i) => {
+        const k = kList[idxs[i]];
+        const denom = k > 1 ? Math.log(k) : 0;
+        return denom > 0 ? v / denom : 0;
+      });
+    }
 
     function getActiveMd() {
       const id = mdSelect.value || (payload.md_sources[0] && payload.md_sources[0].id);
@@ -364,6 +422,8 @@ def _html_template_multi(fig_layout: str, payload: str, div_id: str = "marginal-
       const md = sliceRows(getActiveMd().src.matrix, idxs);
       const sample = sliceRows(getActiveSample().src.matrix, idxs);
       const err = sample.map((row, rIdx) => row.map((v, cIdx) => Math.abs(v - md[rIdx][cIdx])));
+      const kList = getKList();
+      const useNormalize = jsNormalize.checked;
 
       const traces = [
         {type: "heatmap", x: stateLabels, y: yLabels, z: md, xaxis: "x1", yaxis: "y1", zmin: 0, zmax: 1, colorscale: "Viridis", colorbar: {title: "p(state)", len: 0.35, y: 0.82, thickness: 12} , name: "MD"},
@@ -373,27 +433,40 @@ def _html_template_multi(fig_layout: str, payload: str, div_id: str = "marginal-
 
       payload.sample_sources.forEach((src, idx) => {
         const jsVals = sliceVec(payload.js_md_sample[getActiveMd().idx][idx], idxs);
+        const jsNorm = normalizeByLogK(jsVals, idxs, kList);
+        const yVals = useNormalize ? jsNorm : jsVals;
+        const customData = jsVals.map((v, i) => [v, jsNorm[i], kList[idxs[i]]]);
         traces.push({
           type: "bar",
           x: yLabels,
-          y: jsVals,
+          y: yVals,
           xaxis: "x4",
           yaxis: "y4",
           name: src.label,
           marker: {color: palette[idx % palette.length]},
+          customdata: customData,
+          hovertemplate: "Residue %{x}<br>JS: %{customdata[0]:.3f}<br>JS/logK: %{customdata[1]:.3f}<br>K=%{customdata[2]}<extra></extra>",
         });
       });
       return { traces, err };
     }
 
     function setStatus(idxs) {
-      statusEl.textContent = `Showing ${idxs.length} / ${allIdx.length} residues`;
+      const mode = jsNormalize.checked ? "normalized JS" : "raw JS";
+      statusEl.textContent = `Showing ${idxs.length} / ${allIdx.length} residues | ${mode}`;
     }
 
     function applySelection(idxs) {
       const useIdxs = idxs.length ? idxs : allIdx;
       const result = buildTraces(useIdxs);
-      Plotly.react(figId, result.traces, baseLayout, {responsive: true, displaylogo: false});
+      const layout = {
+        ...baseLayout,
+        yaxis4: {
+          ...baseLayout.yaxis4,
+          title: jsNormalize.checked ? "JS / ln(K)" : "JS divergence",
+        },
+      };
+      Plotly.react(figId, result.traces, layout, {responsive: true, displaylogo: false});
       setStatus(useIdxs);
       return result;
     }
@@ -418,6 +491,10 @@ def _html_template_multi(fig_layout: str, payload: str, div_id: str = "marginal-
       const idxs = checkboxes.filter(cb => cb.checked).map(cb => parseInt(cb.value, 10));
       applySelection(idxs);
     });
+    jsNormalize.addEventListener("change", () => {
+      const idxs = checkboxes.filter(cb => cb.checked).map(cb => parseInt(cb.value, 10));
+      applySelection(idxs);
+    });
 
     document.getElementById("btn-all").addEventListener("click", () => setSelected(allIdx));
     document.getElementById("btn-clear").addEventListener("click", () => setSelected([]));
@@ -430,15 +507,23 @@ def _html_template_multi(fig_layout: str, payload: str, div_id: str = "marginal-
         const result = buildTraces(useIdxs.length ? useIdxs : allIdx);
         scores = result.err.map(rowMax);
       } else {
-        scores = payload.js_md_sample[getActiveMd().idx][getActiveSample().idx];
+        if (!jsNormalize.checked) {
+          scores = payload.js_md_sample[getActiveMd().idx][getActiveSample().idx];
+        } else {
+          const raw = payload.js_md_sample[getActiveMd().idx][getActiveSample().idx];
+          const kList = getKList();
+          scores = raw.map((v, i) => {
+            const denom = kList[i] > 1 ? Math.log(kList[i]) : 0;
+            return denom > 0 ? v / denom : 0;
+          });
+        }
       }
       const ranked = allIdx.slice().sort((a, b) => scores[b] - scores[a]);
       const pick = ranked.slice(0, Math.min(n, ranked.length));
       setSelected(pick);
     });
 
-    Plotly.newPlot(figId, buildTraces(allIdx).traces, baseLayout, {responsive: true, displaylogo: false});
-    setStatus(allIdx);
+    applySelection(allIdx);
   </script>
 </body>
 </html>
@@ -780,6 +865,7 @@ def plot_sampling_report_from_npz(
 ) -> Path:
     with np.load(summary_path, allow_pickle=False) as data:
         residue_labels = data["residue_labels"] if "residue_labels" in data else np.array([])
+        K = data["K"] if "K" in data else np.array([], dtype=int)
         edges = data["edges"] if "edges" in data else np.zeros((0, 2), dtype=int)
 
         md_source_ids = data["md_source_ids"] if "md_source_ids" in data else np.array([], dtype=str)
@@ -810,6 +896,22 @@ def plot_sampling_report_from_npz(
         nn_cdf_md_to_sample = data["nn_cdf_md_to_sample"] if "nn_cdf_md_to_sample" in data else np.zeros((0, 0, 0), dtype=float)
 
         edge_strength = data["edge_strength"] if "edge_strength" in data else np.array([], dtype=float)
+        xlik_delta_active = data["xlik_delta_active"] if "xlik_delta_active" in data else np.array([], dtype=float)
+        xlik_delta_inactive = data["xlik_delta_inactive"] if "xlik_delta_inactive" in data else np.array([], dtype=float)
+        xlik_auc = data["xlik_auc"] if "xlik_auc" in data else np.array([], dtype=float)
+        xlik_active_state_ids = data["xlik_active_state_ids"] if "xlik_active_state_ids" in data else np.array([], dtype=str)
+        xlik_inactive_state_ids = data["xlik_inactive_state_ids"] if "xlik_inactive_state_ids" in data else np.array([], dtype=str)
+        xlik_active_state_labels = data["xlik_active_state_labels"] if "xlik_active_state_labels" in data else np.array([], dtype=str)
+        xlik_inactive_state_labels = data["xlik_inactive_state_labels"] if "xlik_inactive_state_labels" in data else np.array([], dtype=str)
+        xlik_delta_fit_by_other = data["xlik_delta_fit_by_other"] if "xlik_delta_fit_by_other" in data else np.array([], dtype=float)
+        xlik_delta_other_by_other = data["xlik_delta_other_by_other"] if "xlik_delta_other_by_other" in data else np.array([], dtype=float)
+        xlik_delta_other_counts = data["xlik_delta_other_counts"] if "xlik_delta_other_counts" in data else np.array([], dtype=int)
+        xlik_other_state_ids = data["xlik_other_state_ids"] if "xlik_other_state_ids" in data else np.array([], dtype=str)
+        xlik_other_state_labels = data["xlik_other_state_labels"] if "xlik_other_state_labels" in data else np.array([], dtype=str)
+        xlik_auc_by_other = data["xlik_auc_by_other"] if "xlik_auc_by_other" in data else np.array([], dtype=float)
+        xlik_roc_fpr_by_other = data["xlik_roc_fpr_by_other"] if "xlik_roc_fpr_by_other" in data else np.array([], dtype=float)
+        xlik_roc_tpr_by_other = data["xlik_roc_tpr_by_other"] if "xlik_roc_tpr_by_other" in data else np.array([], dtype=float)
+        xlik_roc_counts = data["xlik_roc_counts"] if "xlik_roc_counts" in data else np.array([], dtype=int)
 
     md_sources = []
     for idx, src_id in enumerate(md_source_ids):
@@ -847,6 +949,7 @@ def plot_sampling_report_from_npz(
 
     payload = {
         "residue_labels": [str(v) for v in residue_labels.tolist()] if hasattr(residue_labels, "tolist") else [],
+        "K": K.tolist() if hasattr(K, "tolist") else [],
         "edges": edges.tolist() if hasattr(edges, "tolist") else [],
         "md_sources": md_sources,
         "sample_sources": sample_sources,
@@ -865,6 +968,22 @@ def plot_sampling_report_from_npz(
         "nn_cdf_sample_to_md": nn_cdf_sample_to_md.tolist() if nn_cdf_sample_to_md.size else [],
         "nn_cdf_md_to_sample": nn_cdf_md_to_sample.tolist() if nn_cdf_md_to_sample.size else [],
         "edge_strength": edge_strength.tolist() if edge_strength.size else [],
+        "xlik_delta_active": xlik_delta_active.tolist() if xlik_delta_active.size else [],
+        "xlik_delta_inactive": xlik_delta_inactive.tolist() if xlik_delta_inactive.size else [],
+        "xlik_auc": float(xlik_auc[0]) if xlik_auc.size else None,
+        "xlik_active_state_ids": [str(v) for v in xlik_active_state_ids.tolist()] if xlik_active_state_ids.size else [],
+        "xlik_inactive_state_ids": [str(v) for v in xlik_inactive_state_ids.tolist()] if xlik_inactive_state_ids.size else [],
+        "xlik_active_state_labels": [str(v) for v in xlik_active_state_labels.tolist()] if xlik_active_state_labels.size else [],
+        "xlik_inactive_state_labels": [str(v) for v in xlik_inactive_state_labels.tolist()] if xlik_inactive_state_labels.size else [],
+        "xlik_delta_fit_by_other": xlik_delta_fit_by_other.tolist() if xlik_delta_fit_by_other.size else [],
+        "xlik_delta_other_by_other": xlik_delta_other_by_other.tolist() if xlik_delta_other_by_other.size else [],
+        "xlik_delta_other_counts": xlik_delta_other_counts.tolist() if xlik_delta_other_counts.size else [],
+        "xlik_other_state_ids": [str(v) for v in xlik_other_state_ids.tolist()] if xlik_other_state_ids.size else [],
+        "xlik_other_state_labels": [str(v) for v in xlik_other_state_labels.tolist()] if xlik_other_state_labels.size else [],
+        "xlik_auc_by_other": xlik_auc_by_other.tolist() if xlik_auc_by_other.size else [],
+        "xlik_roc_fpr_by_other": xlik_roc_fpr_by_other.tolist() if xlik_roc_fpr_by_other.size else [],
+        "xlik_roc_tpr_by_other": xlik_roc_tpr_by_other.tolist() if xlik_roc_tpr_by_other.size else [],
+        "xlik_roc_counts": xlik_roc_counts.tolist() if xlik_roc_counts.size else [],
         "gibbs_index": gibbs_index,
     }
 
@@ -923,6 +1042,16 @@ def plot_sampling_report_from_npz(
       </div>
     </div>
 
+    <div class="grid">
+      <div class="card">
+        <h2>Edge heatmap</h2>
+        <div class="meta">
+          <label><input id="edge-js-normalize" type="checkbox" /> Normalize edge JS2 by ln(Kx*Ky)</label>
+        </div>
+        <div id="edge-heatmap" class="plot tall"></div>
+      </div>
+    </div>
+
     <div class="tables">
       <div class="card">
         <h3>Top residues</h3>
@@ -931,6 +1060,15 @@ def plot_sampling_report_from_npz(
       <div class="card">
         <h3>Top edges</h3>
         <div id="top-edges"></div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Cross-likelihood classification</h2>
+        <div class="meta" id="xlik-meta"></div>
+        <div id="xlik-hist" class="plot short"></div>
+        <div id="xlik-roc" class="plot short"></div>
       </div>
     </div>
 
@@ -963,6 +1101,8 @@ def plot_sampling_report_from_npz(
     const mdSelect = document.getElementById("md-select");
     const sampleSelect = document.getElementById("sample-select");
     const selectionMeta = document.getElementById("selection-meta");
+    const xlikMeta = document.getElementById("xlik-meta");
+    const edgeNormalize = document.getElementById("edge-js-normalize");
 
     function populateSelect(select, items) {
       select.innerHTML = "";
@@ -992,6 +1132,36 @@ def plot_sampling_report_from_npz(
       const id = sampleSelect.value;
       const idx = getIndexById(payload.sample_sources, id);
       return idx < 0 ? 0 : idx;
+    }
+
+    function edgeStatsFor(edge) {
+      const kList = payload.K || [];
+      const r = edge[0];
+      const s = edge[1];
+      const kr = Number.isFinite(kList[r]) ? kList[r] : null;
+      const ks = Number.isFinite(kList[s]) ? kList[s] : null;
+      const kprod = kr !== null && ks !== null ? kr * ks : null;
+      const denom = kprod && kprod > 1 ? Math.log(kprod) : 0;
+      return { kr, ks, kprod, denom };
+    }
+
+    function normalizeEdgeValues(values, edges) {
+      return values.map((v, idx) => {
+        if (!Number.isFinite(v)) return v;
+        const edge = edges[idx] || [];
+        if (edge.length < 2) return v;
+        const stats = edgeStatsFor(edge);
+        if (stats.denom > 0) return v / stats.denom;
+        if (stats.kprod === null) return v;
+        return 0;
+      });
+    }
+
+    function edgeNormalizedValue(raw, stats) {
+      if (!Number.isFinite(raw)) return raw;
+      if (stats.denom > 0) return raw / stats.denom;
+      if (stats.kprod === null) return raw;
+      return 0;
     }
 
     function setMeta() {
@@ -1052,24 +1222,40 @@ def plot_sampling_report_from_npz(
       const mdIdx = getMdIndex();
       const sampleIdx = getSampleIndex();
       const gibbsIdx = payload.gibbs_index || 0;
-      const jsMdSample = (payload.js2_md_sample[mdIdx] || [])[sampleIdx] || [];
-      const jsMdGibbs = (payload.js2_md_sample[mdIdx] || [])[gibbsIdx] || [];
-      const jsGibbsSample = (payload.js2_gibbs_sample || [])[sampleIdx] || [];
+      const edges = payload.edges || [];
+      const useNormalize = edgeNormalize && edgeNormalize.checked;
+      const jsMdSampleRaw = (payload.js2_md_sample[mdIdx] || [])[sampleIdx] || [];
+      const jsMdGibbsRaw = (payload.js2_md_sample[mdIdx] || [])[gibbsIdx] || [];
+      const jsGibbsSampleRaw = (payload.js2_gibbs_sample || [])[sampleIdx] || [];
+      const jsMdSample = useNormalize ? normalizeEdgeValues(jsMdSampleRaw, edges) : jsMdSampleRaw;
+      const jsMdGibbs = useNormalize ? normalizeEdgeValues(jsMdGibbsRaw, edges) : jsMdGibbsRaw;
+      const jsGibbsSample = useNormalize ? normalizeEdgeValues(jsGibbsSampleRaw, edges) : jsGibbsSampleRaw;
       const order = sortIndices(jsMdSample);
       const edgeLabels = order.map((i) => {
-        const edge = (payload.edges || [])[i] || [];
+        const edge = edges[i] || [];
         const r = edge[0];
         const s = edge[1];
         const rLabel = payload.residue_labels[r] || r;
         const sLabel = payload.residue_labels[s] || s;
         return `${rLabel}-${sLabel}`;
       });
+      const edgeKprod = order.map((i) => {
+        const edge = edges[i] || [];
+        const stats = edge.length >= 2 ? edgeStatsFor(edge) : { kprod: null };
+        return stats.kprod;
+      });
       const z = [
         order.map((i) => jsMdGibbs[i] || 0),
         order.map((i) => jsMdSample[i] || 0),
         order.map((i) => jsGibbsSample[i] || 0),
       ];
-      const y = ["JS2(MD,Gibbs)", "JS2(MD,Sample)", "JS2(Gibbs,Sample)"];
+      const customData = [
+        order.map((i, idx) => [jsMdGibbsRaw[i] || 0, jsMdGibbs[i] || 0, edgeKprod[idx]]),
+        order.map((i, idx) => [jsMdSampleRaw[i] || 0, jsMdSample[i] || 0, edgeKprod[idx]]),
+        order.map((i, idx) => [jsGibbsSampleRaw[i] || 0, jsGibbsSample[i] || 0, edgeKprod[idx]]),
+      ];
+      const suffix = useNormalize ? "/ln(Kx*Ky)" : "";
+      const y = [`JS2${suffix}(MD,Gibbs)`, `JS2${suffix}(MD,Sample)`, `JS2${suffix}(Gibbs,Sample)`];
       Plotly.react(
         "edge-barcode",
         [
@@ -1079,13 +1265,86 @@ def plot_sampling_report_from_npz(
             y: y,
             z: z,
             colorscale: "Viridis",
-            hovertemplate: "Edge %{x}<br>%{y}: %{z:.3f}<extra></extra>",
+            customdata: customData,
+            hovertemplate:
+              "Edge %{x}<br>%{y}: %{z:.3f}" +
+              "<br>JS2(raw): %{customdata[0]:.3f}" +
+              "<br>JS2/ln(Kx*Ky): %{customdata[1]:.3f}" +
+              "<br>Kx*Ky=%{customdata[2]}" +
+              "<extra></extra>",
           },
         ],
         {
           margin: { l: 140, r: 10, t: 10, b: 40 },
           xaxis: { showticklabels: false },
           yaxis: { automargin: true },
+        },
+        { responsive: true }
+      );
+    }
+
+    function buildEdgeHeatmap() {
+      const container = document.getElementById("edge-heatmap");
+      if (!payload.js2_md_sample || !payload.js2_md_sample.length) {
+        container.innerHTML = "<div class='meta'>Edge heatmap unavailable.</div>";
+        return;
+      }
+      const mdIdx = getMdIndex();
+      const sampleIdx = getSampleIndex();
+      const js2Raw = (payload.js2_md_sample[mdIdx] || [])[sampleIdx] || [];
+      const edges = payload.edges || [];
+      const n = (payload.residue_labels || []).length;
+      if (!js2Raw.length || !edges.length || !n) {
+        container.innerHTML = "<div class='meta'>Edge heatmap unavailable.</div>";
+        return;
+      }
+
+      const useNormalize = edgeNormalize && edgeNormalize.checked;
+      const order = Array.from({ length: n }, (_, i) => i);
+      const labels = order.map((i) => payload.residue_labels[i] || i.toString());
+      const z = Array.from({ length: n }, () => Array.from({ length: n }, () => null));
+      const customdata = Array.from({ length: n }, () => Array.from({ length: n }, () => null));
+      let maxVal = 0;
+      edges.forEach((edge, idx) => {
+        const r = edge[0];
+        const s = edge[1];
+        if (r === undefined || s === undefined) return;
+        const raw = js2Raw[idx] || 0;
+        const stats = edgeStatsFor(edge);
+        const norm = edgeNormalizedValue(raw, stats);
+        const val = useNormalize ? norm : raw;
+        z[r][s] = val;
+        z[s][r] = val;
+        customdata[r][s] = [raw, norm, stats.kr, stats.ks, stats.kprod];
+        customdata[s][r] = [raw, norm, stats.kr, stats.ks, stats.kprod];
+        if (val > maxVal) maxVal = val;
+      });
+
+      Plotly.react(
+        "edge-heatmap",
+        [
+          {
+            type: "heatmap",
+            x: labels,
+            y: labels,
+            z: z,
+            colorscale: "Viridis",
+            zmin: 0,
+            zmax: maxVal || 1,
+            customdata: customdata,
+            hoverongaps: false,
+            hovertemplate:
+              "Residues %{x}-%{y}<br>JS2(MD,Sample): %{z:.3f}" +
+              "<br>JS2(raw): %{customdata[0]:.3f}" +
+              "<br>JS2/ln(Kx*Ky): %{customdata[1]:.3f}" +
+              "<br>Kx=%{customdata[2]} Ky=%{customdata[3]} Kx*Ky=%{customdata[4]}" +
+              "<extra></extra>",
+          },
+        ],
+        {
+          margin: { l: 60, r: 20, t: 10, b: 40 },
+          xaxis: { showticklabels: false, constrain: "domain" },
+          yaxis: { showticklabels: false, autorange: "reversed", scaleanchor: "x", scaleratio: 1, constrain: "domain" },
         },
         { responsive: true }
       );
@@ -1127,18 +1386,23 @@ def plot_sampling_report_from_npz(
       }).join("");
       document.getElementById("top-residues").innerHTML = `<table><thead><tr><th>Residue</th><th>JS(MD,Sample)</th><th>JS(MD,Gibbs)</th><th>max|Sample-MD|</th><th>max|Gibbs-MD|</th></tr></thead><tbody>${residueRows}</tbody></table>`;
 
-      const js2MdSample = (payload.js2_md_sample[mdIdx] || [])[sampleIdx] || [];
-      const js2MdGibbs = (payload.js2_md_sample[mdIdx] || [])[gibbsIdx] || [];
+      const edges = payload.edges || [];
+      const useNormalize = edgeNormalize && edgeNormalize.checked;
+      const js2MdSampleRaw = (payload.js2_md_sample[mdIdx] || [])[sampleIdx] || [];
+      const js2MdGibbsRaw = (payload.js2_md_sample[mdIdx] || [])[gibbsIdx] || [];
+      const js2MdSample = useNormalize ? normalizeEdgeValues(js2MdSampleRaw, edges) : js2MdSampleRaw;
+      const js2MdGibbs = useNormalize ? normalizeEdgeValues(js2MdGibbsRaw, edges) : js2MdGibbsRaw;
       const rankedEdges = js2MdSample.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).slice(0, 10);
       const edgeRows = rankedEdges.map(([val, idx]) => {
-        const edge = (payload.edges || [])[idx] || [];
+        const edge = edges[idx] || [];
         const r = edge[0];
         const s = edge[1];
         const rLabel = payload.residue_labels[r] || r;
         const sLabel = payload.residue_labels[s] || s;
         return `<tr><td>${rLabel}-${sLabel}</td><td>${val.toFixed(3)}</td><td>${(js2MdGibbs[idx] || 0).toFixed(3)}</td></tr>`;
       }).join("");
-      document.getElementById("top-edges").innerHTML = `<table><thead><tr><th>Edge</th><th>JS2(MD,Sample)</th><th>JS2(MD,Gibbs)</th></tr></thead><tbody>${edgeRows}</tbody></table>`;
+      const edgeSuffix = useNormalize ? "/ln(Kx*Ky)" : "";
+      document.getElementById("top-edges").innerHTML = `<table><thead><tr><th>Edge</th><th>JS2${edgeSuffix}(MD,Sample)</th><th>JS2${edgeSuffix}(MD,Gibbs)</th></tr></thead><tbody>${edgeRows}</tbody></table>`;
     }
 
     function buildEdgeNetwork() {
@@ -1148,8 +1412,10 @@ def plot_sampling_report_from_npz(
       }
       const mdIdx = getMdIndex();
       const sampleIdx = getSampleIndex();
-      const js2 = (payload.js2_md_sample[mdIdx] || [])[sampleIdx] || [];
       const edges = payload.edges || [];
+      const useNormalize = edgeNormalize && edgeNormalize.checked;
+      const js2Raw = (payload.js2_md_sample[mdIdx] || [])[sampleIdx] || [];
+      const js2 = useNormalize ? normalizeEdgeValues(js2Raw, edges) : js2Raw;
       const n = payload.residue_labels.length || 1;
       const coords = Array.from({ length: n }, (_, i) => {
         const angle = (2 * Math.PI * i) / n;
@@ -1196,7 +1462,10 @@ def plot_sampling_report_from_npz(
       }
       const mdIdx = getMdIndex();
       const sampleIdx = getSampleIndex();
-      const js2 = (payload.js2_md_sample[mdIdx] || [])[sampleIdx] || [];
+      const edges = payload.edges || [];
+      const useNormalize = edgeNormalize && edgeNormalize.checked;
+      const js2Raw = (payload.js2_md_sample[mdIdx] || [])[sampleIdx] || [];
+      const js2 = useNormalize ? normalizeEdgeValues(js2Raw, edges) : js2Raw;
       const edgeLabels = (payload.edges || []).map((edge) => {
         const r = edge[0];
         const s = edge[1];
@@ -1214,13 +1483,23 @@ def plot_sampling_report_from_npz(
             y: js2,
             text: edgeLabels,
             marker: { color: js2, colorscale: "Viridis", size: 6 },
-            hovertemplate: "Edge %{text}<br>|J|=%{x:.3f}<br>JS2=%{y:.3f}<extra></extra>",
+            customdata: js2Raw.map((raw, idx) => {
+              const edge = edges[idx] || [];
+              const stats = edge.length >= 2 ? edgeStatsFor(edge) : { denom: 0, kprod: null };
+              const norm = edgeNormalizedValue(raw, stats);
+              return [raw || 0, norm || 0];
+            }),
+            hovertemplate:
+              "Edge %{text}<br>|J|=%{x:.3f}<br>JS2=%{y:.3f}" +
+              "<br>JS2(raw): %{customdata[0]:.3f}" +
+              "<br>JS2/ln(Kx*Ky): %{customdata[1]:.3f}" +
+              "<extra></extra>",
           },
         ],
         {
           margin: { l: 50, r: 20, t: 10, b: 40 },
           xaxis: { title: "Edge strength |J|" },
-          yaxis: { title: "JS2(MD,Sample)" },
+          yaxis: { title: useNormalize ? "JS2/ln(Kx*Ky)" : "JS2(MD,Sample)" },
         },
         { responsive: true }
       );
@@ -1281,19 +1560,168 @@ def plot_sampling_report_from_npz(
       );
     }
 
+    function buildCrossLikelihood() {
+      const fitByOther = payload.xlik_delta_fit_by_other || [];
+      const otherByOther = payload.xlik_delta_other_by_other || [];
+      const otherCounts = payload.xlik_delta_other_counts || [];
+      const otherLabels = payload.xlik_other_state_labels || [];
+      const aucByOther = payload.xlik_auc_by_other || [];
+      const rocFpr = payload.xlik_roc_fpr_by_other || [];
+      const rocTpr = payload.xlik_roc_tpr_by_other || [];
+      const rocCounts = payload.xlik_roc_counts || [];
+      const active = payload.xlik_delta_active || [];
+      const inactive = payload.xlik_delta_inactive || [];
+      const container = document.getElementById("xlik-hist");
+      const rocContainer = document.getElementById("xlik-roc");
+      if (!fitByOther.length && (!active.length || !inactive.length)) {
+        if (xlikMeta) {
+          xlikMeta.textContent = "Cross-likelihood classification unavailable.";
+        }
+        container.innerHTML = "<div class='meta'>No cross-likelihood scores available.</div>";
+        if (rocContainer) {
+          rocContainer.innerHTML = "";
+        }
+        return;
+      }
+
+      function toRgba(hex, alpha) {
+        const cleaned = (hex || "").replace("#", "");
+        if (cleaned.length !== 6) return hex;
+        const r = parseInt(cleaned.slice(0, 2), 16);
+        const g = parseInt(cleaned.slice(2, 4), 16);
+        const b = parseInt(cleaned.slice(4, 6), 16);
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      }
+
+      const palette = ["#38bdf8", "#f59e0b", "#22c55e", "#a855f7", "#f97316", "#10b981", "#e11d48", "#0ea5e9"];
+      const traces = [];
+      if (fitByOther.length) {
+        const fitCount = fitByOther[0].length;
+        const metaParts = otherLabels.map((label, idx) => {
+          const auc = Number.isFinite(aucByOther[idx]) ? aucByOther[idx].toFixed(3) : "n/a";
+          return `${label || `Other ${idx + 1}`}: AUC=${auc}`;
+        });
+        if (xlikMeta) {
+          xlikMeta.textContent = `Reference: Fit MD (${fitCount}) · ${metaParts.join(" · ")}`;
+        }
+        fitByOther.forEach((fitVals, idx) => {
+          const label = otherLabels[idx] || `Other ${idx + 1}`;
+          const color = palette[idx % palette.length];
+          const fitColor = toRgba(color, 0.35);
+          const otherVals = (otherByOther[idx] || []).slice(0, otherCounts[idx] || 0).filter((v) => Number.isFinite(v));
+          traces.push({
+            type: "histogram",
+            x: fitVals,
+            name: `Fit vs ${label}`,
+            opacity: 0.45,
+            histnorm: "probability",
+            marker: { color: fitColor || color },
+            legendgroup: `pair-${idx}`,
+          });
+          traces.push({
+            type: "histogram",
+            x: otherVals,
+            name: label,
+            opacity: 0.7,
+            histnorm: "probability",
+            marker: { color: color },
+            legendgroup: `pair-${idx}`,
+          });
+        });
+      } else {
+        const activeLabel = (payload.xlik_active_state_labels || []).join(", ") || "Fit MD";
+        const inactiveLabel = (payload.xlik_inactive_state_labels || []).join(", ") || "Other MDs";
+        const auc = payload.xlik_auc;
+        const aucText = Number.isFinite(auc) ? ` · AUC=${auc.toFixed(3)}` : "";
+        if (xlikMeta) {
+          xlikMeta.textContent = `Reference: ${activeLabel} (${active.length}) · Other: ${inactiveLabel} (${inactive.length})${aucText}`;
+        }
+        traces.push({
+          type: "histogram",
+          x: active,
+          name: "Fit",
+          opacity: 0.65,
+          histnorm: "probability",
+          marker: { color: "#38bdf8" },
+        });
+        traces.push({
+          type: "histogram",
+          x: inactive,
+          name: "Other",
+          opacity: 0.65,
+          histnorm: "probability",
+          marker: { color: "#f59e0b" },
+        });
+      }
+
+      Plotly.react(
+        "xlik-hist",
+        traces,
+        {
+          barmode: "overlay",
+          margin: { l: 60, r: 20, t: 10, b: 40 },
+          xaxis: { title: "Delta S = S_fit - S_other" },
+          yaxis: { title: "Probability" },
+        },
+        { responsive: true }
+      );
+
+      if (rocContainer) {
+        if (rocFpr.length && rocTpr.length && rocCounts.length) {
+          const rocTraces = [];
+          rocFpr.forEach((row, idx) => {
+            const n = rocCounts[idx] || 0;
+            if (!n) return;
+            const label = otherLabels[idx] || `Other ${idx + 1}`;
+            const auc = Number.isFinite(aucByOther[idx]) ? aucByOther[idx].toFixed(3) : "n/a";
+            const color = palette[idx % palette.length];
+            rocTraces.push({
+              type: "scatter",
+              mode: "lines",
+              x: row.slice(0, n),
+              y: (rocTpr[idx] || []).slice(0, n),
+              name: `${label} (AUC=${auc})`,
+              line: { color: color, width: 2 },
+            });
+          });
+          if (!rocTraces.length) {
+            rocContainer.innerHTML = "";
+          } else {
+            Plotly.react(
+              "xlik-roc",
+              rocTraces,
+              {
+                margin: { l: 60, r: 20, t: 10, b: 40 },
+                xaxis: { title: "False positive rate" },
+                yaxis: { title: "True positive rate", range: [0, 1] },
+              },
+              { responsive: true }
+            );
+          }
+        } else {
+          rocContainer.innerHTML = "";
+        }
+      }
+    }
+
     function renderAll() {
       setMeta();
       buildResidueBarcode();
       buildEdgeBarcode();
+      buildEdgeHeatmap();
       buildTopTables();
       buildEdgeNetwork();
       buildEdgeStrengthPlot();
       buildEnergyPlots();
       buildNnCdf();
+      buildCrossLikelihood();
     }
 
     mdSelect.addEventListener("change", renderAll);
     sampleSelect.addEventListener("change", renderAll);
+    if (edgeNormalize) {
+      edgeNormalize.addEventListener("change", renderAll);
+    }
     renderAll();
   </script>
 </body>

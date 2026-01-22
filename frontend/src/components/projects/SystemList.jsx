@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom';
 import { ChevronRight, Circle, CheckCircle, AlertTriangle, Trash2 } from 'lucide-react';
+import IconButton from '../common/IconButton';
 
 const statusIcon = {
   ready: CheckCircle,
@@ -37,13 +38,12 @@ export default function SystemList({ projectId, systems, onDelete }) {
               <div className="flex items-center space-x-3">
                 <ChevronRight className="h-5 w-5 text-gray-500" />
                 {onDelete && (
-                  <button
+                  <IconButton
+                    icon={Trash2}
+                    label="Delete system"
                     onClick={() => onDelete(system.system_id)}
                     className="text-gray-500 hover:text-red-400"
-                    title="Delete system"
-                  >
-                    <Trash2 className="h-5 w-5" />
-                  </button>
+                  />
                 )}
               </div>
             </div>

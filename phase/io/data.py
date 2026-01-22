@@ -107,6 +107,9 @@ def sanitize_dataset(
     """
     labels = np.array(ds.labels, copy=True)
     K = np.array(ds.cluster_counts, copy=True)
+    frame_state_ids = ds.frame_state_ids
+    frame_metastable_ids = ds.frame_metastable_ids
+    frame_indices = ds.frame_indices
     T, N = labels.shape
 
     has_unassigned = np.any(labels < 0)
@@ -118,7 +121,12 @@ def sanitize_dataset(
         if unassigned_policy == "drop_frames":
             keep = np.all(labels >= 0, axis=1)
             labels = labels[keep]
-            # nothing else changes
+            if frame_state_ids is not None and frame_state_ids.shape[0] == keep.shape[0]:
+                frame_state_ids = frame_state_ids[keep]
+            if frame_metastable_ids is not None and frame_metastable_ids.shape[0] == keep.shape[0]:
+                frame_metastable_ids = frame_metastable_ids[keep]
+            if frame_indices is not None and frame_indices.shape[0] == keep.shape[0]:
+                frame_indices = frame_indices[keep]
         elif unassigned_policy == "treat_as_state":
             # per residue, map -1 -> K[r], then K[r] += 1
             for r in range(N):
@@ -142,8 +150,8 @@ def sanitize_dataset(
         labels=labels,
         cluster_counts=K,
         edges=ds.edges,
-        frame_state_ids=ds.frame_state_ids,
-        frame_metastable_ids=ds.frame_metastable_ids,
-        frame_indices=ds.frame_indices,
+        frame_state_ids=frame_state_ids,
+        frame_metastable_ids=frame_metastable_ids,
+        frame_indices=frame_indices,
         metadata=ds.metadata,
     )

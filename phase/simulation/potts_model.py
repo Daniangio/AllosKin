@@ -407,3 +407,137 @@ def compute_pseudolikelihood_loss_torch(
             nobs += xb.shape[0]
 
     return total / max(1, nobs)
+
+
+def compute_pseudolikelihood_scores(
+    model: PottsModel,
+    labels: np.ndarray,
+    *,
+    batch_size: int = 512,
+    device: str | None = None,
+    return_residue_scores: bool = False,
+    use_torch: bool = True,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """
+    Compute per-frame pseudolikelihood scores for a fixed Potts model.
+
+    Returns
+    -------
+    scores
+        Array of shape (T,) with sum_r log p(x_r | x_-r) per frame.
+    residue_scores
+        Optional array of shape (T, N) with per-residue log-prob contributions.
+    """
+    labels = np.asarray(labels, dtype=int)
+    T, N = labels.shape
+    if N != len(model.h):
+        raise ValueError("Labels shape does not match Potts model size.")
+    if batch_size <= 0:
+        batch_size = T
+
+    edges = sorted((min(r, s), max(r, s)) for r, s in model.edges if r != s)
+    neigh = [[] for _ in range(N)]
+    for r, s in edges:
+        neigh[r].append(s)
+        neigh[s].append(r)
+
+    if use_torch:
+        try:
+            import torch
+
+            if device is None:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            torch_device = torch.device(device)
+
+            h_params = [
+                torch.tensor(-model.h[r], dtype=torch.float32, device=torch_device)
+                for r in range(N)
+            ]
+            J_params = {}
+            for r, s in edges:
+                key = f"{r}_{s}"
+                J_params[key] = torch.tensor(-model.J[(r, s)], dtype=torch.float32, device=torch_device)
+
+            X = torch.tensor(labels, dtype=torch.long, device=torch_device)
+
+            def _logits_for_residue(x_batch: "torch.Tensor", r: int) -> "torch.Tensor":
+                B = x_batch.shape[0]
+                logits = h_params[r].unsqueeze(0).expand(B, -1)
+                for s in neigh[r]:
+                    rr, ss = (r, s) if r < s else (s, r)
+                    key = f"{rr}_{ss}"
+                    Jmat = J_params[key]
+                    xs = x_batch[:, s]
+                    if r < s:
+                        logits = logits + Jmat[:, xs].T
+                    else:
+                        logits = logits + Jmat[xs, :]
+                return logits
+
+            scores = []
+            residue_scores = [] if return_residue_scores else None
+            with torch.no_grad():
+                for start in range(0, T, batch_size):
+                    xb = X[start:start + batch_size]
+                    B = xb.shape[0]
+                    frame_scores = torch.zeros(B, dtype=torch.float32, device=torch_device)
+                    res_scores = None
+                    if return_residue_scores:
+                        res_scores = torch.zeros((B, N), dtype=torch.float32, device=torch_device)
+                    for r in range(N):
+                        logits = _logits_for_residue(xb, r)
+                        log_probs = torch.log_softmax(logits, dim=1)
+                        contrib = log_probs[torch.arange(B, device=torch_device), xb[:, r]]
+                        frame_scores = frame_scores + contrib
+                        if res_scores is not None:
+                            res_scores[:, r] = contrib
+                    scores.append(frame_scores.cpu().numpy())
+                    if res_scores is not None and residue_scores is not None:
+                        residue_scores.append(res_scores.cpu().numpy())
+
+            score_arr = np.concatenate(scores, axis=0) if scores else np.zeros((0,), dtype=float)
+            res_arr = None
+            if return_residue_scores and residue_scores is not None:
+                res_arr = np.concatenate(residue_scores, axis=0) if residue_scores else np.zeros((0, N), dtype=float)
+            return score_arr, res_arr
+        except Exception:
+            if use_torch:
+                pass
+
+    scores = []
+    residue_scores = [] if return_residue_scores else None
+    for start in range(0, T, batch_size):
+        xb = labels[start:start + batch_size]
+        B = xb.shape[0]
+        frame_scores = np.zeros(B, dtype=float)
+        res_scores = None
+        if return_residue_scores:
+            res_scores = np.zeros((B, N), dtype=float)
+        for r in range(N):
+            hr = model.h[r]
+            logits = -hr[None, :].repeat(B, axis=0)
+            for s in neigh[r]:
+                if r < s:
+                    Jmat = model.J[(r, s)]
+                    xs = xb[:, s]
+                    logits -= Jmat[:, xs].T
+                else:
+                    Jmat = model.J[(s, r)]
+                    xs = xb[:, s]
+                    logits -= Jmat[xs, :]
+            max_logits = np.max(logits, axis=1, keepdims=True)
+            logsumexp = max_logits + np.log(np.sum(np.exp(logits - max_logits), axis=1, keepdims=True))
+            log_probs = logits - logsumexp
+            contrib = log_probs[np.arange(B), xb[:, r]]
+            frame_scores += contrib
+            if res_scores is not None:
+                res_scores[:, r] = contrib
+        scores.append(frame_scores)
+        if res_scores is not None and residue_scores is not None:
+            residue_scores.append(res_scores)
+
+    score_arr = np.concatenate(scores, axis=0) if scores else np.zeros((0,), dtype=float)
+    res_arr = None
+    if return_residue_scores and residue_scores is not None:
+        res_arr = np.concatenate(residue_scores, axis=0) if residue_scores else np.zeros((0, N), dtype=float)
+    return score_arr, res_arr
