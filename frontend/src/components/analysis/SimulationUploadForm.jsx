@@ -92,9 +92,7 @@ export default function SimulationUploadForm({ clusterRuns, onSubmit, isBusy = f
         </select>
         {selectedCluster && (
           <p className="text-xs text-gray-500 mt-1">
-            Metastable: {Array.isArray(selectedCluster.metastable_ids) ? selectedCluster.metastable_ids.join(', ') : '-'} -
-            Contact {selectedCluster.contact_atom_mode || selectedCluster.contact_mode || 'CA'} @{' '}
-            {selectedCluster.contact_cutoff ?? 10} A
+            Metastable: {Array.isArray(selectedCluster.metastable_ids) ? selectedCluster.metastable_ids.join(', ') : '-'}
           </p>
         )}
       </div>

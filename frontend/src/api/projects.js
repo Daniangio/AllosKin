@@ -284,11 +284,8 @@ export function downloadMetastableClusters(projectId, systemId, metastableIds, p
     metastable_ids: metastableIds,
   };
   if (params.cluster_name) payload.cluster_name = params.cluster_name;
-  if (params.max_clusters_per_residue) payload.max_clusters_per_residue = params.max_clusters_per_residue;
   if (params.max_cluster_frames) payload.max_cluster_frames = params.max_cluster_frames;
   if (params.random_state !== undefined) payload.random_state = params.random_state;
-  if (params.contact_atom_mode) payload.contact_atom_mode = params.contact_atom_mode;
-  if (params.contact_cutoff) payload.contact_cutoff = params.contact_cutoff;
   if (params.density_maxk) payload.density_maxk = params.density_maxk;
   if (params.density_z !== undefined) payload.density_z = params.density_z;
   return requestBlobWithBody(
@@ -305,16 +302,99 @@ export function submitMetastableClusterJob(projectId, systemId, metastableIds, p
     metastable_ids: metastableIds,
   };
   if (params.cluster_name) payload.cluster_name = params.cluster_name;
-  if (params.max_clusters_per_residue) payload.max_clusters_per_residue = params.max_clusters_per_residue;
   if (params.max_cluster_frames) payload.max_cluster_frames = params.max_cluster_frames;
   if (params.random_state !== undefined) payload.random_state = params.random_state;
-  if (params.contact_atom_mode) payload.contact_atom_mode = params.contact_atom_mode;
-  if (params.contact_cutoff) payload.contact_cutoff = params.contact_cutoff;
   if (params.density_maxk) payload.density_maxk = params.density_maxk;
   if (params.density_z !== undefined) payload.density_z = params.density_z;
   return requestJSON(`/projects/${projectId}/systems/${systemId}/metastable/cluster_jobs`, {
     method: 'POST',
     body: payload,
+  });
+}
+
+export function downloadBackmappingCluster(projectId, systemId, clusterId, options = {}) {
+  const { onProgress } = options;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(
+      'GET',
+      `${API_BASE}/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/backmapping_npz`
+    );
+    xhr.responseType = 'blob';
+
+    xhr.addEventListener('progress', (event) => {
+      if (!event.lengthComputable || typeof onProgress !== 'function') return;
+      const percent = Math.round((event.loaded / event.total) * 100);
+      onProgress(Math.min(100, percent));
+    });
+
+    xhr.addEventListener('load', () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(xhr.response);
+        return;
+      }
+      reject(new Error(xhr.statusText || 'Failed to download backmapping NPZ.'));
+    });
+
+    xhr.addEventListener('error', () => {
+      reject(new Error('Failed to download backmapping NPZ.'));
+    });
+
+    xhr.send();
+  });
+}
+
+export function submitBackmappingClusterJob(projectId, systemId, clusterId) {
+  return requestJSON(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/backmapping_npz/job`,
+    {
+      method: 'POST',
+    }
+  );
+}
+
+export function uploadMetastableClusterNp(projectId, systemId, payload, options = {}) {
+  const { onUploadProgress } = options;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `${API_BASE}/projects/${projectId}/systems/${systemId}/metastable/clusters/upload`);
+    xhr.responseType = 'json';
+
+    if (xhr.upload && typeof onUploadProgress === 'function') {
+      xhr.upload.addEventListener('loadstart', () => onUploadProgress(0));
+      xhr.upload.addEventListener('progress', (event) => {
+        if (!event.lengthComputable) return;
+        const percent = Math.round((event.loaded / event.total) * 100);
+        onUploadProgress(Math.min(100, percent));
+      });
+      xhr.upload.addEventListener('loadend', () => onUploadProgress(100));
+    }
+
+    const parseResponseJSON = () => {
+      if (xhr.response !== null && xhr.response !== undefined) return xhr.response;
+      try {
+        return xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch (err) {
+        return null;
+      }
+    };
+
+    const handleError = () => {
+      const response = parseResponseJSON() || {};
+      const message = response.detail || response.error || xhr.statusText || 'Upload failed';
+      reject(new Error(message));
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(parseResponseJSON());
+      } else {
+        handleError();
+      }
+    };
+    xhr.onerror = handleError;
+    xhr.onabort = handleError;
+    xhr.send(payload);
   });
 }
 

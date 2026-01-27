@@ -78,6 +78,24 @@ if [ ! -f "$MODEL_PATH" ]; then
   exit 1
 fi
 
+CONTACT_ALL="false"
+CONTACT_PDBS=""
+CONTACT_MODE="CA"
+CONTACT_CUTOFF="10.0"
+if prompt_bool "Use all-vs-all edges? (y/N)" "N"; then
+  CONTACT_ALL="true"
+else
+  CONTACT_PDBS="$(prompt "Contact PDB paths (comma separated)" "")"
+  CONTACT_PDBS="$(trim "$CONTACT_PDBS")"
+  if [ -z "$CONTACT_PDBS" ]; then
+    echo "Contact PDB paths are required unless using all-vs-all."
+    exit 1
+  fi
+  CONTACT_MODE="$(prompt "Contact mode (CA/CM)" "CA")"
+  CONTACT_MODE="$(printf "%s" "$CONTACT_MODE" | tr '[:lower:]' '[:upper:]')"
+  CONTACT_CUTOFF="$(prompt "Contact cutoff (A)" "10.0")"
+fi
+
 RESULTS_DIR="$(prompt "Results directory" "${DEFAULT_RESULTS}")"
 
 GIBBS_METHOD="$(prompt "Gibbs method (single/rex)" "rex")"
@@ -150,6 +168,13 @@ CMD=(
   --sa-sweeps "$SA_SWEEPS"
   --seed "$SEED"
 )
+
+if [ "$CONTACT_ALL" = "true" ]; then
+  CMD+=(--contact-all-vs-all)
+else
+  CMD+=(--pdbs "$CONTACT_PDBS")
+fi
+CMD+=(--contact-atom-mode "$CONTACT_MODE" --contact-cutoff "$CONTACT_CUTOFF")
 
 if [ "$GIBBS_METHOD" = "single" ]; then
   CMD+=(--gibbs-samples "$GIBBS_SAMPLES" --gibbs-burnin "$GIBBS_BURNIN" --gibbs-thin "$GIBBS_THIN" --gibbs-chains "$GIBBS_CHAINS")

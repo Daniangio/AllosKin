@@ -24,6 +24,19 @@ prompt() {
   fi
 }
 
+prompt_bool() {
+  local label="$1"
+  local default="$2"
+  local var
+  read -r -p "${label} [${default}]: " var
+  var="${var:-$default}"
+  var="$(printf "%s" "$var" | tr '[:upper:]' '[:lower:]')"
+  case "$var" in
+    y|yes|true|1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/python" ]; then
   VENV_DIR="${VIRTUAL_ENV}"
   echo "Using active virtual environment at: ${VENV_DIR}"
@@ -57,6 +70,24 @@ fi
 RESULTS_DIR="$(prompt "Results directory" "${DEFAULT_RESULTS}")"
 FIT_METHOD="$(prompt "Fit method (pmi/plm/pmi+plm)" "pmi+plm")"
 
+CONTACT_ALL="false"
+CONTACT_PDBS=""
+CONTACT_MODE="CA"
+CONTACT_CUTOFF="10.0"
+if prompt_bool "Use all-vs-all edges? (y/N)" "N"; then
+  CONTACT_ALL="true"
+else
+  CONTACT_PDBS="$(prompt "Contact PDB paths (comma separated)" "")"
+  CONTACT_PDBS="$(printf "%s" "$CONTACT_PDBS" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  if [ -z "$CONTACT_PDBS" ]; then
+    echo "Contact PDB paths are required unless using all-vs-all."
+    exit 1
+  fi
+  CONTACT_MODE="$(prompt "Contact mode (CA/CM)" "CA")"
+  CONTACT_MODE="$(printf "%s" "$CONTACT_MODE" | tr '[:lower:]' '[:upper:]')"
+  CONTACT_CUTOFF="$(prompt "Contact cutoff (A)" "10.0")"
+fi
+
 PLM_DEVICE=""
 PLM_EPOCHS=""
 PLM_LR=""
@@ -87,6 +118,13 @@ CMD=(
   --fit-only
   --fit "$FIT_METHOD"
 )
+
+if [ "$CONTACT_ALL" = "true" ]; then
+  CMD+=(--contact-all-vs-all)
+else
+  CMD+=(--pdbs "$CONTACT_PDBS")
+fi
+CMD+=(--contact-atom-mode "$CONTACT_MODE" --contact-cutoff "$CONTACT_CUTOFF")
 
 if [ -n "$PLM_DEVICE" ]; then
   CMD+=(--plm-device "$PLM_DEVICE")

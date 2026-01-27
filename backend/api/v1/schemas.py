@@ -44,6 +44,8 @@ class SimulationJobRequest(BaseModel):
     cluster_id: str
     use_potts_model: Optional[bool] = True
     potts_model_path: Optional[str] = None
+    contact_cutoff: Optional[float] = None
+    contact_atom_mode: Optional[str] = None
     rex_betas: Optional[Union[str, List[float]]] = None
     rex_beta_min: Optional[float] = None
     rex_beta_max: Optional[float] = None
@@ -71,6 +73,8 @@ class PottsFitJobRequest(BaseModel):
     system_id: str
     cluster_id: str
     fit_method: Optional[str] = None
+    contact_cutoff: Optional[float] = None
+    contact_atom_mode: Optional[str] = None
     plm_epochs: Optional[int] = None
     plm_lr: Optional[float] = None
     plm_lr_min: Optional[float] = None

@@ -46,6 +46,77 @@ def _parse_float_list(s: str) -> list[float]:
     parts = [p.strip() for p in s.split(",") if p.strip()]
     return [float(p) for p in parts]
 
+
+def _parse_contact_pdbs(raw: str) -> list[Path]:
+    parts = [p.strip() for p in (raw or "").split(",") if p.strip()]
+    return [Path(p) for p in parts]
+
+
+def _default_residue_selection(key: str) -> str:
+    match = re.search(r"(?:res[_-]?)(\d+)$", key, flags=re.IGNORECASE)
+    if match:
+        return f"resid {match.group(1)}"
+    if key.isdigit():
+        return f"resid {key}"
+    return key
+
+
+def _extract_residue_positions(
+    pdb_path: Path,
+    residue_keys: Sequence[str],
+    residue_mapping: dict[str, str],
+    contact_mode: str,
+) -> list[np.ndarray | None]:
+    import MDAnalysis as mda
+
+    positions: list[np.ndarray | None] = []
+    u = mda.Universe(str(pdb_path))
+    for key in residue_keys:
+        sel = residue_mapping.get(key) or _default_residue_selection(key)
+        try:
+            res_atoms = u.select_atoms(sel)
+        except Exception:
+            positions.append(None)
+            continue
+        if res_atoms.n_atoms == 0:
+            positions.append(None)
+            continue
+        if contact_mode == "CA":
+            ca_atoms = res_atoms.select_atoms("name CA")
+            if ca_atoms.n_atoms > 0:
+                positions.append(np.array(ca_atoms[0].position, dtype=float))
+            else:
+                positions.append(np.array(res_atoms.center_of_mass(), dtype=float))
+        else:
+            positions.append(np.array(res_atoms.center_of_mass(), dtype=float))
+    return positions
+
+
+def _compute_contact_edges_from_pdbs(
+    pdb_paths: Sequence[Path],
+    residue_keys: Sequence[str],
+    residue_mapping: dict[str, str],
+    cutoff: float,
+    contact_mode: str,
+) -> list[tuple[int, int]]:
+    edges: set[tuple[int, int]] = set()
+    for pdb_path in pdb_paths:
+        if not pdb_path.exists():
+            continue
+        positions = _extract_residue_positions(pdb_path, residue_keys, residue_mapping, contact_mode)
+        valid_indices = [i for i, pos in enumerate(positions) if pos is not None]
+        if len(valid_indices) < 2:
+            continue
+        coords = np.stack([positions[i] for i in valid_indices], axis=0)
+        diff = coords[:, None, :] - coords[None, :, :]
+        dist = np.sqrt(np.sum(diff * diff, axis=-1))
+        for a_idx, i in enumerate(valid_indices):
+            for b_idx in range(a_idx + 1, len(valid_indices)):
+                j = valid_indices[b_idx]
+                if dist[a_idx, b_idx] < cutoff:
+                    edges.add((min(i, j), max(i, j)))
+    return sorted(edges)
+
 def _parse_beta_schedule(raw: str) -> tuple[float, float]:
     value = raw.strip()
     if not value:
@@ -838,6 +909,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--fit-only", action="store_true", help="Fit and save the Potts model, then exit.")
     ap.add_argument("--model-npz", default="", help="Optional pre-fit Potts model npz to skip fitting.")
     ap.add_argument("--model-out", default="", help="Where to save potts_model.npz (defaults to results-dir/potts_model.npz).")
+    ap.add_argument(
+        "--pdbs",
+        default="",
+        help="Comma-separated PDB paths to compute contact edges if the NPZ has none.",
+    )
+    ap.add_argument("--contact-cutoff", type=float, default=10.0, help="Contact cutoff (Angstrom).")
+    ap.add_argument("--contact-atom-mode", choices=["CA", "CM"], default="CA")
+    ap.add_argument(
+        "--contact-all-vs-all",
+        action="store_true",
+        help="Use all-vs-all residue edges instead of distance-based contacts.",
+    )
 
     ap.add_argument("--fit", default="pmi+plm", choices=["pmi", "plm", "pmi+plm"])
     ap.add_argument("--beta", type=float, default=1.0)
@@ -1038,7 +1121,29 @@ def run_pipeline(
     K = ds.cluster_counts
     edges = ds.edges
     residue_labels = getattr(ds, "residue_keys", np.arange(labels.shape[1]))
+    if len(edges) == 0:
+        if args.contact_all_vs_all:
+            n_res = labels.shape[1]
+            edges = [(i, j) for i in range(n_res) for j in range(i + 1, n_res)]
+        elif args.pdbs:
+            try:
+                contact_pdbs = _parse_contact_pdbs(args.pdbs)
+                residue_keys = [str(k) for k in residue_labels]
+                residue_mapping = {}
+                if isinstance(ds.metadata, dict):
+                    residue_mapping = {str(k): str(v) for k, v in (ds.metadata.get("residue_mapping") or {}).items()}
+                edges = _compute_contact_edges_from_pdbs(
+                    contact_pdbs,
+                    residue_keys,
+                    residue_mapping,
+                    cutoff=float(args.contact_cutoff),
+                    contact_mode=str(args.contact_atom_mode).upper(),
+                )
+            except Exception as exc:
+                print(f"[data] Failed to compute contact edges: {exc}")
 
+    if len(edges) == 0 and not args.contact_all_vs_all and not args.pdbs:
+        print("[data] contact edges empty; pairwise terms disabled (provide --pdbs to compute edges).")
     train_points = int(labels.shape[0] * labels.shape[1])
     print(f"[data] T={labels.shape[0]}  N={labels.shape[1]}  edges={len(edges)}  train_points={train_points}")
     plm_device = (args.plm_device or "").strip()

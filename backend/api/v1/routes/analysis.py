@@ -128,6 +128,13 @@ async def submit_simulation_job(
         raise HTTPException(status_code=400, detail="plm_l2 must be >= 0.")
     if payload.plm_lr_schedule is not None and payload.plm_lr_schedule not in {"cosine", "none"}:
         raise HTTPException(status_code=400, detail="plm_lr_schedule must be 'cosine' or 'none'.")
+
+    if payload.contact_cutoff is not None and float(payload.contact_cutoff) <= 0:
+        raise HTTPException(status_code=400, detail="contact_cutoff must be > 0.")
+    if payload.contact_atom_mode is not None:
+        mode = str(payload.contact_atom_mode).upper()
+        if mode not in {"CA", "CM"}:
+            raise HTTPException(status_code=400, detail="contact_atom_mode must be 'CA' or 'CM'.")
     if payload.sa_beta_hot is not None and float(payload.sa_beta_hot) <= 0:
         raise HTTPException(status_code=400, detail="sa_beta_hot must be > 0.")
     if payload.sa_beta_cold is not None and float(payload.sa_beta_cold) <= 0:

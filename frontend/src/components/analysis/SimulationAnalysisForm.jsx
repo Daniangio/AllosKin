@@ -15,6 +15,8 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
   const [saSweeps, setSaSweeps] = useState('');
   const [saSchedules, setSaSchedules] = useState([]);
   const [pottsModelPath, setPottsModelPath] = useState('');
+  const [contactMode, setContactMode] = useState('CA');
+  const [contactCutoff, setContactCutoff] = useState('10');
   const [plmEpochs, setPlmEpochs] = useState('');
   const [plmLr, setPlmLr] = useState('');
   const [plmLrMin, setPlmLrMin] = useState('');
@@ -91,6 +93,14 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
       const payload = { cluster_id: clusterId };
       payload.use_potts_model = true;
       payload.potts_model_path = pottsModelPath;
+      if (contactMode) payload.contact_atom_mode = contactMode;
+      if (contactCutoff !== '') {
+        const cutoffVal = Number(contactCutoff);
+        if (!Number.isFinite(cutoffVal) || cutoffVal <= 0) {
+          throw new Error('Contact cutoff must be a positive number.');
+        }
+        payload.contact_cutoff = cutoffVal;
+      }
       const betasRaw = rexBetas.trim();
       if (betasRaw) {
         payload.rex_betas = parseBetaList(betasRaw);
@@ -171,8 +181,6 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
         {selectedCluster && (
           <p className="text-xs text-gray-500 mt-1">
             Metastable: {Array.isArray(selectedCluster.metastable_ids) ? selectedCluster.metastable_ids.join(', ') : '—'} ·
-            Contact {selectedCluster.contact_atom_mode || selectedCluster.contact_mode || 'CA'} @{' '}
-            {selectedCluster.contact_cutoff ?? 10} Å
           </p>
         )}
       </div>
@@ -195,6 +203,31 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
         <p className="text-xs text-gray-500 mt-1">
           Select a pre-fit model (webserver or uploaded) to run sampling.
         </p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <label className="space-y-1">
+          <span className="text-sm text-gray-300">Contact mode</span>
+          <select
+            value={contactMode}
+            onChange={(event) => setContactMode(event.target.value)}
+            className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+          >
+            <option value="CA">CA</option>
+            <option value="CM">Residue CM</option>
+          </select>
+        </label>
+        <label className="space-y-1">
+          <span className="text-sm text-gray-300">Contact cutoff (A)</span>
+          <input
+            type="number"
+            min={1}
+            step="0.5"
+            value={contactCutoff}
+            onChange={(event) => setContactCutoff(event.target.value)}
+            className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+          />
+        </label>
       </div>
 
       <div className="border border-gray-700 rounded-md p-3 space-y-3">

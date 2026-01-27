@@ -20,6 +20,7 @@ from backend.services.metastable_clusters import (
     assign_cluster_labels_to_states,
     update_cluster_metadata_with_assignments,
 )
+from backend.services.backmapping_npz import build_backmapping_npz
 from backend.services.project_store import ProjectStore
 
 # Define the persistent results directory (aligned with PHASE_DATA_ROOT).
@@ -62,6 +63,41 @@ def _sanitize_model_filename(name: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
     safe = safe.strip("._-")
     return safe or "potts_model"
+
+
+def _collect_contact_pdbs(system_meta, selected_ids: List[str], analysis_mode: str | None) -> List[str]:
+    pdbs: List[str] = []
+    if (analysis_mode or "").lower() == "macro":
+        for state_id in selected_ids:
+            state = (system_meta.states or {}).get(state_id)
+            if state and state.pdb_file:
+                pdbs.append(state.pdb_file)
+        return pdbs
+
+    meta_by_id = {}
+    for meta in system_meta.metastable_states or []:
+        meta_id = meta.get("metastable_id") or meta.get("id")
+        if meta_id:
+            meta_by_id[str(meta_id)] = meta
+    for meta_id in selected_ids:
+        meta = meta_by_id.get(str(meta_id))
+        if not meta:
+            continue
+        rep = meta.get("representative_pdb") or meta.get("pdb_file")
+        if rep:
+            pdbs.append(rep)
+    return pdbs
+
+
+def _resolve_contact_pdbs(project_id: str, system_id: str, pdb_paths: List[str]) -> List[Path]:
+    resolved: List[Path] = []
+    for value in pdb_paths:
+        path = Path(value)
+        if not path.is_absolute():
+            path = project_store.resolve_path(project_id, system_id, value)
+        if path.exists():
+            resolved.append(path)
+    return resolved
 
 
 def _update_cluster_entry(
@@ -483,6 +519,23 @@ def run_simulation_job(
             else:
                 model_path = None
 
+        contact_mode = sim_params.get("contact_atom_mode") or sim_params.get("contact_mode") or "CA"
+        contact_cutoff = sim_params.get("contact_cutoff") or 10.0
+        contact_pdbs = _resolve_contact_pdbs(
+            project_id,
+            system_id,
+            _collect_contact_pdbs(system_meta, entry.get("metastable_ids") or [], system_meta.analysis_mode),
+        )
+        if contact_pdbs:
+            args_list += [
+                "--pdbs",
+                ",".join(str(p) for p in contact_pdbs),
+                "--contact-cutoff",
+                str(float(contact_cutoff)),
+                "--contact-atom-mode",
+                str(contact_mode),
+            ]
+
         if gibbs_method == "rex":
             if isinstance(rex_betas, str) and rex_betas.strip():
                 args_list += ["--rex-betas", rex_betas.strip()]
@@ -737,6 +790,23 @@ def run_potts_fit_job(
         if fit_method is not None:
             args_list += ["--fit", str(fit_method)]
 
+        contact_mode = fit_params.get("contact_atom_mode") or fit_params.get("contact_mode") or "CA"
+        contact_cutoff = fit_params.get("contact_cutoff") or 10.0
+        contact_pdbs = _resolve_contact_pdbs(
+            project_id,
+            system_id,
+            _collect_contact_pdbs(system_meta, entry.get("metastable_ids") or [], system_meta.analysis_mode),
+        )
+        if contact_pdbs:
+            args_list += [
+                "--pdbs",
+                ",".join(str(p) for p in contact_pdbs),
+                "--contact-cutoff",
+                str(float(contact_cutoff)),
+                "--contact-atom-mode",
+                str(contact_mode),
+            ]
+
         for key, flag in (
             ("plm_epochs", "--plm-epochs"),
             ("plm_lr", "--plm-lr"),
@@ -797,6 +867,64 @@ def run_cluster_chunk_job(work_dir: str, residue_index: int) -> Dict[str, Any]:
     return run_cluster_chunk(Path(work_dir), residue_index)
 
 
+def run_backmapping_job(job_uuid: str, project_id: str, system_id: str, cluster_id: str) -> Dict[str, Any]:
+    job = get_current_job()
+    start_time = datetime.utcnow()
+    rq_job_id = job.id if job else f"backmapping-{job_uuid}"
+
+    def save_progress(status_msg: str, progress: int):
+        if job:
+            job.meta["status"] = status_msg
+            job.meta["progress"] = progress
+            job.save_meta()
+        print(f"[Backmapping {job_uuid}] {status_msg}")
+
+    save_progress("Initializing...", 0)
+    system_meta = project_store.get_system(project_id, system_id)
+    clusters = system_meta.metastable_clusters or []
+    entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+    if not entry:
+        raise ValueError(f"Cluster NPZ not found for cluster_id='{cluster_id}'.")
+    rel_path = entry.get("path")
+    if not rel_path:
+        raise ValueError("Cluster NPZ path missing in system metadata.")
+    cluster_path = Path(rel_path)
+    if not cluster_path.is_absolute():
+        cluster_path = project_store.resolve_path(project_id, system_id, rel_path)
+    if not cluster_path.exists():
+        raise FileNotFoundError(f"Cluster NPZ file is missing on disk: {cluster_path}")
+
+    dirs = project_store.ensure_directories(project_id, system_id)
+    out_dir = dirs["system_dir"] / "metastable" / "clusters"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{cluster_id}_backmapping.npz"
+
+    def progress_callback(current: int, total: int):
+        if not total:
+            return
+        ratio = max(0.0, min(1.0, current / float(total)))
+        progress = 5 + int(ratio * 90)
+        save_progress("Building backmapping NPZ...", min(progress, 95))
+
+    build_backmapping_npz(
+        project_id,
+        system_id,
+        cluster_path,
+        out_path,
+        progress_callback=progress_callback,
+    )
+
+    save_progress("Completed", 100)
+    return {
+        "job_id": rq_job_id,
+        "status": "finished",
+        "cluster_id": cluster_id,
+        "path": str(out_path.relative_to(dirs["system_dir"])),
+        "completed_at": datetime.utcnow().isoformat(),
+        "started_at": start_time.isoformat(),
+    }
+
+
 def run_cluster_job(
     job_uuid: str,
     project_id: str,
@@ -853,11 +981,8 @@ def run_cluster_job(
             project_id,
             system_id,
             meta_ids,
-            max_clusters_per_residue=params.get("max_clusters_per_residue", 6),
             max_cluster_frames=params.get("max_cluster_frames"),
             random_state=params.get("random_state", 0),
-            contact_cutoff=params.get("contact_cutoff", 10.0),
-            contact_atom_mode=params.get("contact_atom_mode", "CA"),
             cluster_algorithm="density_peaks",
             density_maxk=params.get("density_maxk", 100),
             density_z=params.get("density_z"),

@@ -337,6 +337,199 @@ def fit_potts_pseudolikelihood_torch(
     return PottsModel(h=h, J=J, edges=list(edges))
 
 
+def add_potts_models(base: PottsModel, delta: PottsModel) -> PottsModel:
+    if len(base.h) != len(delta.h):
+        raise ValueError("Potts model sizes do not match.")
+    if sorted(base.edges) != sorted(delta.edges):
+        raise ValueError("Potts model edges do not match.")
+    h = [base.h[r] + delta.h[r] for r in range(len(base.h))]
+    J: Dict[Tuple[int, int], np.ndarray] = {}
+    for edge in base.edges:
+        J[edge] = base.J[edge] + delta.J[edge]
+    return PottsModel(h=h, J=J, edges=list(base.edges))
+
+
+def fit_potts_delta_pseudolikelihood_torch(
+    base_model: PottsModel,
+    labels: np.ndarray,
+    *,
+    l2: float = 0.0,
+    lambda_h: float = 0.0,
+    lambda_J: float = 0.0,
+    lr: float = 1e-3,
+    lr_min: float = 1e-3,
+    lr_schedule: str = "cosine",
+    epochs: int = 200,
+    batch_size: int = 512,
+    seed: int = 0,
+    verbose: bool = True,
+    report_init_loss: bool = True,
+    progress_callback: "callable | None" = None,
+    progress_every: int = 10,
+    batch_progress_callback: "callable | None" = None,
+    device: str | None = None,
+) -> PottsModel:
+    """
+    Fit a sparse delta Potts model (Δh, ΔJ) on top of a frozen base model using pseudolikelihood.
+    Regularization:
+      l2: weight for elementwise L2 on delta parameters.
+      lambda_h: group L2 on each residue field vector (sparsity).
+      lambda_J: group Frobenius on each edge coupling matrix (sparsity).
+    """
+    try:
+        import torch
+    except Exception as e:
+        raise RuntimeError("PyTorch is required for delta pseudolikelihood fitting.") from e
+
+    rng = np.random.default_rng(seed)
+    labels = np.asarray(labels, dtype=int)
+    T, N = labels.shape
+    if N != len(base_model.h):
+        raise ValueError("Labels shape does not match base Potts model size.")
+
+    edges = sorted((min(r, s), max(r, s)) for r, s in base_model.edges if r != s)
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_device = torch.device(device)
+    if verbose:
+        print(f"[plm-delta] using device={torch_device}")
+
+    neigh = [[] for _ in range(N)]
+    for r, s in edges:
+        neigh[r].append(s)
+        neigh[s].append(r)
+
+    torch.manual_seed(seed)
+    base_h = [torch.tensor(-base_model.h[r], dtype=torch.float32, device=torch_device) for r in range(N)]
+    base_J: Dict[str, "torch.Tensor"] = {}
+    for r, s in edges:
+        key = f"{r}_{s}"
+        base_J[key] = torch.tensor(-base_model.J[(r, s)], dtype=torch.float32, device=torch_device)
+
+    delta_h = torch.nn.ParameterList([
+        torch.nn.Parameter(torch.zeros(base_model.h[r].shape[0], dtype=torch.float32, device=torch_device))
+        for r in range(N)
+    ])
+    delta_J = torch.nn.ParameterDict()
+    for r, s in edges:
+        key = f"{r}_{s}"
+        delta_J[key] = torch.nn.Parameter(
+            torch.zeros(base_model.J[(r, s)].shape, dtype=torch.float32, device=torch_device)
+        )
+
+    X = torch.tensor(labels, dtype=torch.long, device=torch_device)
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    opt = torch.optim.Adam(list(delta_h) + list(delta_J.values()), lr=lr, weight_decay=0.0)
+    schedule = lr_schedule.lower() if lr_schedule else "none"
+    scheduler = None
+    if schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr_min)
+    elif schedule != "none":
+        raise ValueError(f"Unknown lr_schedule={lr_schedule!r}")
+
+    def _logits_for_residue(x_batch: "torch.Tensor", r: int) -> "torch.Tensor":
+        B = x_batch.shape[0]
+        logits = (base_h[r] + delta_h[r]).unsqueeze(0).expand(B, -1)
+        for s in neigh[r]:
+            rr, ss = (r, s) if r < s else (s, r)
+            key = f"{rr}_{ss}"
+            Jmat = base_J[key] + delta_J[key]
+            xs = x_batch[:, s]
+            if r < s:
+                logits = logits + Jmat[:, xs].T
+            else:
+                logits = logits + Jmat[xs, :]
+        return logits
+
+    def _group_norm(t: "torch.Tensor") -> "torch.Tensor":
+        return torch.sqrt(torch.sum(t * t) + 1e-12)
+
+    idx = np.arange(T)
+    progress_every = max(1, int(progress_every))
+    total_batches = max(1, (T + batch_size - 1) // batch_size)
+
+    def _evaluate_avg_loss() -> float:
+        total = 0.0
+        nobs = 0
+        with torch.no_grad():
+            for start in range(0, T, batch_size):
+                bidx = idx[start:start + batch_size]
+                xb = X[bidx]
+                loss = 0.0
+                for r in range(N):
+                    logits = _logits_for_residue(xb, r)
+                    y = xb[:, r]
+                    loss = loss + loss_fn(logits, y)
+                total += float(loss.item()) * len(bidx)
+                nobs += len(bidx)
+        return total / max(1, nobs)
+
+    if verbose and report_init_loss:
+        init_loss = _evaluate_avg_loss()
+        print(f"[plm-delta] init avg_loss={init_loss:.6f}")
+
+    for ep in range(1, epochs + 1):
+        rng.shuffle(idx)
+        total = 0.0
+        nobs = 0
+        for start in range(0, T, batch_size):
+            bidx = idx[start:start + batch_size]
+            xb = X[bidx]
+            opt.zero_grad()
+
+            loss = 0.0
+            for r in range(N):
+                logits = _logits_for_residue(xb, r)
+                y = xb[:, r]
+                loss = loss + loss_fn(logits, y)
+
+            if l2 > 0:
+                l2_sum = torch.tensor(0.0, device=torch_device)
+                for r in range(N):
+                    l2_sum = l2_sum + torch.sum(delta_h[r] ** 2)
+                for key in delta_J:
+                    l2_sum = l2_sum + torch.sum(delta_J[key] ** 2)
+                loss = loss + l2 * l2_sum
+
+            if lambda_h > 0:
+                gh = torch.tensor(0.0, device=torch_device)
+                for r in range(N):
+                    gh = gh + _group_norm(delta_h[r])
+                loss = loss + lambda_h * gh
+
+            if lambda_J > 0:
+                gJ = torch.tensor(0.0, device=torch_device)
+                for key in delta_J:
+                    gJ = gJ + _group_norm(delta_J[key])
+                loss = loss + lambda_J * gJ
+
+            loss.backward()
+            opt.step()
+
+            total += float(loss.item()) * len(bidx)
+            nobs += len(bidx)
+            if batch_progress_callback:
+                batch_num = start // batch_size + 1
+                batch_progress_callback(ep, epochs, batch_num, total_batches)
+
+        avg_loss = total / max(1, nobs)
+        if verbose and (ep == 1 or ep % max(1, epochs // 10) == 0):
+            print(f"[plm-delta] epoch {ep:4d}/{epochs}  avg_loss={avg_loss:.6f}")
+        if progress_callback and (ep == 1 or ep == epochs or ep % progress_every == 0):
+            progress_callback(ep, epochs, float(avg_loss))
+        if scheduler is not None:
+            scheduler.step()
+
+    h = [-hp.detach().cpu().numpy().astype(float) for hp in delta_h]
+    J = {}
+    for r, s in edges:
+        key = f"{r}_{s}"
+        J[(r, s)] = -delta_J[key].detach().cpu().numpy().astype(float)
+
+    return PottsModel(h=h, J=J, edges=list(edges))
+
+
 def compute_pseudolikelihood_loss_torch(
     model: PottsModel,
     labels: np.ndarray,

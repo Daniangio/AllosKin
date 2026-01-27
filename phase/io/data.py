@@ -53,7 +53,10 @@ def load_npz(
     data = np.load(path, allow_pickle=True)
 
     residue_keys = data["residue_keys"]
-    labels = np.asarray(data["merged__labels"], dtype=int)
+    if "merged__labels_assigned" in data:
+        labels = np.asarray(data["merged__labels_assigned"], dtype=int)
+    else:
+        labels = np.asarray(data["merged__labels"], dtype=int)
     cluster_counts = np.asarray(data["merged__cluster_counts"], dtype=int)
 
     if "contact_edge_index" not in data:

@@ -29,11 +29,14 @@ import {
   recomputeMetastableStates,
   renameMetastableState,
   submitMetastableClusterJob,
+  uploadMetastableClusterNp,
   renameMetastableCluster,
   confirmMacroStates,
   confirmMetastableStates,
   clearMetastableStates,
   downloadSavedCluster,
+  downloadBackmappingCluster,
+  submitBackmappingClusterJob,
   downloadPottsModel,
   uploadPottsModel,
   renamePottsModel,
@@ -85,13 +88,18 @@ export default function SystemDetailPage() {
   const [clusterError, setClusterError] = useState(null);
   const [clusterLoading, setClusterLoading] = useState(false);
   const [clusterPanelOpen, setClusterPanelOpen] = useState(false);
+  const [clusterPanelMode, setClusterPanelMode] = useState('generate');
   const [clusterName, setClusterName] = useState('');
+  const [uploadClusterName, setUploadClusterName] = useState('');
+  const [uploadClusterFile, setUploadClusterFile] = useState(null);
+  const [uploadClusterStateIds, setUploadClusterStateIds] = useState([]);
+  const [uploadClusterError, setUploadClusterError] = useState(null);
+  const [uploadClusterLoading, setUploadClusterLoading] = useState(false);
   const [clusterDetailState, setClusterDetailState] = useState(null);
   const [clusterJobStatus, setClusterJobStatus] = useState({});
-  const [maxClustersPerResidue, setMaxClustersPerResidue] = useState(6);
+  const [backmappingDownloadProgress, setBackmappingDownloadProgress] = useState({});
+  const [backmappingJobStatus, setBackmappingJobStatus] = useState({});
   const [maxClusterFrames, setMaxClusterFrames] = useState(0);
-  const [contactMode, setContactMode] = useState('CA');
-  const [contactCutoff, setContactCutoff] = useState(10);
   const [densityZMode, setDensityZMode] = useState('auto');
   const [densityZValue, setDensityZValue] = useState(1.65);
   const [densityMaxk, setDensityMaxk] = useState(100);
@@ -106,6 +114,8 @@ export default function SystemDetailPage() {
   const [resultsError, setResultsError] = useState(null);
   const [pottsFitClusterId, setPottsFitClusterId] = useState('');
   const [pottsFitMethod, setPottsFitMethod] = useState('pmi+plm');
+  const [pottsFitContactMode, setPottsFitContactMode] = useState('CA');
+  const [pottsFitContactCutoff, setPottsFitContactCutoff] = useState(10);
   const [pottsFitAdvanced, setPottsFitAdvanced] = useState(false);
   const [pottsFitParams, setPottsFitParams] = useState({
     plm_epochs: '',
@@ -316,6 +326,40 @@ export default function SystemDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeClusterJobs]);
 
+  const activeBackmappingJobs = useMemo(
+    () =>
+      Object.entries(backmappingJobStatus)
+        .map(([clusterId, status]) => ({ clusterId, ...status }))
+        .filter((job) => job.job_id && !['finished', 'failed'].includes(job.status)),
+    [backmappingJobStatus]
+  );
+
+  useEffect(() => {
+    if (!activeBackmappingJobs.length) return;
+    let cancelled = false;
+    const poll = async () => {
+      const updates = {};
+      for (const job of activeBackmappingJobs) {
+        if (!job.job_id) continue;
+        try {
+          const status = await fetchJobStatus(job.job_id);
+          updates[job.clusterId] = status;
+        } catch (err) {
+          updates[job.clusterId] = { status: 'failed', result: { error: err.message } };
+        }
+      }
+      if (!cancelled && Object.keys(updates).length) {
+        setBackmappingJobStatus((prev) => ({ ...prev, ...updates }));
+      }
+    };
+    poll();
+    const timer = setInterval(poll, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [activeBackmappingJobs]);
+
   useEffect(() => {
     if (!macroReady) {
       setMetaChoice(null);
@@ -488,6 +532,8 @@ export default function SystemDetailPage() {
         system_id: systemId,
         cluster_id: pottsFitClusterId,
         fit_method: pottsFitMethod,
+        contact_atom_mode: pottsFitContactMode,
+        contact_cutoff: pottsFitContactCutoff,
       };
       const numericKeys = new Set([
         'plm_epochs',
@@ -690,10 +736,6 @@ export default function SystemDetailPage() {
     }
   };
 
-  if (isLoading) return <Loader message="Loading system..." />;
-  if (pageError) return <ErrorMessage message={pageError} />;
-  if (!system) return null;
-
   const handleRunMetastable = async () => {
     setMetaActionError(null);
     setMetaLoading(true);
@@ -795,10 +837,7 @@ export default function SystemDetailPage() {
       const densityZ = densityZMode === 'manual' ? densityZValue : 'auto';
       await submitMetastableClusterJob(projectId, systemId, selectedMetastableIds, {
         cluster_name: trimmedName || undefined,
-        max_clusters_per_residue: maxClustersPerResidue,
         max_cluster_frames: maxClusterFrames > 0 ? maxClusterFrames : undefined,
-        contact_atom_mode: contactMode,
-        contact_cutoff: contactCutoff,
         density_maxk: densityMaxk,
         density_z: densityZ,
       });
@@ -811,6 +850,55 @@ export default function SystemDetailPage() {
       setClusterLoading(false);
     }
   };
+
+  const uploadStateOptions = useMemo(
+    () =>
+      states
+        .filter((s) => s.descriptor_file)
+        .map((s) => ({ id: s.state_id, label: s.name || s.state_id })),
+    [states]
+  );
+
+  const toggleUploadState = (stateId) => {
+    setUploadClusterError(null);
+    setUploadClusterStateIds((prev) =>
+      prev.includes(stateId) ? prev.filter((id) => id !== stateId) : [...prev, stateId]
+    );
+  };
+
+  const handleUploadClusterNp = async () => {
+    setUploadClusterError(null);
+    if (!uploadClusterFile) {
+      setUploadClusterError('Select a cluster NPZ file to upload.');
+      return;
+    }
+    if (!uploadClusterStateIds.length) {
+      setUploadClusterError('Select the macro-states used to build the local cluster.');
+      return;
+    }
+    setUploadClusterLoading(true);
+    try {
+      const payload = new FormData();
+      payload.append('cluster_npz', uploadClusterFile);
+      payload.append('state_ids', uploadClusterStateIds.join(','));
+      if (uploadClusterName.trim()) payload.append('name', uploadClusterName.trim());
+      await uploadMetastableClusterNp(projectId, systemId, payload);
+      setClusterPanelOpen(false);
+      setClusterPanelMode('generate');
+      setUploadClusterName('');
+      setUploadClusterFile(null);
+      setUploadClusterStateIds([]);
+      await refreshSystem();
+    } catch (err) {
+      setUploadClusterError(err.message);
+    } finally {
+      setUploadClusterLoading(false);
+    }
+  };
+
+  if (isLoading) return <Loader message="Loading system..." />;
+  if (pageError) return <ErrorMessage message={pageError} />;
+  if (!system) return null;
 
   const handleRenameCluster = async (clusterId, name) => {
     if (!name.trim()) return;
@@ -838,6 +926,50 @@ export default function SystemDetailPage() {
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
+    } catch (err) {
+      setClusterError(err.message);
+    }
+  };
+
+  const handleDownloadBackmappingCluster = async (clusterId, filename) => {
+    setClusterError(null);
+    try {
+      setBackmappingDownloadProgress((prev) => ({ ...prev, [clusterId]: 0 }));
+      const blob = await downloadBackmappingCluster(projectId, systemId, clusterId, {
+        onProgress: (percent) =>
+          setBackmappingDownloadProgress((prev) => ({ ...prev, [clusterId]: percent })),
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename || `backmapping_${clusterId}.npz`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setClusterError(err.message);
+    } finally {
+      setBackmappingDownloadProgress((prev) => ({ ...prev, [clusterId]: null }));
+    }
+  };
+
+  const handleBackmappingAction = async (clusterId, filename) => {
+    const job = backmappingJobStatus[clusterId];
+    if (job?.status === 'finished') {
+      await handleDownloadBackmappingCluster(clusterId, filename);
+      return;
+    }
+    if (job?.status && job.status !== 'failed') return;
+    setClusterError(null);
+    try {
+      const response = await submitBackmappingClusterJob(projectId, systemId, clusterId);
+      if (response?.job_id) {
+        setBackmappingJobStatus((prev) => ({
+          ...prev,
+          [clusterId]: { status: 'queued', job_id: response.job_id, meta: { progress: 0 } },
+        }));
+      }
     } catch (err) {
       setClusterError(err.message);
     }
@@ -1044,8 +1176,7 @@ export default function SystemDetailPage() {
                               <p className="text-[11px] text-gray-400 mt-1">
                                 {analysisMode === 'macro' ? 'States' : 'Metastable'}:{' '}
                                 {Array.isArray(run.metastable_ids) ? run.metastable_ids.length : '—'} |{' '}
-                                Max clusters: {run.max_clusters_per_residue ?? '—'} | Max frames:{' '}
-                                {run.max_cluster_frames ?? 'all'}
+                                Max frames: {run.max_cluster_frames ?? 'all'}
                               </p>
                             </button>
                           );
@@ -1065,8 +1196,7 @@ export default function SystemDetailPage() {
                             <p className="text-[11px] text-gray-400 mt-1">
                               {analysisMode === 'macro' ? 'States' : 'Metastable'}:{' '}
                               {Array.isArray(run.metastable_ids) ? run.metastable_ids.length : '—'} |{' '}
-                              Max clusters: {run.max_clusters_per_residue ?? '—'} | Max frames:{' '}
-                              {run.max_cluster_frames ?? 'all'}
+                              Max frames: {run.max_cluster_frames ?? 'all'}
                             </p>
                             {isRunning && (
                               <div className="mt-2 space-y-1 text-[11px] text-gray-400">
@@ -1515,6 +1645,32 @@ export default function SystemDetailPage() {
                       <option value="pmi">PMI only</option>
                     </select>
                   </div>
+                  <div className="grid md:grid-cols-2 gap-3 text-sm">
+                    <label className="space-y-1">
+                      <span className="text-xs text-gray-400">Contact mode</span>
+                      <select
+                        value={pottsFitContactMode}
+                        onChange={(event) => setPottsFitContactMode(event.target.value)}
+                        className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                      >
+                        <option value="CA">CA</option>
+                        <option value="CM">Residue CM</option>
+                      </select>
+                    </label>
+                    <label className="space-y-1">
+                      <span className="text-xs text-gray-400">Contact cutoff (A)</span>
+                      <input
+                        type="number"
+                        min={1}
+                        step="0.5"
+                        value={pottsFitContactCutoff}
+                        onChange={(event) =>
+                          setPottsFitContactCutoff(Math.max(0.1, Number(event.target.value) || 0))
+                        }
+                        className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                      />
+                    </label>
+                  </div>
                   <button
                     type="button"
                     onClick={() => setPottsFitAdvanced((prev) => !prev)}
@@ -1757,24 +1913,30 @@ export default function SystemDetailPage() {
           onToggleMetastable={toggleMetastableSelection}
           clusterName={clusterName}
           setClusterName={setClusterName}
+          clusterMode={clusterPanelMode}
+          setClusterMode={setClusterPanelMode}
+          uploadClusterName={uploadClusterName}
+          setUploadClusterName={setUploadClusterName}
+          uploadClusterFile={uploadClusterFile}
+          setUploadClusterFile={setUploadClusterFile}
+          uploadClusterStateIds={uploadClusterStateIds}
+          uploadStateOptions={uploadStateOptions}
+          onToggleUploadState={toggleUploadState}
+          uploadClusterError={uploadClusterError}
+          uploadClusterLoading={uploadClusterLoading}
           densityZMode={densityZMode}
           setDensityZMode={setDensityZMode}
           densityZValue={densityZValue}
           setDensityZValue={setDensityZValue}
           densityMaxk={densityMaxk}
           setDensityMaxk={setDensityMaxk}
-          maxClustersPerResidue={maxClustersPerResidue}
-          setMaxClustersPerResidue={setMaxClustersPerResidue}
           maxClusterFrames={maxClusterFrames}
           setMaxClusterFrames={setMaxClusterFrames}
-          contactMode={contactMode}
-          setContactMode={setContactMode}
-          contactCutoff={contactCutoff}
-          setContactCutoff={setContactCutoff}
           clusterError={clusterError}
           clusterLoading={clusterLoading}
           onClose={() => setClusterPanelOpen(false)}
           onSubmit={handleDownloadClusters}
+          onUpload={handleUploadClusterNp}
         />
       )}
       {clusterDetailState && (
@@ -1784,6 +1946,9 @@ export default function SystemDetailPage() {
           onClose={() => setClusterDetailState(null)}
           onRename={handleRenameCluster}
           onDownload={handleDownloadSavedCluster}
+          onDownloadBackmapping={handleBackmappingAction}
+          backmappingProgress={backmappingDownloadProgress[clusterDetailState.cluster_id] ?? null}
+          backmappingJob={backmappingJobStatus[clusterDetailState.cluster_id] ?? null}
           onDelete={handleDeleteSavedCluster}
           onVisualize={(clusterId) =>
             navigate(

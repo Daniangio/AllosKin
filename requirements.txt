@@ -9,7 +9,7 @@ deeptime # For VAMP analysis
 torch
 pyqubo
 dwave-neal
-dadapy@git+https://github.com/sissa-data-science/DADApy.git#egg=cluster_predict_develop
+dadapy @ git+https://github.com/sissa-data-science/DADApy.git@cluster_predict_develop
 pyyaml
 redis
 rq

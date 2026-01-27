@@ -253,27 +253,36 @@ export function ClusterBuildOverlay({
   onToggleMetastable,
   clusterName,
   setClusterName,
+  clusterMode,
+  setClusterMode,
+  uploadClusterName,
+  setUploadClusterName,
+  uploadClusterFile,
+  setUploadClusterFile,
+  uploadClusterStateIds,
+  uploadStateOptions,
+  onToggleUploadState,
+  uploadClusterError,
+  uploadClusterLoading,
   densityZMode,
   setDensityZMode,
   densityZValue,
   setDensityZValue,
   densityMaxk,
   setDensityMaxk,
-  maxClustersPerResidue,
-  setMaxClustersPerResidue,
   maxClusterFrames,
   setMaxClusterFrames,
-  contactMode,
-  setContactMode,
-  contactCutoff,
-  setContactCutoff,
   clusterError,
   clusterLoading,
   onClose,
   onSubmit,
+  onUpload,
 }) {
   const hasMetastable = metastableStates.length > 0;
-  const canSubmit = selectedMetastableIds.length > 0 && !clusterLoading;
+  const isUpload = clusterMode === 'upload';
+  const canSubmit = !isUpload && selectedMetastableIds.length > 0 && !clusterLoading;
+  const canUpload =
+    isUpload && uploadClusterFile && uploadClusterStateIds.length > 0 && !uploadClusterLoading;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-8">
       <div className="w-full max-w-5xl bg-gray-900 border border-gray-700 rounded-lg shadow-xl">
@@ -289,133 +298,192 @@ export function ClusterBuildOverlay({
           </button>
         </div>
         <div className="p-5 max-h-[75vh] overflow-y-auto space-y-4 text-sm text-gray-200">
-          <div className="space-y-3">
-            <div>
-              <label className="block text-xs text-gray-400 mb-1">Cluster name</label>
-              <input
-                type="text"
-                value={clusterName}
-                onChange={(e) => setClusterName(e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white"
-              />
-            </div>
+          <div className="flex items-center gap-2 text-xs">
+            <button
+              type="button"
+              onClick={() => setClusterMode('generate')}
+              className={`px-3 py-1 rounded-full border ${
+                !isUpload
+                  ? 'border-cyan-400 text-cyan-200 bg-cyan-500/10'
+                  : 'border-gray-700 text-gray-400 hover:border-gray-500'
+              }`}
+            >
+              Generate
+            </button>
+            <button
+              type="button"
+              onClick={() => setClusterMode('upload')}
+              className={`px-3 py-1 rounded-full border ${
+                isUpload
+                  ? 'border-cyan-400 text-cyan-200 bg-cyan-500/10'
+                  : 'border-gray-700 text-gray-400 hover:border-gray-500'
+              }`}
+            >
+              Upload local NPZ
+            </button>
+          </div>
 
-            <div className="flex flex-wrap gap-2 text-xs">
-              {metastableStates.map((meta) => {
-                const key = meta.metastable_id || `${meta.macro_state}-${meta.metastable_index}`;
-                const active = selectedMetastableIds.includes(key);
-                return (
-                  <button
-                    key={key}
-                    type="button"
-                    onClick={() => onToggleMetastable(key)}
-                    className={`px-3 py-1 rounded-full border ${
-                      active
-                        ? 'border-cyan-400 text-cyan-200 bg-cyan-500/10'
-                        : 'border-gray-700 text-gray-400 hover:border-gray-500'
-                    }`}
-                  >
-                    {meta.name || meta.default_name || meta.macro_state || `Meta ${meta.metastable_index}`}
-                  </button>
-                );
-              })}
-              {!hasMetastable && <p className="text-xs text-gray-400">No metastable states available.</p>}
-            </div>
-
-            <div className="grid md:grid-cols-3 gap-3">
-              <label className="space-y-1">
-                <span className="block text-gray-400">Max clusters / residue</span>
+          {!isUpload && (
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Cluster name</label>
                 <input
-                  type="number"
-                  min={2}
-                  max={20}
-                  value={maxClustersPerResidue}
-                  onChange={(e) => setMaxClustersPerResidue(Math.max(2, Number(e.target.value) || 2))}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+                  type="text"
+                  value={clusterName}
+                  onChange={(e) => setClusterName(e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white"
                 />
-              </label>
-              <label className="space-y-1">
-                <span className="block text-gray-400">Max frames</span>
-                <input
-                  type="number"
-                  min={0}
-                  value={maxClusterFrames}
-                  onChange={(e) => setMaxClusterFrames(Math.max(0, Number(e.target.value) || 0))}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                />
-              </label>
-            </div>
+              </div>
 
-            <div className="grid md:grid-cols-3 gap-3">
-              <label className="space-y-1">
-                <span className="block text-gray-400">Z threshold</span>
-                <select
-                  value={densityZMode}
-                  onChange={(e) => setDensityZMode(e.target.value)}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                >
-                  <option value="auto">Auto</option>
-                  <option value="manual">Manual</option>
-                </select>
-              </label>
-              {densityZMode === 'manual' && (
+              <div className="flex flex-wrap gap-2 text-xs">
+                {metastableStates.map((meta) => {
+                  const key = meta.metastable_id || `${meta.macro_state}-${meta.metastable_index}`;
+                  const active = selectedMetastableIds.includes(key);
+                  return (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => onToggleMetastable(key)}
+                      className={`px-3 py-1 rounded-full border ${
+                        active
+                          ? 'border-cyan-400 text-cyan-200 bg-cyan-500/10'
+                          : 'border-gray-700 text-gray-400 hover:border-gray-500'
+                      }`}
+                    >
+                      {meta.name || meta.default_name || meta.macro_state || `Meta ${meta.metastable_index}`}
+                    </button>
+                  );
+                })}
+                {!hasMetastable && <p className="text-xs text-gray-400">No metastable states available.</p>}
+              </div>
+
+              <div className="grid md:grid-cols-3 gap-3">
                 <label className="space-y-1">
-                  <span className="block text-gray-400">Z value</span>
+                  <span className="block text-gray-400">Max frames</span>
                   <input
                     type="number"
-                    step="0.05"
                     min={0}
-                    value={densityZValue}
-                    onChange={(e) => setDensityZValue(Math.max(0.1, Number(e.target.value) || 0))}
+                    value={maxClusterFrames}
+                    onChange={(e) => setMaxClusterFrames(Math.max(0, Number(e.target.value) || 0))}
                     className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
                   />
                 </label>
-              )}
-              <label className="space-y-1">
-                <span className="block text-gray-400">Max k</span>
-                <input
-                  type="number"
-                  min={5}
-                  value={densityMaxk}
-                  onChange={(e) => setDensityMaxk(Math.max(5, Number(e.target.value) || 5))}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                />
-              </label>
-            </div>
-            <label className="space-y-1">
-              <span className="block text-gray-400">Contact mode</span>
-              <select
-                value={contactMode}
-                onChange={(e) => setContactMode(e.target.value)}
-                className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-              >
-                <option value="CA">CA</option>
-                <option value="CM">Residue CM</option>
-              </select>
-            </label>
-            <label className="space-y-1">
-              <span className="block text-gray-400">Contact cutoff (A)</span>
-              <input
-                type="number"
-                min={1}
-                step="0.5"
-                value={contactCutoff}
-                onChange={(e) => setContactCutoff(Math.max(0.1, Number(e.target.value) || 0))}
-                className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-              />
-            </label>
-            <div className="flex items-center">
-              <p className="text-gray-300">
-                Selected: <span className="text-white font-semibold">{selectedMetastableIds.length}</span> /{' '}
-                {metastableStates.length}
-              </p>
-            </div>
-          </div>
+              </div>
 
-          <p className="text-gray-400 text-xs">
-            NPZ includes merged cluster vectors, contact map edge_index (pyg format), and metadata JSON.
-          </p>
-          {clusterError && <ErrorMessage message={clusterError} />}
+              <div className="grid md:grid-cols-3 gap-3">
+                <label className="space-y-1">
+                  <span className="block text-gray-400">Z threshold</span>
+                  <select
+                    value={densityZMode}
+                    onChange={(e) => setDensityZMode(e.target.value)}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+                  >
+                    <option value="auto">Auto</option>
+                    <option value="manual">Manual</option>
+                  </select>
+                </label>
+                {densityZMode === 'manual' && (
+                  <label className="space-y-1">
+                    <span className="block text-gray-400">Z value</span>
+                    <input
+                      type="number"
+                      step="0.05"
+                      min={0}
+                      value={densityZValue}
+                      onChange={(e) => setDensityZValue(Math.max(0.1, Number(e.target.value) || 0))}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+                    />
+                  </label>
+                )}
+                <label className="space-y-1">
+                  <span className="block text-gray-400">Max k</span>
+                  <input
+                    type="number"
+                    min={5}
+                    value={densityMaxk}
+                    onChange={(e) => setDensityMaxk(Math.max(5, Number(e.target.value) || 5))}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+                  />
+                </label>
+              </div>
+              <div className="flex items-center">
+                <p className="text-gray-300">
+                  Selected: <span className="text-white font-semibold">{selectedMetastableIds.length}</span> /{' '}
+                  {metastableStates.length}
+                </p>
+              </div>
+            </div>
+          )}
+
+          {isUpload && (
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Cluster name (optional)</label>
+                <input
+                  type="text"
+                  value={uploadClusterName}
+                  onChange={(e) => setUploadClusterName(e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Upload cluster NPZ</label>
+                <input
+                  type="file"
+                  accept=".npz"
+                  onChange={(e) => setUploadClusterFile(e.target.files?.[0] || null)}
+                  className="w-full text-sm text-gray-300"
+                />
+              </div>
+              <div className="space-y-2">
+                <p className="text-xs text-gray-400">
+                  Select the macro-states used for local clustering (order inferred from NPZ metadata).
+                </p>
+                <div className="flex flex-wrap gap-2 text-xs">
+                  {uploadStateOptions.map((opt) => {
+                    const active = uploadClusterStateIds.includes(opt.id);
+                    return (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => onToggleUploadState(opt.id)}
+                        className={`px-3 py-1 rounded-full border ${
+                          active
+                            ? 'border-cyan-400 text-cyan-200 bg-cyan-500/10'
+                            : 'border-gray-700 text-gray-400 hover:border-gray-500'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                {uploadClusterStateIds.length > 0 && (
+                  <div className="space-y-1 text-xs text-gray-300">
+                    {uploadClusterStateIds.map((sid) => {
+                      const label = uploadStateOptions.find((opt) => opt.id === sid)?.label || sid;
+                      return (
+                        <div key={sid} className="flex items-center gap-2">
+                          <span className="w-5 text-gray-500">•</span>
+                          <span className="flex-1">{label}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              {uploadClusterError && <ErrorMessage message={uploadClusterError} />}
+            </div>
+          )}
+
+          {!isUpload && (
+            <>
+              <p className="text-gray-400 text-xs">
+                NPZ includes merged cluster vectors, contact map edge_index (pyg format), and metadata JSON.
+              </p>
+              {clusterError && <ErrorMessage message={clusterError} />}
+            </>
+          )}
         </div>
         <div className="flex items-center justify-end gap-2 border-t border-gray-800 px-4 py-3">
           <button
@@ -425,21 +493,43 @@ export function ClusterBuildOverlay({
           >
             Cancel
           </button>
-          <button
-            type="button"
-            onClick={onSubmit}
-            disabled={!canSubmit}
-            className="text-xs px-3 py-2 rounded-md border border-emerald-500 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
-          >
-            {clusterLoading ? 'Generating...' : 'Run clustering'}
-          </button>
+          {!isUpload ? (
+            <button
+              type="button"
+              onClick={onSubmit}
+              disabled={!canSubmit}
+              className="text-xs px-3 py-2 rounded-md border border-emerald-500 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
+            >
+              {clusterLoading ? 'Generating...' : 'Run clustering'}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={onUpload}
+              disabled={!canUpload}
+              className="text-xs px-3 py-2 rounded-md border border-emerald-500 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
+            >
+              {uploadClusterLoading ? 'Uploading...' : 'Upload cluster'}
+            </button>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-export function ClusterDetailOverlay({ cluster, analysisMode, onClose, onRename, onDownload, onDelete, onVisualize }) {
+export function ClusterDetailOverlay({
+  cluster,
+  analysisMode,
+  onClose,
+  onRename,
+  onDownload,
+  onDownloadBackmapping,
+  backmappingProgress,
+  backmappingJob,
+  onDelete,
+  onVisualize,
+}) {
   const [name, setName] = useState(getClusterDisplayName(cluster));
   const [isSaving, setIsSaving] = useState(false);
   const stateLabel = analysisMode === 'macro' ? 'States' : 'Metastable';
@@ -508,14 +598,7 @@ export function ClusterDetailOverlay({ cluster, analysisMode, onClose, onRename,
               {Array.isArray(cluster.metastable_ids) ? cluster.metastable_ids.join(', ') : '—'}
             </p>
             <p>
-              <span className="text-gray-300 font-semibold">Max clusters:</span> {cluster.max_clusters_per_residue ?? '—'}
-            </p>
-            <p>
               <span className="text-gray-300 font-semibold">Max frames:</span> {cluster.max_cluster_frames ?? 'all'}
-            </p>
-            <p>
-              <span className="text-gray-300 font-semibold">Contact:</span>{' '}
-              {cluster.contact_atom_mode || cluster.contact_mode || 'CA'} @ {cluster.contact_cutoff ?? 10} A
             </p>
             <p>
               <span className="text-gray-300 font-semibold">Generated:</span> {cluster.generated_at || '—'}
@@ -532,6 +615,23 @@ export function ClusterDetailOverlay({ cluster, analysisMode, onClose, onRename,
           </button>
           <button
             type="button"
+            onClick={() => onDownloadBackmapping?.(cluster.cluster_id, `backmapping_${cluster.cluster_id}.npz`)}
+            disabled={
+              (backmappingJob && backmappingJob.status && backmappingJob.status !== 'failed' && backmappingJob.status !== 'finished') ||
+              (backmappingProgress !== null && backmappingProgress !== undefined)
+            }
+            className="text-xs px-3 py-2 rounded-md border border-sky-500 text-sky-300 hover:bg-sky-500/10 disabled:opacity-60"
+          >
+            {backmappingJob?.status === 'finished'
+              ? 'Download backmapping NPZ'
+              : backmappingJob?.status && backmappingJob.status !== 'failed'
+              ? `Preparing... ${backmappingJob?.meta?.progress ?? 0}%`
+              : backmappingProgress !== null && backmappingProgress !== undefined
+              ? `Downloading... ${backmappingProgress ?? 0}%`
+              : 'Backmapping NPZ'}
+          </button>
+          <button
+            type="button"
             onClick={() => onVisualize(cluster.cluster_id)}
             className="text-xs px-3 py-2 rounded-md border border-cyan-500 text-cyan-300 hover:bg-cyan-500/10"
           >
@@ -545,6 +645,29 @@ export function ClusterDetailOverlay({ cluster, analysisMode, onClose, onRename,
             Delete
           </button>
         </div>
+        {(backmappingJob?.status && backmappingJob.status !== 'finished' && backmappingJob.status !== 'failed') ||
+        (backmappingProgress !== null && backmappingProgress !== undefined) ? (
+          <div className="px-4 pb-4">
+            <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-sky-500 transition-all duration-200"
+                style={{
+                  width: `${Math.max(
+                    2,
+                    backmappingJob?.status && backmappingJob.status !== 'finished' && backmappingJob.status !== 'failed'
+                      ? backmappingJob?.meta?.progress ?? 0
+                      : backmappingProgress || 0
+                  )}%`,
+                }}
+              />
+            </div>
+            <p className="text-[11px] text-gray-400 mt-1">
+              {backmappingProgress !== null && backmappingProgress !== undefined
+                ? 'Downloading backmapping NPZ…'
+                : 'Building backmapping NPZ…'}
+            </p>
+          </div>
+        ) : null}
       </div>
     </div>
   );

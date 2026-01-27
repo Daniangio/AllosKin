@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 import inspect
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -68,13 +69,13 @@ def _fit_density_peaks(
     if n == 1:
         labels = np.zeros(1, dtype=np.int32)
         diag = {"density_peaks_k": 1, "density_peaks_maxk": 1, "density_peaks_Z": density_z}
-        dp_data = Data(coordinates=emb, maxk=1, verbose=False, n_jobs=n_jobs or 1)
+        dp_data = Data(coordinates=emb, maxk=1, verbose=False, n_jobs=1)
         dp_data.cluster_assignment = labels  # type: ignore[attr-defined]
         dp_data.N_clusters = 1  # type: ignore[attr-defined]
         return dp_data, labels, 1, diag
 
     dp_maxk = max(1, min(int(density_maxk), n - 1))
-    dp_data = Data(coordinates=emb, maxk=dp_maxk, verbose=False, n_jobs=n_jobs or 1)
+    dp_data = Data(coordinates=emb, maxk=dp_maxk, verbose=False, n_jobs=1)
     dp_data.compute_distances()
     dp_data.compute_id_2NN()
     dp_data.compute_density_kstarNN()
@@ -102,7 +103,6 @@ def _predict_cluster_adp(
     samples: np.ndarray,
     *,
     density_maxk: int,
-    density_z: float | str,
     halo: bool,
     n_jobs: int | None = None,
 ) -> np.ndarray:
@@ -110,23 +110,13 @@ def _predict_cluster_adp(
     if not hasattr(dp_data, "predict_cluster_ADP"):
         raise ValueError("DADApy predict_cluster_ADP is not available. Update the DADApy installation.")
     emb = _angles_to_embedding(samples)
-    fn = getattr(dp_data, "predict_cluster_ADP")
-    params = inspect.signature(fn).parameters
-    kwargs: Dict[str, Any] = {}
-    if "maxk" in params:
-        kwargs["maxk"] = max(1, min(int(density_maxk), emb.shape[0] - 1))
-    if "density_est" in params:
-        kwargs["density_est"] = "PAk"
-    if "halo" in params:
-        kwargs["halo"] = halo
-    if "n_jobs" in params:
-        kwargs["n_jobs"] = n_jobs or 1
-    if not (isinstance(density_z, str) and density_z.lower() == "auto"):
-        if "Dthr" in params:
-            kwargs["Dthr"] = float(density_z)
-        if "Z" in params:
-            kwargs["Z"] = float(density_z)
-    labels = fn(emb, **kwargs)
+    labels, _ = dp_data.predict_cluster_ADP(
+        emb,
+        maxk=max(1, min(int(density_maxk), emb.shape[0] - 1)),
+        density_est="kstarNN",
+        halo=halo,
+        n_jobs=1
+    )
     return np.asarray(labels, dtype=np.int32)
 
 
@@ -194,7 +184,6 @@ def _cluster_with_subsample(
             dp_data,
             samples,
             density_maxk=density_maxk,
-            density_z=density_z,
             halo=False,
             n_jobs=n_jobs,
         )
@@ -221,7 +210,6 @@ def _cluster_with_subsample(
         dp_data,
         samples,
         density_maxk=density_maxk,
-        density_z=density_z,
         halo=True,
         n_jobs=n_jobs,
     )
@@ -229,7 +217,6 @@ def _cluster_with_subsample(
         dp_data,
         samples,
         density_maxk=density_maxk,
-        density_z=density_z,
         halo=False,
         n_jobs=n_jobs,
     )
@@ -237,6 +224,25 @@ def _cluster_with_subsample(
     diag["subsample_size"] = int(subsample_indices.size)
     diag["total_frames"] = int(n_frames)
     return labels_halo, labels_assigned, k, diag, int(subsample_indices.size), dp_data
+
+
+def _cluster_residue_worker(
+    col: int,
+    samples: np.ndarray,
+    density_maxk: int,
+    density_z: float | str,
+    max_cluster_frames: Optional[int],
+    subsample_indices: Optional[np.ndarray],
+) -> Tuple[int, np.ndarray, np.ndarray, int]:
+    labels_halo, labels_assigned, k, _, _, _ = _cluster_with_subsample(
+        samples,
+        density_maxk=density_maxk,
+        density_z=density_z,
+        max_cluster_frames=max_cluster_frames,
+        subsample_indices=subsample_indices,
+        n_jobs=1,
+    )
+    return col, labels_halo, labels_assigned, k
 
 
 def _resolve_states_for_meta(meta: Dict[str, Any], system: SystemMetadata) -> List[DescriptorState]:
@@ -556,8 +562,6 @@ def _collect_cluster_inputs(
     project_id: str,
     system_id: str,
     metastable_ids: List[str],
-    cutoff_val: float,
-    contact_atom_mode: str,
 ) -> Dict[str, Any]:
     unique_meta_ids = list(dict.fromkeys([str(mid) for mid in metastable_ids]))
 
@@ -664,23 +668,6 @@ def _collect_cluster_inputs(
         if matched_frames == 0:
             raise ValueError(f"No frames matched metastable '{meta_id}'.")
 
-        rep_rel = meta.get("representative_pdb")
-        if rep_rel:
-            rep_path = store.resolve_path(project_id, system_id, rep_rel)
-            if rep_path.exists():
-                contact_sources.append(str(rep_path))
-                try:
-                    edges = _compute_contact_edges(
-                        rep_path,
-                        residue_keys,
-                        residue_mapping,
-                        cutoff_val,
-                        contact_atom_mode,
-                    )
-                    contact_edges.update(edges)
-                except Exception:
-                    pass
-
     return {
         "unique_meta_ids": unique_meta_ids,
         "residue_keys": residue_keys,
@@ -733,6 +720,7 @@ def _build_condition_predictions(
     state_labels: Dict[str, str],
     metastable_labels: Dict[str, str],
     analysis_mode: Optional[str],
+    n_jobs: int | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     store = ProjectStore()
     system_meta = store.get_system(project_id, system_id)
@@ -769,15 +757,15 @@ def _build_condition_predictions(
                 dp_models[res_idx],
                 angles,
                 density_maxk=density_maxk,
-                density_z=density_z,
                 halo=True,
+                n_jobs=n_jobs,
             )
             labels_assigned[:, res_idx] = _predict_cluster_adp(
                 dp_models[res_idx],
                 angles,
                 density_maxk=density_maxk,
-                density_z=density_z,
                 halo=False,
+                n_jobs=n_jobs,
             )
 
         key_slug = _slug(str(state_id))
@@ -874,20 +862,158 @@ def _build_condition_predictions(
     return payload, predictions_meta, {"halo_summary": halo_meta}
 
 
+def _build_state_predictions_from_features(
+    *,
+    residue_keys: List[str],
+    features_by_state: Dict[str, Dict[str, np.ndarray]],
+    dp_models: List[Data],
+    density_maxk: int,
+    density_z: float | str,
+    state_labels: Dict[str, str],
+    n_jobs: int | None = None,
+) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    n_residues = len(residue_keys)
+    payload: Dict[str, Any] = {}
+    predictions_meta: Dict[str, Any] = {}
+    halo_condition_ids: List[str] = []
+    halo_condition_labels: List[str] = []
+    halo_condition_types: List[str] = []
+    halo_matrix: List[np.ndarray] = []
+
+    for state_id, features in features_by_state.items():
+        frame_count = _infer_frame_count(features)
+        if frame_count <= 0:
+            continue
+        labels_halo = np.full((frame_count, n_residues), -1, dtype=np.int32)
+        labels_assigned = np.full((frame_count, n_residues), -1, dtype=np.int32)
+
+        for res_idx, key in enumerate(residue_keys):
+            angles = _extract_angles_array(features, key)
+            if angles is None or angles.shape[0] != frame_count:
+                continue
+            labels_halo[:, res_idx] = _predict_cluster_adp(
+                dp_models[res_idx],
+                angles,
+                density_maxk=density_maxk,
+                halo=True,
+                n_jobs=n_jobs,
+            )
+            labels_assigned[:, res_idx] = _predict_cluster_adp(
+                dp_models[res_idx],
+                angles,
+                density_maxk=density_maxk,
+                halo=False,
+                n_jobs=n_jobs,
+            )
+
+        key_slug = _slug(str(state_id))
+        payload[f"state__{key_slug}__labels_halo"] = labels_halo
+        payload[f"state__{key_slug}__labels_assigned"] = labels_assigned
+        payload[f"state__{key_slug}__frame_indices"] = np.arange(frame_count, dtype=np.int64)
+        predictions_meta[f"state:{state_id}"] = {
+            "type": "macro",
+            "labels_halo": f"state__{key_slug}__labels_halo",
+            "labels_assigned": f"state__{key_slug}__labels_assigned",
+            "frame_indices": f"state__{key_slug}__frame_indices",
+            "frame_count": int(frame_count),
+        }
+        halo_condition_ids.append(f"state:{state_id}")
+        halo_condition_labels.append(state_labels.get(str(state_id), str(state_id)))
+        halo_condition_types.append("macro")
+        halo_matrix.append(np.mean(labels_halo == -1, axis=0))
+
+    halo_payload, halo_meta = _build_halo_summary(
+        condition_ids=halo_condition_ids,
+        condition_labels=halo_condition_labels,
+        condition_types=halo_condition_types,
+        halo_matrix=halo_matrix,
+    )
+    payload.update(halo_payload)
+    return payload, predictions_meta, {"halo_summary": halo_meta}
+
+
+def _build_state_predictions_from_merged(
+    *,
+    merged_labels_halo: np.ndarray,
+    merged_labels_assigned: np.ndarray,
+    merged_frame_state_ids: List[str],
+    merged_frame_indices: List[int],
+    state_frame_counts: Dict[str, int],
+    state_labels: Dict[str, str],
+) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    n_frames = merged_labels_halo.shape[0]
+    n_residues = merged_labels_halo.shape[1] if merged_labels_halo.ndim == 2 else 0
+    payload: Dict[str, Any] = {}
+    predictions_meta: Dict[str, Any] = {}
+    halo_condition_ids: List[str] = []
+    halo_condition_labels: List[str] = []
+    halo_condition_types: List[str] = []
+    halo_matrix: List[np.ndarray] = []
+
+    state_buffers: Dict[str, Dict[str, np.ndarray]] = {}
+    for state_id, count in state_frame_counts.items():
+        if count <= 0:
+            continue
+        state_buffers[state_id] = {
+            "labels_halo": np.full((count, n_residues), -1, dtype=np.int32),
+            "labels_assigned": np.full((count, n_residues), -1, dtype=np.int32),
+        }
+
+    for row in range(n_frames):
+        state_id = str(merged_frame_state_ids[row])
+        frame_idx = int(merged_frame_indices[row])
+        buf = state_buffers.get(state_id)
+        if buf is None:
+            continue
+        if frame_idx < 0 or frame_idx >= buf["labels_halo"].shape[0]:
+            continue
+        buf["labels_halo"][frame_idx] = merged_labels_halo[row]
+        buf["labels_assigned"][frame_idx] = merged_labels_assigned[row]
+
+    for state_id, buf in state_buffers.items():
+        labels_halo = buf["labels_halo"]
+        labels_assigned = buf["labels_assigned"]
+        key_slug = _slug(str(state_id))
+        payload[f"state__{key_slug}__labels_halo"] = labels_halo
+        payload[f"state__{key_slug}__labels_assigned"] = labels_assigned
+        payload[f"state__{key_slug}__frame_indices"] = np.arange(labels_halo.shape[0], dtype=np.int64)
+        predictions_meta[f"state:{state_id}"] = {
+            "type": "macro",
+            "labels_halo": f"state__{key_slug}__labels_halo",
+            "labels_assigned": f"state__{key_slug}__labels_assigned",
+            "frame_indices": f"state__{key_slug}__frame_indices",
+            "frame_count": int(labels_halo.shape[0]),
+        }
+        halo_condition_ids.append(f"state:{state_id}")
+        halo_condition_labels.append(state_labels.get(str(state_id), str(state_id)))
+        halo_condition_types.append("macro")
+        if labels_halo.size:
+            halo_matrix.append(np.mean(labels_halo == -1, axis=0))
+        else:
+            halo_matrix.append(np.full(n_residues, np.nan))
+
+    halo_payload, halo_meta = _build_halo_summary(
+        condition_ids=halo_condition_ids,
+        condition_labels=halo_condition_labels,
+        condition_types=halo_condition_types,
+        halo_matrix=halo_matrix,
+    )
+    payload.update(halo_payload)
+    return payload, predictions_meta, {"halo_summary": halo_meta}
+
+
 def generate_metastable_cluster_npz(
     project_id: str,
     system_id: str,
     metastable_ids: List[str],
     *,
-    max_clusters_per_residue: int = 6,
     max_cluster_frames: Optional[int] = None,
     random_state: int = 0,
-    contact_cutoff: float = 10.0,
-    contact_atom_mode: str = "CA",
     cluster_algorithm: str = "density_peaks",
     density_maxk: Optional[int] = 100,
     density_z: float | str | None = None,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    n_jobs: int | None = None,
 ) -> Tuple[Path, Dict[str, Any]]:
     """
     Build per-residue cluster labels for selected metastable states and save NPZ.
@@ -896,8 +1022,6 @@ def generate_metastable_cluster_npz(
     """
     if not metastable_ids:
         raise ValueError("At least one metastable_id is required.")
-    if max_clusters_per_residue < 1:
-        raise ValueError("max_clusters_per_residue must be >= 1.")
     max_cluster_frames_val: Optional[int] = None
     if max_cluster_frames is not None:
         try:
@@ -906,15 +1030,6 @@ def generate_metastable_cluster_npz(
             raise ValueError("max_cluster_frames must be an integer.") from exc
         if max_cluster_frames_val < 1:
             raise ValueError("max_cluster_frames must be >= 1.")
-    try:
-        cutoff_val = float(contact_cutoff)
-    except Exception as exc:
-        raise ValueError("contact_cutoff must be a number.") from exc
-    if cutoff_val <= 0:
-        raise ValueError("contact_cutoff must be > 0.")
-    contact_atom_mode = str(contact_atom_mode or "CA").upper()
-    if contact_atom_mode not in {"CA", "CM"}:
-        raise ValueError("contact_atom_mode must be 'CA' or 'CM'.")
     algo = (cluster_algorithm or "density_peaks").lower()
     if algo != "density_peaks":
         raise ValueError("Only density_peaks clustering is supported.")
@@ -933,7 +1048,7 @@ def generate_metastable_cluster_npz(
         except Exception as exc:
             raise ValueError("density_z must be a number or 'auto'.") from exc
 
-    inputs = _collect_cluster_inputs(project_id, system_id, metastable_ids, cutoff_val, contact_atom_mode)
+    inputs = _collect_cluster_inputs(project_id, system_id, metastable_ids)
     unique_meta_ids = inputs["unique_meta_ids"]
     residue_keys = inputs["residue_keys"]
     residue_mapping = inputs["residue_mapping"]
@@ -979,6 +1094,7 @@ def generate_metastable_cluster_npz(
             density_z=density_z_val,
             max_cluster_frames=max_cluster_frames_val,
             subsample_indices=merged_subsample_indices,
+            n_jobs=n_jobs,
         )
         if labels_halo.size == 0:
             merged_labels_halo[:, col] = -1
@@ -1009,6 +1125,7 @@ def generate_metastable_cluster_npz(
         state_labels=state_labels,
         metastable_labels=metastable_labels,
         analysis_mode=getattr(system_meta, "analysis_mode", None),
+        n_jobs=n_jobs,
     )
 
     # Persist NPZ
@@ -1032,17 +1149,13 @@ def generate_metastable_cluster_npz(
         "cluster_params": {
             "density_maxk": density_maxk_val,
             "density_z": density_z_val,
-            "max_clusters_per_residue": max_clusters_per_residue,
             "max_cluster_frames": max_cluster_frames_val,
             "random_state": random_state,
         },
         "predictions": predictions_meta,
         "residue_keys": residue_keys,
         "residue_mapping": residue_mapping,
-        "max_clusters_per_residue": max_clusters_per_residue,
         "random_state": random_state,
-        "contact_mode": contact_atom_mode,
-        "contact_cutoff": cutoff_val,
         "contact_sources": contact_sources,
         "contact_edge_count": len(contact_edges),
         "merged": {
@@ -1076,12 +1189,305 @@ def generate_metastable_cluster_npz(
     else:
         edge_index = np.zeros((2, 0), dtype=np.int64)
     payload["contact_edge_index"] = edge_index
-    payload["contact_mode"] = np.array(contact_atom_mode)
-    payload["contact_cutoff"] = np.array(cutoff_val)
+    # contact_edge_index remains to keep downstream loaders happy
     payload.update(condition_payload)
 
     np.savez_compressed(out_path, **payload)
     return out_path, metadata
+
+
+def generate_cluster_npz_from_descriptors(
+    descriptor_paths: Sequence[Path],
+    *,
+    labels: Optional[Sequence[str]] = None,
+    eval_descriptor_paths: Optional[Sequence[Path]] = None,
+    output_path: Optional[Path] = None,
+    max_cluster_frames: Optional[int] = None,
+    random_state: int = 0,
+    density_maxk: Optional[int] = 100,
+    density_z: float | str | None = None,
+    n_jobs: int | None = None,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+) -> Tuple[Path, Dict[str, Any]]:
+    """
+    Cluster local descriptor NPZ files without a project/system context.
+    Each descriptor file is treated as a macro-state; labels default to file stems.
+    """
+    if not descriptor_paths:
+        raise ValueError("At least one descriptor NPZ path is required.")
+    if labels and len(labels) != len(descriptor_paths):
+        raise ValueError("Labels must match the number of descriptor NPZ paths.")
+    max_cluster_frames_val: Optional[int] = None
+    if max_cluster_frames is not None:
+        try:
+            max_cluster_frames_val = int(max_cluster_frames)
+        except Exception as exc:
+            raise ValueError("max_cluster_frames must be an integer.") from exc
+        if max_cluster_frames_val < 1:
+            raise ValueError("max_cluster_frames must be >= 1.")
+    if density_maxk is None:
+        density_maxk_val = 100
+    else:
+        try:
+            density_maxk_val = max(1, int(density_maxk))
+        except Exception as exc:
+            raise ValueError("density_maxk must be an integer >=1.") from exc
+    if density_z is None or (isinstance(density_z, str) and density_z.lower() == "auto"):
+        density_z_val: float | str = "auto"
+    else:
+        try:
+            density_z_val = float(density_z)
+        except Exception as exc:
+            raise ValueError("density_z must be a number or 'auto'.") from exc
+
+    resolved_paths = [Path(p) for p in descriptor_paths]
+    for path in resolved_paths:
+        if not path.exists():
+            raise ValueError(f"Descriptor NPZ not found: {path}")
+    eval_paths = [Path(p) for p in (eval_descriptor_paths or [])]
+    for path in eval_paths:
+        if not path.exists():
+            raise ValueError(f"Eval descriptor NPZ not found: {path}")
+
+    if labels:
+        raw_labels = [str(v).strip() or path.stem for v, path in zip(labels, resolved_paths)]
+    else:
+        raw_labels = [path.stem for path in resolved_paths]
+    raw_eval_labels = [path.stem for path in eval_paths]
+    state_ids: List[str] = []
+    state_labels: Dict[str, str] = {}
+    for idx, raw in enumerate(raw_labels):
+        base = _slug(raw) or f"state_{idx + 1}"
+        candidate = base
+        suffix = 2
+        while candidate in state_labels:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        state_ids.append(candidate)
+        state_labels[candidate] = raw
+    eval_state_ids: List[str] = []
+    for idx, raw in enumerate(raw_eval_labels):
+        base = _slug(raw) or f"eval_{idx + 1}"
+        candidate = base
+        suffix = 2
+        while candidate in state_labels:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        eval_state_ids.append(candidate)
+        state_labels[candidate] = raw
+
+    features_by_state: Dict[str, Dict[str, np.ndarray]] = {}
+    residue_keys: List[str] = []
+    for state_id, path in zip(state_ids, resolved_paths):
+        features = load_descriptor_npz(path)
+        if not features:
+            raise ValueError(f"No descriptor data found in '{path}'.")
+        keys = sorted(features.keys())
+        if not residue_keys:
+            residue_keys = keys
+        elif residue_keys != keys:
+            missing = sorted(set(residue_keys) - set(keys))
+            extra = sorted(set(keys) - set(residue_keys))
+            raise ValueError(
+                f"Descriptor keys mismatch for '{path}'. Missing={missing} Extra={extra}"
+            )
+        features_by_state[state_id] = features
+    for state_id, path in zip(eval_state_ids, eval_paths):
+        features = load_descriptor_npz(path)
+        if not features:
+            raise ValueError(f"No descriptor data found in '{path}'.")
+        keys = sorted(features.keys())
+        if residue_keys and residue_keys != keys:
+            missing = sorted(set(residue_keys) - set(keys))
+            extra = sorted(set(keys) - set(residue_keys))
+            raise ValueError(
+                f"Descriptor keys mismatch for '{path}'. Missing={missing} Extra={extra}"
+            )
+        features_by_state[state_id] = features
+
+    if not residue_keys:
+        raise ValueError("Could not determine residue keys for clustering.")
+
+    merged_frame_state_ids: List[str] = []
+    merged_frame_meta_ids: List[str] = []
+    merged_frame_indices: List[int] = []
+    merged_angles_per_residue: List[List[np.ndarray]] = [[] for _ in residue_keys]
+
+    for state_id, features in features_by_state.items():
+        frame_count = _infer_frame_count(features)
+        if frame_count <= 0:
+            raise ValueError(f"Could not determine frame count for '{state_id}'.")
+        for idx in range(frame_count):
+            merged_frame_state_ids.append(state_id)
+            merged_frame_meta_ids.append(state_id)
+            merged_frame_indices.append(int(idx))
+            for col, key in enumerate(residue_keys):
+                arr = np.asarray(features.get(key))
+                if arr is None or arr.shape[0] != frame_count:
+                    raise ValueError(
+                        f"Descriptor array for '{key}' is missing or misaligned in '{state_id}'."
+                    )
+                if arr.ndim >= 3:
+                    vec = arr[idx, 0, :3]
+                elif arr.ndim == 2:
+                    vec = arr[idx, :3]
+                else:
+                    vec = arr[idx : idx + 1]
+                vec = np.asarray(vec, dtype=float).reshape(-1)
+                if vec.size < 3:
+                    padded = np.zeros(3, dtype=float)
+                    padded[: vec.size] = vec
+                    vec = padded
+                else:
+                    vec = vec[:3]
+                merged_angles_per_residue[col].append(vec)
+
+    merged_frame_count = len(merged_frame_state_ids)
+    merged_labels_halo = np.zeros((merged_frame_count, len(residue_keys)), dtype=np.int32)
+    merged_labels_assigned = np.zeros((merged_frame_count, len(residue_keys)), dtype=np.int32)
+    merged_counts = np.zeros(len(residue_keys), dtype=np.int32)
+    merged_subsample_indices = None
+    if max_cluster_frames_val and merged_frame_count > max_cluster_frames_val:
+        merged_subsample_indices = _uniform_subsample_indices(merged_frame_count, max_cluster_frames_val)
+    merged_clustered_frames = (
+        merged_subsample_indices.size if merged_subsample_indices is not None else merged_frame_count
+    )
+
+    total_residue_jobs = len(residue_keys)
+    completed_residue_jobs = 0
+    if progress_callback:
+        progress_callback("Clustering residues...", 0, total_residue_jobs)
+
+    use_processes = n_jobs is not None and int(n_jobs) > 1
+    if use_processes:
+        with ProcessPoolExecutor(max_workers=int(n_jobs)) as executor:
+            futures = []
+            for col, samples in enumerate(merged_angles_per_residue):
+                sample_arr = np.asarray(samples, dtype=float)
+                futures.append(
+                    executor.submit(
+                        _cluster_residue_worker,
+                        col,
+                        sample_arr,
+                        density_maxk_val,
+                        density_z_val,
+                        max_cluster_frames_val,
+                        merged_subsample_indices,
+                    )
+                )
+            for fut in as_completed(futures):
+                col, labels_halo, labels_assigned, k = fut.result()
+                if labels_halo.size == 0:
+                    merged_labels_halo[:, col] = -1
+                    merged_labels_assigned[:, col] = -1
+                    merged_counts[col] = 0
+                else:
+                    merged_labels_halo[:, col] = labels_halo
+                    merged_labels_assigned[:, col] = labels_assigned
+                    if np.any(labels_assigned >= 0):
+                        k = max(k, int(labels_assigned.max()) + 1)
+                    merged_counts[col] = k
+                if progress_callback and total_residue_jobs:
+                    completed_residue_jobs += 1
+                    progress_callback(
+                        f"Clustering residues: {completed_residue_jobs}/{total_residue_jobs}",
+                        completed_residue_jobs,
+                        total_residue_jobs,
+                    )
+    else:
+        for col, samples in enumerate(merged_angles_per_residue):
+            sample_arr = np.asarray(samples, dtype=float)
+            labels_halo, labels_assigned, k, _, _, _ = _cluster_with_subsample(
+                sample_arr,
+                density_maxk=density_maxk_val,
+                density_z=density_z_val,
+                max_cluster_frames=max_cluster_frames_val,
+                subsample_indices=merged_subsample_indices,
+                n_jobs=1,
+            )
+            if labels_halo.size == 0:
+                merged_labels_halo[:, col] = -1
+                merged_labels_assigned[:, col] = -1
+                merged_counts[col] = 0
+            else:
+                merged_labels_halo[:, col] = labels_halo
+                merged_labels_assigned[:, col] = labels_assigned
+                if np.any(labels_assigned >= 0):
+                    k = max(k, int(labels_assigned.max()) + 1)
+                merged_counts[col] = k
+            if progress_callback and total_residue_jobs:
+                completed_residue_jobs += 1
+                progress_callback(
+                    f"Clustering residues: {completed_residue_jobs}/{total_residue_jobs}",
+                    completed_residue_jobs,
+                    total_residue_jobs,
+                )
+
+    state_frame_counts = {state_id: _infer_frame_count(features) for state_id, features in features_by_state.items()}
+    condition_payload, predictions_meta, extra_meta = _build_state_predictions_from_merged(
+        merged_labels_halo=merged_labels_halo,
+        merged_labels_assigned=merged_labels_assigned,
+        merged_frame_state_ids=merged_frame_state_ids,
+        merged_frame_indices=merged_frame_indices,
+        state_frame_counts=state_frame_counts,
+        state_labels=state_labels,
+    )
+
+    if output_path is None:
+        output_path = Path.cwd() / f"cluster_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.npz"
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    metadata = {
+        "generated_at": datetime.utcnow().isoformat(),
+        "analysis_mode": "macro",
+        "selected_metastable_ids": state_ids,
+        "state_labels": state_labels,
+        "metastable_labels": {},
+        "cluster_algorithm": "density_peaks",
+        "cluster_params": {
+            "density_maxk": density_maxk_val,
+            "density_z": density_z_val,
+            "max_cluster_frames": max_cluster_frames_val,
+            "random_state": random_state,
+        },
+        "predictions": predictions_meta,
+        "residue_keys": residue_keys,
+        "residue_mapping": {},
+        "random_state": random_state,
+        "contact_sources": [],
+        "contact_edge_count": 0,
+        "merged": {
+            "n_frames": merged_frame_count,
+            "clustered_frames": int(merged_clustered_frames),
+            "npz_keys": {
+                "labels": "merged__labels",
+                "labels_halo": "merged__labels",
+                "labels_assigned": "merged__labels_assigned",
+                "cluster_counts": "merged__cluster_counts",
+                "frame_state_ids": "merged__frame_state_ids",
+                "frame_metastable_ids": "merged__frame_metastable_ids",
+                "frame_indices": "merged__frame_indices",
+            },
+        },
+    }
+    metadata.update(extra_meta)
+
+    payload: Dict[str, Any] = {
+        "residue_keys": np.array(residue_keys),
+        "metadata_json": np.array(json.dumps(metadata)),
+        "merged__labels": merged_labels_halo,
+        "merged__labels_assigned": merged_labels_assigned,
+        "merged__cluster_counts": merged_counts,
+        "merged__frame_state_ids": np.array(merged_frame_state_ids),
+        "merged__frame_metastable_ids": np.array(merged_frame_meta_ids),
+        "merged__frame_indices": np.array(merged_frame_indices, dtype=np.int64),
+        "contact_edge_index": np.zeros((2, 0), dtype=np.int64),
+    }
+    payload.update(condition_payload)
+
+    np.savez_compressed(output_path, **payload)
+    return output_path, metadata
 
 
 def prepare_cluster_workspace(
@@ -1089,21 +1495,16 @@ def prepare_cluster_workspace(
     system_id: str,
     metastable_ids: List[str],
     *,
-    max_clusters_per_residue: int,
     max_cluster_frames: Optional[int],
     random_state: int,
-    contact_cutoff: float,
-    contact_atom_mode: str,
     density_maxk: int,
     density_z: float | str | None,
     work_dir: Path,
 ) -> Dict[str, Any]:
     """Precompute and persist clustering inputs for fan-out chunk jobs."""
     work_dir.mkdir(parents=True, exist_ok=True)
-    cutoff_val = float(contact_cutoff)
-    contact_atom_mode = str(contact_atom_mode or "CA").upper()
 
-    inputs = _collect_cluster_inputs(project_id, system_id, metastable_ids, cutoff_val, contact_atom_mode)
+    inputs = _collect_cluster_inputs(project_id, system_id, metastable_ids)
     residue_keys = inputs["residue_keys"]
     merged_angles_per_residue = inputs["merged_angles_per_residue"]
     merged_frame_state_ids = inputs["merged_frame_state_ids"]
@@ -1134,9 +1535,6 @@ def prepare_cluster_workspace(
     else:
         edge_index = np.zeros((2, 0), dtype=np.int64)
     np.save(work_dir / "contact_edge_index.npy", edge_index)
-    np.save(work_dir / "contact_mode.npy", np.array(contact_atom_mode))
-    np.save(work_dir / "contact_cutoff.npy", np.array(cutoff_val))
-
     manifest = {
         "project_id": project_id,
         "system_id": system_id,
@@ -1150,14 +1548,11 @@ def prepare_cluster_workspace(
         "frame_meta_ids_path": "frame_meta_ids.npy",
         "frame_indices_path": "frame_indices.npy",
         "contact_edge_index_path": "contact_edge_index.npy",
-        "contact_mode_path": "contact_mode.npy",
-        "contact_cutoff_path": "contact_cutoff.npy",
         "contact_sources": contact_sources,
         "cluster_algorithm": "density_peaks",
         "cluster_params": {
             "density_maxk": int(density_maxk),
             "density_z": density_z,
-            "max_clusters_per_residue": int(max_clusters_per_residue),
             "max_cluster_frames": int(max_cluster_frames) if max_cluster_frames else None,
             "random_state": int(random_state),
         },
@@ -1270,8 +1665,6 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
     frame_meta_ids = np.load(work_dir / manifest["frame_meta_ids_path"], allow_pickle=True)
     frame_indices = np.load(work_dir / manifest["frame_indices_path"], allow_pickle=True)
     contact_edge_index = np.load(work_dir / manifest["contact_edge_index_path"], allow_pickle=True)
-    contact_mode = np.load(work_dir / manifest["contact_mode_path"], allow_pickle=True)
-    contact_cutoff = np.load(work_dir / manifest["contact_cutoff_path"], allow_pickle=True)
     contact_sources = manifest.get("contact_sources") or []
 
     condition_payload, predictions_meta, extra_meta = _build_condition_predictions(
@@ -1300,10 +1693,7 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
         "predictions": predictions_meta,
         "residue_keys": residue_keys,
         "residue_mapping": residue_mapping,
-        "max_clusters_per_residue": cluster_params.get("max_clusters_per_residue"),
         "random_state": cluster_params.get("random_state"),
-        "contact_mode": str(contact_mode.item() if hasattr(contact_mode, "item") else contact_mode),
-        "contact_cutoff": float(contact_cutoff.item() if hasattr(contact_cutoff, "item") else contact_cutoff),
         "contact_sources": contact_sources,
         "contact_edge_count": int(contact_edge_index.shape[1]) if contact_edge_index.ndim == 2 else 0,
         "merged": {
@@ -1332,8 +1722,6 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
         "merged__frame_metastable_ids": frame_meta_ids,
         "merged__frame_indices": frame_indices,
         "contact_edge_index": contact_edge_index,
-        "contact_mode": np.array(contact_mode),
-        "contact_cutoff": np.array(contact_cutoff),
     }
     payload.update(condition_payload)
 
