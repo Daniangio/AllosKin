@@ -578,6 +578,7 @@ def run_simulation_job(
         summary_path = _coerce_path(run_result.get("summary_path"))
         plot_path = _coerce_path(run_result.get("plot_path"))
         report_path = _coerce_path(run_result.get("report_path"))
+        cross_likelihood_report_path = _coerce_path(run_result.get("cross_likelihood_report_path"))
         meta_path = _coerce_path(run_result.get("metadata_path"))
         beta_scan_path = _coerce_path(run_result.get("beta_scan_path"))
         model_artifact = _coerce_path(run_result.get("model_path"))
@@ -607,6 +608,7 @@ def run_simulation_job(
             "metadata_json": _relativize_path(meta_path) if meta_path else None,
             "marginals_plot": _relativize_path(plot_path) if plot_path else None,
             "sampling_report": _relativize_path(report_path) if report_path else None,
+            "cross_likelihood_report": _relativize_path(cross_likelihood_report_path) if cross_likelihood_report_path else None,
             "beta_scan_plot": _relativize_path(beta_scan_path) if beta_scan_path else None,
             "cluster_npz": _relativize_path(cluster_path),
             "potts_model": potts_model_rel or (_relativize_path(model_path) if model_path else None),
@@ -846,106 +848,21 @@ def run_cluster_job(
         if not meta_ids:
             raise ValueError("Provide at least one metastable_id.")
 
-        parallel_ok = False
-        queue = None
-        if job and job.connection:
-            workers = Worker.all(connection=job.connection)
-            parallel_ok = len(workers) > 1
-            queue = Queue(name=job.origin, connection=job.connection)
-
-        if not parallel_ok or queue is None:
-            save_progress("Clustering residues...", 10)
-            npz_path, meta = generate_metastable_cluster_npz(
-                project_id,
-                system_id,
-                meta_ids,
-                max_clusters_per_residue=params.get("max_clusters_per_residue", 6),
-                max_cluster_frames=params.get("max_cluster_frames"),
-                random_state=params.get("random_state", 0),
-                contact_cutoff=params.get("contact_cutoff", 10.0),
-                contact_atom_mode=params.get("contact_atom_mode", "CA"),
-                cluster_algorithm=params.get("cluster_algorithm", "density_peaks"),
-                dbscan_eps=params.get("dbscan_eps", 0.5),
-                dbscan_min_samples=params.get("dbscan_min_samples", 5),
-                hierarchical_n_clusters=params.get("hierarchical_n_clusters"),
-                hierarchical_linkage=params.get("hierarchical_linkage", "ward"),
-                density_maxk=params.get("density_maxk", 100),
-                density_z=params.get("density_z"),
-                tomato_k=params.get("tomato_k", 15),
-                tomato_tau=params.get("tomato_tau", "auto"),
-                tomato_k_max=params.get("tomato_k_max"),
-                progress_callback=progress_callback,
-            )
-        else:
-            save_progress("Preparing clustering workspace...", 5)
-            dirs = project_store.ensure_directories(project_id, system_id)
-            cluster_dir = dirs["system_dir"] / "metastable" / "clusters"
-            work_dir = cluster_dir / f"{cluster_id}_work"
-            manifest = prepare_cluster_workspace(
-                project_id,
-                system_id,
-                meta_ids,
-                max_clusters_per_residue=params.get("max_clusters_per_residue", 6),
-                max_cluster_frames=params.get("max_cluster_frames"),
-                random_state=params.get("random_state", 0),
-                contact_cutoff=params.get("contact_cutoff", 10.0),
-                contact_atom_mode=params.get("contact_atom_mode", "CA"),
-                cluster_algorithm=params.get("cluster_algorithm", "density_peaks"),
-                density_maxk=params.get("density_maxk", 100),
-                density_z=params.get("density_z"),
-                dbscan_eps=params.get("dbscan_eps", 0.5),
-                dbscan_min_samples=params.get("dbscan_min_samples", 5),
-                hierarchical_n_clusters=params.get("hierarchical_n_clusters"),
-                hierarchical_linkage=params.get("hierarchical_linkage", "ward"),
-                tomato_k=params.get("tomato_k", 15),
-                tomato_tau=params.get("tomato_tau", "auto"),
-                tomato_k_max=params.get("tomato_k_max"),
-                work_dir=work_dir,
-            )
-
-            residue_total = int(manifest.get("n_residues", 0))
-            if residue_total <= 0:
-                raise ValueError("No residues found to cluster.")
-
-            chunk_job_ids: List[str] = []
-            for idx in range(residue_total):
-                chunk_job = queue.enqueue(
-                    run_cluster_chunk_job,
-                    args=(str(work_dir), idx),
-                    job_timeout="2h",
-                    result_ttl=86400,
-                    job_id=f"cluster-chunk-{cluster_id}-{idx}",
-                )
-                chunk_job_ids.append(chunk_job.id)
-
-            completed = 0
-            failed = 0
-            while completed < residue_total:
-                completed = 0
-                failed = 0
-                for job_id in chunk_job_ids:
-                    try:
-                        chunk_job = Job.fetch(job_id, connection=queue.connection)
-                    except Exception:
-                        failed += 1
-                        continue
-                    status = chunk_job.get_status()
-                    if status == "finished":
-                        completed += 1
-                    elif status == "failed":
-                        failed += 1
-                if failed:
-                    raise RuntimeError(f"{failed} clustering chunks failed.")
-                save_progress(
-                    f"Clustering residues: {completed}/{residue_total}",
-                    10 + int((completed / float(residue_total)) * 70),
-                )
-                if completed >= residue_total:
-                    break
-                time.sleep(2)
-
-            save_progress("Reducing cluster outputs...", 90)
-            npz_path, meta = reduce_cluster_workspace(work_dir)
+        save_progress("Clustering residues...", 10)
+        npz_path, meta = generate_metastable_cluster_npz(
+            project_id,
+            system_id,
+            meta_ids,
+            max_clusters_per_residue=params.get("max_clusters_per_residue", 6),
+            max_cluster_frames=params.get("max_cluster_frames"),
+            random_state=params.get("random_state", 0),
+            contact_cutoff=params.get("contact_cutoff", 10.0),
+            contact_atom_mode=params.get("contact_atom_mode", "CA"),
+            cluster_algorithm="density_peaks",
+            density_maxk=params.get("density_maxk", 100),
+            density_z=params.get("density_z"),
+            progress_callback=progress_callback,
+        )
 
         save_progress("Saving cluster metadata...", 90)
         dirs = project_store.ensure_directories(project_id, system_id)

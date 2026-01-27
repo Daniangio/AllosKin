@@ -26,6 +26,7 @@ export default function SimulationResultPage() {
   const [error, setError] = useState(null);
   const [downloadError, setDownloadError] = useState(null);
   const [reportHtml, setReportHtml] = useState('');
+  const [crossLikelihoodHtml, setCrossLikelihoodHtml] = useState('');
   const [marginalsHtml, setMarginalsHtml] = useState('');
   const [betaHtml, setBetaHtml] = useState('');
 
@@ -59,6 +60,13 @@ export default function SimulationResultPage() {
         if (alive) setReportHtml('');
       }
       try {
+        const blob = await downloadResultArtifact(jobId, 'cross_likelihood_report');
+        const text = await blob.text();
+        if (alive) setCrossLikelihoodHtml(text);
+      } catch (err) {
+        if (alive) setCrossLikelihoodHtml('');
+      }
+      try {
         const blob = await downloadResultArtifact(jobId, 'marginals_plot');
         const text = await blob.text();
         if (alive) setMarginalsHtml(text);
@@ -81,6 +89,7 @@ export default function SimulationResultPage() {
 
   const artifacts = useMemo(() => result?.results || {}, [result]);
   const hasReport = Boolean(reportHtml);
+  const hasCrossLikelihood = Boolean(crossLikelihoodHtml);
   const hasMarginals = Boolean(marginalsHtml);
   const hasBetaScan = Boolean(betaHtml);
   const betaEff = artifacts?.beta_eff;
@@ -227,6 +236,39 @@ export default function SimulationResultPage() {
             />
           ) : (
             <p className="text-sm text-gray-400">No sampling report available.</p>
+          )}
+        </div>
+        <div className="bg-gray-800 border border-gray-700 rounded-lg p-4">
+          <div className="flex items-center justify-between gap-2 mb-3">
+            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+              <BarChart3 className="h-4 w-4 text-cyan-400" />
+              Cross-likelihood classification
+            </h2>
+            {hasCrossLikelihood && (
+              <button
+                type="button"
+                onClick={() => {
+                  const blob = new Blob([crossLikelihoodHtml], { type: 'text/html' });
+                  const url = URL.createObjectURL(blob);
+                  window.open(url, '_blank', 'noopener,noreferrer');
+                  setTimeout(() => URL.revokeObjectURL(url), 10000);
+                }}
+                className="text-xs text-cyan-300 hover:text-cyan-200 flex items-center gap-1"
+              >
+                <ExternalLink className="h-3 w-3" />
+                Open in new tab
+              </button>
+            )}
+          </div>
+          {hasCrossLikelihood ? (
+            <iframe
+              title="Cross-likelihood classification"
+              srcDoc={crossLikelihoodHtml}
+              className="w-full h-[520px] rounded-md border border-gray-700 bg-gray-900"
+              sandbox="allow-scripts allow-same-origin"
+            />
+          ) : (
+            <p className="text-sm text-gray-400">No cross-likelihood report available.</p>
           )}
         </div>
         <div className="bg-gray-800 border border-gray-700 rounded-lg p-4">

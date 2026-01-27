@@ -26,7 +26,7 @@ dependencies = [
     "torch",
     "pyqubo",
     "dwave-neal",
-    "dadapy",
+    "dadapy@git+https://github.com/sissa-data-science/DADApy.git#egg=cluster_predict_develop",
     # "idtxl", # Or "pyJIDT" if you prefer
     "pyyaml",
     "redis", # Added for worker/backend

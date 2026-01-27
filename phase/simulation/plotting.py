@@ -912,6 +912,13 @@ def plot_sampling_report_from_npz(
         xlik_roc_fpr_by_other = data["xlik_roc_fpr_by_other"] if "xlik_roc_fpr_by_other" in data else np.array([], dtype=float)
         xlik_roc_tpr_by_other = data["xlik_roc_tpr_by_other"] if "xlik_roc_tpr_by_other" in data else np.array([], dtype=float)
         xlik_roc_counts = data["xlik_roc_counts"] if "xlik_roc_counts" in data else np.array([], dtype=int)
+        xlik_score_fit_by_other = data["xlik_score_fit_by_other"] if "xlik_score_fit_by_other" in data else np.array([], dtype=float)
+        xlik_score_other_by_other = data["xlik_score_other_by_other"] if "xlik_score_other_by_other" in data else np.array([], dtype=float)
+        xlik_score_other_counts = data["xlik_score_other_counts"] if "xlik_score_other_counts" in data else np.array([], dtype=int)
+        xlik_auc_score_by_other = data["xlik_auc_score_by_other"] if "xlik_auc_score_by_other" in data else np.array([], dtype=float)
+        xlik_score_roc_fpr_by_other = data["xlik_score_roc_fpr_by_other"] if "xlik_score_roc_fpr_by_other" in data else np.array([], dtype=float)
+        xlik_score_roc_tpr_by_other = data["xlik_score_roc_tpr_by_other"] if "xlik_score_roc_tpr_by_other" in data else np.array([], dtype=float)
+        xlik_score_roc_counts = data["xlik_score_roc_counts"] if "xlik_score_roc_counts" in data else np.array([], dtype=int)
 
     md_sources = []
     for idx, src_id in enumerate(md_source_ids):
@@ -984,6 +991,13 @@ def plot_sampling_report_from_npz(
         "xlik_roc_fpr_by_other": xlik_roc_fpr_by_other.tolist() if xlik_roc_fpr_by_other.size else [],
         "xlik_roc_tpr_by_other": xlik_roc_tpr_by_other.tolist() if xlik_roc_tpr_by_other.size else [],
         "xlik_roc_counts": xlik_roc_counts.tolist() if xlik_roc_counts.size else [],
+        "xlik_score_fit_by_other": xlik_score_fit_by_other.tolist() if xlik_score_fit_by_other.size else [],
+        "xlik_score_other_by_other": xlik_score_other_by_other.tolist() if xlik_score_other_by_other.size else [],
+        "xlik_score_other_counts": xlik_score_other_counts.tolist() if xlik_score_other_counts.size else [],
+        "xlik_auc_score_by_other": xlik_auc_score_by_other.tolist() if xlik_auc_score_by_other.size else [],
+        "xlik_score_roc_fpr_by_other": xlik_score_roc_fpr_by_other.tolist() if xlik_score_roc_fpr_by_other.size else [],
+        "xlik_score_roc_tpr_by_other": xlik_score_roc_tpr_by_other.tolist() if xlik_score_roc_tpr_by_other.size else [],
+        "xlik_score_roc_counts": xlik_score_roc_counts.tolist() if xlik_score_roc_counts.size else [],
         "gibbs_index": gibbs_index,
     }
 
@@ -1060,15 +1074,6 @@ def plot_sampling_report_from_npz(
       <div class="card">
         <h3>Top edges</h3>
         <div id="top-edges"></div>
-      </div>
-    </div>
-
-    <div class="grid">
-      <div class="card">
-        <h2>Cross-likelihood classification</h2>
-        <div class="meta" id="xlik-meta"></div>
-        <div id="xlik-hist" class="plot short"></div>
-        <div id="xlik-roc" class="plot short"></div>
       </div>
     </div>
 
@@ -1561,7 +1566,8 @@ def plot_sampling_report_from_npz(
     }
 
     function buildCrossLikelihood() {
-      const fitByOther = payload.xlik_delta_fit_by_other || [];
+      const fitByOtherRaw = payload.xlik_delta_fit_by_other || [];
+      const fitByOther = fitByOtherRaw.map((row) => (row || []).filter((v) => Number.isFinite(v)));
       const otherByOther = payload.xlik_delta_other_by_other || [];
       const otherCounts = payload.xlik_delta_other_counts || [];
       const otherLabels = payload.xlik_other_state_labels || [];
@@ -1569,11 +1575,24 @@ def plot_sampling_report_from_npz(
       const rocFpr = payload.xlik_roc_fpr_by_other || [];
       const rocTpr = payload.xlik_roc_tpr_by_other || [];
       const rocCounts = payload.xlik_roc_counts || [];
-      const active = payload.xlik_delta_active || [];
-      const inactive = payload.xlik_delta_inactive || [];
+      const scoreFitByOtherRaw = payload.xlik_score_fit_by_other || [];
+      const scoreFitByOther = scoreFitByOtherRaw.map((row) => (row || []).filter((v) => Number.isFinite(v)));
+      const scoreOtherByOther = payload.xlik_score_other_by_other || [];
+      const scoreOtherCounts = payload.xlik_score_other_counts || [];
+      const aucScoreByOther = payload.xlik_auc_score_by_other || [];
+      const rocScoreFpr = payload.xlik_score_roc_fpr_by_other || [];
+      const rocScoreTpr = payload.xlik_score_roc_tpr_by_other || [];
+      const rocScoreCounts = payload.xlik_score_roc_counts || [];
+      const active = (payload.xlik_delta_active || []).filter((v) => Number.isFinite(v));
+      const inactive = (payload.xlik_delta_inactive || []).filter((v) => Number.isFinite(v));
       const container = document.getElementById("xlik-hist");
       const rocContainer = document.getElementById("xlik-roc");
-      if (!fitByOther.length && (!active.length || !inactive.length)) {
+      if (!container) {
+        return;
+      }
+      const hasScoreByOther = scoreFitByOther.some((row) => Array.isArray(row) && row.length);
+      const hasFitByOther = fitByOther.some((row) => Array.isArray(row) && row.length);
+      if (!hasScoreByOther && !hasFitByOther && (!active.length || !inactive.length)) {
         if (xlikMeta) {
           xlikMeta.textContent = "Cross-likelihood classification unavailable.";
         }
@@ -1593,31 +1612,64 @@ def plot_sampling_report_from_npz(
         return `rgba(${r}, ${g}, ${b}, ${alpha})`;
       }
 
-      const palette = ["#38bdf8", "#f59e0b", "#22c55e", "#a855f7", "#f97316", "#10b981", "#e11d48", "#0ea5e9"];
+      const palette = ["#38bdf8", "#f59e0b", "#22c55e", "#a855f7", "#f97316", "#10b981", "#e11d48", "#0ea5e9", "#facc15"];
+      const fitColor = palette[0];
+      const otherPalette = palette.slice(1);
       const traces = [];
-      if (fitByOther.length) {
-        const fitCount = fitByOther[0].length;
+      let xaxisTitle = "Delta S = S_fit - S_other";
+      if (hasScoreByOther) {
+        const activeLabel = (payload.xlik_active_state_labels || []).join(", ") || "Fit MD";
+        const fitVals = scoreFitByOther.find((row) => Array.isArray(row) && row.length) || [];
+        const fitCount = fitVals.length;
+        const metaParts = otherLabels.map((label, idx) => {
+          const auc = Number.isFinite(aucScoreByOther[idx]) ? aucScoreByOther[idx].toFixed(3) : "n/a";
+          return `${label || `Other ${idx + 1}`}: AUC=${auc}`;
+        });
+        if (xlikMeta) {
+          xlikMeta.textContent = `Scores under fit model · ${activeLabel} (${fitCount}) · ${metaParts.join(" · ")}`;
+        }
+        xaxisTitle = "S_fit (pseudolikelihood score)";
+        if (fitVals.length) {
+          traces.push({
+            type: "histogram",
+            x: fitVals,
+            name: `${activeLabel} (S_fit)`,
+            opacity: 0.55,
+            histnorm: "probability",
+            marker: { color: fitColor },
+            legendgroup: "score-fit",
+          });
+        }
+        scoreOtherByOther.forEach((row, idx) => {
+          const label = otherLabels[idx] || `Other ${idx + 1}`;
+          const color = otherPalette[idx % otherPalette.length];
+          const otherVals = (row || []).slice(0, scoreOtherCounts[idx] || 0).filter((v) => Number.isFinite(v));
+          if (!otherVals.length) return;
+          traces.push({
+            type: "histogram",
+            x: otherVals,
+            name: label,
+            opacity: 0.65,
+            histnorm: "probability",
+            marker: { color: color },
+            legendgroup: `score-other-${idx}`,
+          });
+        });
+      } else if (hasFitByOther) {
+        const activeLabel = (payload.xlik_active_state_labels || []).join(", ") || "Fit MD";
+        const fitCount = fitByOther[0] ? fitByOther[0].length : 0;
         const metaParts = otherLabels.map((label, idx) => {
           const auc = Number.isFinite(aucByOther[idx]) ? aucByOther[idx].toFixed(3) : "n/a";
           return `${label || `Other ${idx + 1}`}: AUC=${auc}`;
         });
         if (xlikMeta) {
-          xlikMeta.textContent = `Reference: Fit MD (${fitCount}) · ${metaParts.join(" · ")}`;
+          xlikMeta.textContent = `Reference: ${activeLabel} (${fitCount}) · ${metaParts.join(" · ")}`;
         }
         fitByOther.forEach((fitVals, idx) => {
           const label = otherLabels[idx] || `Other ${idx + 1}`;
           const color = palette[idx % palette.length];
-          const fitColor = toRgba(color, 0.35);
+          const deltaFitColor = toRgba(color, 0.35);
           const otherVals = (otherByOther[idx] || []).slice(0, otherCounts[idx] || 0).filter((v) => Number.isFinite(v));
-          traces.push({
-            type: "histogram",
-            x: fitVals,
-            name: `Fit vs ${label}`,
-            opacity: 0.45,
-            histnorm: "probability",
-            marker: { color: fitColor || color },
-            legendgroup: `pair-${idx}`,
-          });
           traces.push({
             type: "histogram",
             x: otherVals,
@@ -1625,6 +1677,15 @@ def plot_sampling_report_from_npz(
             opacity: 0.7,
             histnorm: "probability",
             marker: { color: color },
+            legendgroup: `pair-${idx}`,
+          });
+          traces.push({
+            type: "histogram",
+            x: fitVals,
+            name: `${activeLabel} vs ${label}`,
+            opacity: 0.6,
+            histnorm: "probability",
+            marker: { color: deltaFitColor || color },
             legendgroup: `pair-${idx}`,
           });
         });
@@ -1660,26 +1721,31 @@ def plot_sampling_report_from_npz(
         {
           barmode: "overlay",
           margin: { l: 60, r: 20, t: 10, b: 40 },
-          xaxis: { title: "Delta S = S_fit - S_other" },
+          xaxis: { title: xaxisTitle },
           yaxis: { title: "Probability" },
         },
         { responsive: true }
       );
 
       if (rocContainer) {
-        if (rocFpr.length && rocTpr.length && rocCounts.length) {
+        const useScoreRoc = hasScoreByOther && rocScoreFpr.length && rocScoreTpr.length && rocScoreCounts.length;
+        if (useScoreRoc || (rocFpr.length && rocTpr.length && rocCounts.length)) {
           const rocTraces = [];
-          rocFpr.forEach((row, idx) => {
-            const n = rocCounts[idx] || 0;
+          const rocRows = useScoreRoc ? rocScoreFpr : rocFpr;
+          const rocCols = useScoreRoc ? rocScoreTpr : rocTpr;
+          const rocN = useScoreRoc ? rocScoreCounts : rocCounts;
+          const rocAuc = useScoreRoc ? aucScoreByOther : aucByOther;
+          rocRows.forEach((row, idx) => {
+            const n = rocN[idx] || 0;
             if (!n) return;
             const label = otherLabels[idx] || `Other ${idx + 1}`;
-            const auc = Number.isFinite(aucByOther[idx]) ? aucByOther[idx].toFixed(3) : "n/a";
+            const auc = Number.isFinite(rocAuc[idx]) ? rocAuc[idx].toFixed(3) : "n/a";
             const color = palette[idx % palette.length];
             rocTraces.push({
               type: "scatter",
               mode: "lines",
               x: row.slice(0, n),
-              y: (rocTpr[idx] || []).slice(0, n),
+              y: (rocCols[idx] || []).slice(0, n),
               name: `${label} (AUC=${auc})`,
               line: { color: color, width: 2 },
             });
@@ -1723,6 +1789,312 @@ def plot_sampling_report_from_npz(
       edgeNormalize.addEventListener("change", renderAll);
     }
     renderAll();
+  </script>
+</body>
+</html>
+"""
+
+    html = html.replace("__PAYLOAD__", json.dumps(payload))
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(html, encoding="utf-8")
+    return out_path
+
+
+def plot_cross_likelihood_report_from_npz(
+    *,
+    summary_path: str | Path,
+    out_path: str | Path,
+) -> Path:
+    with np.load(summary_path, allow_pickle=False) as data:
+        xlik_delta_active = data["xlik_delta_active"] if "xlik_delta_active" in data else np.array([], dtype=float)
+        xlik_delta_inactive = data["xlik_delta_inactive"] if "xlik_delta_inactive" in data else np.array([], dtype=float)
+        xlik_auc = data["xlik_auc"] if "xlik_auc" in data else np.array([], dtype=float)
+        xlik_active_state_ids = data["xlik_active_state_ids"] if "xlik_active_state_ids" in data else np.array([], dtype=str)
+        xlik_inactive_state_ids = data["xlik_inactive_state_ids"] if "xlik_inactive_state_ids" in data else np.array([], dtype=str)
+        xlik_active_state_labels = data["xlik_active_state_labels"] if "xlik_active_state_labels" in data else np.array([], dtype=str)
+        xlik_inactive_state_labels = data["xlik_inactive_state_labels"] if "xlik_inactive_state_labels" in data else np.array([], dtype=str)
+        xlik_delta_fit_by_other = data["xlik_delta_fit_by_other"] if "xlik_delta_fit_by_other" in data else np.array([], dtype=float)
+        xlik_delta_other_by_other = data["xlik_delta_other_by_other"] if "xlik_delta_other_by_other" in data else np.array([], dtype=float)
+        xlik_delta_other_counts = data["xlik_delta_other_counts"] if "xlik_delta_other_counts" in data else np.array([], dtype=int)
+        xlik_other_state_ids = data["xlik_other_state_ids"] if "xlik_other_state_ids" in data else np.array([], dtype=str)
+        xlik_other_state_labels = data["xlik_other_state_labels"] if "xlik_other_state_labels" in data else np.array([], dtype=str)
+        xlik_auc_by_other = data["xlik_auc_by_other"] if "xlik_auc_by_other" in data else np.array([], dtype=float)
+        xlik_roc_fpr_by_other = data["xlik_roc_fpr_by_other"] if "xlik_roc_fpr_by_other" in data else np.array([], dtype=float)
+        xlik_roc_tpr_by_other = data["xlik_roc_tpr_by_other"] if "xlik_roc_tpr_by_other" in data else np.array([], dtype=float)
+        xlik_roc_counts = data["xlik_roc_counts"] if "xlik_roc_counts" in data else np.array([], dtype=int)
+        xlik_score_fit_by_other = data["xlik_score_fit_by_other"] if "xlik_score_fit_by_other" in data else np.array([], dtype=float)
+        xlik_score_other_by_other = data["xlik_score_other_by_other"] if "xlik_score_other_by_other" in data else np.array([], dtype=float)
+        xlik_score_other_counts = data["xlik_score_other_counts"] if "xlik_score_other_counts" in data else np.array([], dtype=int)
+        xlik_auc_score_by_other = data["xlik_auc_score_by_other"] if "xlik_auc_score_by_other" in data else np.array([], dtype=float)
+        xlik_score_roc_fpr_by_other = data["xlik_score_roc_fpr_by_other"] if "xlik_score_roc_fpr_by_other" in data else np.array([], dtype=float)
+        xlik_score_roc_tpr_by_other = data["xlik_score_roc_tpr_by_other"] if "xlik_score_roc_tpr_by_other" in data else np.array([], dtype=float)
+        xlik_score_roc_counts = data["xlik_score_roc_counts"] if "xlik_score_roc_counts" in data else np.array([], dtype=int)
+
+    payload = {
+        "xlik_delta_active": xlik_delta_active.tolist() if xlik_delta_active.size else [],
+        "xlik_delta_inactive": xlik_delta_inactive.tolist() if xlik_delta_inactive.size else [],
+        "xlik_auc": float(xlik_auc[0]) if xlik_auc.size else None,
+        "xlik_active_state_ids": [str(v) for v in xlik_active_state_ids.tolist()] if xlik_active_state_ids.size else [],
+        "xlik_inactive_state_ids": [str(v) for v in xlik_inactive_state_ids.tolist()] if xlik_inactive_state_ids.size else [],
+        "xlik_active_state_labels": [str(v) for v in xlik_active_state_labels.tolist()] if xlik_active_state_labels.size else [],
+        "xlik_inactive_state_labels": [str(v) for v in xlik_inactive_state_labels.tolist()] if xlik_inactive_state_labels.size else [],
+        "xlik_delta_fit_by_other": xlik_delta_fit_by_other.tolist() if xlik_delta_fit_by_other.size else [],
+        "xlik_delta_other_by_other": xlik_delta_other_by_other.tolist() if xlik_delta_other_by_other.size else [],
+        "xlik_delta_other_counts": xlik_delta_other_counts.tolist() if xlik_delta_other_counts.size else [],
+        "xlik_other_state_ids": [str(v) for v in xlik_other_state_ids.tolist()] if xlik_other_state_ids.size else [],
+        "xlik_other_state_labels": [str(v) for v in xlik_other_state_labels.tolist()] if xlik_other_state_labels.size else [],
+        "xlik_auc_by_other": xlik_auc_by_other.tolist() if xlik_auc_by_other.size else [],
+        "xlik_roc_fpr_by_other": xlik_roc_fpr_by_other.tolist() if xlik_roc_fpr_by_other.size else [],
+        "xlik_roc_tpr_by_other": xlik_roc_tpr_by_other.tolist() if xlik_roc_tpr_by_other.size else [],
+        "xlik_roc_counts": xlik_roc_counts.tolist() if xlik_roc_counts.size else [],
+        "xlik_score_fit_by_other": xlik_score_fit_by_other.tolist() if xlik_score_fit_by_other.size else [],
+        "xlik_score_other_by_other": xlik_score_other_by_other.tolist() if xlik_score_other_by_other.size else [],
+        "xlik_score_other_counts": xlik_score_other_counts.tolist() if xlik_score_other_counts.size else [],
+        "xlik_auc_score_by_other": xlik_auc_score_by_other.tolist() if xlik_auc_score_by_other.size else [],
+        "xlik_score_roc_fpr_by_other": xlik_score_roc_fpr_by_other.tolist() if xlik_score_roc_fpr_by_other.size else [],
+        "xlik_score_roc_tpr_by_other": xlik_score_roc_tpr_by_other.tolist() if xlik_score_roc_tpr_by_other.size else [],
+        "xlik_score_roc_counts": xlik_score_roc_counts.tolist() if xlik_score_roc_counts.size else [],
+    }
+
+    html = """<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Cross-likelihood classification</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #0f172a; color: #e2e8f0; }
+    .wrap { padding: 18px 20px 32px; }
+    h1 { margin: 0 0 6px; font-size: 24px; }
+    h2 { margin: 12px 0 6px; font-size: 18px; }
+    .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px; padding: 12px; }
+    .plot { height: 320px; }
+    .plot.short { height: 260px; }
+    .meta { font-size: 12px; color: #94a3b8; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Cross-likelihood classification</h1>
+    <p class="meta">Global cross-likelihood scores comparing the fit model against other MD sources.</p>
+    <div class="card">
+      <div class="meta" id="xlik-meta"></div>
+      <div id="xlik-hist" class="plot"></div>
+      <div id="xlik-roc" class="plot short"></div>
+    </div>
+  </div>
+
+  <script>
+    const payload = __PAYLOAD__;
+    const xlikMeta = document.getElementById("xlik-meta");
+
+    function buildCrossLikelihood() {
+      const fitByOtherRaw = payload.xlik_delta_fit_by_other || [];
+      const fitByOther = fitByOtherRaw.map((row) => (row || []).filter((v) => Number.isFinite(v)));
+      const otherByOther = payload.xlik_delta_other_by_other || [];
+      const otherCounts = payload.xlik_delta_other_counts || [];
+      const otherLabels = payload.xlik_other_state_labels || [];
+      const aucByOther = payload.xlik_auc_by_other || [];
+      const rocFpr = payload.xlik_roc_fpr_by_other || [];
+      const rocTpr = payload.xlik_roc_tpr_by_other || [];
+      const rocCounts = payload.xlik_roc_counts || [];
+      const scoreFitByOtherRaw = payload.xlik_score_fit_by_other || [];
+      const scoreFitByOther = scoreFitByOtherRaw.map((row) => (row || []).filter((v) => Number.isFinite(v)));
+      const scoreOtherByOther = payload.xlik_score_other_by_other || [];
+      const scoreOtherCounts = payload.xlik_score_other_counts || [];
+      const aucScoreByOther = payload.xlik_auc_score_by_other || [];
+      const rocScoreFpr = payload.xlik_score_roc_fpr_by_other || [];
+      const rocScoreTpr = payload.xlik_score_roc_tpr_by_other || [];
+      const rocScoreCounts = payload.xlik_score_roc_counts || [];
+      const active = (payload.xlik_delta_active || []).filter((v) => Number.isFinite(v));
+      const inactive = (payload.xlik_delta_inactive || []).filter((v) => Number.isFinite(v));
+      const container = document.getElementById("xlik-hist");
+      const rocContainer = document.getElementById("xlik-roc");
+      if (!container) {
+        return;
+      }
+      const hasScoreByOther = scoreFitByOther.some((row) => Array.isArray(row) && row.length);
+      const hasFitByOther = fitByOther.some((row) => Array.isArray(row) && row.length);
+      if (!hasScoreByOther && !hasFitByOther && (!active.length || !inactive.length)) {
+        if (xlikMeta) {
+          xlikMeta.textContent = "Cross-likelihood classification unavailable.";
+        }
+        container.innerHTML = "<div class='meta'>No cross-likelihood scores available.</div>";
+        if (rocContainer) {
+          rocContainer.innerHTML = "";
+        }
+        return;
+      }
+
+      function toRgba(hex, alpha) {
+        const cleaned = (hex || "").replace("#", "");
+        if (cleaned.length !== 6) return hex;
+        const r = parseInt(cleaned.slice(0, 2), 16);
+        const g = parseInt(cleaned.slice(2, 4), 16);
+        const b = parseInt(cleaned.slice(4, 6), 16);
+        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      }
+
+      const palette = ["#38bdf8", "#f59e0b", "#22c55e", "#a855f7", "#f97316", "#10b981", "#e11d48", "#0ea5e9", "#facc15"];
+      const fitColor = palette[0];
+      const otherPalette = palette.slice(1);
+      const traces = [];
+      let xaxisTitle = "Delta S = S_fit - S_other";
+      if (hasScoreByOther) {
+        const activeLabel = (payload.xlik_active_state_labels || []).join(", ") || "Fit MD";
+        const fitVals = scoreFitByOther.find((row) => Array.isArray(row) && row.length) || [];
+        const fitCount = fitVals.length;
+        const metaParts = otherLabels.map((label, idx) => {
+          const auc = Number.isFinite(aucScoreByOther[idx]) ? aucScoreByOther[idx].toFixed(3) : "n/a";
+          return `${label || `Other ${idx + 1}`}: AUC=${auc}`;
+        });
+        if (xlikMeta) {
+          xlikMeta.textContent = `Scores under fit model · ${activeLabel} (${fitCount}) · ${metaParts.join(" · ")}`;
+        }
+        xaxisTitle = "S_fit (pseudolikelihood score)";
+        if (fitVals.length) {
+          traces.push({
+            type: "histogram",
+            x: fitVals,
+            name: `${activeLabel} (S_fit)`,
+            opacity: 0.55,
+            histnorm: "probability",
+            marker: { color: fitColor },
+            legendgroup: "score-fit",
+          });
+        }
+        scoreOtherByOther.forEach((row, idx) => {
+          const label = otherLabels[idx] || `Other ${idx + 1}`;
+          const color = otherPalette[idx % otherPalette.length];
+          const otherVals = (row || []).slice(0, scoreOtherCounts[idx] || 0).filter((v) => Number.isFinite(v));
+          if (!otherVals.length) return;
+          traces.push({
+            type: "histogram",
+            x: otherVals,
+            name: label,
+            opacity: 0.65,
+            histnorm: "probability",
+            marker: { color: color },
+            legendgroup: `score-other-${idx}`,
+          });
+        });
+      } else if (hasFitByOther) {
+        const activeLabel = (payload.xlik_active_state_labels || []).join(", ") || "Fit MD";
+        const fitCount = fitByOther[0] ? fitByOther[0].length : 0;
+        const metaParts = otherLabels.map((label, idx) => {
+          const auc = Number.isFinite(aucByOther[idx]) ? aucByOther[idx].toFixed(3) : "n/a";
+          return `${label || `Other ${idx + 1}`}: AUC=${auc}`;
+        });
+        if (xlikMeta) {
+          xlikMeta.textContent = `Reference: ${activeLabel} (${fitCount}) · ${metaParts.join(" · ")}`;
+        }
+        fitByOther.forEach((fitVals, idx) => {
+          const label = otherLabels[idx] || `Other ${idx + 1}`;
+          const color = palette[idx % palette.length];
+          const deltaFitColor = toRgba(color, 0.35);
+          const otherVals = (otherByOther[idx] || []).slice(0, otherCounts[idx] || 0).filter((v) => Number.isFinite(v));
+          traces.push({
+            type: "histogram",
+            x: otherVals,
+            name: label,
+            opacity: 0.7,
+            histnorm: "probability",
+            marker: { color: color },
+            legendgroup: `pair-${idx}`,
+          });
+          traces.push({
+            type: "histogram",
+            x: fitVals,
+            name: `${activeLabel} vs ${label}`,
+            opacity: 0.6,
+            histnorm: "probability",
+            marker: { color: deltaFitColor || color },
+            legendgroup: `pair-${idx}`,
+          });
+        });
+      } else {
+        const activeLabel = (payload.xlik_active_state_labels || []).join(", ") || "Fit MD";
+        const inactiveLabel = (payload.xlik_inactive_state_labels || []).join(", ") || "Other MDs";
+        const auc = payload.xlik_auc;
+        const aucText = Number.isFinite(auc) ? ` · AUC=${auc.toFixed(3)}` : "";
+        if (xlikMeta) {
+          xlikMeta.textContent = `Reference: ${activeLabel} (${active.length}) · Other: ${inactiveLabel} (${inactive.length})${aucText}`;
+        }
+        traces.push({
+          type: "histogram",
+          x: active,
+          name: "Fit",
+          opacity: 0.65,
+          histnorm: "probability",
+          marker: { color: "#38bdf8" },
+        });
+        traces.push({
+          type: "histogram",
+          x: inactive,
+          name: "Other",
+          opacity: 0.65,
+          histnorm: "probability",
+          marker: { color: "#f59e0b" },
+        });
+      }
+
+      Plotly.react(
+        "xlik-hist",
+        traces,
+        {
+          barmode: "overlay",
+          margin: { l: 60, r: 20, t: 10, b: 40 },
+          xaxis: { title: xaxisTitle },
+          yaxis: { title: "Probability" },
+        },
+        { responsive: true }
+      );
+
+      if (rocContainer) {
+        const useScoreRoc = hasScoreByOther && rocScoreFpr.length && rocScoreTpr.length && rocScoreCounts.length;
+        if (useScoreRoc || (rocFpr.length && rocTpr.length && rocCounts.length)) {
+          const rocTraces = [];
+          const rocRows = useScoreRoc ? rocScoreFpr : rocFpr;
+          const rocCols = useScoreRoc ? rocScoreTpr : rocTpr;
+          const rocN = useScoreRoc ? rocScoreCounts : rocCounts;
+          const rocAuc = useScoreRoc ? aucScoreByOther : aucByOther;
+          rocRows.forEach((row, idx) => {
+            const n = rocN[idx] || 0;
+            if (!n) return;
+            const label = otherLabels[idx] || `Other ${idx + 1}`;
+            const auc = Number.isFinite(rocAuc[idx]) ? rocAuc[idx].toFixed(3) : "n/a";
+            const color = palette[idx % palette.length];
+            rocTraces.push({
+              type: "scatter",
+              mode: "lines",
+              x: row.slice(0, n),
+              y: (rocCols[idx] || []).slice(0, n),
+              name: `${label} (AUC=${auc})`,
+              line: { color: color, width: 2 },
+            });
+          });
+          if (!rocTraces.length) {
+            rocContainer.innerHTML = "";
+          } else {
+            Plotly.react(
+              "xlik-roc",
+              rocTraces,
+              {
+                margin: { l: 60, r: 20, t: 10, b: 40 },
+                xaxis: { title: "False positive rate" },
+                yaxis: { title: "True positive rate", range: [0, 1] },
+              },
+              { responsive: true }
+            );
+          }
+        } else {
+          rocContainer.innerHTML = "";
+        }
+      }
+    }
+
+    buildCrossLikelihood();
   </script>
 </body>
 </html>

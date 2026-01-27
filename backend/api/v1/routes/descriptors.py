@@ -109,6 +109,8 @@ async def get_state_descriptors(
     cluster_residue_indices: Dict[str, int] = {}
     merged_labels_arr: Optional[np.ndarray] = None
     cluster_legend: List[Dict[str, Any]] = []
+    state_labels_arr: Optional[np.ndarray] = None
+    halo_summary = None
 
     def _build_lookup(entry_key: str, npz_dict, keys_dict):
         """
@@ -157,6 +159,12 @@ async def get_state_descriptors(
             raise HTTPException(status_code=400, detail="Cluster NPZ missing metadata_json. Regenerate clusters.")
         cluster_res_keys = list(cluster_meta.get("residue_keys", []))
         cluster_residue_indices = {k: i for i, k in enumerate(cluster_res_keys)}
+        predictions = cluster_meta.get("predictions") or {}
+        state_pred = predictions.get(f"state:{state_meta.state_id}")
+        if isinstance(state_pred, dict):
+            labels_key = state_pred.get("labels_halo")
+            if isinstance(labels_key, str) and labels_key in cluster_npz:
+                state_labels_arr = cluster_npz[labels_key]
         merged_keys = cluster_meta.get("merged", {}).get("npz_keys", {})
         if (
             not merged_keys
@@ -169,6 +177,7 @@ async def get_state_descriptors(
         merged_labels_arr = cluster_npz[merged_keys.get("labels")]
         unique_clusters = sorted({int(v) for v in np.unique(merged_labels_arr) if int(v) >= 0})
         cluster_legend = [{"id": c, "label": f"Merged c{c}"} for c in unique_clusters]
+        halo_summary = cluster_meta.get("halo_summary") if isinstance(cluster_meta, dict) else None
 
     # Shared frame selection (metastable filter + sampling) computed once
     labels_meta = None
@@ -219,7 +228,14 @@ async def get_state_descriptors(
         if cluster_npz is not None:
             res_idx = cluster_residue_indices.get(key, None)
             if res_idx is not None:
-                if merged_rows_for_samples is not None and merged_labels_arr is not None:
+                if state_labels_arr is not None:
+                    if sample_indices.size == 0 or sample_indices.max() < state_labels_arr.shape[0]:
+                        labels_for_res = state_labels_arr[sample_indices, res_idx].astype(int)
+                    else:
+                        safe_rows = np.clip(sample_indices, 0, state_labels_arr.shape[0] - 1)
+                        labels_for_res = state_labels_arr[safe_rows, res_idx].astype(int)
+                    angles_payload[key]["cluster_labels"] = labels_for_res.tolist()
+                elif merged_rows_for_samples is not None and merged_labels_arr is not None:
                     safe_rows = np.clip(merged_rows_for_samples, 0, merged_labels_arr.shape[0] - 1)
                     labels_for_res = merged_labels_arr[safe_rows, res_idx].astype(int)
                     labels_for_res[merged_rows_for_samples < 0] = -1
@@ -237,6 +253,26 @@ async def get_state_descriptors(
 
     if not angles_payload:
         raise HTTPException(status_code=500, detail="Descriptor file contained no usable angle data.")
+
+    halo_payload = {}
+    if halo_summary and cluster_npz is not None:
+        keys = (halo_summary or {}).get("npz_keys", {})
+        matrix_key = keys.get("matrix") if isinstance(keys, dict) else None
+        ids_key = keys.get("condition_ids") if isinstance(keys, dict) else None
+        labels_key = keys.get("condition_labels") if isinstance(keys, dict) else None
+        types_key = keys.get("condition_types") if isinstance(keys, dict) else None
+        if isinstance(cluster_meta, dict):
+            residue_keys = cluster_meta.get("residue_keys")
+            if residue_keys:
+                halo_payload["halo_rate_residue_keys"] = [str(v) for v in residue_keys]
+        if matrix_key in cluster_npz:
+            halo_payload["halo_rate_matrix"] = cluster_npz[matrix_key].tolist()
+        if ids_key in cluster_npz:
+            halo_payload["halo_rate_condition_ids"] = [str(v) for v in cluster_npz[ids_key].tolist()]
+        if labels_key in cluster_npz:
+            halo_payload["halo_rate_condition_labels"] = [str(v) for v in cluster_npz[labels_key].tolist()]
+        if types_key in cluster_npz:
+            halo_payload["halo_rate_condition_types"] = [str(v) for v in cluster_npz[types_key].tolist()]
 
     return {
         "residue_keys": keys_to_use,
@@ -257,4 +293,5 @@ async def get_state_descriptors(
             if m.get("metastable_index") is not None
         ],
         "metastable_filter_applied": bool(metastable_filter_ids),
+        **halo_payload,
     }

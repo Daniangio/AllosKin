@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_PY="3.11"
+DEFAULT_PY="3.10"
 if [ -d "${ROOT_DIR}/.venv-potts-fit" ]; then
   DEFAULT_ENV="${ROOT_DIR}/.venv-potts-fit"
 elif [ -d "${ROOT_DIR}/.venv" ]; then
@@ -48,7 +48,7 @@ REQ_TMP="$(mktemp)"
 CONSTRAINTS_TMP="$(mktemp)"
 trap 'rm -f "$REQ_TMP" "$CONSTRAINTS_TMP"' EXIT
 
-grep -v -E '^(torch|dadapy)($|[<>=])' "${ROOT_DIR}/requirements.txt" > "$REQ_TMP"
+grep -v -E '^(torch)($|[<>=])' "${ROOT_DIR}/requirements.txt" > "$REQ_TMP"
 echo "numpy<2" > "$CONSTRAINTS_TMP"
 
 echo "Installing base dependencies (numpy, tqdm)..."
@@ -57,9 +57,6 @@ uv pip install tqdm
 
 echo "Installing full dependencies (excluding torch, dadapy)..."
 uv pip install -r "$REQ_TMP" --constraints "$CONSTRAINTS_TMP"
-
-echo "Installing DADApy from GitHub..."
-pip install git+https://github.com/sissa-data-science/DADApy
 
 INSTALL_TORCH="$(prompt "Install torch now (y/N)" "Y")"
 if [[ "$INSTALL_TORCH" =~ ^[Yy]$ ]]; then

@@ -60,6 +60,7 @@ export function uploadSimulationResults(
   projectId,
   systemId,
   clusterId,
+  compareClusterIds,
   summaryFile,
   modelFile,
   options = {}
@@ -120,6 +121,11 @@ export function uploadSimulationResults(
     payload.append('project_id', projectId);
     payload.append('system_id', systemId);
     payload.append('cluster_id', clusterId);
+    if (Array.isArray(compareClusterIds)) {
+      compareClusterIds.forEach((cid) => {
+        if (cid) payload.append('compare_cluster_ids', cid);
+      });
+    }
     payload.append('summary_npz', summaryFile);
     payload.append('potts_model', modelFile);
     xhr.send(payload);

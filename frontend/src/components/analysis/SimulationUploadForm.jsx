@@ -3,6 +3,7 @@ import ErrorMessage from '../common/ErrorMessage';
 
 export default function SimulationUploadForm({ clusterRuns, onSubmit, isBusy = false }) {
   const [clusterId, setClusterId] = useState('');
+  const [compareClusterIds, setCompareClusterIds] = useState([]);
   const [summaryFile, setSummaryFile] = useState(null);
   const [modelFile, setModelFile] = useState(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -10,6 +11,10 @@ export default function SimulationUploadForm({ clusterRuns, onSubmit, isBusy = f
   const busy = isBusy || isSubmitting;
 
   const clusterOptions = useMemo(() => clusterRuns || [], [clusterRuns]);
+  const compareOptions = useMemo(
+    () => clusterOptions.filter((run) => run.cluster_id !== clusterId),
+    [clusterOptions, clusterId]
+  );
   const selectedCluster = useMemo(
     () => clusterOptions.find((run) => run.cluster_id === clusterId),
     [clusterOptions, clusterId]
@@ -26,6 +31,15 @@ export default function SimulationUploadForm({ clusterRuns, onSubmit, isBusy = f
     }
   }, [clusterOptions, clusterId]);
 
+  useEffect(() => {
+    if (!compareClusterIds.length) return;
+    const allowed = new Set(compareOptions.map((run) => run.cluster_id));
+    const filtered = compareClusterIds.filter((id) => allowed.has(id));
+    if (filtered.length !== compareClusterIds.length) {
+      setCompareClusterIds(filtered);
+    }
+  }, [compareClusterIds, compareOptions]);
+
   const handleSubmit = async (event) => {
     event.preventDefault();
     setIsSubmitting(true);
@@ -40,7 +54,13 @@ export default function SimulationUploadForm({ clusterRuns, onSubmit, isBusy = f
       if (!modelFile) {
         throw new Error('Upload the Potts model NPZ used for sampling.');
       }
-      await onSubmit({ cluster_id: clusterId, summaryFile, modelFile });
+      await onSubmit({
+        cluster_id: clusterId,
+        compare_cluster_ids: compareClusterIds,
+        summaryFile,
+        modelFile,
+      });
+      setCompareClusterIds([]);
       setSummaryFile(null);
       setModelFile(null);
     } catch (err) {
@@ -77,6 +97,44 @@ export default function SimulationUploadForm({ clusterRuns, onSubmit, isBusy = f
             {selectedCluster.contact_cutoff ?? 10} A
           </p>
         )}
+      </div>
+
+      <div>
+        <label className="block text-sm text-gray-300 mb-1">Compare MD clusters (optional)</label>
+        <div className="space-y-2">
+          {compareOptions.length === 0 ? (
+            <p className="text-xs text-gray-500">No additional clusters available for comparison.</p>
+          ) : (
+            compareOptions.map((run) => {
+              const name = run.name || run.path?.split('/').pop() || run.cluster_id;
+              const checked = compareClusterIds.includes(run.cluster_id);
+              return (
+                <label
+                  key={run.cluster_id}
+                  className="flex items-center gap-2 text-sm text-gray-200 bg-gray-800/40 border border-gray-700 rounded-md px-3 py-2"
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={busy}
+                    onChange={() => {
+                      setCompareClusterIds((prev) =>
+                        prev.includes(run.cluster_id)
+                          ? prev.filter((id) => id !== run.cluster_id)
+                          : [...prev, run.cluster_id]
+                      );
+                    }}
+                    className="h-4 w-4 rounded border-gray-500 bg-gray-900 text-cyan-500 focus:ring-cyan-500"
+                  />
+                  <span className="truncate">{name}</span>
+                </label>
+              );
+            })
+          )}
+        </div>
+        <p className="text-xs text-gray-500 mt-1">
+          Pick additional cluster NPZs to compare their trajectories against the uploaded samples. The selected fit cluster is excluded.
+        </p>
       </div>
 
       <div>

@@ -35,7 +35,11 @@ from phase.simulation.metrics import (
     per_residue_js_from_padded,
     per_edge_js_from_padded,
 )
-from phase.simulation.plotting import plot_marginal_summary_from_npz, plot_sampling_report_from_npz
+from phase.simulation.plotting import (
+    plot_cross_likelihood_report_from_npz,
+    plot_marginal_summary_from_npz,
+    plot_sampling_report_from_npz,
+)
 
 
 def _parse_float_list(s: str) -> list[float]:
@@ -182,6 +186,8 @@ def _compute_cross_likelihood_classification(
     meta = metadata or {}
     assigned_state_paths = meta.get("assigned_state_paths") or {}
     assigned_meta_paths = meta.get("assigned_metastable_paths") or {}
+    state_labels = meta.get("state_labels") or {}
+    metastable_labels = meta.get("metastable_labels") or {}
     if not assigned_state_paths and not assigned_meta_paths:
         return None
 
@@ -215,13 +221,29 @@ def _compute_cross_likelihood_classification(
         use_torch=True,
     )
 
+    def _clean_label(value: object) -> str:
+        label = str(value)
+        for prefix in ("Macro:", "Metastable:", "MD cluster:"):
+            if label.lower().startswith(prefix.lower()):
+                label = label[len(prefix):].strip()
+        return label.strip()
+
     delta_fit_list: list[np.ndarray] = []
     delta_other_list: list[np.ndarray] = []
     auc_list: list[float] = []
     roc_fpr_list: list[np.ndarray] = []
     roc_tpr_list: list[np.ndarray] = []
+    score_fit_list: list[np.ndarray] = []
+    score_other_list: list[np.ndarray] = []
+    auc_score_list: list[float] = []
+    roc_score_fpr_list: list[np.ndarray] = []
+    roc_score_tpr_list: list[np.ndarray] = []
     other_labels: list[str] = []
     other_ids: list[str] = []
+
+    score_fit_clean = score_fit_fit[np.isfinite(score_fit_fit)]
+    if score_fit_clean.shape[0] < min_frames:
+        return None
 
     for src in other_sources:
         X_other = src.get("labels")
@@ -250,8 +272,20 @@ def _compute_cross_likelihood_classification(
             use_torch=True,
         )
 
+        score_other_clean = score_other_fit[np.isfinite(score_other_fit)]
+        if score_other_clean.shape[0] < min_frames:
+            continue
+        labels_auc_score = np.concatenate([np.ones_like(score_fit_clean), np.zeros_like(score_other_clean)])
+        scores_auc_score = np.concatenate([score_fit_clean, score_other_clean])
+        auc_score = _roc_auc_score(labels_auc_score, scores_auc_score)
+        fpr_score, tpr_score = _roc_curve(labels_auc_score, scores_auc_score)
+
         delta_fit = score_fit_fit - score_fit_other
         delta_other = score_other_fit - score_other_other
+        delta_fit = delta_fit[np.isfinite(delta_fit)]
+        delta_other = delta_other[np.isfinite(delta_other)]
+        if delta_fit.shape[0] < min_frames or delta_other.shape[0] < min_frames:
+            continue
 
         labels_auc = np.concatenate([np.ones_like(delta_fit), np.zeros_like(delta_other)])
         scores_auc = np.concatenate([delta_fit, delta_other])
@@ -263,7 +297,12 @@ def _compute_cross_likelihood_classification(
         auc_list.append(auc)
         roc_fpr_list.append(fpr)
         roc_tpr_list.append(tpr)
-        other_labels.append(str(src.get("label") or src.get("id")))
+        score_fit_list.append(score_fit_clean)
+        score_other_list.append(score_other_clean)
+        auc_score_list.append(auc_score)
+        roc_score_fpr_list.append(fpr_score)
+        roc_score_tpr_list.append(tpr_score)
+        other_labels.append(_clean_label(src.get("label") or src.get("id")))
         other_ids.append(str(src.get("id")))
 
     if not delta_fit_list:
@@ -274,14 +313,31 @@ def _compute_cross_likelihood_classification(
     roc_fpr_by_other, roc_counts = _pad_ragged(roc_fpr_list)
     roc_tpr_by_other, _ = _pad_ragged(roc_tpr_list)
     auc_by_other = np.asarray(auc_list, dtype=float)
+    score_fit_by_other = np.stack(score_fit_list, axis=0)
+    score_other_by_other, score_other_counts = _pad_ragged(score_other_list)
+    roc_score_fpr_by_other, roc_score_counts = _pad_ragged(roc_score_fpr_list)
+    roc_score_tpr_by_other, _ = _pad_ragged(roc_score_tpr_list)
+    auc_score_by_other = np.asarray(auc_score_list, dtype=float)
+
+    active_state_ids: list[str] = []
+    active_state_labels: list[str] = []
+    if fit_state_ids:
+        active_state_ids = sorted(fit_state_ids)
+        active_state_labels = [_clean_label(state_labels.get(state_id, state_id)) for state_id in active_state_ids]
+    elif fit_meta_ids:
+        active_state_ids = sorted(fit_meta_ids)
+        active_state_labels = [_clean_label(metastable_labels.get(meta_id, meta_id)) for meta_id in active_state_ids]
+    else:
+        active_state_ids = ["fit"]
+        active_state_labels = ["Fit MD"]
 
     return {
         "delta_active": delta_fit_list[0],
         "delta_inactive": delta_other_list[0],
         "auc": auc_by_other[0] if auc_by_other.size else float("nan"),
-        "active_state_ids": ["fit"],
+        "active_state_ids": active_state_ids,
         "inactive_state_ids": [other_ids[0]] if other_ids else [],
-        "active_state_labels": ["Fit MD"],
+        "active_state_labels": active_state_labels,
         "inactive_state_labels": [other_labels[0]] if other_labels else ["Other MDs"],
         "delta_fit_by_other": delta_fit_by_other,
         "delta_other_by_other": delta_other_by_other,
@@ -292,6 +348,13 @@ def _compute_cross_likelihood_classification(
         "roc_fpr_by_other": roc_fpr_by_other,
         "roc_tpr_by_other": roc_tpr_by_other,
         "roc_counts": roc_counts,
+        "score_fit_by_other": score_fit_by_other,
+        "score_other_by_other": score_other_by_other,
+        "score_other_counts": score_other_counts,
+        "auc_score_by_other": auc_score_by_other,
+        "score_roc_fpr_by_other": roc_score_fpr_by_other,
+        "score_roc_tpr_by_other": roc_score_tpr_by_other,
+        "score_roc_counts": roc_score_counts,
     }
 
 
@@ -619,6 +682,13 @@ def _save_run_summary(
     xlik_roc_fpr_by_other: np.ndarray | None = None,
     xlik_roc_tpr_by_other: np.ndarray | None = None,
     xlik_roc_counts: np.ndarray | None = None,
+    xlik_score_fit_by_other: np.ndarray | None = None,
+    xlik_score_other_by_other: np.ndarray | None = None,
+    xlik_score_other_counts: np.ndarray | None = None,
+    xlik_auc_score_by_other: np.ndarray | None = None,
+    xlik_score_roc_fpr_by_other: np.ndarray | None = None,
+    xlik_score_roc_tpr_by_other: np.ndarray | None = None,
+    xlik_score_roc_counts: np.ndarray | None = None,
 ) -> Path:
     """
     Save a compact summary bundle of inputs + sampling results into results_dir/run_summary.npz,
@@ -713,6 +783,23 @@ def _save_run_summary(
         xlik_roc_fpr_by_other=xlik_roc_fpr_by_other if xlik_roc_fpr_by_other is not None else np.zeros((0, 0), dtype=float),
         xlik_roc_tpr_by_other=xlik_roc_tpr_by_other if xlik_roc_tpr_by_other is not None else np.zeros((0, 0), dtype=float),
         xlik_roc_counts=xlik_roc_counts if xlik_roc_counts is not None else np.array([], dtype=int),
+        xlik_score_fit_by_other=xlik_score_fit_by_other if xlik_score_fit_by_other is not None else np.zeros((0, 0), dtype=float),
+        xlik_score_other_by_other=(
+            xlik_score_other_by_other if xlik_score_other_by_other is not None else np.zeros((0, 0), dtype=float)
+        ),
+        xlik_score_other_counts=(
+            xlik_score_other_counts if xlik_score_other_counts is not None else np.array([], dtype=int)
+        ),
+        xlik_auc_score_by_other=xlik_auc_score_by_other if xlik_auc_score_by_other is not None else np.array([], dtype=float),
+        xlik_score_roc_fpr_by_other=(
+            xlik_score_roc_fpr_by_other if xlik_score_roc_fpr_by_other is not None else np.zeros((0, 0), dtype=float)
+        ),
+        xlik_score_roc_tpr_by_other=(
+            xlik_score_roc_tpr_by_other if xlik_score_roc_tpr_by_other is not None else np.zeros((0, 0), dtype=float)
+        ),
+        xlik_score_roc_counts=(
+            xlik_score_roc_counts if xlik_score_roc_counts is not None else np.array([], dtype=int)
+        ),
     )
 
     metadata = {
@@ -920,12 +1007,17 @@ def run_pipeline(
             summary_path=default_summary_path,
             out_path=results_dir / "sampling_report.html",
         )
+        cross_likelihood_report_path = plot_cross_likelihood_report_from_npz(
+            summary_path=default_summary_path,
+            out_path=results_dir / "cross_likelihood_report.html",
+        )
         print(f"[plot] loaded summary from {default_summary_path} -> {out_path}")
         return {
             "summary_path": default_summary_path,
             "metadata_path": results_dir / "run_metadata.json",
             "plot_path": out_path,
             "report_path": report_path,
+            "cross_likelihood_report_path": cross_likelihood_report_path,
             "beta_scan_path": None,
             "beta_eff": None,
             "model_path": None,
@@ -1602,23 +1694,30 @@ def run_pipeline(
                 nn_cdf_sample_to_md=nn_payload["cdf_sample_to_md"],
                 nn_cdf_md_to_sample=nn_payload["cdf_md_to_sample"],
                 edge_strength=edge_strength,
-            xlik_delta_active=cross_likelihood["delta_active"] if cross_likelihood else None,
-            xlik_delta_inactive=cross_likelihood["delta_inactive"] if cross_likelihood else None,
-            xlik_auc=cross_likelihood["auc"] if cross_likelihood else None,
-            xlik_active_state_ids=cross_likelihood["active_state_ids"] if cross_likelihood else None,
-            xlik_inactive_state_ids=cross_likelihood["inactive_state_ids"] if cross_likelihood else None,
-            xlik_active_state_labels=cross_likelihood["active_state_labels"] if cross_likelihood else None,
-            xlik_inactive_state_labels=cross_likelihood["inactive_state_labels"] if cross_likelihood else None,
-            xlik_delta_fit_by_other=cross_likelihood["delta_fit_by_other"] if cross_likelihood else None,
-            xlik_delta_other_by_other=cross_likelihood["delta_other_by_other"] if cross_likelihood else None,
-            xlik_delta_other_counts=cross_likelihood["delta_other_counts"] if cross_likelihood else None,
-            xlik_other_state_ids=cross_likelihood["other_state_ids"] if cross_likelihood else None,
-            xlik_other_state_labels=cross_likelihood["other_state_labels"] if cross_likelihood else None,
-            xlik_auc_by_other=cross_likelihood["auc_by_other"] if cross_likelihood else None,
-            xlik_roc_fpr_by_other=cross_likelihood["roc_fpr_by_other"] if cross_likelihood else None,
-            xlik_roc_tpr_by_other=cross_likelihood["roc_tpr_by_other"] if cross_likelihood else None,
-            xlik_roc_counts=cross_likelihood["roc_counts"] if cross_likelihood else None,
-        )
+                xlik_delta_active=cross_likelihood["delta_active"] if cross_likelihood else None,
+                xlik_delta_inactive=cross_likelihood["delta_inactive"] if cross_likelihood else None,
+                xlik_auc=cross_likelihood["auc"] if cross_likelihood else None,
+                xlik_active_state_ids=cross_likelihood["active_state_ids"] if cross_likelihood else None,
+                xlik_inactive_state_ids=cross_likelihood["inactive_state_ids"] if cross_likelihood else None,
+                xlik_active_state_labels=cross_likelihood["active_state_labels"] if cross_likelihood else None,
+                xlik_inactive_state_labels=cross_likelihood["inactive_state_labels"] if cross_likelihood else None,
+                xlik_delta_fit_by_other=cross_likelihood["delta_fit_by_other"] if cross_likelihood else None,
+                xlik_delta_other_by_other=cross_likelihood["delta_other_by_other"] if cross_likelihood else None,
+                xlik_delta_other_counts=cross_likelihood["delta_other_counts"] if cross_likelihood else None,
+                xlik_other_state_ids=cross_likelihood["other_state_ids"] if cross_likelihood else None,
+                xlik_other_state_labels=cross_likelihood["other_state_labels"] if cross_likelihood else None,
+                xlik_auc_by_other=cross_likelihood["auc_by_other"] if cross_likelihood else None,
+                xlik_roc_fpr_by_other=cross_likelihood["roc_fpr_by_other"] if cross_likelihood else None,
+                xlik_roc_tpr_by_other=cross_likelihood["roc_tpr_by_other"] if cross_likelihood else None,
+                xlik_roc_counts=cross_likelihood["roc_counts"] if cross_likelihood else None,
+                xlik_score_fit_by_other=cross_likelihood["score_fit_by_other"] if cross_likelihood else None,
+                xlik_score_other_by_other=cross_likelihood["score_other_by_other"] if cross_likelihood else None,
+                xlik_score_other_counts=cross_likelihood["score_other_counts"] if cross_likelihood else None,
+                xlik_auc_score_by_other=cross_likelihood["auc_score_by_other"] if cross_likelihood else None,
+                xlik_score_roc_fpr_by_other=cross_likelihood["score_roc_fpr_by_other"] if cross_likelihood else None,
+                xlik_score_roc_tpr_by_other=cross_likelihood["score_roc_tpr_by_other"] if cross_likelihood else None,
+                xlik_score_roc_counts=cross_likelihood["score_roc_counts"] if cross_likelihood else None,
+            )
             print(f"[results] summary saved to {summary_path}")
             out_path = plot_marginal_summary_from_npz(
                 summary_path=summary_path,
@@ -1629,6 +1728,10 @@ def run_pipeline(
                 summary_path=summary_path,
                 out_path=results_dir / "sampling_report.html",
             )
+            cross_likelihood_report_path = plot_cross_likelihood_report_from_npz(
+                summary_path=summary_path,
+                out_path=results_dir / "cross_likelihood_report.html",
+            )
             print(f"[plot] saved marginal comparison to {out_path}")
             print("[done]")
             return {
@@ -1636,6 +1739,7 @@ def run_pipeline(
                 "metadata_path": results_dir / "run_metadata.json",
                 "plot_path": out_path,
                 "report_path": report_path,
+                "cross_likelihood_report_path": cross_likelihood_report_path,
                 "beta_scan_path": None,
                 "beta_eff": beta_eff_value,
                 "beta_eff_by_schedule": beta_eff_by_schedule,
@@ -1803,6 +1907,13 @@ def run_pipeline(
         xlik_roc_fpr_by_other=cross_likelihood["roc_fpr_by_other"] if cross_likelihood else None,
         xlik_roc_tpr_by_other=cross_likelihood["roc_tpr_by_other"] if cross_likelihood else None,
         xlik_roc_counts=cross_likelihood["roc_counts"] if cross_likelihood else None,
+        xlik_score_fit_by_other=cross_likelihood["score_fit_by_other"] if cross_likelihood else None,
+        xlik_score_other_by_other=cross_likelihood["score_other_by_other"] if cross_likelihood else None,
+        xlik_score_other_counts=cross_likelihood["score_other_counts"] if cross_likelihood else None,
+        xlik_auc_score_by_other=cross_likelihood["auc_score_by_other"] if cross_likelihood else None,
+        xlik_score_roc_fpr_by_other=cross_likelihood["score_roc_fpr_by_other"] if cross_likelihood else None,
+        xlik_score_roc_tpr_by_other=cross_likelihood["score_roc_tpr_by_other"] if cross_likelihood else None,
+        xlik_score_roc_counts=cross_likelihood["score_roc_counts"] if cross_likelihood else None,
     )
     print(f"[results] summary saved to {summary_path}")
 
@@ -1817,6 +1928,10 @@ def run_pipeline(
         summary_path=summary_path,
         out_path=results_dir / "sampling_report.html",
     )
+    cross_likelihood_report_path = plot_cross_likelihood_report_from_npz(
+        summary_path=summary_path,
+        out_path=results_dir / "cross_likelihood_report.html",
+    )
     print(f"[plot] saved marginal comparison to {out_path}")
 
     print("[done]")
@@ -1826,6 +1941,7 @@ def run_pipeline(
         "metadata_path": results_dir / "run_metadata.json",
         "plot_path": out_path,
         "report_path": report_path,
+        "cross_likelihood_report_path": cross_likelihood_report_path,
         "beta_scan_path": beta_scan_plot_path,
         "beta_eff": beta_eff_value,
         "beta_eff_by_schedule": beta_eff_by_schedule,

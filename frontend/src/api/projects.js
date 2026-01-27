@@ -109,6 +109,10 @@ export function downloadStructure(projectId, systemId, stateId) {
   return requestBlob(`/projects/${projectId}/systems/${systemId}/structures/${stateId}`);
 }
 
+export function downloadStateDescriptors(projectId, systemId, stateId) {
+  return requestBlob(`/projects/${projectId}/systems/${systemId}/states/${stateId}/descriptors/npz`);
+}
+
 export function deleteProject(projectId) {
   return requestJSON(`/projects/${projectId}`, {
     method: 'DELETE',
@@ -285,10 +289,8 @@ export function downloadMetastableClusters(projectId, systemId, metastableIds, p
   if (params.random_state !== undefined) payload.random_state = params.random_state;
   if (params.contact_atom_mode) payload.contact_atom_mode = params.contact_atom_mode;
   if (params.contact_cutoff) payload.contact_cutoff = params.contact_cutoff;
-  if (params.cluster_algorithm) payload.cluster_algorithm = params.cluster_algorithm;
-  if (params.algorithm_params) payload.algorithm_params = params.algorithm_params;
-  if (params.dbscan_eps) payload.dbscan_eps = params.dbscan_eps;
-  if (params.dbscan_min_samples) payload.dbscan_min_samples = params.dbscan_min_samples;
+  if (params.density_maxk) payload.density_maxk = params.density_maxk;
+  if (params.density_z !== undefined) payload.density_z = params.density_z;
   return requestBlobWithBody(
     `/projects/${projectId}/systems/${systemId}/metastable/cluster_vectors`,
     {
@@ -308,10 +310,8 @@ export function submitMetastableClusterJob(projectId, systemId, metastableIds, p
   if (params.random_state !== undefined) payload.random_state = params.random_state;
   if (params.contact_atom_mode) payload.contact_atom_mode = params.contact_atom_mode;
   if (params.contact_cutoff) payload.contact_cutoff = params.contact_cutoff;
-  if (params.cluster_algorithm) payload.cluster_algorithm = params.cluster_algorithm;
-  if (params.algorithm_params) payload.algorithm_params = params.algorithm_params;
-  if (params.dbscan_eps) payload.dbscan_eps = params.dbscan_eps;
-  if (params.dbscan_min_samples) payload.dbscan_min_samples = params.dbscan_min_samples;
+  if (params.density_maxk) payload.density_maxk = params.density_maxk;
+  if (params.density_z !== undefined) payload.density_z = params.density_z;
   return requestJSON(`/projects/${projectId}/systems/${systemId}/metastable/cluster_jobs`, {
     method: 'POST',
     body: payload,

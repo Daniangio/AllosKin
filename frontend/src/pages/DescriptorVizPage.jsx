@@ -48,6 +48,8 @@ export default function DescriptorVizPage() {
   const [appliedStateQuery, setAppliedStateQuery] = useState('');
   const [selectedClusterId, setSelectedClusterId] = useState('');
   const [clusterLegend, setClusterLegend] = useState([]);
+  const [haloSummary, setHaloSummary] = useState(null);
+  const [selectedHaloCondition, setSelectedHaloCondition] = useState('');
 
   const [anglesByState, setAnglesByState] = useState({});
   const [metaByState, setMetaByState] = useState({});
@@ -378,6 +380,8 @@ export default function DescriptorVizPage() {
       setAnglesByState({});
       setMetaByState({});
       setClusterLegend([]);
+      setHaloSummary(null);
+      setSelectedHaloCondition('');
       setSelectedResidue('');
       return;
     }
@@ -403,6 +407,7 @@ export default function DescriptorVizPage() {
       const newAngles = {};
       const newMeta = {};
       const unionResidues = new Set();
+      let nextHaloSummary = null;
 
       responses.forEach(({ stateId, data }) => {
         newAngles[stateId] = data.angles || {};
@@ -416,6 +421,15 @@ export default function DescriptorVizPage() {
           metastable_labels: data.metastable_labels || [],
           metastable_legend: data.metastable_legend || [],
         };
+        if (!nextHaloSummary && Array.isArray(data.halo_rate_matrix)) {
+          nextHaloSummary = {
+            matrix: data.halo_rate_matrix,
+            conditionIds: data.halo_rate_condition_ids || [],
+            conditionLabels: data.halo_rate_condition_labels || [],
+            conditionTypes: data.halo_rate_condition_types || [],
+            residueKeys: data.halo_rate_residue_keys || data.residue_keys || [],
+          };
+        }
         (data.residue_keys || []).forEach((key) => unionResidues.add(key));
         // Cache labels from this response to keep names informative in the list
         const labels = data.residue_labels || {};
@@ -439,6 +453,14 @@ export default function DescriptorVizPage() {
       const firstLegend = responses.find((r) => (r.data.cluster_legend || []).length);
       setClusterLegend(firstLegend ? firstLegend.data.cluster_legend || [] : []);
       setMetaByState(newMeta);
+      setHaloSummary(nextHaloSummary);
+      if (nextHaloSummary?.conditionIds?.length) {
+        setSelectedHaloCondition((prev) =>
+          nextHaloSummary.conditionIds.includes(prev) ? prev : nextHaloSummary.conditionIds[0]
+        );
+      } else {
+        setSelectedHaloCondition('');
+      }
 
       const sortedResidues = sortResidues(Array.from(unionResidues));
       setResidueOptions((prev) => {
@@ -539,6 +561,64 @@ export default function DescriptorVizPage() {
       Object.values(anglesByState).some((residues) => Boolean((residues || {})[selectedResidue])),
     [anglesByState, selectedResidue]
   );
+
+  const hasHaloSummary = useMemo(() => {
+    const matrix = haloSummary?.matrix;
+    return Array.isArray(matrix) && matrix.length > 0;
+  }, [haloSummary]);
+
+  const haloConditionOptions = useMemo(() => {
+    if (!hasHaloSummary) return [];
+    return (haloSummary.conditionIds || []).map((id, idx) => ({
+      id,
+      label: haloSummary.conditionLabels?.[idx] || id,
+      type: haloSummary.conditionTypes?.[idx] || 'condition',
+    }));
+  }, [haloSummary, hasHaloSummary]);
+
+  const haloResidueLabels = useMemo(() => {
+    if (!hasHaloSummary) return [];
+    const keys = haloSummary.residueKeys || [];
+    return keys.map((key) => residueLabel(key));
+  }, [haloSummary, hasHaloSummary, residueLabel]);
+
+  const haloRanking = useMemo(() => {
+    if (!hasHaloSummary) return [];
+    const idx = (haloSummary.conditionIds || []).indexOf(selectedHaloCondition);
+    if (idx < 0) return [];
+    const row = haloSummary.matrix?.[idx] || [];
+    return (haloSummary.residueKeys || []).map((key, i) => ({
+      key,
+      label: residueLabel(key),
+      value: row?.[i],
+    })).filter((entry) => Number.isFinite(entry.value))
+      .sort((a, b) => b.value - a.value);
+  }, [haloSummary, hasHaloSummary, selectedHaloCondition, residueLabel]);
+
+  const haloHeatmapData = useMemo(() => {
+    if (!hasHaloSummary) return [];
+    const conditionLabels = haloConditionOptions.map((opt) => {
+      const prefix = opt.type === 'metastable' ? 'Metastable' : 'Macro';
+      return `${prefix}: ${opt.label}`;
+    });
+    return [
+      {
+        type: 'heatmap',
+        z: haloSummary.matrix,
+        x: haloResidueLabels,
+        y: conditionLabels,
+        colorscale: 'YlOrRd',
+        zmin: 0,
+        zmax: 1,
+        hovertemplate: 'Condition: %{y}<br>Residue: %{x}<br>Halo rate: %{z:.3f}<extra></extra>',
+      },
+    ];
+  }, [haloConditionOptions, haloResidueLabels, haloSummary, hasHaloSummary]);
+
+  const haloShowResidueTicks = useMemo(() => {
+    if (!hasHaloSummary) return false;
+    return haloResidueLabels.length <= 60;
+  }, [haloResidueLabels, hasHaloSummary]);
 
   const stateSummaries = useMemo(
     () =>
@@ -735,6 +815,97 @@ export default function DescriptorVizPage() {
                       />
                     </div>
                   ))}
+                </div>
+              </div>
+            )}
+
+            {hasHaloSummary && (
+              <div className="space-y-4">
+                <div className="bg-gray-800 border border-gray-700 rounded-lg p-3 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-white">Halo rate heatmap</h3>
+                      <p className="text-[11px] text-gray-400">
+                        Fraction of frames labeled as halo (-1) per residue and condition.
+                      </p>
+                    </div>
+                    <div className="text-[11px] text-gray-500">
+                      Conditions: {haloConditionOptions.length} • Residues: {haloResidueLabels.length}
+                    </div>
+                  </div>
+                  <Plot
+                    data={haloHeatmapData}
+                    layout={{
+                      height: Math.max(320, 26 * haloConditionOptions.length),
+                      paper_bgcolor: '#111827',
+                      plot_bgcolor: '#111827',
+                      font: { color: '#e5e7eb' },
+                      margin: { l: 110, r: 10, t: 20, b: 80 },
+                      xaxis: {
+                        title: 'Residues',
+                        showticklabels: haloShowResidueTicks,
+                        tickangle: -40,
+                      },
+                      yaxis: { title: 'Condition', automargin: true },
+                    }}
+                    useResizeHandler
+                    style={{ width: '100%', height: '100%' }}
+                    config={{ displaylogo: false, responsive: true }}
+                  />
+                </div>
+
+                <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-white">Halo ranking</h3>
+                      <p className="text-[11px] text-gray-400">
+                        Ranked residues by halo rate for the selected condition.
+                      </p>
+                    </div>
+                    <div className="min-w-[220px]">
+                      <label className="block text-[11px] text-gray-500 mb-1">Condition</label>
+                      <select
+                        value={selectedHaloCondition}
+                        onChange={(e) => setSelectedHaloCondition(e.target.value)}
+                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1 text-white text-xs"
+                      >
+                        {haloConditionOptions.map((opt) => (
+                          <option key={opt.id} value={opt.id}>
+                            {opt.type === 'metastable' ? 'Metastable' : 'Macro'}: {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                  <div className="grid md:grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                      {haloRanking.length === 0 && (
+                        <p className="text-xs text-gray-500">No halo ranking available.</p>
+                      )}
+                      {haloRanking.slice(0, 25).map((entry, idx) => (
+                        <div
+                          key={`${entry.key}-${idx}`}
+                          className="flex items-center justify-between text-xs text-gray-200"
+                        >
+                          <span className="truncate">
+                            {idx + 1}. {entry.label}
+                          </span>
+                          <span className="text-gray-400">{entry.value.toFixed(3)}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="text-xs text-gray-400 space-y-2">
+                      <p>
+                        Higher halo rates indicate residues that fall outside dense clusters more often under the
+                        selected condition.
+                      </p>
+                      {haloRanking.length > 25 && (
+                        <p className="text-[11px] text-gray-500">
+                          Showing top 25 of {haloRanking.length} residues. Refine by residue name for details.
+                        </p>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
             )}

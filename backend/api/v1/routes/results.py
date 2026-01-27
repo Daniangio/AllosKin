@@ -10,6 +10,10 @@ from fastapi import APIRouter, HTTPException, Query, Response, UploadFile, File,
 from fastapi.responses import FileResponse
 
 from backend.api.v1.common import DATA_ROOT, RESULTS_DIR, get_cluster_entry, project_store, stream_upload
+from backend.services.metastable_clusters import (
+    assign_cluster_labels_to_states,
+    update_cluster_metadata_with_assignments,
+)
 
 
 router = APIRouter()
@@ -50,6 +54,382 @@ def _safe_filename(name: str | None, fallback: str) -> str:
         return fallback
     base = Path(name).name.strip()
     return base or fallback
+
+
+def _resolve_cluster_path(project_id: str, system_id: str, entry: dict) -> Path:
+    rel_path = entry.get("path")
+    if not rel_path:
+        raise HTTPException(status_code=404, detail="Cluster NPZ path missing in system metadata.")
+    cluster_path = Path(rel_path)
+    if not cluster_path.is_absolute():
+        cluster_path = project_store.resolve_path(project_id, system_id, rel_path)
+    if not cluster_path.exists():
+        raise HTTPException(status_code=404, detail="Cluster NPZ file is missing on disk.")
+    return cluster_path
+
+
+def _load_assigned_labels(path: Path) -> np.ndarray | None:
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if "assigned__labels" in data:
+                return np.asarray(data["assigned__labels"], dtype=int)
+    except Exception:
+        return None
+    return None
+
+
+def _labels_for_cluster_frames(
+    cluster_path: Path,
+    *,
+    assigned_state_paths: dict,
+    base_dir: Path,
+    n_residues: int,
+) -> np.ndarray | None:
+    with np.load(cluster_path, allow_pickle=True) as data:
+        if "merged__frame_state_ids" not in data or "merged__frame_indices" not in data:
+            return None
+        state_ids = np.asarray(data["merged__frame_state_ids"]).astype(str)
+        frame_indices = np.asarray(data["merged__frame_indices"]).astype(int)
+
+    if state_ids.size == 0 or frame_indices.size == 0:
+        return None
+
+    labels_chunks: list[np.ndarray] = []
+    for state_id in np.unique(state_ids):
+        rel_path = assigned_state_paths.get(str(state_id))
+        if not rel_path:
+            continue
+        path = Path(rel_path)
+        if not path.is_absolute():
+            path = base_dir / rel_path
+        assigned = _load_assigned_labels(path)
+        if assigned is None or assigned.size == 0:
+            continue
+        if assigned.shape[1] != n_residues:
+            continue
+        mask = state_ids == state_id
+        frames = frame_indices[mask]
+        valid = (frames >= 0) & (frames < assigned.shape[0])
+        if not np.any(valid):
+            continue
+        labels_chunks.append(assigned[frames[valid]])
+
+    if not labels_chunks:
+        return None
+    labels = np.concatenate(labels_chunks, axis=0)
+    if labels.size == 0:
+        return None
+    keep = np.all(labels >= 0, axis=1)
+    labels = labels[keep]
+    if labels.size == 0:
+        return None
+    return labels
+
+
+def _augment_sampling_summary(
+    summary_path: Path,
+    *,
+    base_cluster_path: Path,
+    base_cluster_id: str,
+    base_cluster_name: str | None,
+    compare_clusters: list[dict],
+    model_path: Path,
+    project_id: str,
+    system_id: str,
+) -> None:
+    from phase.io.data import load_npz
+    from phase.simulation.metrics import per_edge_js_from_padded, per_residue_js_from_padded, marginals, pairwise_joints_padded
+    from phase.simulation.main import (
+        _build_md_sources,
+        _build_sample_sources,
+        _pad_marginals_for_save,
+        _compute_cross_likelihood_classification,
+        _compute_energy_histograms,
+        _compute_nn_cdfs,
+    )
+    from phase.simulation.potts_model import load_potts_model
+
+    assignments = assign_cluster_labels_to_states(base_cluster_path, project_id, system_id)
+    update_cluster_metadata_with_assignments(base_cluster_path, assignments)
+
+    ds = load_npz(str(base_cluster_path))
+    labels = ds.labels
+    K = ds.cluster_counts
+    edges = ds.edges
+
+    with np.load(summary_path, allow_pickle=False) as data:
+        payload = {k: data[k] for k in data.files}
+
+    if "K" in payload and payload["K"].size:
+        summary_k = np.asarray(payload["K"], dtype=int)
+        if summary_k.shape != K.shape or np.any(summary_k != K):
+            raise HTTPException(status_code=400, detail="Uploaded summary does not match selected cluster NPZ.")
+    if "edges" in payload and payload["edges"].size:
+        summary_edges = np.asarray(payload["edges"], dtype=int)
+        if summary_edges.shape != np.asarray(edges, dtype=int).shape:
+            raise HTTPException(status_code=400, detail="Uploaded summary edges do not match selected cluster NPZ.")
+
+    X_gibbs = np.asarray(payload.get("X_gibbs", np.zeros((0, len(K)), dtype=int)), dtype=int)
+    X_sa = np.asarray(payload.get("X_sa", np.zeros((0, len(K)), dtype=int)), dtype=int)
+    sa_labels_raw = payload.get("sa_schedule_labels")
+    sa_schedule_labels = None
+    if isinstance(sa_labels_raw, np.ndarray) and sa_labels_raw.size:
+        sa_schedule_labels = [str(v) for v in sa_labels_raw.tolist()]
+
+    beta = 1.0
+    if "target_beta" in payload and payload["target_beta"].size:
+        beta = float(np.asarray(payload["target_beta"])[0])
+    gibbs_label = f"Gibbs β={beta:g}"
+    sa_samples = [X_sa] if X_sa.size else []
+    sample_sources = _build_sample_sources(
+        X_gibbs,
+        sa_samples,
+        sa_schedule_labels,
+        K,
+        edges,
+        gibbs_label=gibbs_label,
+    )
+
+    md_sources = _build_md_sources(
+        labels,
+        K,
+        edges,
+        ds.frame_state_ids,
+        ds.frame_metastable_ids,
+        ds.metadata,
+        base_cluster_path,
+    )
+    meta = ds.metadata or {}
+    assigned_state_paths = meta.get("assigned_state_paths") or {}
+    base_dir = base_cluster_path.resolve().parent
+
+    def _normalize_label(raw: str) -> str:
+        label = str(raw or "").lower().strip()
+        for prefix in ("macro:", "metastable:", "md cluster:"):
+            if label.startswith(prefix):
+                label = label[len(prefix) :].strip()
+        return label
+
+    existing_labels = {_normalize_label(src.get("label", "")) for src in md_sources}
+
+    for info in compare_clusters:
+        cid = str(info.get("cluster_id"))
+        if not cid or cid == base_cluster_id:
+            continue
+        labels_other = _labels_for_cluster_frames(
+            info["path"],
+            assigned_state_paths=assigned_state_paths,
+            base_dir=base_dir,
+            n_residues=labels.shape[1],
+        )
+        if labels_other is None or labels_other.size == 0:
+            continue
+        if any(src.get("id") == f"cluster:{cid}" for src in md_sources):
+            continue
+        name = info.get("name") or cid
+        if _normalize_label(name) in existing_labels:
+            continue
+        md_sources.append(
+            {
+                "id": f"cluster:{cid}",
+                "label": f"MD cluster: {name}",
+                "type": "cluster",
+                "count": int(labels_other.shape[0]),
+                "labels": labels_other,
+                "p": _pad_marginals_for_save(marginals(labels_other, K)),
+                "p2": pairwise_joints_padded(labels_other, K, edges),
+            }
+        )
+        existing_labels.add(_normalize_label(name))
+
+    md_source_ids = [src["id"] for src in md_sources]
+    md_source_labels = [src["label"] for src in md_sources]
+    md_source_types = [src["type"] for src in md_sources]
+    md_source_counts = np.asarray([src["count"] for src in md_sources], dtype=int)
+    p_md_by_source = np.stack([src["p"] for src in md_sources], axis=0) if md_sources else np.zeros((0, 0, 0), dtype=float)
+    p2_md_by_source = (
+        np.stack([src["p2"] for src in md_sources], axis=0) if md_sources else np.zeros((0, 0, 0, 0), dtype=float)
+    )
+
+    sample_source_ids = [src["id"] for src in sample_sources]
+    sample_source_labels = [src["label"] for src in sample_sources]
+    sample_source_types = [src["type"] for src in sample_sources]
+    sample_source_counts = np.asarray([src["count"] for src in sample_sources], dtype=int)
+    p_sample_by_source = (
+        np.stack([src["p"] for src in sample_sources], axis=0) if sample_sources else np.zeros((0, 0, 0), dtype=float)
+    )
+    p2_sample_by_source = (
+        np.stack([src["p2"] for src in sample_sources], axis=0) if sample_sources else np.zeros((0, 0, 0, 0), dtype=float)
+    )
+
+    js_md_sample = np.zeros((len(md_sources), len(sample_sources), len(K)), dtype=float)
+    js2_md_sample = np.zeros((len(md_sources), len(sample_sources), len(edges)), dtype=float)
+    for i, md in enumerate(md_sources):
+        for j, sample in enumerate(sample_sources):
+            js_md_sample[i, j] = per_residue_js_from_padded(md["p"], sample["p"], K)
+            if len(edges) > 0:
+                js2_md_sample[i, j] = per_edge_js_from_padded(md["p2"], sample["p2"], edges, K)
+
+    gibbs_idx = next((i for i, src in enumerate(sample_sources) if src["id"] == "gibbs"), None)
+    js_gibbs_sample = np.zeros((len(sample_sources), len(K)), dtype=float)
+    js2_gibbs_sample = np.zeros((len(sample_sources), len(edges)), dtype=float)
+    if gibbs_idx is not None:
+        gibbs_p = sample_sources[gibbs_idx]["p"]
+        gibbs_p2 = sample_sources[gibbs_idx]["p2"]
+        for j, sample in enumerate(sample_sources):
+            js_gibbs_sample[j] = per_residue_js_from_padded(gibbs_p, sample["p"], K)
+            if len(edges) > 0:
+                js2_gibbs_sample[j] = per_edge_js_from_padded(gibbs_p2, sample["p2"], edges, K)
+
+    p2_md = md_sources[0]["p2"] if md_sources else np.zeros((0, 0, 0), dtype=float)
+    p2_gibbs = sample_sources[gibbs_idx]["p2"] if gibbs_idx is not None else np.zeros((0, 0, 0), dtype=float)
+    sa_idx = next((i for i, src in enumerate(sample_sources) if src["type"] == "sa"), None)
+    p2_sa = sample_sources[sa_idx]["p2"] if sa_idx is not None else np.zeros((0, 0, 0), dtype=float)
+    js2_gibbs = js2_md_sample[0, gibbs_idx] if md_sources and gibbs_idx is not None else np.array([], dtype=float)
+    js2_sa = js2_md_sample[0, sa_idx] if md_sources and sa_idx is not None else np.array([], dtype=float)
+    js2_sa_vs_gibbs = js2_gibbs_sample[sa_idx] if sa_idx is not None else np.array([], dtype=float)
+
+    model = load_potts_model(model_path) if model_path.exists() else None
+    edge_strength = np.array([], dtype=float)
+    if model is not None and len(edges) > 0:
+        strengths = []
+        for r, s in edges:
+            strengths.append(float(np.linalg.norm(model.coupling(int(r), int(s)))))
+        edge_strength = np.asarray(strengths, dtype=float)
+
+    energy_payload = _compute_energy_histograms(
+        model=model,
+        md_sources=md_sources,
+        sample_sources=sample_sources,
+        n_bins=40,
+    )
+    nn_payload = _compute_nn_cdfs(
+        md_sources=md_sources,
+        sample_sources=sample_sources,
+        max_md=2000,
+        max_sample=1000,
+        block_size=256,
+    )
+
+    cross_likelihood = _compute_cross_likelihood_classification(
+        labels,
+        md_sources,
+        ds.frame_state_ids,
+        ds.frame_metastable_ids,
+        ds.metadata,
+        K,
+        edges,
+        batch_size=512,
+    )
+
+    payload.update(
+        {
+            "md_source_ids": np.asarray(md_source_ids, dtype=str),
+            "md_source_labels": np.asarray(md_source_labels, dtype=str),
+            "md_source_types": np.asarray(md_source_types, dtype=str),
+            "md_source_counts": md_source_counts,
+            "p_md_by_source": p_md_by_source,
+            "p2_md_by_source": p2_md_by_source,
+            "sample_source_ids": np.asarray(sample_source_ids, dtype=str),
+            "sample_source_labels": np.asarray(sample_source_labels, dtype=str),
+            "sample_source_types": np.asarray(sample_source_types, dtype=str),
+            "sample_source_counts": sample_source_counts,
+            "p_sample_by_source": p_sample_by_source,
+            "p2_sample_by_source": p2_sample_by_source,
+            "js_md_sample": js_md_sample,
+            "js2_md_sample": js2_md_sample,
+            "js_gibbs_sample": js_gibbs_sample,
+            "js2_gibbs_sample": js2_gibbs_sample,
+            "p2_md": p2_md,
+            "p2_gibbs": p2_gibbs,
+            "p2_sa": p2_sa,
+            "js2_gibbs": js2_gibbs,
+            "js2_sa": js2_sa,
+            "js2_sa_vs_gibbs": js2_sa_vs_gibbs,
+            "energy_bins": energy_payload["bins"],
+            "energy_hist_md": energy_payload["hist_md"],
+            "energy_cdf_md": energy_payload["cdf_md"],
+            "energy_hist_sample": energy_payload["hist_sample"],
+            "energy_cdf_sample": energy_payload["cdf_sample"],
+            "nn_bins": nn_payload["bins"],
+            "nn_cdf_sample_to_md": nn_payload["cdf_sample_to_md"],
+            "nn_cdf_md_to_sample": nn_payload["cdf_md_to_sample"],
+            "edge_strength": edge_strength,
+            "xlik_delta_active": cross_likelihood["delta_active"] if cross_likelihood else np.array([], dtype=float),
+            "xlik_delta_inactive": cross_likelihood["delta_inactive"] if cross_likelihood else np.array([], dtype=float),
+            "xlik_auc": np.array([cross_likelihood["auc"]], dtype=float) if cross_likelihood else np.array([], dtype=float),
+            "xlik_active_state_ids": np.asarray(
+                cross_likelihood["active_state_ids"], dtype=str
+            )
+            if cross_likelihood
+            else np.array([], dtype=str),
+            "xlik_inactive_state_ids": np.asarray(
+                cross_likelihood["inactive_state_ids"], dtype=str
+            )
+            if cross_likelihood
+            else np.array([], dtype=str),
+            "xlik_active_state_labels": np.asarray(
+                cross_likelihood["active_state_labels"], dtype=str
+            )
+            if cross_likelihood
+            else np.array([], dtype=str),
+            "xlik_inactive_state_labels": np.asarray(
+                cross_likelihood["inactive_state_labels"], dtype=str
+            )
+            if cross_likelihood
+            else np.array([], dtype=str),
+            "xlik_delta_fit_by_other": cross_likelihood["delta_fit_by_other"]
+            if cross_likelihood
+            else np.zeros((0, 0), dtype=float),
+            "xlik_delta_other_by_other": cross_likelihood["delta_other_by_other"]
+            if cross_likelihood
+            else np.zeros((0, 0), dtype=float),
+            "xlik_delta_other_counts": cross_likelihood["delta_other_counts"]
+            if cross_likelihood
+            else np.array([], dtype=int),
+            "xlik_other_state_ids": np.asarray(cross_likelihood["other_state_ids"], dtype=str)
+            if cross_likelihood
+            else np.array([], dtype=str),
+            "xlik_other_state_labels": np.asarray(cross_likelihood["other_state_labels"], dtype=str)
+            if cross_likelihood
+            else np.array([], dtype=str),
+            "xlik_auc_by_other": np.asarray(cross_likelihood["auc_by_other"], dtype=float)
+            if cross_likelihood
+            else np.array([], dtype=float),
+            "xlik_roc_fpr_by_other": np.asarray(cross_likelihood["roc_fpr_by_other"], dtype=float)
+            if cross_likelihood
+            else np.zeros((0, 0), dtype=float),
+            "xlik_roc_tpr_by_other": np.asarray(cross_likelihood["roc_tpr_by_other"], dtype=float)
+            if cross_likelihood
+            else np.zeros((0, 0), dtype=float),
+            "xlik_roc_counts": np.asarray(cross_likelihood["roc_counts"], dtype=int)
+            if cross_likelihood
+            else np.array([], dtype=int),
+            "xlik_score_fit_by_other": np.asarray(cross_likelihood["score_fit_by_other"], dtype=float)
+            if cross_likelihood
+            else np.zeros((0, 0), dtype=float),
+            "xlik_score_other_by_other": np.asarray(cross_likelihood["score_other_by_other"], dtype=float)
+            if cross_likelihood
+            else np.zeros((0, 0), dtype=float),
+            "xlik_score_other_counts": np.asarray(cross_likelihood["score_other_counts"], dtype=int)
+            if cross_likelihood
+            else np.array([], dtype=int),
+            "xlik_auc_score_by_other": np.asarray(cross_likelihood["auc_score_by_other"], dtype=float)
+            if cross_likelihood
+            else np.array([], dtype=float),
+            "xlik_score_roc_fpr_by_other": np.asarray(cross_likelihood["score_roc_fpr_by_other"], dtype=float)
+            if cross_likelihood
+            else np.zeros((0, 0), dtype=float),
+            "xlik_score_roc_tpr_by_other": np.asarray(cross_likelihood["score_roc_tpr_by_other"], dtype=float)
+            if cross_likelihood
+            else np.zeros((0, 0), dtype=float),
+            "xlik_score_roc_counts": np.asarray(cross_likelihood["score_roc_counts"], dtype=int)
+            if cross_likelihood
+            else np.array([], dtype=int),
+        }
+    )
+
+    np.savez_compressed(summary_path, **payload)
 
 
 def _remove_results_dir(path_value: str | None) -> None:
@@ -211,6 +591,7 @@ async def download_result_artifact(job_uuid: str, artifact: str, download: bool 
         "metadata_json": "metadata_json",
         "marginals_plot": "marginals_plot",
         "sampling_report": "sampling_report",
+        "cross_likelihood_report": "cross_likelihood_report",
         "beta_scan_plot": "beta_scan_plot",
         "cluster_npz": "cluster_npz",
         "potts_model": "potts_model",
@@ -220,22 +601,31 @@ async def download_result_artifact(job_uuid: str, artifact: str, download: bool 
         raise HTTPException(status_code=404, detail="Unknown artifact.")
 
     path_value = results.get(key)
-    if (not isinstance(path_value, str) or not path_value) and artifact == "sampling_report":
+    if (not isinstance(path_value, str) or not path_value) and artifact in ("sampling_report", "cross_likelihood_report"):
         summary_value = results.get("summary_npz")
         if not isinstance(summary_value, str) or not summary_value:
-            raise HTTPException(status_code=404, detail="Sampling report unavailable (missing summary NPZ).")
+            report_name = "sampling report" if artifact == "sampling_report" else "cross-likelihood report"
+            raise HTTPException(status_code=404, detail=f"{report_name} unavailable (missing summary NPZ).")
         summary_path = _resolve_result_artifact_path(summary_value)
-        report_path = summary_path.parent / "sampling_report.html"
+        if artifact == "sampling_report":
+            report_path = summary_path.parent / "sampling_report.html"
+        else:
+            report_path = summary_path.parent / "cross_likelihood_report.html"
         try:
-            from phase.simulation.plotting import plot_sampling_report_from_npz
-            plot_sampling_report_from_npz(summary_path=summary_path, out_path=report_path)
+            if artifact == "sampling_report":
+                from phase.simulation.plotting import plot_sampling_report_from_npz
+                plot_sampling_report_from_npz(summary_path=summary_path, out_path=report_path)
+            else:
+                from phase.simulation.plotting import plot_cross_likelihood_report_from_npz
+                plot_cross_likelihood_report_from_npz(summary_path=summary_path, out_path=report_path)
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to generate sampling report: {exc}") from exc
+            report_name = "sampling report" if artifact == "sampling_report" else "cross-likelihood report"
+            raise HTTPException(status_code=500, detail=f"Failed to generate {report_name}: {exc}") from exc
         try:
             rel_path = str(report_path.relative_to(DATA_ROOT))
         except ValueError:
             rel_path = str(report_path)
-        results["sampling_report"] = rel_path
+        results[key] = rel_path
         payload["results"] = results
         try:
             result_file.write_text(json.dumps(payload, indent=2))
@@ -262,6 +652,7 @@ async def upload_simulation_result(
     project_id: str = Form(...),
     system_id: str = Form(...),
     cluster_id: str = Form(...),
+    compare_cluster_ids: list[str] = Form(default=[]),
     summary_npz: UploadFile = File(...),
     potts_model: UploadFile = File(...),
 ):
@@ -274,14 +665,7 @@ async def upload_simulation_result(
         )
 
     entry = get_cluster_entry(system_meta, cluster_id)
-    rel_path = entry.get("path")
-    if not rel_path:
-        raise HTTPException(status_code=404, detail="Cluster NPZ path missing in system metadata.")
-    cluster_path = Path(rel_path)
-    if not cluster_path.is_absolute():
-        cluster_path = project_store.resolve_path(project_id, system_id, rel_path)
-    if not cluster_path.exists():
-        raise HTTPException(status_code=404, detail="Cluster NPZ file is missing on disk.")
+    cluster_path = _resolve_cluster_path(project_id, system_id, entry)
 
     if summary_npz.filename and not summary_npz.filename.lower().endswith(".npz"):
         raise HTTPException(status_code=400, detail="Summary upload must be an .npz file.")
@@ -309,8 +693,41 @@ async def upload_simulation_result(
     entry["potts_model_name"] = Path(model_filename).stem
     project_store.save_system(system_meta)
 
+    compare_ids = []
+    for cid in compare_cluster_ids or []:
+        cid = str(cid).strip()
+        if not cid or cid == cluster_id or cid in compare_ids:
+            continue
+        compare_ids.append(cid)
+    compare_clusters = []
+    for cid in compare_ids:
+        other_entry = get_cluster_entry(system_meta, cid)
+        compare_clusters.append(
+            {
+                "cluster_id": cid,
+                "name": other_entry.get("name"),
+                "path": _resolve_cluster_path(project_id, system_id, other_entry),
+            }
+        )
+
     try:
-        from phase.simulation.plotting import plot_beta_scan_curve, plot_marginal_summary_from_npz, plot_sampling_report_from_npz
+        _augment_sampling_summary(
+            summary_path,
+            base_cluster_path=cluster_path,
+            base_cluster_id=cluster_id,
+            base_cluster_name=entry.get("name"),
+            compare_clusters=compare_clusters,
+            model_path=model_path,
+            project_id=project_id,
+            system_id=system_id,
+        )
+
+        from phase.simulation.plotting import (
+            plot_beta_scan_curve,
+            plot_cross_likelihood_report_from_npz,
+            plot_marginal_summary_from_npz,
+            plot_sampling_report_from_npz,
+        )
 
         plot_path = plot_marginal_summary_from_npz(
             summary_path=summary_path,
@@ -320,6 +737,10 @@ async def upload_simulation_result(
         report_path = plot_sampling_report_from_npz(
             summary_path=summary_path,
             out_path=results_dir / "sampling_report.html",
+        )
+        cross_likelihood_report_path = plot_cross_likelihood_report_from_npz(
+            summary_path=summary_path,
+            out_path=results_dir / "cross_likelihood_report.html",
         )
         beta_scan_path = None
         beta_eff_value = None
@@ -358,6 +779,7 @@ async def upload_simulation_result(
         "completed_at": datetime.utcnow().isoformat(),
         "params": {
             "source": "upload",
+            "compare_cluster_ids": compare_ids,
         },
         "results": {
             "results_dir": _relativize_path(results_dir),
@@ -365,6 +787,7 @@ async def upload_simulation_result(
             "metadata_json": None,
             "marginals_plot": _relativize_path(plot_path) if plot_path else None,
             "sampling_report": _relativize_path(report_path) if report_path else None,
+            "cross_likelihood_report": _relativize_path(cross_likelihood_report_path) if cross_likelihood_report_path else None,
             "beta_scan_plot": _relativize_path(beta_scan_path) if beta_scan_path else None,
             "cluster_npz": _relativize_path(cluster_path),
             "potts_model": _relativize_path(model_path),

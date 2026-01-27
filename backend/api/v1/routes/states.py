@@ -50,6 +50,34 @@ async def download_structure(project_id: str, system_id: str, state_id: str):
     )
 
 
+@router.get(
+    "/projects/{project_id}/systems/{system_id}/states/{state_id}/descriptors/npz",
+    summary="Download the descriptor NPZ for a system state",
+)
+async def download_state_descriptors(project_id: str, system_id: str, state_id: str):
+    try:
+        system = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    state_meta = get_state_or_404(system, state_id)
+    if not state_meta.descriptor_file:
+        raise HTTPException(status_code=404, detail=f"No descriptors stored for state '{state_id}'.")
+
+    file_path = project_store.resolve_path(project_id, system_id, state_meta.descriptor_file)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Descriptor NPZ file is missing on disk.")
+
+    base_name = state_meta.name or state_id
+    download_name = f"{base_name}_descriptors.npz"
+
+    return FileResponse(
+        file_path,
+        filename=download_name,
+        media_type="application/octet-stream",
+    )
+
+
 @router.post(
     "/projects/{project_id}/systems/{system_id}/states",
     summary="Add a new state to an existing system",
@@ -113,6 +141,7 @@ async def upload_state_trajectory(
     state_id: str,
     trajectory: UploadFile = File(...),
     stride: int = Form(1),
+    residue_selection: str = Form(None),
 ):
     try:
         system_meta = project_store.get_system(project_id, system_id)
@@ -135,6 +164,7 @@ async def upload_state_trajectory(
     state_meta.source_traj = trajectory.filename
     state_meta.stride = stride_val
     state_meta.slice_spec = slice_spec
+    state_meta.residue_selection = residue_selection.strip() if residue_selection else None
     if state_meta.descriptor_file:
         old_descriptor = project_store.resolve_path(project_id, system_id, state_meta.descriptor_file)
         try:
@@ -159,7 +189,12 @@ async def upload_state_trajectory(
     project_store.save_system(system_meta)
 
     try:
-        await build_state_descriptors(project_id, system_meta, state_meta)
+        await build_state_descriptors(
+            project_id,
+            system_meta,
+            state_meta,
+            residue_filter=residue_selection,
+        )
     except Exception as exc:
         system_meta.status = "failed"
         project_store.save_system(system_meta)

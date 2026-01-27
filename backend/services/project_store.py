@@ -55,6 +55,7 @@ class DescriptorState:
     stride: int = 1
     source_traj: Optional[str] = None
     slice_spec: Optional[str] = None
+    residue_selection: Optional[str] = None
     residue_keys: List[str] = field(default_factory=list)
     residue_mapping: Dict[str, str] = field(default_factory=dict)
     metastable_labels_file: Optional[str] = None

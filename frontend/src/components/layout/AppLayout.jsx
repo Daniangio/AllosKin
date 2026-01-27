@@ -14,7 +14,7 @@ export default function AppLayout({ children }) {
         <div className="container mx-auto px-4 py-4 flex justify-between items-center">
           <div className="flex items-center space-x-3">
             <div className="h-10 w-10 rounded-full bg-cyan-500 flex items-center justify-center text-gray-900 font-bold">
-              AK
+              PH
             </div>
             <div>
               <h1 className="text-2xl font-bold tracking-tight text-white">PHASE</h1>

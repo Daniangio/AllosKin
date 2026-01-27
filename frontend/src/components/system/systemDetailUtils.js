@@ -11,19 +11,11 @@ export function getArtifactDisplayName(pathValue) {
 
 export function formatClusterAlgorithm(run) {
   if (!run) return '';
-  const algo = (run.cluster_algorithm || '').toLowerCase();
+  const algo = (run.cluster_algorithm || 'density_peaks').toLowerCase();
+  if (algo !== 'density_peaks') return algo;
   const params = run.algorithm_params || {};
-  if (algo === 'dbscan') {
-    return `dbscan (eps=${params.eps ?? '—'}, min_samples=${params.min_samples ?? '—'})`;
-  }
-  if (algo === 'hierarchical') {
-    return `hierarchical (n_clusters=${params.n_clusters ?? '—'}, linkage=${params.linkage || 'ward'})`;
-  }
-  if (algo === 'tomato') {
-    return `tomato (k=${params.k_neighbors ?? '—'}, tau=${params.tau ?? '—'}, k_max=${params.k_max ?? '—'})`;
-  }
-  if (algo === 'density_peaks' || algo === 'kmeans') {
-    return `${algo} (max_clusters=${run.max_clusters_per_residue ?? '—'})`;
-  }
-  return algo ? `${algo}` : 'cluster';
+  const maxClusters = run.max_clusters_per_residue ?? '—';
+  const maxk = params.density_maxk ?? params.maxk ?? '—';
+  const zVal = params.density_z ?? params.Z ?? 'auto';
+  return `density_peaks (max_clusters=${maxClusters}, maxk=${maxk}, Z=${zVal})`;
 }

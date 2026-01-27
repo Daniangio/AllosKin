@@ -19,6 +19,7 @@ import { getClusterDisplayName } from '../components/system/systemDetailUtils';
 import {
   fetchSystem,
   downloadStructure,
+  downloadStateDescriptors,
   uploadStateTrajectory,
   deleteStateTrajectory,
   addSystemState,
@@ -91,15 +92,6 @@ export default function SystemDetailPage() {
   const [maxClusterFrames, setMaxClusterFrames] = useState(0);
   const [contactMode, setContactMode] = useState('CA');
   const [contactCutoff, setContactCutoff] = useState(10);
-  const [clusterAlgorithm, setClusterAlgorithm] = useState('DENSITY_PEAKS');
-  const [dbscanEps, setDbscanEps] = useState(0.5);
-  const [dbscanMinSamples, setDbscanMinSamples] = useState(5);
-  const [hierClusters, setHierClusters] = useState(4);
-  const [hierLinkage, setHierLinkage] = useState('ward');
-  const [tomatoK, setTomatoK] = useState(15);
-  const [tomatoTauMode, setTomatoTauMode] = useState('auto');
-  const [tomatoTauValue, setTomatoTauValue] = useState(0.5);
-  const [tomatoKMax, setTomatoKMax] = useState(6);
   const [densityZMode, setDensityZMode] = useState('auto');
   const [densityZValue, setDensityZValue] = useState(1.65);
   const [densityMaxk, setDensityMaxk] = useState(100);
@@ -255,20 +247,6 @@ export default function SystemDetailPage() {
     }
     return metastableStates;
   }, [analysisMode, metastableLocked, metastableStates, states]);
-  const selectedClusterFrameCount = useMemo(() => {
-    const framesById = new Map();
-    clusterSelectableStates.forEach((m) => {
-      const metaId = m.metastable_id || `${m.macro_state}-${m.metastable_index}`;
-      const count = Number(m.n_frames ?? 0);
-      framesById.set(metaId, Number.isFinite(count) ? count : 0);
-    });
-    return selectedMetastableIds.reduce((sum, id) => sum + (framesById.get(id) || 0), 0);
-  }, [clusterSelectableStates, selectedMetastableIds]);
-  const clusterFrameCap = useMemo(() => {
-    if (!selectedClusterFrameCount) return 0;
-    if (maxClusterFrames > 0) return Math.min(maxClusterFrames, selectedClusterFrameCount);
-    return selectedClusterFrameCount;
-  }, [maxClusterFrames, selectedClusterFrameCount]);
   const activeClusterJobs = useMemo(
     () =>
       clusterRuns.filter(
@@ -470,7 +448,7 @@ export default function SystemDetailPage() {
     navigate(`/jobs/${response.job_id}`, { state: { analysis_uuid: response.analysis_uuid } });
   };
 
-  const handleUploadSimulationResults = async ({ cluster_id, summaryFile, modelFile }) => {
+  const handleUploadSimulationResults = async ({ cluster_id, compare_cluster_ids, summaryFile, modelFile }) => {
     setSamplingUploadBusy(true);
     setSamplingUploadProgress(0);
     try {
@@ -478,6 +456,7 @@ export default function SystemDetailPage() {
         projectId,
         systemId,
         cluster_id,
+        compare_cluster_ids,
         summaryFile,
         modelFile,
         { onUploadProgress: (percent) => setSamplingUploadProgress(percent) }
@@ -601,7 +580,7 @@ export default function SystemDetailPage() {
     }
   };
 
-  const handleUploadTrajectory = async (stateId, file, stride) => {
+  const handleUploadTrajectory = async (stateId, file, stride, residueSelection) => {
     if (!file) return;
     setUploadingState(stateId);
     setActionError(null);
@@ -609,6 +588,9 @@ export default function SystemDetailPage() {
       const payload = new FormData();
       payload.append('trajectory', file);
       payload.append('stride', stride || 1);
+      if (residueSelection && residueSelection.trim()) {
+        payload.append('residue_selection', residueSelection.trim());
+      }
       await uploadStateTrajectory(projectId, systemId, stateId, payload, {
         onUploadProgress: (percent) =>
           setUploadProgress((prev) => ({
@@ -664,6 +646,23 @@ export default function SystemDetailPage() {
       const link = document.createElement('a');
       link.href = url;
       link.download = `${system?.name || systemId}-${name || stateId}.pdb`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setDownloadError(err.message);
+    }
+  };
+
+  const handleDownloadMacroStateNpz = async (stateId, name) => {
+    setDownloadError(null);
+    try {
+      const blob = await downloadStateDescriptors(projectId, systemId, stateId);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${system?.name || systemId}-${name || stateId}_descriptors.npz`;
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -793,36 +792,15 @@ export default function SystemDetailPage() {
     setClusterLoading(true);
     try {
       const trimmedName = clusterName.trim();
-      const algo = (clusterAlgorithm || 'DENSITY_PEAKS').toLowerCase();
-      const algorithmParams = {};
-      if (algo === 'dbscan') {
-        algorithmParams.eps = dbscanEps;
-        algorithmParams.min_samples = dbscanMinSamples;
-      } else if (algo === 'tomato') {
-        algorithmParams.k_neighbors = tomatoK;
-        algorithmParams.tau = tomatoTauMode === 'auto' ? 'auto' : tomatoTauValue;
-        algorithmParams.k_max = tomatoKMax;
-      } else if (algo === 'density_peaks') {
-        if (densityZMode === 'manual') {
-          algorithmParams.Z = densityZValue;
-        } else {
-          algorithmParams.Z = 'auto';
-        }
-        algorithmParams.maxk = densityMaxk;
-        } else if (algo === 'hierarchical') {
-          algorithmParams.n_clusters = hierClusters;
-          algorithmParams.linkage = hierLinkage;
-        }
+      const densityZ = densityZMode === 'manual' ? densityZValue : 'auto';
       await submitMetastableClusterJob(projectId, systemId, selectedMetastableIds, {
         cluster_name: trimmedName || undefined,
         max_clusters_per_residue: maxClustersPerResidue,
         max_cluster_frames: maxClusterFrames > 0 ? maxClusterFrames : undefined,
         contact_atom_mode: contactMode,
         contact_cutoff: contactCutoff,
-        cluster_algorithm: algo,
-        algorithm_params: algorithmParams,
-        dbscan_eps: dbscanEps,
-        dbscan_min_samples: dbscanMinSamples,
+        density_maxk: densityMaxk,
+        density_z: densityZ,
       });
       setClusterPanelOpen(false);
       setClusterName('');
@@ -1779,17 +1757,6 @@ export default function SystemDetailPage() {
           onToggleMetastable={toggleMetastableSelection}
           clusterName={clusterName}
           setClusterName={setClusterName}
-          analysisMode={analysisMode}
-          clusterAlgorithm={clusterAlgorithm}
-          setClusterAlgorithm={setClusterAlgorithm}
-          tomatoK={tomatoK}
-          setTomatoK={setTomatoK}
-          tomatoTauMode={tomatoTauMode}
-          setTomatoTauMode={setTomatoTauMode}
-          tomatoTauValue={tomatoTauValue}
-          setTomatoTauValue={setTomatoTauValue}
-          tomatoKMax={tomatoKMax}
-          setTomatoKMax={setTomatoKMax}
           densityZMode={densityZMode}
           setDensityZMode={setDensityZMode}
           densityZValue={densityZValue}
@@ -1800,16 +1767,6 @@ export default function SystemDetailPage() {
           setMaxClustersPerResidue={setMaxClustersPerResidue}
           maxClusterFrames={maxClusterFrames}
           setMaxClusterFrames={setMaxClusterFrames}
-          selectedClusterFrameCount={selectedClusterFrameCount}
-          clusterFrameCap={clusterFrameCap}
-          dbscanEps={dbscanEps}
-          setDbscanEps={setDbscanEps}
-          dbscanMinSamples={dbscanMinSamples}
-          setDbscanMinSamples={setDbscanMinSamples}
-          hierClusters={hierClusters}
-          setHierClusters={setHierClusters}
-          hierLinkage={hierLinkage}
-          setHierLinkage={setHierLinkage}
           contactMode={contactMode}
           setContactMode={setContactMode}
           contactCutoff={contactCutoff}
@@ -1847,6 +1804,7 @@ export default function SystemDetailPage() {
           onClose={handleCloseInfoOverlay}
           onRenameMacro={handleRenameMacroState}
           onRenameMeta={handleRenameMetastable}
+          onDownloadMacroNpz={handleDownloadMacroStateNpz}
         />
       )}
         </div>

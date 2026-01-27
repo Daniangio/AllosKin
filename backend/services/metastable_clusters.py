@@ -6,11 +6,10 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
+import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
-from sklearn.metrics import silhouette_score
 from scipy.spatial import KDTree
 import MDAnalysis as mda
 from dadapy import Data
@@ -53,52 +52,82 @@ def _build_metastable_kind_map(system_meta: SystemMetadata) -> Dict[str, str]:
     return kinds
 
 
-def _kmeans_sweep(
-    samples: np.ndarray, max_k: int, random_state: int
-) -> Tuple[np.ndarray, int, float]:
-    """Run KMeans sweep to find best K by silhouette score."""
-    n_samples = samples.shape[0]
-    if n_samples == 0:
-        return np.array([], dtype=np.int32), 0, 0.0
-    
-    # If we only have 1 point or max_k=1, we can't do silhouette
-    upper_k = max(1, min(int(max_k), n_samples))
-    
-    if upper_k == 1:
-        return np.zeros(n_samples, dtype=np.int32), 1, 0.0
+def _fit_density_peaks(
+    samples: np.ndarray,
+    *,
+    density_maxk: int,
+    density_z: float | str,
+    halo: bool,
+    n_jobs: int | None = None,
+) -> tuple[Data, np.ndarray, int, Dict[str, Any]]:
+    """Fit ADP density-peak clustering on embedded samples."""
+    if samples.size == 0:
+        raise ValueError("No samples provided for density peaks.")
+    emb = _angles_to_embedding(samples)
+    n = emb.shape[0]
+    if n == 1:
+        labels = np.zeros(1, dtype=np.int32)
+        diag = {"density_peaks_k": 1, "density_peaks_maxk": 1, "density_peaks_Z": density_z}
+        dp_data = Data(coordinates=emb, maxk=1, verbose=False, n_jobs=n_jobs or 1)
+        dp_data.cluster_assignment = labels  # type: ignore[attr-defined]
+        dp_data.N_clusters = 1  # type: ignore[attr-defined]
+        return dp_data, labels, 1, diag
 
-    best_k = 1
-    best_score = -np.inf
-
-    for k in range(1, upper_k + 1):
-        if k == 1:
-            score = 0.0  # fallback
-        else:
-            km = KMeans(n_clusters=k, n_init="auto", random_state=random_state)
-            labels = km.fit_predict(samples)
-            n_labels = len(np.unique(labels))
-            # silhouette_score requires 2 <= n_labels <= n_samples - 1
-            if n_labels < 2 or n_labels >= n_samples:
-                score = -np.inf
-            else:
-                try:
-                    score = silhouette_score(samples, labels)
-                except ValueError:
-                    # Handle tiny sample sets where sklearn refuses to score
-                    score = -np.inf
-        
-        # Prefer higher K slightly if scores are very close? No, stick to raw score.
-        if score > best_score:
-            best_score = score
-            best_k = k
-
-    if best_k == 1:
-        final_labels = np.zeros(samples.shape[0], dtype=np.int32)
+    dp_maxk = max(1, min(int(density_maxk), n - 1))
+    dp_data = Data(coordinates=emb, maxk=dp_maxk, verbose=False, n_jobs=n_jobs or 1)
+    dp_data.compute_distances()
+    dp_data.compute_id_2NN()
+    dp_data.compute_density_kstarNN()
+    if isinstance(density_z, str) and density_z.lower() == "auto":
+        dp_data.compute_clustering_ADP(halo=halo)
+        density_z_val: float | str = "auto"
     else:
-        km = KMeans(n_clusters=best_k, n_init="auto", random_state=random_state)
-        final_labels = km.fit_predict(samples).astype(np.int32)
+        density_z_val = float(density_z)
+        dp_data.compute_clustering_ADP(Z=float(density_z_val), halo=halo)
+    labels = np.asarray(dp_data.cluster_assignment, dtype=np.int32)
+    k_final = int(dp_data.N_clusters) if hasattr(dp_data, "N_clusters") else int(
+        len([c for c in np.unique(labels) if c >= 0])
+    )
+    diag: Dict[str, Any] = {
+        "density_peaks_method": "dadapy_adp",
+        "density_peaks_k": k_final,
+        "density_peaks_maxk": dp_maxk,
+        "density_peaks_Z": density_z_val,
+    }
+    return dp_data, labels, k_final, diag
 
-    return final_labels, best_k, best_score
+
+def _predict_cluster_adp(
+    dp_data: Data,
+    samples: np.ndarray,
+    *,
+    density_maxk: int,
+    density_z: float | str,
+    halo: bool,
+    n_jobs: int | None = None,
+) -> np.ndarray:
+    """Predict ADP cluster labels for new samples using a fitted Data object."""
+    if not hasattr(dp_data, "predict_cluster_ADP"):
+        raise ValueError("DADApy predict_cluster_ADP is not available. Update the DADApy installation.")
+    emb = _angles_to_embedding(samples)
+    fn = getattr(dp_data, "predict_cluster_ADP")
+    params = inspect.signature(fn).parameters
+    kwargs: Dict[str, Any] = {}
+    if "maxk" in params:
+        kwargs["maxk"] = max(1, min(int(density_maxk), emb.shape[0] - 1))
+    if "density_est" in params:
+        kwargs["density_est"] = "PAk"
+    if "halo" in params:
+        kwargs["halo"] = halo
+    if "n_jobs" in params:
+        kwargs["n_jobs"] = n_jobs or 1
+    if not (isinstance(density_z, str) and density_z.lower() == "auto"):
+        if "Dthr" in params:
+            kwargs["Dthr"] = float(density_z)
+        if "Z" in params:
+            kwargs["Z"] = float(density_z)
+    labels = fn(emb, **kwargs)
+    return np.asarray(labels, dtype=np.int32)
 
 
 def _angles_to_embedding(samples: np.ndarray) -> np.ndarray:
@@ -110,346 +139,28 @@ def _angles_to_embedding(samples: np.ndarray) -> np.ndarray:
 
 def _cluster_residue_samples(
     samples: np.ndarray,
-    max_k: int,
-    random_state: int,
     *,
-    algorithm: str = "tomato",
-    density_z: float | str | None = None,
-    density_maxk: Optional[int] = None,
-    dbscan_eps: float = 0.5,
-    dbscan_min_samples: int = 5,
-    hierarchical_n_clusters: Optional[int] = None,
-    hierarchical_linkage: str = "ward",
-    tomato_k: int = 15,
-    tomato_tau: float | str = "auto",
-) -> Tuple[np.ndarray, int, Dict[str, Any]]:
-    """Cluster angles with periodic distance. Returns labels, cluster count, diagnostics."""
+    density_maxk: int,
+    density_z: float | str,
+    halo: bool,
+    n_jobs: int | None = None,
+) -> Tuple[np.ndarray, int, Dict[str, Any], Data]:
+    """Cluster angles with ADP density peaks."""
     if samples.size == 0:
-        return np.array([], dtype=np.int32), 0, {}
-
+        return np.array([], dtype=np.int32), 0, {}, Data(coordinates=np.zeros((1, 1)))
     if samples.ndim == 1:
         samples = samples.reshape(1, -1)
     if samples.ndim != 2 or samples.shape[1] < 3:
         raise ValueError("Residue samples must be (n_frames, >=3) shaped.")
 
-    # Use sin/cos embedding to respect angular periodicity.
-    emb = _angles_to_embedding(samples)
-
-    algo = (algorithm or "tomato").lower()
-    diagnostics: Dict[str, Any] = {}
-    density_z_val: float | str = "auto"
-    if density_z is not None and not (isinstance(density_z, str) and density_z.lower() == "auto"):
-        try:
-            density_z_val = float(density_z)
-        except Exception:
-            density_z_val = "auto"
-    density_maxk_val: int = max(1, int(density_maxk)) if density_maxk is not None else 100
-
-    # --- Standard KMeans ---
-    if algo == "kmeans":
-        labels, k, _ = _kmeans_sweep(emb, max_k, random_state)
-        return labels, k, diagnostics
-
-    # --- Hierarchical ---
-    if algo == "hierarchical":
-        n_clusters = hierarchical_n_clusters or max_k
-        n_clusters = max(1, min(int(n_clusters), emb.shape[0]))
-        linkage = (hierarchical_linkage or "ward").lower()
-        if linkage not in {"ward", "complete", "average", "single"}:
-            linkage = "ward"
-        model = AgglomerativeClustering(n_clusters=n_clusters, linkage=linkage)
-        labels = model.fit_predict(emb).astype(np.int32)
-        k = len(np.unique(labels))
-        return labels, int(k), diagnostics
-
-    # --- Density Peaks ---
-    if algo == "density_peaks":
-        n = emb.shape[0]
-        if n == 1:
-            return np.zeros(1, dtype=np.int32), 1, diagnostics
-
-        # Use DADApy for density peak clustering (adaptive density peak).
-        try:
-            dp_maxk = max(1, min(density_maxk_val, n - 1))
-            dp_data = Data(coordinates=emb, maxk=dp_maxk, verbose=False)
-            dp_data.compute_distances()
-            dp_data.compute_id_2NN()
-            dp_data.compute_density_kstarNN()
-            if density_z_val == "auto":
-                dp_data.compute_clustering_ADP()
-                diagnostics["density_peaks_Z"] = "auto"
-            else:
-                dp_data.compute_clustering_ADP(Z=float(density_z_val))
-                diagnostics["density_peaks_Z"] = float(density_z_val)
-            labels = np.asarray(dp_data.cluster_assignment, dtype=np.int32)
-            k_final = int(dp_data.N_clusters) if hasattr(dp_data, "N_clusters") else int(
-                len([c for c in np.unique(labels) if c >= 0])
-            )
-            diagnostics["density_peaks_method"] = "dadapy_adp"
-            diagnostics["density_peaks_k"] = k_final
-            diagnostics["density_peaks_maxk"] = dp_maxk
-        except Exception as exc:
-            raise ValueError(f"DADApy density peaks failed: {exc}") from exc
-        
-        final_labels = labels
-
-    # --- ToMATo ---
-    elif algo == "tomato":
-        n = emb.shape[0]
-        if n == 1:
-            return np.zeros(1, dtype=np.int32), 1, diagnostics
-        
-        t_k_val = tomato_k if tomato_k is not None else 15
-        k_nn = max(1, min(int(t_k_val), n - 1))
-        
-        tree = KDTree(emb)
-        dists, idxs = tree.query(emb, k=k_nn + 1)
-        knn_idxs = idxs[:, 1:]
-        d_k = dists[:, -1] + 1e-8
-        
-        # --- FIXED DENSITY ESTIMATOR ---
-        # Old (Unstable): rho = 1.0 / (d_k ** max(dim, 1))
-        # New (Stable): Log-density. 
-        # Since d_k is small for dense regions, -log(d_k) is large positive.
-        # This prevents "super peaks" from dominating the persistence diagram.
-        rho = -np.log(d_k)
-        
-        local_max = np.zeros(n, dtype=bool)
-        for i in range(n):
-            neigh = knn_idxs[i]
-            best_rho = rho[i]
-            is_max = True
-            for j in neigh:
-                if rho[j] > best_rho:
-                    is_max = False
-                    break
-            local_max[i] = is_max
-
-        order = sorted(range(n), key=lambda idx: (-rho[idx], idx))
-        uf_parent = np.arange(n, dtype=int)
-        root_density = rho.copy()
-        processed = np.zeros(n, dtype=bool)
-        transitions: List[Dict[str, Any]] = []
-        events: List[Dict[str, Any]] = []
-
-        def find(x: int) -> int:
-            while uf_parent[x] != x:
-                uf_parent[x] = uf_parent[uf_parent[x]]
-                x = uf_parent[x]
-            return x
-
-        def union(a: int, b: int):
-            ra, rb = find(a), find(b)
-            if ra == rb:
-                return ra
-            if root_density[ra] >= root_density[rb]:
-                uf_parent[rb] = ra
-                return ra
-            uf_parent[ra] = rb
-            return rb
-        
-        auto_tau = isinstance(tomato_tau, str) and tomato_tau.lower() == "auto"
-        
-        # Compute tau from gaps in persistence values if user requested "auto".
-        def _auto_tau_from_persistence(values: List[float], fallback: float = 0.5) -> float:
-            finite_vals = [float(v) for v in values if np.isfinite(v)]
-            if not finite_vals:
-                return fallback
-            vals = sorted(finite_vals, reverse=True)
-            if len(vals) == 1:
-                # Use half of the observed barrier to keep threshold in-range
-                return max(fallback, vals[0] * 0.5)
-            best_gap = -np.inf
-            best_idx = 0
-            # Look for the largest gap to separate "real" peaks from "noise"
-            for i in range(len(vals) - 1):
-                high, low = vals[i], vals[i + 1]
-                gap = high - low
-                if gap > best_gap:
-                    best_gap = gap
-                    best_idx = i
-            high, low = vals[best_idx], vals[best_idx + 1]
-            return low + (high - low) * 0.5
-
-        tau = 0.5 if auto_tau else float(tomato_tau if tomato_tau is not None else 0.5)
-        diagnostics["tau_mode"] = "auto" if auto_tau else "manual"
-
-        # --- ToMATo Loop ---
-        pending_transitions: List[Dict[str, Any]] = []
-        for idx in order:
-            if local_max[idx]:
-                processed[idx] = True
-                continue
-            
-            processed[idx] = True
-            neigh = [j for j in knn_idxs[idx] if processed[j] and rho[j] > rho[idx]]
-            
-            if not neigh:
-                # Disconnected point. We explicitly leave it as self-parent.
-                continue
-
-            roots = []
-            seen_roots = set()
-            for j in neigh:
-                rj = find(j)
-                if rj not in seen_roots:
-                    seen_roots.add(rj)
-                    roots.append(rj)
-            
-            if len(roots) == 1:
-                union(idx, roots[0])
-                continue
-
-            roots_sorted = sorted(roots, key=lambda r: (-root_density[r], r))
-            r_max = roots_sorted[0]
-            
-            for r_other in roots_sorted[1:]:
-                persistence = float(root_density[r_other] - rho[idx])
-                event = {
-                    "peak_density": float(root_density[r_other]),
-                    "persistence": persistence,
-                    "saddle_density": float(rho[idx]),
-                }
-                events.append(event)
-                transition_record = {
-                    "root_a": int(r_max),
-                    "root_b": int(r_other),
-                    "saddle_index": int(idx),
-                    "persistence": persistence,
-                }
-                if auto_tau:
-                    pending_transitions.append(transition_record)
-                else:
-                    if persistence < tau:
-                        union(r_other, r_max)
-                    else:
-                        transitions.append(transition_record)
-            union(idx, r_max)
-
-        # Resolve tau automatically from persistence gaps, then apply merges.
-        if auto_tau:
-            persistence_values = [float(ev.get("persistence", 0.0)) for ev in events]
-            # Since density is now log-scale, the fallback must be sensible for log-space
-            # 0.1 in log space corresponds to exp(0.1) ~ 1.1x density ratio.
-            tau = _auto_tau_from_persistence(persistence_values, fallback=0.1)
-            diagnostics["tau"] = tau
-            diagnostics["tau_candidates"] = persistence_values
-            for tr in pending_transitions:
-                ra, rb = find(tr["root_a"]), find(tr["root_b"])
-                if ra == rb:
-                    continue
-                if tr["persistence"] < tau:
-                    union(ra, rb)
-                else:
-                    transitions.append(tr)
-        else:
-            diagnostics["tau"] = tau
-
-        # --- 1. Persistence-based merging (Water-filling) to respect max_k ---
-        t_k_max = max_clusters_per_residue if max_k is None else max_k
-        active_roots = {find(i) for i in range(n)}
-        
-        if len(active_roots) > t_k_max:
-            merge_candidates: Dict[Tuple[int, int], float] = {}
-            for tr in transitions:
-                ra = find(tr["root_a"])
-                rb = find(tr["root_b"])
-                if ra == rb: continue
-                key = tuple(sorted((ra, rb)))
-                pers = float(tr.get("persistence", 0.0))
-                if key not in merge_candidates or pers < merge_candidates[key]:
-                    merge_candidates[key] = pers
-            
-            forced_merges: List[Dict[str, Any]] = []
-            for (ra, rb), pers in sorted(merge_candidates.items(), key=lambda kv: kv[1]):
-                root_a, root_b = find(ra), find(rb)
-                if root_a == root_b: continue
-                active_roots = {find(i) for i in range(n)}
-                if len(active_roots) <= t_k_max: break
-                union(root_a, root_b)
-                forced_merges.append({"roots": (int(root_a), int(root_b)), "persistence": pers})
-            diagnostics["forced_merges"] = forced_merges
-
-        # --- Final Label Assignment ---
-        root_map: Dict[int, int] = {}
-        labels = np.full(n, -1, dtype=np.int32)
-        next_id = 0
-        
-        # Pre-pass: Identify population of roots
-        root_counts: Dict[int, int] = {}
-        for i in range(n):
-            r = find(i)
-            root_counts[r] = root_counts.get(r, 0) + 1
-            
-        for i in range(n):
-            r = find(i)
-            # If strictly disconnected (size 1), mark as -1 so KMeans can handle it
-            if root_counts[r] == 1:
-                labels[i] = -1
-            else:
-                if r not in root_map:
-                    root_map[r] = next_id
-                    next_id += 1
-                labels[i] = root_map[r]
-
-        diagnostics["persistence_events"] = events
-        diagnostics["transitions"] = transitions
-        
-        final_labels = labels
-        k_final = next_id
-
-    # --- DBSCAN ---
-    else:
-        eps = float(dbscan_eps) if dbscan_eps is not None else 0.5
-        min_s = int(dbscan_min_samples) if dbscan_min_samples is not None else 5
-        min_s = max(1, min_s)
-        db = DBSCAN(eps=eps, min_samples=min_s, metric="euclidean")
-        labels = db.fit_predict(emb).astype(np.int32)
-        
-        # Remap standard DBSCAN labels (-1 is noise)
-        unique_clusters = sorted([int(v) for v in np.unique(labels) if v != -1])
-        mapping = {old: idx for idx, old in enumerate(unique_clusters)}
-        remapped = np.array([mapping.get(int(v), -1) for v in labels], dtype=np.int32)
-        diagnostics["dbscan_unique"] = unique_clusters
-        
-        final_labels = remapped
-        k_final = len(unique_clusters)
-
-    # =========================================================
-    # COMMON POST-PROCESSING: CLUSTER UNASSIGNED (-1) VIA KMEANS
-    # =========================================================
-    
-    noise_mask = final_labels == -1
-    n_noise = np.sum(noise_mask)
-    
-    if n_noise > 0:
-        # Determine how many slots we have left
-        available_slots = max(1, max_k - k_final)
-        
-        # Extract noise samples
-        noise_samples = emb[noise_mask]
-        
-        # Run KMeans sweep on noise
-        # Note: best_k_noise is 1-based count
-        noise_labels, best_k_noise, score = _kmeans_sweep(
-            noise_samples, 
-            max_k=available_slots, 
-            random_state=random_state
-        )
-        
-        # If noise_labels returns empty (shouldn't happen given check), skip
-        if noise_labels.size > 0:
-            # Shift noise labels to start after existing clusters
-            shifted_labels = noise_labels + k_final
-            final_labels[noise_mask] = shifted_labels
-            
-            # Update total K
-            k_final += best_k_noise
-            
-            diagnostics["noise_kmeans_k"] = int(best_k_noise)
-            diagnostics["noise_kmeans_score"] = float(score)
-
-    return final_labels, int(k_final), diagnostics
+    dp_data, labels, k_final, diagnostics = _fit_density_peaks(
+        samples,
+        density_maxk=density_maxk,
+        density_z=density_z,
+        halo=halo,
+        n_jobs=n_jobs,
+    )
+    return labels, int(k_final), diagnostics, dp_data
 
 
 def _uniform_subsample_indices(n_frames: int, max_frames: int) -> np.ndarray:
@@ -460,79 +171,37 @@ def _uniform_subsample_indices(n_frames: int, max_frames: int) -> np.ndarray:
     return np.unique(idx)
 
 
-def _assign_labels_by_knn(
-    emb_full: np.ndarray,
-    emb_subset: np.ndarray,
-    subset_labels: np.ndarray,
-    subset_indices: np.ndarray,
-    k_neighbors: int,
-) -> np.ndarray:
-    """Assign labels to remaining frames by majority vote of nearest neighbors."""
-    n_frames = emb_full.shape[0]
-    full_labels = np.full(n_frames, -1, dtype=np.int32)
-    full_labels[subset_indices] = subset_labels.astype(np.int32)
-    if emb_subset.shape[0] == 0 or k_neighbors <= 0:
-        return full_labels
-
-    k_neighbors = min(int(k_neighbors), emb_subset.shape[0])
-    tree = KDTree(emb_subset)
-    _, idxs = tree.query(emb_full, k=k_neighbors)
-    if idxs.ndim == 1:
-        idxs = idxs[:, None]
-
-    for i in range(n_frames):
-        if full_labels[i] != -1:
-            continue
-        neigh_labels = subset_labels[idxs[i]]
-        valid = neigh_labels[neigh_labels >= 0]
-        if valid.size == 0:
-            continue
-        vals, counts = np.unique(valid, return_counts=True)
-        full_labels[i] = int(vals[np.argmax(counts)])
-
-    return full_labels
-
-
 def _cluster_with_subsample(
     samples: np.ndarray,
-    max_k: int,
-    random_state: int,
     *,
-    algorithm: str,
     density_maxk: int,
-    density_z: float | str | None,
-    dbscan_eps: float,
-    dbscan_min_samples: int,
-    hierarchical_n_clusters: Optional[int],
-    hierarchical_linkage: str,
-    tomato_k: int,
-    tomato_tau: float | str,
+    density_z: float | str,
     max_cluster_frames: Optional[int],
-    assign_k: int = 10,
+    n_jobs: int | None = None,
     subsample_indices: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, int, Dict[str, Any], int]:
-    """Cluster on a subsample if requested, then assign remaining frames by neighbor majority."""
+) -> Tuple[np.ndarray, np.ndarray, int, Dict[str, Any], int, Data]:
+    """Fit ADP on a subsample if requested, then predict labels on all frames."""
     n_frames = samples.shape[0]
     if not max_cluster_frames or max_cluster_frames <= 0 or n_frames <= max_cluster_frames:
-        labels, k, diag = _cluster_residue_samples(
+        labels_halo, k, diag, dp_data = _cluster_residue_samples(
             samples,
-            max_k,
-            random_state,
-            algorithm=algorithm,
             density_maxk=density_maxk,
             density_z=density_z,
-            dbscan_eps=dbscan_eps,
-            dbscan_min_samples=dbscan_min_samples,
-            hierarchical_n_clusters=hierarchical_n_clusters,
-            hierarchical_linkage=hierarchical_linkage,
-            tomato_k=tomato_k,
-            tomato_tau=tomato_tau,
+            halo=True,
+            n_jobs=n_jobs,
+        )
+        labels_assigned = _predict_cluster_adp(
+            dp_data,
+            samples,
+            density_maxk=density_maxk,
+            density_z=density_z,
+            halo=False,
+            n_jobs=n_jobs,
         )
         diag["subsampled"] = False
         diag["subsample_size"] = int(n_frames)
         diag["total_frames"] = int(n_frames)
-        diag["assign_k"] = int(assign_k)
-        return labels, k, diag, int(n_frames)
+        return labels_halo, labels_assigned, k, diag, int(n_frames), dp_data
 
     subsample_indices = (
         _uniform_subsample_indices(n_frames, int(max_cluster_frames))
@@ -541,30 +210,33 @@ def _cluster_with_subsample(
     )
     subsample_indices = np.asarray(subsample_indices, dtype=int)
     sub_samples = samples[subsample_indices]
-    labels_sub, k, diag = _cluster_residue_samples(
+    _, k, diag, dp_data = _cluster_residue_samples(
         sub_samples,
-        max_k,
-        random_state,
-        algorithm=algorithm,
         density_maxk=density_maxk,
         density_z=density_z,
-        dbscan_eps=dbscan_eps,
-        dbscan_min_samples=dbscan_min_samples,
-        hierarchical_n_clusters=hierarchical_n_clusters,
-        hierarchical_linkage=hierarchical_linkage,
-        tomato_k=tomato_k,
-        tomato_tau=tomato_tau,
+        halo=True,
+        n_jobs=n_jobs,
     )
-
-    emb_full = _angles_to_embedding(samples)
-    emb_sub = emb_full[subsample_indices]
-    assigned = _assign_labels_by_knn(emb_full, emb_sub, labels_sub, subsample_indices, assign_k)
-
+    labels_halo = _predict_cluster_adp(
+        dp_data,
+        samples,
+        density_maxk=density_maxk,
+        density_z=density_z,
+        halo=True,
+        n_jobs=n_jobs,
+    )
+    labels_assigned = _predict_cluster_adp(
+        dp_data,
+        samples,
+        density_maxk=density_maxk,
+        density_z=density_z,
+        halo=False,
+        n_jobs=n_jobs,
+    )
     diag["subsampled"] = True
     diag["subsample_size"] = int(subsample_indices.size)
     diag["total_frames"] = int(n_frames)
-    diag["assign_k"] = int(min(assign_k, emb_sub.shape[0]))
-    return assigned.astype(np.int32), k, diag, int(subsample_indices.size)
+    return labels_halo, labels_assigned, k, diag, int(subsample_indices.size), dp_data
 
 
 def _resolve_states_for_meta(meta: Dict[str, Any], system: SystemMetadata) -> List[DescriptorState]:
@@ -738,10 +410,7 @@ def assign_cluster_labels_to_states(
     data = np.load(cluster_path, allow_pickle=True)
 
     residue_keys = [str(k) for k in data["residue_keys"]]
-    merged_labels = np.asarray(data["merged__labels"], dtype=np.int32)
     merged_counts = np.asarray(data["merged__cluster_counts"], dtype=np.int32)
-    merged_state_ids = np.asarray(data["merged__frame_state_ids"]).astype(str)
-    merged_frame_indices = np.asarray(data["merged__frame_indices"]).astype(int)
 
     meta = {}
     if "metadata_json" in data:
@@ -751,106 +420,40 @@ def assign_cluster_labels_to_states(
             meta = json.loads(str(meta_val))
         except Exception:
             meta = {}
-    analysis_mode = meta.get("analysis_mode") or getattr(system, "analysis_mode", None)
-    metastable_kinds = meta.get("metastable_kinds") or _build_metastable_kind_map(system)
 
-    state_cache: Dict[str, Dict[str, Any]] = {}
-
-    grouped: Dict[str, Dict[str, np.ndarray]] = {}
-    for row_idx, (state_id, frame_idx) in enumerate(zip(merged_state_ids, merged_frame_indices)):
-        entry = grouped.setdefault(state_id, {"rows": [], "frames": []})
-        entry["rows"].append(int(row_idx))
-        entry["frames"].append(int(frame_idx))
-    for state_id, entry in grouped.items():
-        entry["rows"] = np.asarray(entry["rows"], dtype=int)
-        entry["frames"] = np.asarray(entry["frames"], dtype=int)
-
-    ref_trees: List[Optional[KDTree]] = []
-    ref_labels_list: List[np.ndarray] = []
-
-    for key_idx, key in enumerate(residue_keys):
-        emb_list = []
-        label_list = []
-        for state_id, entry in grouped.items():
-            state = system.states.get(state_id)
-            if not state or not state.descriptor_file:
-                continue
-            cached = state_cache.get(state_id)
-            if cached is None:
-                desc_path = store.resolve_path(project_id, system_id, state.descriptor_file)
-                features = load_descriptor_npz(desc_path)
-                cached = {
-                    "features": features,
-                    "angles": {},
-                    "metastable_labels": None,
-                }
-                state_cache[state_id] = cached
-            angles = cached["angles"].get(key)
-            if angles is None:
-                angles = _extract_angles_array(cached["features"], key)
-                cached["angles"][key] = angles
-            if angles is None:
-                continue
-            frames = entry["frames"]
-            rows = entry["rows"]
-            if frames.size == 0 or rows.size == 0:
-                continue
-            emb_list.append(_angles_to_embedding(angles[frames]))
-            label_list.append(merged_labels[rows, key_idx])
-
-        if emb_list:
-            ref_emb = np.concatenate(emb_list, axis=0)
-            ref_labels = np.concatenate(label_list, axis=0).astype(np.int32)
-            ref_trees.append(KDTree(ref_emb))
-            ref_labels_list.append(ref_labels)
-        else:
-            ref_trees.append(None)
-            ref_labels_list.append(np.array([], dtype=np.int32))
+    predictions = meta.get("predictions") or {}
 
     assign_dir = cluster_path.parent / f"{cluster_path.stem}_assigned"
     assign_dir.mkdir(parents=True, exist_ok=True)
 
     assigned_state_paths: Dict[str, str] = {}
     for state_id, state in system.states.items():
-        if not state.descriptor_file:
+        key = f"state:{state_id}"
+        entry = predictions.get(key)
+        if not isinstance(entry, dict):
             continue
-        cached = state_cache.get(state_id)
-        if cached is None:
-            desc_path = store.resolve_path(project_id, system_id, state.descriptor_file)
-            features = load_descriptor_npz(desc_path)
-            cached = {
-                "features": features,
-                "angles": {},
-                "metastable_labels": None,
-            }
-            state_cache[state_id] = cached
-
-        angles_by_key = {}
-        frame_count = 0
-        for key in residue_keys:
-            angles = _extract_angles_array(cached["features"], key)
-            angles_by_key[key] = angles
-            if angles is not None and angles.shape[0] > frame_count:
-                frame_count = angles.shape[0]
-        if frame_count <= 0:
+        labels_key = entry.get("labels_halo")
+        if not labels_key or labels_key not in data:
             continue
+        labels_halo = np.asarray(data[labels_key], dtype=np.int32)
+        assigned_key = entry.get("labels_assigned")
+        labels_assigned = (
+            np.asarray(data[assigned_key], dtype=np.int32)
+            if isinstance(assigned_key, str) and assigned_key in data
+            else None
+        )
+        frame_indices_key = entry.get("frame_indices")
+        if isinstance(frame_indices_key, str) and frame_indices_key in data:
+            frame_indices = np.asarray(data[frame_indices_key], dtype=np.int64)
+        else:
+            frame_indices = np.arange(labels_halo.shape[0], dtype=np.int64)
 
-        labels_out = np.full((frame_count, len(residue_keys)), -1, dtype=np.int32)
-        for idx, key in enumerate(residue_keys):
-            angles = angles_by_key.get(key)
-            tree = ref_trees[idx]
-            ref_labels = ref_labels_list[idx]
-            if angles is None or tree is None:
-                continue
-            emb = _angles_to_embedding(angles)
-            labels_out[:, idx] = _assign_labels_from_reference(emb, tree, ref_labels, k_neighbors)
-
-        payload = {
+        payload: Dict[str, Any] = {
             "residue_keys": np.asarray(residue_keys),
-            "assigned__labels": labels_out,
+            "assigned__labels": labels_halo,
             "assigned__cluster_counts": merged_counts,
             "assigned__frame_state_id": np.array([state_id]),
-            "assigned__frame_indices": np.arange(frame_count, dtype=np.int64),
+            "assigned__frame_indices": frame_indices,
             "metadata_json": np.array(
                 json.dumps(
                     {
@@ -861,88 +464,66 @@ def assign_cluster_labels_to_states(
                 )
             ),
         }
+        if labels_assigned is not None:
+            payload["assigned__labels_assigned"] = labels_assigned
+
         out_path = assign_dir / f"state_{state_id}.npz"
         np.savez_compressed(out_path, **payload)
         assigned_state_paths[state_id] = str(out_path.relative_to(cluster_path.parent))
 
     assigned_meta_paths: Dict[str, str] = {}
-    if analysis_mode != "macro":
-        meta_lookup = {m.get("metastable_id"): m for m in system.metastable_states or []}
-        for meta_id, meta in meta_lookup.items():
-            if metastable_kinds.get(str(meta_id)) == "macro":
-                continue
-            meta_index = meta.get("metastable_index")
-            if meta_index is None:
-                continue
-            labels_list = []
-            frame_state_ids = []
-            frame_indices = []
-            for state_id, state in system.states.items():
-                if not state.descriptor_file:
-                    continue
-                cached = state_cache.get(state_id)
-                if cached is None:
-                    desc_path = store.resolve_path(project_id, system_id, state.descriptor_file)
-                    features = load_descriptor_npz(desc_path)
-                    cached = {
-                        "features": features,
-                        "angles": {},
-                        "metastable_labels": None,
+    meta_lookup = {m.get("metastable_id") or m.get("id"): m for m in system.metastable_states or []}
+    for meta_id in meta_lookup.keys():
+        key = f"meta:{meta_id}"
+        entry = predictions.get(key)
+        if not isinstance(entry, dict):
+            continue
+        labels_key = entry.get("labels_halo")
+        if not labels_key or labels_key not in data:
+            continue
+        labels_halo = np.asarray(data[labels_key], dtype=np.int32)
+        assigned_key = entry.get("labels_assigned")
+        labels_assigned = (
+            np.asarray(data[assigned_key], dtype=np.int32)
+            if isinstance(assigned_key, str) and assigned_key in data
+            else None
+        )
+        frame_state_ids_key = entry.get("frame_state_ids")
+        frame_indices_key = entry.get("frame_indices")
+        frame_state_ids = (
+            np.asarray(data[frame_state_ids_key], dtype=str)
+            if isinstance(frame_state_ids_key, str) and frame_state_ids_key in data
+            else np.array([], dtype=str)
+        )
+        frame_indices = (
+            np.asarray(data[frame_indices_key], dtype=np.int64)
+            if isinstance(frame_indices_key, str) and frame_indices_key in data
+            else np.arange(labels_halo.shape[0], dtype=np.int64)
+        )
+
+        payload = {
+            "residue_keys": np.asarray(residue_keys),
+            "assigned__labels": labels_halo,
+            "assigned__cluster_counts": merged_counts,
+            "assigned__frame_state_id": frame_state_ids,
+            "assigned__frame_indices": frame_indices,
+            "assigned__frame_metastable_id": np.array([str(meta_id)]),
+            "metadata_json": np.array(
+                json.dumps(
+                    {
+                        "source_cluster": cluster_path.name,
+                        "metastable_id": str(meta_id),
+                        "generated_at": datetime.utcnow().isoformat(),
                     }
-                    state_cache[state_id] = cached
-                if cached["metastable_labels"] is None:
-                    try:
-                        cached["metastable_labels"] = _extract_labels_for_state(
-                            store, project_id, system_id, state, cached["features"]
-                        )
-                    except Exception:
-                        cached["metastable_labels"] = None
-                labels_meta = cached["metastable_labels"]
-                if labels_meta is None or labels_meta.size == 0:
-                    continue
-                mask = labels_meta == int(meta_index)
-                if not np.any(mask):
-                    continue
-                idxs = np.where(mask)[0]
-                if idxs.size == 0:
-                    continue
-                local_labels = np.full((idxs.size, len(residue_keys)), -1, dtype=np.int32)
-                for res_idx, key in enumerate(residue_keys):
-                    angles = cached["angles"].get(key)
-                    if angles is None:
-                        angles = _extract_angles_array(cached["features"], key)
-                        cached["angles"][key] = angles
-                    tree = ref_trees[res_idx]
-                    ref_labels = ref_labels_list[res_idx]
-                    if angles is None or tree is None:
-                        continue
-                    emb = _angles_to_embedding(angles[idxs])
-                    local_labels[:, res_idx] = _assign_labels_from_reference(emb, tree, ref_labels, k_neighbors)
-                labels_list.append(local_labels)
-                frame_state_ids.extend([state_id] * idxs.size)
-                frame_indices.extend(idxs.tolist())
-            if labels_list:
-                labels_concat = np.concatenate(labels_list, axis=0)
-                payload = {
-                    "residue_keys": np.asarray(residue_keys),
-                    "assigned__labels": labels_concat,
-                    "assigned__cluster_counts": merged_counts,
-                    "assigned__frame_state_id": np.asarray(frame_state_ids, dtype=str),
-                    "assigned__frame_indices": np.asarray(frame_indices, dtype=np.int64),
-                    "assigned__frame_metastable_id": np.array([meta_id]),
-                    "metadata_json": np.array(
-                        json.dumps(
-                            {
-                                "source_cluster": cluster_path.name,
-                                "metastable_id": meta_id,
-                                "generated_at": datetime.utcnow().isoformat(),
-                            }
-                        )
-                    ),
-                }
-                out_path = assign_dir / f"meta_{meta_id}.npz"
-                np.savez_compressed(out_path, **payload)
-                assigned_meta_paths[str(meta_id)] = str(out_path.relative_to(cluster_path.parent))
+                )
+            ),
+        }
+        if labels_assigned is not None:
+            payload["assigned__labels_assigned"] = labels_assigned
+
+        out_path = assign_dir / f"meta_{meta_id}.npz"
+        np.savez_compressed(out_path, **payload)
+        assigned_meta_paths[str(meta_id)] = str(out_path.relative_to(cluster_path.parent))
 
     return {
         "assigned_state_paths": assigned_state_paths,
@@ -1113,6 +694,186 @@ def _collect_cluster_inputs(
     }
 
 
+def _build_halo_summary(
+    *,
+    condition_ids: List[str],
+    condition_labels: List[str],
+    condition_types: List[str],
+    halo_matrix: List[np.ndarray],
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    if not halo_matrix:
+        matrix = np.zeros((0, 0), dtype=float)
+    else:
+        matrix = np.stack(halo_matrix, axis=0)
+    payload = {
+        "halo_rate__matrix": matrix,
+        "halo_rate__condition_ids": np.array(condition_ids, dtype=str),
+        "halo_rate__condition_labels": np.array(condition_labels, dtype=str),
+        "halo_rate__condition_types": np.array(condition_types, dtype=str),
+    }
+    meta = {
+        "npz_keys": {
+            "matrix": "halo_rate__matrix",
+            "condition_ids": "halo_rate__condition_ids",
+            "condition_labels": "halo_rate__condition_labels",
+            "condition_types": "halo_rate__condition_types",
+        }
+    }
+    return payload, meta
+
+
+def _build_condition_predictions(
+    *,
+    project_id: str,
+    system_id: str,
+    residue_keys: List[str],
+    dp_models: List[Data],
+    density_maxk: int,
+    density_z: float | str,
+    state_labels: Dict[str, str],
+    metastable_labels: Dict[str, str],
+    analysis_mode: Optional[str],
+) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    store = ProjectStore()
+    system_meta = store.get_system(project_id, system_id)
+    n_residues = len(residue_keys)
+
+    payload: Dict[str, Any] = {}
+    predictions_meta: Dict[str, Any] = {}
+    halo_condition_ids: List[str] = []
+    halo_condition_labels: List[str] = []
+    halo_condition_types: List[str] = []
+    halo_matrix: List[np.ndarray] = []
+
+    state_predictions: Dict[str, Dict[str, np.ndarray]] = {}
+    state_meta_labels: Dict[str, np.ndarray] = {}
+
+    for state_id, state in (system_meta.states or {}).items():
+        if not state.descriptor_file:
+            continue
+        desc_path = store.resolve_path(project_id, system_id, state.descriptor_file)
+        if not desc_path.exists():
+            continue
+        features = load_descriptor_npz(desc_path)
+        frame_count = _infer_frame_count(features)
+        if frame_count <= 0:
+            continue
+        labels_halo = np.full((frame_count, n_residues), -1, dtype=np.int32)
+        labels_assigned = np.full((frame_count, n_residues), -1, dtype=np.int32)
+
+        for res_idx, key in enumerate(residue_keys):
+            angles = _extract_angles_array(features, key)
+            if angles is None or angles.shape[0] != frame_count:
+                continue
+            labels_halo[:, res_idx] = _predict_cluster_adp(
+                dp_models[res_idx],
+                angles,
+                density_maxk=density_maxk,
+                density_z=density_z,
+                halo=True,
+            )
+            labels_assigned[:, res_idx] = _predict_cluster_adp(
+                dp_models[res_idx],
+                angles,
+                density_maxk=density_maxk,
+                density_z=density_z,
+                halo=False,
+            )
+
+        key_slug = _slug(str(state_id))
+        payload[f"state__{key_slug}__labels_halo"] = labels_halo
+        payload[f"state__{key_slug}__labels_assigned"] = labels_assigned
+        payload[f"state__{key_slug}__frame_indices"] = np.arange(frame_count, dtype=np.int64)
+        predictions_meta[f"state:{state_id}"] = {
+            "type": "macro",
+            "labels_halo": f"state__{key_slug}__labels_halo",
+            "labels_assigned": f"state__{key_slug}__labels_assigned",
+            "frame_indices": f"state__{key_slug}__frame_indices",
+            "frame_count": int(frame_count),
+        }
+        halo_condition_ids.append(f"state:{state_id}")
+        halo_condition_labels.append(state_labels.get(str(state_id), str(state_id)))
+        halo_condition_types.append("macro")
+        halo_matrix.append(np.mean(labels_halo == -1, axis=0))
+        state_predictions[str(state_id)] = {
+            "labels_halo": labels_halo,
+            "labels_assigned": labels_assigned,
+        }
+
+        if analysis_mode != "macro":
+            meta_labels = features.get("metastable_labels")
+            if meta_labels is None and state.metastable_labels_file:
+                label_path = store.resolve_path(project_id, system_id, state.metastable_labels_file)
+                if label_path.exists():
+                    meta_labels = np.load(label_path)
+            if meta_labels is not None:
+                state_meta_labels[str(state_id)] = np.asarray(meta_labels).astype(np.int32)
+
+    if analysis_mode != "macro":
+        meta_lookup = {m.get("metastable_id") or m.get("id"): m for m in (system_meta.metastable_states or [])}
+        for meta_id, meta in meta_lookup.items():
+            if meta_id is None:
+                continue
+            meta_index = meta.get("metastable_index")
+            if meta_index is None:
+                continue
+            labels_list = []
+            labels_assigned_list = []
+            frame_state_ids: List[str] = []
+            frame_indices: List[int] = []
+            for state_id, preds in state_predictions.items():
+                labels_meta = state_meta_labels.get(state_id)
+                if labels_meta is None:
+                    continue
+                mask = labels_meta == int(meta_index)
+                if not np.any(mask):
+                    continue
+                idxs = np.where(mask)[0]
+                labels_list.append(preds["labels_halo"][idxs])
+                labels_assigned_list.append(preds["labels_assigned"][idxs])
+                frame_state_ids.extend([state_id] * int(idxs.size))
+                frame_indices.extend(idxs.tolist())
+
+            if labels_list:
+                labels_halo = np.concatenate(labels_list, axis=0)
+                labels_assigned = np.concatenate(labels_assigned_list, axis=0)
+            else:
+                labels_halo = np.zeros((0, n_residues), dtype=np.int32)
+                labels_assigned = np.zeros((0, n_residues), dtype=np.int32)
+
+            key_slug = _slug(str(meta_id))
+            payload[f"meta__{key_slug}__labels_halo"] = labels_halo
+            payload[f"meta__{key_slug}__labels_assigned"] = labels_assigned
+            payload[f"meta__{key_slug}__frame_state_ids"] = np.array(frame_state_ids, dtype=str)
+            payload[f"meta__{key_slug}__frame_indices"] = np.array(frame_indices, dtype=np.int64)
+            payload[f"meta__{key_slug}__frame_metastable_ids"] = np.array([str(meta_id)] * len(frame_indices), dtype=str)
+            predictions_meta[f"meta:{meta_id}"] = {
+                "type": "metastable",
+                "labels_halo": f"meta__{key_slug}__labels_halo",
+                "labels_assigned": f"meta__{key_slug}__labels_assigned",
+                "frame_state_ids": f"meta__{key_slug}__frame_state_ids",
+                "frame_indices": f"meta__{key_slug}__frame_indices",
+                "frame_metastable_ids": f"meta__{key_slug}__frame_metastable_ids",
+                "frame_count": int(labels_halo.shape[0]),
+            }
+            halo_condition_ids.append(f"meta:{meta_id}")
+            halo_condition_labels.append(metastable_labels.get(str(meta_id), str(meta_id)))
+            halo_condition_types.append("metastable")
+            if labels_halo.size:
+                halo_matrix.append(np.mean(labels_halo == -1, axis=0))
+            else:
+                halo_matrix.append(np.full(n_residues, np.nan))
+
+    halo_payload, halo_meta = _build_halo_summary(
+        condition_ids=halo_condition_ids,
+        condition_labels=halo_condition_labels,
+        condition_types=halo_condition_types,
+        halo_matrix=halo_matrix,
+    )
+    payload.update(halo_payload)
+    return payload, predictions_meta, {"halo_summary": halo_meta}
+
+
 def generate_metastable_cluster_npz(
     project_id: str,
     system_id: str,
@@ -1126,13 +887,6 @@ def generate_metastable_cluster_npz(
     cluster_algorithm: str = "density_peaks",
     density_maxk: Optional[int] = 100,
     density_z: float | str | None = None,
-    dbscan_eps: float = 0.5,
-    dbscan_min_samples: int = 5,
-    hierarchical_n_clusters: Optional[int] = None,
-    hierarchical_linkage: str = "ward",
-    tomato_k: int = 15,
-    tomato_tau: float | str = "auto",
-    tomato_k_max: Optional[int] = None,
     progress_callback: Optional[Callable[[str, int, int], None]] = None,
 ) -> Tuple[Path, Dict[str, Any]]:
     """
@@ -1161,17 +915,9 @@ def generate_metastable_cluster_npz(
     contact_atom_mode = str(contact_atom_mode or "CA").upper()
     if contact_atom_mode not in {"CA", "CM"}:
         raise ValueError("contact_atom_mode must be 'CA' or 'CM'.")
-    algo = (cluster_algorithm or "dbscan").lower()
-    if algo not in {"tomato", "dbscan", "kmeans", "hierarchical", "density_peaks"}:
-        raise ValueError("cluster_algorithm must be one of: tomato, density_peaks, dbscan, kmeans, hierarchical.")
-    try:
-        db_eps_val = float(dbscan_eps)
-    except Exception as exc:
-        raise ValueError("dbscan_eps must be a number.") from exc
-    try:
-        db_min_samples_val = max(1, int(dbscan_min_samples))
-    except Exception as exc:
-        raise ValueError("dbscan_min_samples must be an integer >=1.") from exc
+    algo = (cluster_algorithm or "density_peaks").lower()
+    if algo != "density_peaks":
+        raise ValueError("Only density_peaks clustering is supported.")
     if density_maxk is None:
         density_maxk_val = 100
     else:
@@ -1186,21 +932,6 @@ def generate_metastable_cluster_npz(
             density_z_val = float(density_z)
         except Exception as exc:
             raise ValueError("density_z must be a number or 'auto'.") from exc
-    h_linkage = (hierarchical_linkage or "ward").lower()
-    if h_linkage not in {"ward", "complete", "average", "single"}:
-        h_linkage = "ward"
-    h_n_clusters_val = (
-        max_clusters_per_residue if hierarchical_n_clusters is None else max(1, int(hierarchical_n_clusters))
-    )
-    t_k = max(1, int(tomato_k))
-    t_k_max = max_clusters_per_residue if tomato_k_max is None else max(1, int(tomato_k_max))
-    if tomato_tau is None or (isinstance(tomato_tau, str) and tomato_tau.lower() == "auto"):
-        t_tau = "auto"
-    else:
-        try:
-            t_tau = float(tomato_tau)
-        except Exception as exc:
-            raise ValueError("tomato_tau must be a number or 'auto'.") from exc
 
     inputs = _collect_cluster_inputs(project_id, system_id, metastable_ids, cutoff_val, contact_atom_mode)
     unique_meta_ids = inputs["unique_meta_ids"]
@@ -1212,24 +943,22 @@ def generate_metastable_cluster_npz(
     merged_frame_indices = inputs["merged_frame_indices"]
     contact_edges = inputs["contact_edges"]
     contact_sources = inputs["contact_sources"]
-    tomato_diag_merged: Optional[Dict[str, Any]] = None
     total_residue_jobs = len(residue_keys)
     completed_residue_jobs = 0
-    assign_k = 10
     if progress_callback:
         progress_callback("Clustering residues...", 0, total_residue_jobs)
+
     store = ProjectStore()
     system_meta = store.get_system(project_id, system_id)
     state_labels, metastable_labels = _build_state_name_maps(system_meta)
     metastable_kinds = _build_metastable_kind_map(system_meta)
-    metastable_kinds = _build_metastable_kind_map(system_meta)
 
-    # Build merged clusters
     if not merged_angles_per_residue:
         raise ValueError("No frames gathered across the selected metastable states.")
 
     merged_frame_count = len(merged_frame_state_ids)
-    merged_labels = np.zeros((merged_frame_count, len(residue_keys)), dtype=np.int32)
+    merged_labels_halo = np.zeros((merged_frame_count, len(residue_keys)), dtype=np.int32)
+    merged_labels_assigned = np.zeros((merged_frame_count, len(residue_keys)), dtype=np.int32)
     merged_counts = np.zeros(len(residue_keys), dtype=np.int32)
     merged_subsample_indices = None
     if max_cluster_frames_val and merged_frame_count > max_cluster_frames_val:
@@ -1237,37 +966,31 @@ def generate_metastable_cluster_npz(
     merged_clustered_frames = (
         merged_subsample_indices.size if merged_subsample_indices is not None else merged_frame_count
     )
+
+    dp_models: List[Data] = []
+
     for col, samples in enumerate(merged_angles_per_residue):
         sample_arr = np.asarray(samples, dtype=float)
         if sample_arr.shape[0] != merged_frame_count:
             raise ValueError("Merged residue samples have inconsistent frame counts.")
-        labels_arr, k, diag, _ = _cluster_with_subsample(
+        labels_halo, labels_assigned, k, diag, _, dp_data = _cluster_with_subsample(
             sample_arr,
-            max_clusters_per_residue,
-            random_state,
-            algorithm=algo,
             density_maxk=density_maxk_val,
             density_z=density_z_val,
-            dbscan_eps=db_eps_val,
-            dbscan_min_samples=db_min_samples_val,
-            hierarchical_n_clusters=h_n_clusters_val,
-            hierarchical_linkage=h_linkage,
-            tomato_k=t_k,
-            tomato_tau=t_tau,
             max_cluster_frames=max_cluster_frames_val,
-            assign_k=assign_k,
             subsample_indices=merged_subsample_indices,
         )
-        if labels_arr.size == 0:
-            merged_labels[:, col] = -1
+        if labels_halo.size == 0:
+            merged_labels_halo[:, col] = -1
+            merged_labels_assigned[:, col] = -1
             merged_counts[col] = 0
         else:
-            if np.any(labels_arr >= 0):
-                k = max(k, int(labels_arr.max()) + 1)
-            merged_labels[:, col] = labels_arr
+            merged_labels_halo[:, col] = labels_halo
+            merged_labels_assigned[:, col] = labels_assigned
+            if np.any(labels_assigned >= 0):
+                k = max(k, int(labels_assigned.max()) + 1)
             merged_counts[col] = k
-        if algo == "tomato" and col == 0 and diag and tomato_diag_merged is None:
-            tomato_diag_merged = diag
+        dp_models.append(dp_data)
         if progress_callback and total_residue_jobs:
             completed_residue_jobs += 1
             progress_callback(
@@ -1275,6 +998,18 @@ def generate_metastable_cluster_npz(
                 completed_residue_jobs,
                 total_residue_jobs,
             )
+
+    condition_payload, predictions_meta, extra_meta = _build_condition_predictions(
+        project_id=project_id,
+        system_id=system_id,
+        residue_keys=residue_keys,
+        dp_models=dp_models,
+        density_maxk=density_maxk_val,
+        density_z=density_z_val,
+        state_labels=state_labels,
+        metastable_labels=metastable_labels,
+        analysis_mode=getattr(system_meta, "analysis_mode", None),
+    )
 
     # Persist NPZ
     dirs = store.ensure_directories(project_id, system_id)
@@ -1293,21 +1028,15 @@ def generate_metastable_cluster_npz(
         "state_labels": state_labels,
         "metastable_labels": metastable_labels,
         "metastable_kinds": metastable_kinds,
-        "cluster_algorithm": algo,
+        "cluster_algorithm": "density_peaks",
         "cluster_params": {
-            "dbscan_eps": db_eps_val,
-            "dbscan_min_samples": db_min_samples_val,
-            "hierarchical_n_clusters": h_n_clusters_val,
-            "hierarchical_linkage": h_linkage,
-            "tomato_k": t_k,
-            "tomato_tau": t_tau,
             "density_maxk": density_maxk_val,
             "density_z": density_z_val,
             "max_clusters_per_residue": max_clusters_per_residue,
             "max_cluster_frames": max_cluster_frames_val,
-            "assign_k": assign_k,
             "random_state": random_state,
         },
+        "predictions": predictions_meta,
         "residue_keys": residue_keys,
         "residue_mapping": residue_mapping,
         "max_clusters_per_residue": max_clusters_per_residue,
@@ -1321,6 +1050,8 @@ def generate_metastable_cluster_npz(
             "clustered_frames": int(merged_clustered_frames),
             "npz_keys": {
                 "labels": "merged__labels",
+                "labels_halo": "merged__labels",
+                "labels_assigned": "merged__labels_assigned",
                 "cluster_counts": "merged__cluster_counts",
                 "frame_state_ids": "merged__frame_state_ids",
                 "frame_metastable_ids": "merged__frame_metastable_ids",
@@ -1328,16 +1059,13 @@ def generate_metastable_cluster_npz(
             },
         },
     }
-    if algo == "tomato":
-        tomato_meta = {}
-        if tomato_diag_merged:
-            tomato_meta["merged_example"] = tomato_diag_merged
-        metadata["cluster_params"]["tomato_diagnostics"] = tomato_meta
+    metadata.update(extra_meta)
 
     payload: Dict[str, Any] = {
         "residue_keys": np.array(residue_keys),
         "metadata_json": np.array(json.dumps(metadata)),
-        "merged__labels": merged_labels,
+        "merged__labels": merged_labels_halo,
+        "merged__labels_assigned": merged_labels_assigned,
         "merged__cluster_counts": merged_counts,
         "merged__frame_state_ids": np.array(merged_frame_state_ids),
         "merged__frame_metastable_ids": np.array(merged_frame_meta_ids),
@@ -1350,6 +1078,7 @@ def generate_metastable_cluster_npz(
     payload["contact_edge_index"] = edge_index
     payload["contact_mode"] = np.array(contact_atom_mode)
     payload["contact_cutoff"] = np.array(cutoff_val)
+    payload.update(condition_payload)
 
     np.savez_compressed(out_path, **payload)
     return out_path, metadata
@@ -1365,16 +1094,8 @@ def prepare_cluster_workspace(
     random_state: int,
     contact_cutoff: float,
     contact_atom_mode: str,
-    cluster_algorithm: str,
     density_maxk: int,
     density_z: float | str | None,
-    dbscan_eps: float,
-    dbscan_min_samples: int,
-    hierarchical_n_clusters: Optional[int],
-    hierarchical_linkage: str,
-    tomato_k: int,
-    tomato_tau: float | str,
-    tomato_k_max: Optional[int],
     work_dir: Path,
 ) -> Dict[str, Any]:
     """Precompute and persist clustering inputs for fan-out chunk jobs."""
@@ -1432,23 +1153,13 @@ def prepare_cluster_workspace(
         "contact_mode_path": "contact_mode.npy",
         "contact_cutoff_path": "contact_cutoff.npy",
         "contact_sources": contact_sources,
-        "cluster_algorithm": cluster_algorithm,
+        "cluster_algorithm": "density_peaks",
         "cluster_params": {
-            "dbscan_eps": float(dbscan_eps),
-            "dbscan_min_samples": int(dbscan_min_samples),
-            "hierarchical_n_clusters": int(hierarchical_n_clusters)
-            if hierarchical_n_clusters is not None
-            else None,
-            "hierarchical_linkage": str(hierarchical_linkage or "ward"),
-            "tomato_k": int(tomato_k),
-            "tomato_tau": tomato_tau,
             "density_maxk": int(density_maxk),
             "density_z": density_z,
             "max_clusters_per_residue": int(max_clusters_per_residue),
             "max_cluster_frames": int(max_cluster_frames) if max_cluster_frames else None,
-            "assign_k": 10,
             "random_state": int(random_state),
-            "tomato_k_max": int(tomato_k_max) if tomato_k_max is not None else None,
         },
         "timestamp": datetime.utcnow().isoformat(),
     }
@@ -1471,32 +1182,20 @@ def run_cluster_chunk(
         raise ValueError(f"Residue index {residue_index} out of range (0..{n_residues - 1}).")
 
     params = manifest.get("cluster_params", {})
-    algo = manifest.get("cluster_algorithm", "density_peaks")
     sample_arr = np.asarray(angles[:, residue_index, :], dtype=float)
-    labels, k, diag, _ = _cluster_with_subsample(
+    labels_halo, labels_assigned, k, diag, _, _ = _cluster_with_subsample(
         sample_arr,
-        int(params.get("max_clusters_per_residue", 6)),
-        int(params.get("random_state", 0)),
-        algorithm=algo,
         density_maxk=int(params.get("density_maxk", 100)),
         density_z=params.get("density_z", "auto"),
-        dbscan_eps=float(params.get("dbscan_eps", 0.5)),
-        dbscan_min_samples=int(params.get("dbscan_min_samples", 5)),
-        hierarchical_n_clusters=params.get("hierarchical_n_clusters"),
-        hierarchical_linkage=params.get("hierarchical_linkage", "ward"),
-        tomato_k=int(params.get("tomato_k", 15)),
-        tomato_tau=params.get("tomato_tau", "auto"),
         max_cluster_frames=params.get("max_cluster_frames"),
-        assign_k=int(params.get("assign_k", 10)),
     )
 
     out_path = work_dir / f"chunk_{residue_index:04d}.npz"
     payload: Dict[str, Any] = {
-        "labels": labels.astype(np.int32),
+        "labels_halo": labels_halo.astype(np.int32),
+        "labels_assigned": labels_assigned.astype(np.int32),
         "cluster_count": np.array([int(k)], dtype=np.int32),
     }
-    if residue_index == 0 and algo == "tomato":
-        payload["diagnostics_json"] = np.array(json.dumps(diag))
 
     np.savez_compressed(out_path, **payload)
     return {"residue_index": residue_index, "path": str(out_path)}
@@ -1513,38 +1212,54 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
     n_residues = int(manifest.get("n_residues", len(residue_keys)))
     selected_meta_ids = manifest.get("selected_metastable_ids") or []
     cluster_params = manifest.get("cluster_params") or {}
-    algo = manifest.get("cluster_algorithm") or "density_peaks"
 
-    merged_labels = np.zeros((n_frames, n_residues), dtype=np.int32)
+    density_maxk_val = int(cluster_params.get("density_maxk", 100))
+    density_z_val = cluster_params.get("density_z", "auto")
+    max_cluster_frames_val = cluster_params.get("max_cluster_frames")
+
+    angles_path = work_dir / manifest["angles_path"]
+    angles = np.load(angles_path, mmap_mode="r")
+    if angles.shape[0] != n_frames or angles.shape[1] != n_residues:
+        raise ValueError("Angle array does not match manifest dimensions.")
+
+    merged_labels_halo = np.zeros((n_frames, n_residues), dtype=np.int32)
+    merged_labels_assigned = np.zeros((n_frames, n_residues), dtype=np.int32)
     merged_counts = np.zeros(n_residues, dtype=np.int32)
-    tomato_diag_merged = None
+    merged_subsample_indices = None
+    if max_cluster_frames_val and n_frames > int(max_cluster_frames_val):
+        merged_subsample_indices = _uniform_subsample_indices(n_frames, int(max_cluster_frames_val))
+    merged_clustered_frames = (
+        merged_subsample_indices.size if merged_subsample_indices is not None else n_frames
+    )
+
+    dp_models: List[Data] = []
 
     for idx in range(n_residues):
-        chunk_path = work_dir / f"chunk_{idx:04d}.npz"
-        if not chunk_path.exists():
-            raise ValueError(f"Missing cluster chunk output for residue index {idx}.")
-        data = np.load(chunk_path, allow_pickle=True)
-        labels = np.asarray(data["labels"], dtype=np.int32)
-        if labels.shape[0] != n_frames:
-            raise ValueError(f"Chunk {idx} has {labels.shape[0]} frames, expected {n_frames}.")
-        merged_labels[:, idx] = labels
-        merged_counts[idx] = int(np.asarray(data["cluster_count"]).reshape(-1)[0])
-        if idx == 0 and "diagnostics_json" in data:
-            try:
-                tomato_diag_merged = json.loads(str(data["diagnostics_json"].item()))
-            except Exception:
-                tomato_diag_merged = None
-
-    max_cluster_frames_val = cluster_params.get("max_cluster_frames")
-    if max_cluster_frames_val and n_frames > int(max_cluster_frames_val):
-        merged_clustered_frames = len(_uniform_subsample_indices(n_frames, int(max_cluster_frames_val)))
-    else:
-        merged_clustered_frames = n_frames
+        sample_arr = np.asarray(angles[:, idx, :], dtype=float)
+        labels_halo, labels_assigned, k, diag, _, dp_data = _cluster_with_subsample(
+            sample_arr,
+            density_maxk=density_maxk_val,
+            density_z=density_z_val,
+            max_cluster_frames=max_cluster_frames_val,
+            subsample_indices=merged_subsample_indices,
+        )
+        if labels_halo.size == 0:
+            merged_labels_halo[:, idx] = -1
+            merged_labels_assigned[:, idx] = -1
+            merged_counts[idx] = 0
+        else:
+            merged_labels_halo[:, idx] = labels_halo
+            merged_labels_assigned[:, idx] = labels_assigned
+            if np.any(labels_assigned >= 0):
+                k = max(k, int(labels_assigned.max()) + 1)
+            merged_counts[idx] = k
+        dp_models.append(dp_data)
 
     store = ProjectStore()
     dirs = store.ensure_directories(project_id, system_id)
     system_meta = store.get_system(project_id, system_id)
     state_labels, metastable_labels = _build_state_name_maps(system_meta)
+    metastable_kinds = _build_metastable_kind_map(system_meta)
     cluster_dir = dirs["system_dir"] / "metastable" / "clusters"
     cluster_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
@@ -1559,6 +1274,18 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
     contact_cutoff = np.load(work_dir / manifest["contact_cutoff_path"], allow_pickle=True)
     contact_sources = manifest.get("contact_sources") or []
 
+    condition_payload, predictions_meta, extra_meta = _build_condition_predictions(
+        project_id=project_id,
+        system_id=system_id,
+        residue_keys=residue_keys,
+        dp_models=dp_models,
+        density_maxk=density_maxk_val,
+        density_z=density_z_val,
+        state_labels=state_labels,
+        metastable_labels=metastable_labels,
+        analysis_mode=getattr(system_meta, "analysis_mode", None),
+    )
+
     metadata = {
         "project_id": project_id,
         "system_id": system_id,
@@ -1568,8 +1295,9 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
         "state_labels": state_labels,
         "metastable_labels": metastable_labels,
         "metastable_kinds": metastable_kinds,
-        "cluster_algorithm": algo,
+        "cluster_algorithm": "density_peaks",
         "cluster_params": cluster_params,
+        "predictions": predictions_meta,
         "residue_keys": residue_keys,
         "residue_mapping": residue_mapping,
         "max_clusters_per_residue": cluster_params.get("max_clusters_per_residue"),
@@ -1583,6 +1311,8 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
             "clustered_frames": int(merged_clustered_frames),
             "npz_keys": {
                 "labels": "merged__labels",
+                "labels_halo": "merged__labels",
+                "labels_assigned": "merged__labels_assigned",
                 "cluster_counts": "merged__cluster_counts",
                 "frame_state_ids": "merged__frame_state_ids",
                 "frame_metastable_ids": "merged__frame_metastable_ids",
@@ -1590,13 +1320,13 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
             },
         },
     }
-    if algo == "tomato" and tomato_diag_merged:
-        metadata["cluster_params"]["tomato_diagnostics"] = {"merged_example": tomato_diag_merged}
+    metadata.update(extra_meta)
 
     payload = {
         "residue_keys": np.array(residue_keys),
         "metadata_json": np.array(json.dumps(metadata)),
-        "merged__labels": merged_labels,
+        "merged__labels": merged_labels_halo,
+        "merged__labels_assigned": merged_labels_assigned,
         "merged__cluster_counts": merged_counts,
         "merged__frame_state_ids": frame_state_ids,
         "merged__frame_metastable_ids": frame_meta_ids,
@@ -1605,6 +1335,7 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
         "contact_mode": np.array(contact_mode),
         "contact_cutoff": np.array(contact_cutoff),
     }
+    payload.update(condition_payload)
 
     np.savez_compressed(out_path, **payload)
     return out_path, metadata

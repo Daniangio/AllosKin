@@ -16,7 +16,13 @@ from fastapi.concurrency import run_in_threadpool
 
 from backend.services.descriptors import save_descriptor_npz
 from backend.services.preprocessing import DescriptorPreprocessor
-from backend.services.project_store import DescriptorState, ProjectMetadata, ProjectStore, SystemMetadata
+from backend.services.project_store import (
+    DescriptorState,
+    ProjectMetadata,
+    ProjectStore,
+    SelectionInput,
+    SystemMetadata,
+)
 
 
 DATA_ROOT = Path(os.getenv("PHASE_DATA_ROOT", "/app/data"))
@@ -87,6 +93,25 @@ def parse_residue_selections(raw_value: Optional[str], expect_json: bool = False
     return lines or None
 
 
+def build_residue_selection_config(
+    *,
+    base_selections: Optional[SelectionInput],
+    residue_filter: Optional[str],
+) -> Optional[SelectionInput]:
+    """
+    If a residue_filter is provided, build a selection list that intersects
+    protein residues with the filter and expands to singles. Otherwise, fall
+    back to the base selections (or None for default protein selection).
+    """
+    if residue_filter is None:
+        return base_selections
+    selection = residue_filter.strip()
+    if not selection:
+        return base_selections
+    combined = f"protein and ({selection})"
+    return [f"{combined} [singles]"]
+
+
 def get_state_or_404(system_meta: SystemMetadata, state_id: str) -> DescriptorState:
     state = system_meta.states.get(state_id)
     if not state:
@@ -135,6 +160,7 @@ def _build_state_artifacts(
     descriptors_dir: Path,
     slice_spec: Optional[str],
     state_id: str,
+    selection_used: str,
 ) -> Tuple[Any, Dict[str, Path]]:
     build_result = preprocessor.build_single(str(traj_path), str(pdb_path), slice_spec)
     artifact_paths = {
@@ -146,13 +172,18 @@ def _build_state_artifacts(
         "descriptor_keys": build_result.residue_keys,
         "residue_mapping": build_result.residue_mapping,
         "n_frames": build_result.n_frames,
+        "residue_selection": selection_used,
     }
     artifact_paths["metadata"].write_text(json.dumps(metadata_payload, indent=2))
     return build_result, artifact_paths
 
 
 async def build_state_descriptors(
-    project_id: str, system_meta: SystemMetadata, state_meta: DescriptorState
+    project_id: str,
+    system_meta: SystemMetadata,
+    state_meta: DescriptorState,
+    *,
+    residue_filter: Optional[str] = None,
 ) -> SystemMetadata:
     if not state_meta.trajectory_file:
         raise HTTPException(status_code=400, detail="No trajectory uploaded for this state.")
@@ -171,7 +202,16 @@ async def build_state_descriptors(
     if not pdb_path.exists():
         raise HTTPException(status_code=404, detail="Stored PDB file missing on disk.")
 
-    preprocessor = DescriptorPreprocessor(residue_selections=system_meta.residue_selections)
+    selection_used = "protein"
+    if residue_filter is not None and residue_filter.strip():
+        selection_used = f"protein and ({residue_filter.strip()})"
+    elif system_meta.residue_selections:
+        selection_used = "system_selections"
+    selections_config = build_residue_selection_config(
+        base_selections=system_meta.residue_selections,
+        residue_filter=residue_filter,
+    )
+    preprocessor = DescriptorPreprocessor(residue_selections=selections_config)
     print(f"[state-update] Building descriptors for state={state_meta.state_id} system={system_meta.system_id}")
     build_result, artifact_paths = await run_in_threadpool(
         functools.partial(
@@ -182,6 +222,7 @@ async def build_state_descriptors(
             descriptors_dir=descriptors_dir,
             slice_spec=state_meta.slice_spec,
             state_id=state_meta.state_id,
+            selection_used=selection_used,
         )
     )
 
@@ -193,6 +234,7 @@ async def build_state_descriptors(
     state_meta.n_frames = build_result.n_frames
     state_meta.residue_keys = build_result.residue_keys
     state_meta.residue_mapping = build_result.residue_mapping
+    state_meta.residue_selection = residue_filter.strip() if residue_filter else None
 
     refresh_system_metadata(system_meta)
 

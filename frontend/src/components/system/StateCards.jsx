@@ -13,6 +13,7 @@ export function StateCard({
 }) {
   const [file, setFile] = useState(null);
   const [stride, setStride] = useState(state?.stride || 1);
+  const [residueSelection, setResidueSelection] = useState(state?.residue_selection || '');
 
   const descriptorLabel = state?.descriptor_file ? 'Ready' : 'Not built';
   const trajectoryLabel = state?.source_traj || '—';
@@ -87,8 +88,19 @@ export function StateCard({
             className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
           />
         </div>
+        <div>
+          <label className="block text-sm text-gray-300 mb-1">Residue filter (MDAnalysis)</label>
+          <input
+            type="text"
+            value={residueSelection}
+            onChange={(e) => setResidueSelection(e.target.value)}
+            placeholder="protein (default), e.g. resnum 10-300"
+            className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+          />
+          <p className="text-[11px] text-gray-500 mt-1">Applied as: protein and (&lt;filter&gt;).</p>
+        </div>
         <button
-          onClick={() => onUpload(state.state_id, file, stride)}
+          onClick={() => onUpload(state.state_id, file, stride, residueSelection)}
           disabled={uploading || !file}
           className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-semibold py-2 rounded-md transition-colors disabled:opacity-50"
         >

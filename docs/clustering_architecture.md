@@ -65,6 +65,19 @@ The frontend polls the orchestrator job ID, so progress is always tied to a sing
 - If any chunk job fails, the orchestrator raises and marks the cluster entry as failed.
 - Workspaces are kept on disk for debugging unless explicitly cleaned.
 
+## Assigning MD Frames to an Existing Cluster
+
+When we need to label frames from other MD trajectories (states or metastable subsets) using an already-built cluster
+NPZ, we do a per-residue k-nearest-neighbor (kNN) assignment in a periodic angle embedding:
+
+- For each residue, we build a reference KD-tree from the original clustered frames.
+- Each frame’s residue angles are embedded as `sin/cos` pairs (periodic, so the distance is meaningful across wrap-around).
+- For every target frame, we query the `k` nearest neighbors in that embedding and assign the majority label.
+- Default `k_neighbors` is 10. Missing residues or empty references yield label `-1` for that residue.
+
+This is distance-based, but done in the sin/cos embedding rather than raw angles.
+See `backend/services/metastable_clusters.py` (`assign_cluster_labels_to_states` and `_assign_labels_from_reference`).
+
 ## Worker Configuration
 
 Parallel fan-out requires multiple RQ worker processes. If only one worker is available, the orchestrator

@@ -253,16 +253,6 @@ export function ClusterBuildOverlay({
   onToggleMetastable,
   clusterName,
   setClusterName,
-  clusterAlgorithm,
-  setClusterAlgorithm,
-  tomatoK,
-  setTomatoK,
-  tomatoTauMode,
-  setTomatoTauMode,
-  tomatoTauValue,
-  setTomatoTauValue,
-  tomatoKMax,
-  setTomatoKMax,
   densityZMode,
   setDensityZMode,
   densityZValue,
@@ -273,16 +263,6 @@ export function ClusterBuildOverlay({
   setMaxClustersPerResidue,
   maxClusterFrames,
   setMaxClusterFrames,
-  selectedClusterFrameCount,
-  clusterFrameCap,
-  dbscanEps,
-  setDbscanEps,
-  dbscanMinSamples,
-  setDbscanMinSamples,
-  hierClusters,
-  setHierClusters,
-  hierLinkage,
-  setHierLinkage,
   contactMode,
   setContactMode,
   contactCutoff,
@@ -364,163 +344,44 @@ export function ClusterBuildOverlay({
                   className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
                 />
               </label>
-              <label className="space-y-1">
-                <span className="block text-gray-400">Algorithm</span>
-                <select
-                  value={clusterAlgorithm}
-                  onChange={(e) => setClusterAlgorithm(e.target.value)}
-                  className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                >
-                  <option value="DENSITY_PEAKS">Density Peaks</option>
-                  <option value="TOMATO">ToMATo</option>
-                  <option value="DBSCAN">DBSCAN</option>
-                  <option value="HIERARCHICAL">Hierarchical</option>
-                </select>
-              </label>
             </div>
 
-            {clusterAlgorithm === 'DENSITY_PEAKS' && (
-              <div className="grid md:grid-cols-3 gap-3">
+            <div className="grid md:grid-cols-3 gap-3">
+              <label className="space-y-1">
+                <span className="block text-gray-400">Z threshold</span>
+                <select
+                  value={densityZMode}
+                  onChange={(e) => setDensityZMode(e.target.value)}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+                >
+                  <option value="auto">Auto</option>
+                  <option value="manual">Manual</option>
+                </select>
+              </label>
+              {densityZMode === 'manual' && (
                 <label className="space-y-1">
-                  <span className="block text-gray-400">Z threshold</span>
-                  <select
-                    value={densityZMode}
-                    onChange={(e) => setDensityZMode(e.target.value)}
-                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                  >
-                    <option value="auto">Auto</option>
-                    <option value="manual">Manual</option>
-                  </select>
-                </label>
-                {densityZMode === 'manual' && (
-                  <label className="space-y-1">
-                    <span className="block text-gray-400">Z value</span>
-                    <input
-                      type="number"
-                      step="0.05"
-                      min={0}
-                      value={densityZValue}
-                      onChange={(e) => setDensityZValue(Math.max(0.1, Number(e.target.value) || 0))}
-                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                    />
-                  </label>
-                )}
-                <label className="space-y-1">
-                  <span className="block text-gray-400">Max k</span>
-                  <input
-                    type="number"
-                    min={5}
-                    value={densityMaxk}
-                    onChange={(e) => setDensityMaxk(Math.max(5, Number(e.target.value) || 5))}
-                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                  />
-                </label>
-              </div>
-            )}
-
-            {clusterAlgorithm === 'TOMATO' && (
-              <div className="grid md:grid-cols-3 gap-3">
-                <label className="space-y-1">
-                  <span className="block text-gray-400">k neighbors</span>
-                  <input
-                    type="number"
-                    min={5}
-                    value={tomatoK}
-                    onChange={(e) => setTomatoK(Math.max(5, Number(e.target.value) || 5))}
-                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                  />
-                </label>
-                <label className="space-y-1">
-                  <span className="block text-gray-400">Tau mode</span>
-                  <select
-                    value={tomatoTauMode}
-                    onChange={(e) => setTomatoTauMode(e.target.value)}
-                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                  >
-                    <option value="auto">Auto</option>
-                    <option value="manual">Manual</option>
-                  </select>
-                </label>
-                {tomatoTauMode === 'manual' && (
-                  <label className="space-y-1">
-                    <span className="block text-gray-400">Tau</span>
-                    <input
-                      type="number"
-                      step="0.05"
-                      min={0}
-                      value={tomatoTauValue}
-                      onChange={(e) => setTomatoTauValue(Math.max(0.1, Number(e.target.value) || 0))}
-                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                    />
-                  </label>
-                )}
-                <label className="space-y-1">
-                  <span className="block text-gray-400">k max</span>
-                  <input
-                    type="number"
-                    min={3}
-                    value={tomatoKMax}
-                    onChange={(e) => setTomatoKMax(Math.max(3, Number(e.target.value) || 3))}
-                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                  />
-                </label>
-              </div>
-            )}
-
-            {clusterAlgorithm === 'DBSCAN' && (
-              <div className="grid md:grid-cols-3 gap-3">
-                <label className="space-y-1">
-                  <span className="block text-gray-400">Epsilon</span>
+                  <span className="block text-gray-400">Z value</span>
                   <input
                     type="number"
                     step="0.05"
-                    min={0.1}
-                    value={dbscanEps}
-                    onChange={(e) => setDbscanEps(Math.max(0.05, Number(e.target.value) || 0.05))}
+                    min={0}
+                    value={densityZValue}
+                    onChange={(e) => setDensityZValue(Math.max(0.1, Number(e.target.value) || 0))}
                     className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
                   />
                 </label>
-                <label className="space-y-1">
-                  <span className="block text-gray-400">Min samples</span>
-                  <input
-                    type="number"
-                    min={2}
-                    value={dbscanMinSamples}
-                    onChange={(e) => setDbscanMinSamples(Math.max(2, Number(e.target.value) || 2))}
-                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                  />
-                </label>
-              </div>
-            )}
-
-            {clusterAlgorithm === 'HIERARCHICAL' && (
-              <>
-                <label className="space-y-1">
-                  <span className="block text-gray-400">Clusters / residue</span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={12}
-                    value={hierClusters}
-                    onChange={(e) => setHierClusters(Math.max(1, Number(e.target.value) || 1))}
-                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                  />
-                </label>
-                <label className="space-y-1">
-                  <span className="block text-gray-400">Linkage</span>
-                  <select
-                    value={hierLinkage}
-                    onChange={(e) => setHierLinkage(e.target.value)}
-                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
-                  >
-                    <option value="ward">Ward</option>
-                    <option value="complete">Complete</option>
-                    <option value="average">Average</option>
-                    <option value="single">Single</option>
-                  </select>
-                </label>
-              </>
-            )}
+              )}
+              <label className="space-y-1">
+                <span className="block text-gray-400">Max k</span>
+                <input
+                  type="number"
+                  min={5}
+                  value={densityMaxk}
+                  onChange={(e) => setDensityMaxk(Math.max(5, Number(e.target.value) || 5))}
+                  className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+                />
+              </label>
+            </div>
             <label className="space-y-1">
               <span className="block text-gray-400">Contact mode</span>
               <select
@@ -689,7 +550,7 @@ export function ClusterDetailOverlay({ cluster, analysisMode, onClose, onRename,
   );
 }
 
-export function InfoOverlay({ state, type, onClose, onRenameMacro, onRenameMeta }) {
+export function InfoOverlay({ state, type, onClose, onRenameMacro, onRenameMeta, onDownloadMacroNpz }) {
   const [isEditing, setIsEditing] = useState(false);
   const [name, setName] = useState(state.name || state.default_name || '');
   const isMetastable = type === 'meta';
@@ -767,6 +628,15 @@ export function InfoOverlay({ state, type, onClose, onRenameMacro, onRenameMeta 
             <span className="font-semibold">Descriptors Ready:</span>{' '}
             {state.descriptor_file ? 'Yes' : 'No'}
           </p>
+          {!isMetastable && state.descriptor_file && (
+            <button
+              type="button"
+              onClick={() => onDownloadMacroNpz?.(state.state_id, state.name)}
+              className="text-xs px-3 py-2 rounded-md border border-cyan-500 text-cyan-300 hover:bg-cyan-500/10"
+            >
+              Download descriptors (NPZ)
+            </button>
+          )}
           {isMetastable && state.representative_pdb && (
             <p>
               <span className="font-semibold">Representative PDB:</span>{' '}
