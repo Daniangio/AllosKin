@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Download, Eye, Plus, SlidersHorizontal, Trash2, UploadCloud, X } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Check, Download, Eye, Pencil, Plus, SlidersHorizontal, Trash2, UploadCloud, X } from 'lucide-react';
 import ErrorMessage from '../common/ErrorMessage';
 import { AnalysisResultsList, InfoTooltip } from './SystemDetailWidgets';
 import SimulationAnalysisForm from '../analysis/SimulationAnalysisForm';
@@ -16,6 +16,12 @@ export default function SystemDetailPottsSection(props) {
     pottsFitClusterId,
     pottsFitMode,
     setPottsFitMode,
+    pottsFitKind,
+    setPottsFitKind,
+    pottsDeltaBaseModelId,
+    setPottsDeltaBaseModelId,
+    pottsDeltaStateIds,
+    setPottsDeltaStateIds,
     setPottsFitClusterId,
     readyClusterRuns,
     pottsModelName,
@@ -36,6 +42,8 @@ export default function SystemDetailPottsSection(props) {
     setPottsFitAdvanced,
     pottsFitParams,
     setPottsFitParams,
+    pottsDeltaParams,
+    setPottsDeltaParams,
     pottsFitError,
     enqueuePottsFitJob,
     pottsFitSubmitting,
@@ -82,12 +90,43 @@ export default function SystemDetailPottsSection(props) {
   const [backmappingUploadError, setBackmappingUploadError] = useState(null);
   const [backmappingUploadBusy, setBackmappingUploadBusy] = useState(false);
   const [backmappingFiles, setBackmappingFiles] = useState({});
+  const [renameEditingId, setRenameEditingId] = useState(null);
 
   const clusterLabel =
     selectedClusterName || selectedCluster?.name || selectedCluster?.cluster_id || '';
   const clusterFileName = selectedCluster?.path?.split('/').pop();
   const backmappingJob = pottsFitClusterId ? backmappingJobStatus?.[pottsFitClusterId] : null;
   const backmappingProgress = pottsFitClusterId ? backmappingProgressById?.[pottsFitClusterId] : null;
+  const analysisStateOptions = useMemo(() => {
+    const options = [];
+    (states || []).forEach((state) => {
+      if (!state?.state_id) return;
+      options.push({
+        value: state.state_id,
+        label: `[macro] ${state.name || state.state_id}`,
+      });
+    });
+    if (metastableById instanceof Map) {
+      metastableById.forEach((meta, key) => {
+        const id = meta?.metastable_id || meta?.id || key;
+        if (!id) return;
+        options.push({
+          value: String(id),
+          label: `[metastable] ${meta?.name || meta?.default_name || id}`,
+        });
+      });
+    }
+    return options;
+  }, [states, metastableById]);
+  const baseNameById = useMemo(() => {
+    const map = new Map();
+    (pottsModels || []).forEach((model) => {
+      if (model?.model_id) {
+        map.set(model.model_id, formatPottsModelName(model));
+      }
+    });
+    return map;
+  }, [pottsModels, formatPottsModelName]);
 
   return (
     <div className="space-y-4">
@@ -214,50 +253,113 @@ export default function SystemDetailPottsSection(props) {
             <div className="space-y-3">
               {pottsModels.map((run) => {
                 const displayName = formatPottsModelName(run);
-                const value = pottsRenameValues[run.model_id] ?? displayName;
                 const isBusy = pottsRenameBusy[run.model_id];
                 const isDeleting = pottsDeleteBusy[run.model_id];
+                const deltaKind = run?.params?.delta_kind || (run?.params?.fit_mode === 'delta' ? 'delta' : null);
+                const baseModelId = run?.params?.base_model_id;
+                const baseLabel = baseModelId ? baseNameById.get(baseModelId) : null;
+                const isEditing = renameEditingId === run.model_id;
+                const draftValue = pottsRenameValues[run.model_id] ?? displayName;
                 return (
                   <div key={run.model_id} className="rounded-md border border-gray-800 bg-gray-950/50 p-2 space-y-2">
-                    <input
-                      type="text"
-                      value={value}
-                      onChange={(event) =>
-                        setPottsRenameValues((prev) => ({
-                          ...prev,
-                          [run.model_id]: event.target.value,
-                        }))
-                      }
-                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-xs text-white focus:ring-cyan-500"
-                    />
-                    <div className="flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleDownloadPottsModel(run.cluster_id, run.model_id, run.path?.split('/').pop())
-                        }
-                        disabled={isBusy || isDeleting}
-                        className="text-[11px] px-2 py-1 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60 disabled:opacity-50"
-                      >
-                        Download
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleRenamePottsModel(run.cluster_id, run.model_id)}
-                        disabled={isBusy || isDeleting}
-                        className="text-[11px] px-2 py-1 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60 disabled:opacity-50"
-                      >
-                        {isBusy ? 'Saving…' : 'Rename'}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleDeletePottsModel(run.cluster_id, run.model_id)}
-                        disabled={isDeleting || isBusy}
-                        className="text-[11px] px-2 py-1 rounded-md border border-red-500/40 text-red-200 hover:bg-red-500/10 disabled:opacity-50"
-                      >
-                        {isDeleting ? 'Deleting…' : 'Delete'}
-                      </button>
+                    <div className="flex items-center gap-2">
+                      {!isEditing ? (
+                        <p className="flex-1 min-w-0 text-sm text-white truncate">{displayName}</p>
+                      ) : (
+                        <input
+                          type="text"
+                          value={draftValue}
+                          onChange={(event) =>
+                            setPottsRenameValues((prev) => ({
+                              ...prev,
+                              [run.model_id]: event.target.value,
+                            }))
+                          }
+                          className="flex-1 min-w-0 bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-xs text-white focus:ring-cyan-500"
+                        />
+                      )}
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleDownloadPottsModel(run.cluster_id, run.model_id, run.path?.split('/').pop())
+                          }
+                          disabled={isBusy || isDeleting}
+                          className="inline-flex items-center justify-center rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60 disabled:opacity-50 p-1.5"
+                          aria-label="Download Potts model"
+                        >
+                          <Download className="h-4 w-4" />
+                        </button>
+                        {!isEditing && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPottsRenameValues((prev) => ({
+                                ...prev,
+                                [run.model_id]: displayName,
+                              }));
+                              setRenameEditingId(run.model_id);
+                            }}
+                            disabled={isBusy || isDeleting}
+                            className="inline-flex items-center justify-center rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60 disabled:opacity-50 p-1.5"
+                            aria-label="Rename Potts model"
+                          >
+                            <Pencil className="h-4 w-4" />
+                          </button>
+                        )}
+                        {isEditing && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                const name = (pottsRenameValues[run.model_id] || '').trim();
+                                if (!name) {
+                                  await handleRenamePottsModel(run.cluster_id, run.model_id);
+                                  return;
+                                }
+                                await handleRenamePottsModel(run.cluster_id, run.model_id);
+                                setRenameEditingId(null);
+                              }}
+                              disabled={isBusy || isDeleting}
+                              className="inline-flex items-center justify-center rounded-md border border-cyan-500 text-cyan-200 hover:bg-cyan-500/10 disabled:opacity-50 p-1.5"
+                              aria-label="Confirm rename"
+                            >
+                              <Check className="h-4 w-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setRenameEditingId(null);
+                                setPottsRenameValues((prev) => {
+                                  const next = { ...prev };
+                                  delete next[run.model_id];
+                                  return next;
+                                });
+                              }}
+                              disabled={isBusy || isDeleting}
+                              className="inline-flex items-center justify-center rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60 disabled:opacity-50 p-1.5"
+                              aria-label="Cancel rename"
+                            >
+                              <X className="h-4 w-4" />
+                            </button>
+                          </>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleDeletePottsModel(run.cluster_id, run.model_id)}
+                          disabled={isDeleting || isBusy}
+                          className="inline-flex items-center justify-center rounded-md border border-red-500/40 text-red-200 hover:bg-red-500/10 disabled:opacity-50 p-1.5"
+                          aria-label="Delete Potts model"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
                     </div>
+                    {deltaKind && (
+                      <p className="text-[10px] text-cyan-300">
+                        Δ patch{baseLabel ? ` · base: ${baseLabel}` : ''}
+                      </p>
+                    )}
                   </div>
                 );
               })}
@@ -469,6 +571,30 @@ export default function SystemDetailPottsSection(props) {
                     })}
                   </select>
                 </div>
+                <div className="flex items-center gap-2 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => setPottsFitKind('standard')}
+                    className={`px-3 py-1 rounded-full border ${
+                      pottsFitKind === 'standard'
+                        ? 'border-cyan-400 text-cyan-200 bg-cyan-500/10'
+                        : 'border-gray-700 text-gray-400 hover:border-gray-500'
+                    }`}
+                  >
+                    Standard fit
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPottsFitKind('delta')}
+                    className={`px-3 py-1 rounded-full border ${
+                      pottsFitKind === 'delta'
+                        ? 'border-cyan-400 text-cyan-200 bg-cyan-500/10'
+                        : 'border-gray-700 text-gray-400 hover:border-gray-500'
+                    }`}
+                  >
+                    Delta fit
+                  </button>
+                </div>
                 <div>
                   <label className="block text-sm text-gray-300 mb-1">Potts model name</label>
                   <input
@@ -479,53 +605,112 @@ export default function SystemDetailPottsSection(props) {
                     className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
                   />
                 </div>
-                <div>
-                  <label className="block text-sm text-gray-300 mb-1">Fit method</label>
-                  <select
-                    value={pottsFitMethod}
-                    onChange={(event) => setPottsFitMethod(event.target.value)}
-                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
-                  >
-                    <option value="pmi+plm">PMI + PLM</option>
-                    <option value="plm">PLM only</option>
-                    <option value="pmi">PMI only</option>
-                  </select>
-                </div>
-                <div className="grid md:grid-cols-2 gap-3 text-sm">
-                  <label className="space-y-1">
-                    <span className="text-xs text-gray-400">Contact mode</span>
-                    <select
-                      value={pottsFitContactMode}
-                      onChange={(event) => setPottsFitContactMode(event.target.value)}
-                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
-                    >
-                      <option value="CA">CA</option>
-                      <option value="CM">Residue CM</option>
-                    </select>
-                  </label>
-                  <label className="space-y-1">
-                    <span className="text-xs text-gray-400">Contact cutoff (A)</span>
-                    <input
-                      type="number"
-                      min={1}
-                      step="0.5"
-                      value={pottsFitContactCutoff}
-                      onChange={(event) =>
-                        setPottsFitContactCutoff(Math.max(0.1, Number(event.target.value) || 0))
-                      }
-                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
-                    />
-                  </label>
-                </div>
+                {pottsFitKind === 'delta' && (
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-sm text-gray-300 mb-1">Base Potts model</label>
+                      <select
+                        value={pottsDeltaBaseModelId}
+                        onChange={(event) => setPottsDeltaBaseModelId(event.target.value)}
+                        disabled={!pottsModels.length}
+                        className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500 disabled:opacity-60"
+                      >
+                        {!pottsModels.length && <option value="">No base models available</option>}
+                        {pottsModels.map((model) => (
+                          <option key={model.model_id} value={model.model_id}>
+                            {formatPottsModelName(model)}
+                          </option>
+                        ))}
+                      </select>
+                      <p className="text-xs text-gray-500 mt-1">
+                        Delta fit learns sparse patches on top of the selected base model.
+                      </p>
+                    </div>
+                    <div className="space-y-2">
+                      <p className="text-xs text-gray-400">
+                        Select one or more macro/metastable states to fit the delta patch.
+                      </p>
+                      {analysisStateOptions.length === 0 && (
+                        <p className="text-xs text-gray-500">No states available for delta fit.</p>
+                      )}
+                      {analysisStateOptions.length > 0 && (
+                        <div className="grid md:grid-cols-2 gap-2 text-xs text-gray-200">
+                          {analysisStateOptions.map((opt) => {
+                            const checked = pottsDeltaStateIds.includes(opt.value);
+                            return (
+                              <label key={`delta-${opt.value}`} className="flex items-center gap-2">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() =>
+                                    setPottsDeltaStateIds((prev) =>
+                                      checked
+                                        ? prev.filter((id) => id !== opt.value)
+                                        : [...prev, opt.value]
+                                    )
+                                  }
+                                  className="h-4 w-4 text-cyan-500 rounded border-gray-600 bg-gray-900"
+                                />
+                                <span>{opt.label}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {pottsFitKind !== 'delta' && (
+                  <>
+                    <div>
+                      <label className="block text-sm text-gray-300 mb-1">Fit method</label>
+                      <select
+                        value={pottsFitMethod}
+                        onChange={(event) => setPottsFitMethod(event.target.value)}
+                        className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                      >
+                        <option value="pmi+plm">PMI + PLM</option>
+                        <option value="plm">PLM only</option>
+                        <option value="pmi">PMI only</option>
+                      </select>
+                    </div>
+                    <div className="grid md:grid-cols-2 gap-3 text-sm">
+                      <label className="space-y-1">
+                        <span className="text-xs text-gray-400">Contact mode</span>
+                        <select
+                          value={pottsFitContactMode}
+                          onChange={(event) => setPottsFitContactMode(event.target.value)}
+                          className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                        >
+                          <option value="CA">CA</option>
+                          <option value="CM">Residue CM</option>
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-xs text-gray-400">Contact cutoff (A)</span>
+                        <input
+                          type="number"
+                          min={1}
+                          step="0.5"
+                          value={pottsFitContactCutoff}
+                          onChange={(event) =>
+                            setPottsFitContactCutoff(Math.max(0.1, Number(event.target.value) || 0))
+                          }
+                          className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                        />
+                      </label>
+                    </div>
+                  </>
+                )}
                 <button
                   type="button"
                   onClick={() => setPottsFitAdvanced((prev) => !prev)}
                   className="flex items-center gap-2 text-xs text-cyan-300 hover:text-cyan-200"
                 >
                   <SlidersHorizontal className="h-4 w-4" />
-                  {pottsFitAdvanced ? 'Hide' : 'Show'} fit hyperparams
+                  {pottsFitAdvanced ? 'Hide' : 'Show'} {pottsFitKind === 'delta' ? 'delta' : 'fit'} hyperparams
                 </button>
-                {pottsFitAdvanced && (
+                {pottsFitAdvanced && pottsFitKind !== 'delta' && (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
                     {[
                       { key: 'plm_epochs', label: 'PLM epochs', placeholder: '200' },
@@ -567,6 +752,106 @@ export default function SystemDetailPottsSection(props) {
                         <option value="none">None</option>
                       </select>
                     </label>
+                  </div>
+                )}
+                {pottsFitAdvanced && pottsFitKind === 'delta' && (
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                      {[
+                        { key: 'delta_epochs', label: 'Epochs', placeholder: '200' },
+                        { key: 'delta_lr', label: 'Learning rate', placeholder: '1e-3' },
+                        { key: 'delta_lr_min', label: 'LR min', placeholder: '1e-3' },
+                        { key: 'delta_batch_size', label: 'Batch size', placeholder: '512' },
+                        { key: 'delta_seed', label: 'Random seed', placeholder: '0' },
+                        { key: 'delta_l2', label: 'Delta L2', placeholder: '0.0' },
+                        { key: 'delta_group_h', label: 'Group sparsity (fields)', placeholder: '0.0' },
+                        { key: 'delta_group_j', label: 'Group sparsity (couplings)', placeholder: '0.0' },
+                      ].map((field) => (
+                        <label key={field.key} className="space-y-1">
+                          <span className="text-xs text-gray-400">{field.label}</span>
+                          <input
+                            type="text"
+                            placeholder={field.placeholder}
+                            value={pottsDeltaParams[field.key]}
+                            onChange={(event) =>
+                              setPottsDeltaParams((prev) => ({
+                                ...prev,
+                                [field.key]: event.target.value,
+                              }))
+                            }
+                            className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                          />
+                        </label>
+                      ))}
+                    </div>
+                    <div className="grid md:grid-cols-2 gap-3 text-sm">
+                      <label className="space-y-1">
+                        <span className="text-xs text-gray-400">LR schedule</span>
+                        <select
+                          value={pottsDeltaParams.delta_lr_schedule}
+                          onChange={(event) =>
+                            setPottsDeltaParams((prev) => ({
+                              ...prev,
+                              delta_lr_schedule: event.target.value,
+                            }))
+                          }
+                          className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                        >
+                          <option value="cosine">Cosine</option>
+                          <option value="none">None</option>
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-xs text-gray-400">Device</span>
+                        <select
+                          value={pottsDeltaParams.delta_device}
+                          onChange={(event) =>
+                            setPottsDeltaParams((prev) => ({
+                              ...prev,
+                              delta_device: event.target.value,
+                            }))
+                          }
+                          className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                        >
+                          <option value="auto">Auto</option>
+                          <option value="cpu">CPU</option>
+                          <option value="cuda">CUDA</option>
+                        </select>
+                      </label>
+                    </div>
+                    <div className="grid md:grid-cols-2 gap-3 text-sm">
+                      <label className="space-y-1">
+                        <span className="text-xs text-gray-400">Unassigned policy</span>
+                        <select
+                          value={pottsDeltaParams.unassigned_policy}
+                          onChange={(event) =>
+                            setPottsDeltaParams((prev) => ({
+                              ...prev,
+                              unassigned_policy: event.target.value,
+                            }))
+                          }
+                          className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                        >
+                          <option value="drop_frames">Drop frames</option>
+                          <option value="treat_as_state">Treat as state</option>
+                          <option value="error">Error</option>
+                        </select>
+                      </label>
+                      <label className="flex items-center gap-2 text-xs text-gray-300 mt-6">
+                        <input
+                          type="checkbox"
+                          checked={!!pottsDeltaParams.delta_no_combined}
+                          onChange={(event) =>
+                            setPottsDeltaParams((prev) => ({
+                              ...prev,
+                              delta_no_combined: event.target.checked,
+                            }))
+                          }
+                          className="h-4 w-4 text-cyan-500 rounded border-gray-600 bg-gray-900"
+                        />
+                        Skip saving combined models
+                      </label>
+                    </div>
                   </div>
                 )}
                 {pottsFitError && <ErrorMessage message={pottsFitError} />}

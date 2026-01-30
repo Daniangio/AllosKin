@@ -30,6 +30,108 @@ from backend.tasks import run_cluster_job, run_backmapping_job
 router = APIRouter()
 
 
+def _remove_results_dir(path_value: str | None, *, system_dir: Path | None = None) -> None:
+    if not isinstance(path_value, str) or not path_value:
+        return
+    candidate = Path(path_value)
+    if not candidate.is_absolute():
+        candidate = DATA_ROOT / candidate
+    candidate = candidate.resolve()
+    try:
+        candidate.relative_to(DATA_ROOT)
+    except ValueError:
+        return
+    if system_dir is not None:
+        results_root = (system_dir / "results").resolve()
+        try:
+            candidate.relative_to(results_root)
+        except ValueError:
+            return
+    if candidate.exists() and candidate.is_dir():
+        shutil.rmtree(candidate, ignore_errors=True)
+
+
+def _matches_sample(payload: dict, sample_id: str) -> bool:
+    system_ref = payload.get("system_reference") or {}
+    if system_ref.get("sample_id") == sample_id:
+        return True
+    results_payload = payload.get("results") or {}
+    for key in ("results_dir", "summary_npz"):
+        value = results_payload.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        parts = Path(value).parts
+        if sample_id in parts:
+            return True
+    return False
+
+
+def _matches_model(payload: dict, model_id: str) -> bool:
+    system_ref = payload.get("system_reference") or {}
+    if system_ref.get("potts_model_id") == model_id:
+        return True
+    params_payload = payload.get("params") or {}
+    if params_payload.get("potts_model_id") == model_id:
+        return True
+    results_payload = payload.get("results") or {}
+    value = results_payload.get("potts_model")
+    if isinstance(value, str) and value:
+        parts = Path(value).parts
+        if model_id in parts:
+            return True
+    return False
+
+
+def _remove_simulation_results(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    *,
+    sample_id: str | None = None,
+    model_id: str | None = None,
+) -> int:
+    removed = 0
+    results_dirs = project_store.ensure_results_directories(project_id, system_id)
+    jobs_dir = results_dirs["jobs_dir"]
+    system_dir = results_dirs["system_dir"]
+    if not jobs_dir.exists():
+        return removed
+    for result_file in jobs_dir.glob("*.json"):
+        try:
+            payload = json.loads(result_file.read_text())
+        except Exception:
+            continue
+        if payload.get("analysis_type") != "simulation":
+            continue
+        system_ref = payload.get("system_reference") or {}
+        if cluster_id and system_ref.get("cluster_id") != cluster_id:
+            continue
+        if sample_id and not _matches_sample(payload, sample_id):
+            continue
+        if model_id and not _matches_model(payload, model_id):
+            continue
+        try:
+            _remove_results_dir((payload.get("results") or {}).get("results_dir"), system_dir=system_dir)
+            result_file.unlink(missing_ok=True)
+            removed += 1
+        except Exception:
+            continue
+    if jobs_dir.exists():
+        try:
+            if not any(jobs_dir.iterdir()):
+                jobs_dir.rmdir()
+        except Exception:
+            pass
+    results_dir = system_dir / "results"
+    if results_dir.exists():
+        try:
+            if not any(results_dir.iterdir()):
+                results_dir.rmdir()
+        except Exception:
+            pass
+    return removed
+
+
 def _parse_state_ids(raw: str) -> List[str]:
     if not raw:
         return []
@@ -261,6 +363,12 @@ async def delete_sampling_sample(
 
     entry["samples"] = [s for s in samples if not (isinstance(s, dict) and s.get("sample_id") == sample_id)]
     project_store.save_system(system_meta)
+    _remove_simulation_results(
+        project_id,
+        system_id,
+        cluster_id,
+        sample_id=sample_id,
+    )
     return {"status": "deleted", "sample_id": sample_id}
 
 
@@ -1212,4 +1320,10 @@ async def delete_potts_model_npz(project_id: str, system_id: str, cluster_id: st
     entry["potts_models"] = [m for m in models if m.get("model_id") != model_id]
     system_meta.metastable_clusters = clusters
     project_store.save_system(system_meta)
+    _remove_simulation_results(
+        project_id,
+        system_id,
+        cluster_id,
+        model_id=model_id,
+    )
     return {"status": "deleted", "cluster_id": cluster_id, "model_id": model_id}

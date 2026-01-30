@@ -44,9 +44,14 @@ export function AnalysisResultsList({ results, emptyLabel, onOpen, onOpenSimulat
           <div className="flex items-center gap-3">
             <StatusBadge status={result.status} />
             <div>
-              <p className="text-sm text-gray-200">{result.analysis_type.toUpperCase()}</p>
+              <p className="text-sm text-gray-200">
+                {result.analysis_type === 'simulation' ? 'POTTS SAMPLING' : result.analysis_type.toUpperCase()}
+              </p>
               <p className="text-xs text-gray-500">
-                Job {result.job_id?.slice(0, 8)} · {result.status}
+                {result.analysis_type === 'simulation'
+                  ? result.sample_name || result.potts_model_name || 'Sampling run'
+                  : `Job ${result.job_id?.slice(0, 8)}`}{' '}
+                · {result.status}
                 {result.created_at ? ` · ${new Date(result.created_at).toLocaleString()}` : ''}
               </p>
               {result.cluster_label && (
@@ -54,12 +59,12 @@ export function AnalysisResultsList({ results, emptyLabel, onOpen, onOpenSimulat
               )}
               {result.analysis_type === 'simulation' && (
                 <>
-                  <p className="text-xs text-gray-500">
-                    Cluster NPZ: {getArtifactDisplayName(result.cluster_npz)}
-                  </p>
-                  <p className="text-xs text-gray-500">
-                    Potts model: {getArtifactDisplayName(result.potts_model)}
-                  </p>
+                  {result.potts_model_name && (
+                    <p className="text-xs text-gray-500">Potts model: {result.potts_model_name}</p>
+                  )}
+                  {result.cluster_npz && (
+                    <p className="text-xs text-gray-500">Cluster NPZ: {getArtifactDisplayName(result.cluster_npz)}</p>
+                  )}
                 </>
               )}
             </div>
@@ -71,7 +76,7 @@ export function AnalysisResultsList({ results, emptyLabel, onOpen, onOpenSimulat
                 onClick={() => onOpenSimulation(result)}
                 className="text-xs text-cyan-300 hover:text-cyan-200"
               >
-                View
+                Sampling viz
               </button>
             )}
             {result.analysis_type === 'simulation' && result.status === 'finished' && (

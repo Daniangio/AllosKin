@@ -47,7 +47,7 @@ OFFLINE_PROJECT_ID=""
 OFFLINE_SYSTEM_ID=""
 CLUSTER_ID=""
 NPZ_PATH=""
-MODEL_PATH=""
+MODEL_PATHS=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -62,7 +62,14 @@ while [ "$#" -gt 0 ]; do
     --npz)
       NPZ_PATH="$2"; shift 2 ;;
     --model-npz)
-      MODEL_PATH="$2"; shift 2 ;;
+      IFS=',' read -r -a _MODEL_PARTS <<< "$2"
+      for _part in "${_MODEL_PARTS[@]}"; do
+        _part="$(trim "$_part")"
+        if [ -n "$_part" ]; then
+          MODEL_PATHS+=("$_part")
+        fi
+      done
+      shift 2 ;;
     *)
       echo "Unknown argument: $1" >&2
       exit 1 ;;
@@ -109,18 +116,30 @@ if [ -z "$NPZ_PATH" ] || [ ! -f "$NPZ_PATH" ]; then
   exit 1
 fi
 
-if [ -z "$MODEL_PATH" ]; then
+if [ "${#MODEL_PATHS[@]}" -eq 0 ]; then
   MODEL_LINES="$(_offline_list list-models --project-id "$OFFLINE_PROJECT_ID" --system-id "$OFFLINE_SYSTEM_ID" || true)"
   if [ -n "$CLUSTER_ID" ]; then
     MODEL_LINES="$(printf "%s\n" "$MODEL_LINES" | awk -F'|' -v cid="$CLUSTER_ID" '$4==cid')"
   fi
-  MODEL_ROW="$(offline_choose_one "Available Potts models:" "$MODEL_LINES")"
-  MODEL_PATH="$(printf "%s" "$MODEL_ROW" | awk -F'|' '{print $3}')"
+  MODEL_ROWS="$(offline_choose_multi "Available Potts models:" "$MODEL_LINES")"
+  while IFS= read -r row; do
+    [ -z "$row" ] && continue
+    path="$(printf "%s" "$row" | awk -F'|' '{print $3}')"
+    if [ -n "$path" ]; then
+      MODEL_PATHS+=("$path")
+    fi
+  done <<< "$MODEL_ROWS"
 fi
-if [ -z "$MODEL_PATH" ] || [ ! -f "$MODEL_PATH" ]; then
-  echo "Potts model not found: $MODEL_PATH"
+if [ "${#MODEL_PATHS[@]}" -eq 0 ]; then
+  echo "No Potts model selected."
   exit 1
 fi
+for model_path in "${MODEL_PATHS[@]}"; do
+  if [ ! -f "$model_path" ]; then
+    echo "Potts model not found: $model_path"
+    exit 1
+  fi
+done
 
 RESULTS_DIR="$(python - <<PY
 from pathlib import Path
@@ -209,13 +228,15 @@ fi
 CMD=(
   "$PYTHON_BIN" -m phase.scripts.potts_sample
   --npz "$NPZ_PATH"
-  --model-npz "$MODEL_PATH"
   --results-dir "$RESULTS_DIR"
   --sampling-method "$SAMPLING_METHOD"
   --gibbs-method "$GIBBS_METHOD"
   --beta "$BETA"
   --seed "$SEED"
 )
+for model_path in "${MODEL_PATHS[@]}"; do
+  CMD+=(--model-npz "$model_path")
+done
 
 if [ "$SAMPLING_METHOD" = "gibbs" ] && [ "$GIBBS_METHOD" = "single" ]; then
   CMD+=(--gibbs-samples "$GIBBS_SAMPLES" --gibbs-burnin "$GIBBS_BURNIN" --gibbs-thin "$GIBBS_THIN" --gibbs-chains "$GIBBS_CHAINS")

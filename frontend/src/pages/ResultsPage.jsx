@@ -44,7 +44,7 @@ export default function ResultsPage() {
     return (
       <EmptyState
         title="No analysis results yet"
-        description="Queue a static or Potts simulation job from the system page to see results here."
+        description="Queue a static or Potts sampling job from the system page to see results here."
         action={
           <button
             onClick={() => navigate('/projects')}
@@ -68,8 +68,14 @@ export default function ResultsPage() {
             <div className="flex items-center space-x-3">
               <StatusIcon status={result.status} />
               <div>
-                <p className="text-white font-semibold">{result.analysis_type.toUpperCase()}</p>
-                <p className="text-sm text-gray-400">Job {result.job_id}</p>
+                <p className="text-white font-semibold">
+                  {result.analysis_type === 'simulation' ? 'Potts sampling' : result.analysis_type.toUpperCase()}
+                </p>
+                <p className="text-sm text-gray-400">
+                  {result.analysis_type === 'simulation'
+                    ? result.sample_name || result.potts_model_name || 'Sampling run'
+                    : `Job ${result.job_id}`}
+                </p>
               </div>
             </div>
             <div className="mt-2 text-xs text-gray-400 flex flex-wrap gap-2">
@@ -81,6 +87,9 @@ export default function ResultsPage() {
               )}
               {result.analysis_type === 'potts_fit' && result.cluster_npz && (
                 <span>Cluster NPZ: {result.cluster_npz.split('/').pop()}</span>
+              )}
+              {result.analysis_type === 'simulation' && result.potts_model_name && (
+                <span>Potts model: {result.potts_model_name}</span>
               )}
               {result.created_at && <span>Submitted: {new Date(result.created_at).toLocaleString()}</span>}
             </div>
@@ -102,10 +111,16 @@ export default function ResultsPage() {
             </button>
             {result.analysis_type === 'simulation' && result.status === 'finished' && (
               <button
-                onClick={() => navigate(`/simulation/${result.job_id}`)}
-                className="text-sm text-cyan-400 hover:text-cyan-300"
+                onClick={() => {
+                  if (!result.project_id || !result.system_id || !result.cluster_id) return;
+                  const params = new URLSearchParams({ cluster_id: result.cluster_id });
+                  if (result.sample_id) params.set('sample_id', result.sample_id);
+                  navigate(`/projects/${result.project_id}/systems/${result.system_id}/sampling/visualize?${params}`);
+                }}
+                disabled={!result.project_id || !result.system_id || !result.cluster_id}
+                className="text-sm text-cyan-400 hover:text-cyan-300 disabled:text-gray-500 disabled:cursor-not-allowed"
               >
-                Simulation
+                Sampling viz
               </button>
             )}
             {result.analysis_type === 'simulation' && result.status === 'finished' && (

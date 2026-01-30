@@ -33,7 +33,8 @@ python -m phase.simulation.main \\
   --plm-device cuda
 ```
 
-Use `--model-npz` to skip fitting and use a pre-fit model in a later run.
+Use `--model-npz` to skip fitting and use a pre-fit model in a later run. You can repeat
+`--model-npz` (or pass a comma-separated list) to combine multiple models (they are summed).
 
 If you use the webserver, you can upload a pre-fit model NPZ to the cluster via
 `POST /api/v1/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/potts_model`.
@@ -53,6 +54,17 @@ Then run the interactive fitting script (requires an active venv):
 ```
 
 The fitting script prompts for the PLM device (auto/cuda/cpu) and hyperparameters.
+
+## Delta Potts fits (optional)
+Delta fits learn sparse patches on top of a frozen base model. You can select one or more
+macro/metastable states to define the patch dataset. Run the interactive script:
+
+```bash
+./scripts/potts_delta_fit.sh
+```
+
+This produces delta models (patches) and combined models that can be sampled or combined with
+other Potts models.
 
 ## Diagnostics
 - Per-residue marginals and JS divergence versus MD.

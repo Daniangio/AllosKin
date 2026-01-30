@@ -20,6 +20,7 @@ from phase.pipeline.runner import run_analysis
 from phase.simulation.main import parse_args as parse_simulation_args
 from phase.simulation.main import run_pipeline as run_simulation_pipeline
 from phase.simulation import main as sim_main
+from phase.simulation import delta_fit as delta_fit_main
 from backend.services.metastable_clusters import (
     generate_metastable_cluster_npz,
     prepare_cluster_workspace,
@@ -109,6 +110,36 @@ def _resolve_contact_pdbs(project_id: str, system_id: str, pdb_paths: List[str])
         if path.exists():
             resolved.append(path)
     return resolved
+
+
+def _coerce_str_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        items: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            if isinstance(item, str):
+                parts = [part.strip() for part in item.split(",") if part.strip()]
+                items.extend(parts)
+            else:
+                items.append(str(item))
+        return items
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return [str(value)]
+
+
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen = set()
+    ordered: List[str] = []
+    for item in values:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
 
 
 def _update_cluster_entry(
@@ -465,22 +496,56 @@ def run_simulation_job(
 
         sim_params = dict(params or {})
         sampling_method = sim_params.get("sampling_method") or "gibbs"
-        model_rel = None
+        model_rels: List[str] = []
+        model_ids: List[str] = []
+        model_names: List[str] = []
         model_id = None
+        model_name = None
         if sim_params.get("use_potts_model", True):
-            model_rel = sim_params.get("potts_model_path")
-            model_id = sim_params.get("potts_model_id")
-            if not model_rel:
-                models = entry.get("potts_models") if isinstance(entry, dict) else None
-                if isinstance(models, list) and models:
-                    model_entry = None
-                    if model_id:
-                        model_entry = next((m for m in models if m.get("model_id") == model_id), None)
-                    if model_entry is None:
-                        model_entry = models[-1]
-                    if model_entry and not model_id:
-                        model_id = model_entry.get("model_id")
-                    model_rel = model_entry.get("path") if isinstance(model_entry, dict) else None
+            requested_ids = _coerce_str_list(sim_params.get("potts_model_ids"))
+            if not requested_ids:
+                requested_ids = _coerce_str_list(sim_params.get("potts_model_id"))
+            requested_paths = _coerce_str_list(sim_params.get("potts_model_paths") or sim_params.get("potts_model_path"))
+            models = entry.get("potts_models") if isinstance(entry, dict) else None
+            model_entries: List[Dict[str, Any]] = []
+            missing_ids: List[str] = []
+            if requested_ids:
+                if isinstance(models, list):
+                    for mid in requested_ids:
+                        model_entry = next((m for m in models if m.get("model_id") == mid), None)
+                        if model_entry:
+                            model_entries.append(model_entry)
+                        else:
+                            missing_ids.append(mid)
+                else:
+                    missing_ids = requested_ids
+            if missing_ids:
+                raise FileNotFoundError(f"Potts model(s) not found for ids: {', '.join(missing_ids)}")
+            if not model_entries and isinstance(models, list) and models and not requested_paths and not requested_ids:
+                model_entries.append(models[-1])
+            for model_entry in model_entries:
+                rel = model_entry.get("path")
+                if rel:
+                    model_rels.append(rel)
+                mid = model_entry.get("model_id")
+                if mid:
+                    model_ids.append(mid)
+                name = model_entry.get("name")
+                if not name and rel:
+                    name = Path(rel).stem
+                if name:
+                    model_names.append(name)
+            for path in requested_paths:
+                if path:
+                    model_rels.append(path)
+                    model_names.append(Path(path).stem)
+            model_rels = _dedupe_preserve_order([str(p) for p in model_rels if p])
+            model_ids = _dedupe_preserve_order([str(p) for p in model_ids if p])
+            model_names = _dedupe_preserve_order([str(p) for p in model_names if p])
+            if model_ids:
+                model_id = model_ids[0]
+            if model_names:
+                model_name = " + ".join(model_names)
         rex_betas_raw = sim_params.get("rex_betas")
         rex_betas_list = []
         if isinstance(rex_betas_raw, (list, tuple)):
@@ -547,15 +612,21 @@ def run_simulation_job(
         if beta_override is not None:
             args_list += ["--beta", str(float(beta_override))]
 
-        model_path = None
-        if model_rel:
-            model_path = Path(model_rel)
-            if not model_path.is_absolute():
-                model_path = project_store.resolve_path(project_id, system_id, model_rel)
-            if model_path.exists():
-                args_list += ["--model-npz", str(model_path)]
-            else:
-                model_path = None
+        model_paths: List[Path] = []
+        if model_rels:
+            missing_paths: List[str] = []
+            for rel in model_rels:
+                model_path = Path(rel)
+                if not model_path.is_absolute():
+                    model_path = project_store.resolve_path(project_id, system_id, rel)
+                if model_path.exists():
+                    model_paths.append(model_path)
+                    args_list += ["--model-npz", str(model_path)]
+                else:
+                    missing_paths.append(rel)
+            if missing_paths:
+                raise FileNotFoundError(f"Potts model file(s) missing on disk: {', '.join(missing_paths)}")
+        model_path = model_paths[0] if model_paths else None
 
         contact_mode = sim_params.get("contact_atom_mode") or sim_params.get("contact_mode") or "CA"
         contact_cutoff = sim_params.get("contact_cutoff") or 10.0
@@ -616,6 +687,18 @@ def run_simulation_job(
         sa_sweeps = sim_params.get("sa_sweeps")
         if sa_sweeps is not None:
             args_list += ["--sa-sweeps", str(int(sa_sweeps))]
+        sa_init = sim_params.get("sa_init")
+        if sa_init:
+            args_list += ["--sa-init", str(sa_init)]
+        sa_init_md_frame = sim_params.get("sa_init_md_frame")
+        if sa_init_md_frame is not None:
+            args_list += ["--sa-init-md-frame", str(int(sa_init_md_frame))]
+        sa_restart = sim_params.get("sa_restart")
+        if sa_restart:
+            args_list += ["--sa-restart", str(sa_restart)]
+        sa_restart_topk = sim_params.get("sa_restart_topk")
+        if sa_restart_topk is not None:
+            args_list += ["--sa-restart-topk", str(int(sa_restart_topk))]
         sa_beta_schedules = []
         raw_schedules = sim_params.get("sa_beta_schedules") or []
         for schedule in raw_schedules:
@@ -686,8 +769,8 @@ def run_simulation_job(
         beta_scan_path = _coerce_path(run_result.get("beta_scan_path"))
         model_artifact = _coerce_path(run_result.get("model_path"))
 
-        potts_model_rel = str(model_rel) if model_rel else None
-        if not model_rel and model_artifact and model_artifact.exists():
+        potts_model_rels = [str(rel) for rel in model_rels] if model_rels else []
+        if not potts_model_rels and model_artifact and model_artifact.exists():
             potts_model_rel = _persist_potts_model(
                 project_id,
                 system_id,
@@ -698,12 +781,31 @@ def run_simulation_job(
                 model_id=str(uuid.uuid4()),
                 model_name=None,
             )
+            if potts_model_rel:
+                potts_model_rels = [potts_model_rel]
+                model_names = [Path(potts_model_rel).stem]
+                model_name = None
 
         cluster_name = entry.get("name") if isinstance(entry, dict) else None
         if cluster_name:
             result_payload["system_reference"]["cluster_name"] = cluster_name
 
+        if not model_name:
+            if potts_model_rels:
+                model_name = " + ".join(Path(rel).stem for rel in potts_model_rels)
+
         sample_paths: Dict[str, str] = {}
+        for path in [plot_path, report_path, cross_likelihood_report_path, beta_scan_path]:
+            if path and path.exists():
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+        plot_path = None
+        report_path = None
+        cross_likelihood_report_path = None
+        beta_scan_path = None
+
         for key, path in {
             "summary_npz": summary_path,
             "metadata_json": meta_path,
@@ -732,6 +834,7 @@ def run_simulation_job(
             "type": "potts_sampling",
             "method": "sa" if sampling_method == "sa" else "gibbs",
             "model_id": model_id,
+            "model_ids": model_ids or None,
             "created_at": datetime.utcnow().isoformat(),
             "paths": sample_paths,
         }
@@ -741,6 +844,13 @@ def run_simulation_job(
                 samples = []
             samples.append(sample_entry)
             _update_cluster_entry(project_id, system_id, cluster_id, {"samples": samples})
+
+        result_payload["system_reference"]["sample_id"] = sample_id
+        result_payload["system_reference"]["sample_name"] = sample_entry.get("name")
+        result_payload["system_reference"]["potts_model_id"] = model_id
+        result_payload["system_reference"]["potts_model_name"] = model_name
+        if model_ids:
+            result_payload["system_reference"]["potts_model_ids"] = model_ids
 
         result_payload["status"] = "finished"
         result_payload["results"] = {
@@ -752,7 +862,8 @@ def run_simulation_job(
             "cross_likelihood_report": _relativize_path(cross_likelihood_report_path) if cross_likelihood_report_path else None,
             "beta_scan_plot": _relativize_path(beta_scan_path) if beta_scan_path else None,
             "cluster_npz": _relativize_path(cluster_path),
-            "potts_model": potts_model_rel or (_relativize_path(model_path) if model_path else None),
+            "potts_model": potts_model_rels[0] if potts_model_rels else (_relativize_path(model_path) if model_path else None),
+            "potts_models": potts_model_rels or None,
             "beta_eff": run_result.get("beta_eff"),
         }
 
@@ -865,103 +976,263 @@ def run_potts_fit_job(
 
         fit_params = dict(params or {})
         model_name = fit_params.get("model_name")
-        model_id = str(uuid.uuid4())
-        display_name = None
-        if isinstance(model_name, str) and model_name.strip():
-            display_name = model_name.strip()
-        elif isinstance(entry, dict):
-            cluster_name = entry.get("name")
-            if isinstance(cluster_name, str) and cluster_name.strip():
-                display_name = f"{cluster_name} Potts Model"
-        if not display_name:
-            display_name = f"{cluster_id} Potts Model"
-        cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
-        model_dir = cluster_dirs["potts_models_dir"] / model_id
-        model_dir.mkdir(parents=True, exist_ok=True)
-        model_path = model_dir / f"{_sanitize_model_filename(display_name)}.npz"
-
-        args_list = [
-            "--npz",
-            str(cluster_path),
-            "--results-dir",
-            str(model_dir),
-            "--fit-only",
-            "--model-out",
-            str(model_path),
-        ]
-
-        fit_method = fit_params.get("fit_method")
-        if fit_method is not None:
-            args_list += ["--fit", str(fit_method)]
-
-        contact_mode = fit_params.get("contact_atom_mode") or fit_params.get("contact_mode") or "CA"
-        contact_cutoff = fit_params.get("contact_cutoff") or 10.0
-        contact_pdbs = _resolve_contact_pdbs(
-            project_id,
-            system_id,
-            _collect_contact_pdbs(
-                system_meta,
-                entry.get("state_ids") or entry.get("metastable_ids") or [],
-                system_meta.analysis_mode,
-            ),
-        )
-        if contact_pdbs:
-            pdb_flag = None
-            if _supports_sim_arg("--pdbs"):
-                pdb_flag = "--pdbs"
-            elif _supports_sim_arg("--contact-pdb"):
-                pdb_flag = "--contact-pdb"
-            if pdb_flag:
-                args_list += [
-                    pdb_flag,
-                    ",".join(str(p) for p in contact_pdbs),
-                    "--contact-cutoff",
-                    str(float(contact_cutoff)),
-                    "--contact-atom-mode",
-                    str(contact_mode),
-                ]
+        fit_mode = fit_params.get("fit_mode")
+        if not fit_mode:
+            if fit_params.get("base_model_id") or fit_params.get("base_model_path") or fit_params.get("active_state_id") or fit_params.get("inactive_state_id"):
+                fit_mode = "delta"
+            elif fit_params.get("active_npz") or fit_params.get("inactive_npz"):
+                fit_mode = "delta"
             else:
-                print("[potts-sample] warning: simulation args do not support contact PDBs; skipping edge build.")
+                fit_mode = "standard"
+        fit_mode = str(fit_mode)
+        fit_params["fit_mode"] = fit_mode
+        result_payload["params"] = fit_params
 
-        for key, flag in (
-            ("plm_epochs", "--plm-epochs"),
-            ("plm_lr", "--plm-lr"),
-            ("plm_lr_min", "--plm-lr-min"),
-            ("plm_lr_schedule", "--plm-lr-schedule"),
-            ("plm_l2", "--plm-l2"),
-            ("plm_batch_size", "--plm-batch-size"),
-            ("plm_progress_every", "--plm-progress-every"),
-            ("plm_device", "--plm-device"),
-        ):
-            val = fit_params.get(key)
-            if val is not None:
-                args_list += [flag, str(val)]
+        if fit_mode == "delta":
+            base_model_rel = fit_params.get("base_model_path")
+            base_model_id = fit_params.get("base_model_id")
+            base_model_name = None
+            if base_model_id and isinstance(entry, dict):
+                models = entry.get("potts_models")
+                if isinstance(models, list):
+                    base_entry = next((m for m in models if m.get("model_id") == base_model_id), None)
+                    if base_entry:
+                        base_model_rel = base_entry.get("path") or base_model_rel
+                        base_model_name = base_entry.get("name") or base_model_name
+            if not base_model_rel:
+                raise FileNotFoundError("Base Potts model path missing for delta fit.")
+            base_model_path = Path(base_model_rel)
+            if not base_model_path.is_absolute():
+                base_model_path = project_store.resolve_path(project_id, system_id, base_model_rel)
+            if not base_model_path.exists():
+                raise FileNotFoundError(f"Base Potts model is missing on disk: {base_model_path}")
 
-        save_progress("Fitting Potts model", 20)
-        try:
-            sim_args = parse_simulation_args(args_list)
-        except SystemExit as exc:
-            raise ValueError("Invalid potts fit arguments.") from exc
-        run_result = run_simulation_pipeline(sim_args, progress_callback=save_progress)
+            cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+            results_dir = cluster_dirs["potts_models_dir"] / f"delta_fit_{job_uuid}"
+            results_dir.mkdir(parents=True, exist_ok=True)
 
-        potts_model_rel = _persist_potts_model(
-            project_id,
-            system_id,
-            cluster_id,
-            Path(model_path),
-            fit_params,
-            source="potts_fit",
-            model_id=model_id,
-            model_name=display_name,
-        )
+            args_list = [
+                "--base-model",
+                str(base_model_path),
+                "--results-dir",
+                str(results_dir),
+            ]
+            state_ids = _coerce_str_list(fit_params.get("state_ids"))
+            active_npz = fit_params.get("active_npz")
+            inactive_npz = fit_params.get("inactive_npz")
+            if state_ids:
+                args_list += ["--npz", str(cluster_path), "--state-ids", ",".join(state_ids)]
+            elif active_npz and inactive_npz:
+                active_npz_path = Path(active_npz)
+                if not active_npz_path.is_absolute():
+                    active_npz_path = project_store.resolve_path(project_id, system_id, active_npz)
+                inactive_npz_path = Path(inactive_npz)
+                if not inactive_npz_path.is_absolute():
+                    inactive_npz_path = project_store.resolve_path(project_id, system_id, inactive_npz)
+                if not active_npz_path.exists() or not inactive_npz_path.exists():
+                    raise FileNotFoundError("Active/inactive NPZ file(s) missing on disk.")
+                args_list += ["--active-npz", str(active_npz_path), "--inactive-npz", str(inactive_npz_path)]
+            else:
+                active_state_id = fit_params.get("active_state_id")
+                inactive_state_id = fit_params.get("inactive_state_id")
+                args_list += [
+                    "--npz",
+                    str(cluster_path),
+                    "--active-state-id",
+                    str(active_state_id),
+                    "--inactive-state-id",
+                    str(inactive_state_id),
+                ]
 
-        result_payload["status"] = "finished"
-        result_payload["results"] = {
-            "results_dir": _relativize_path(model_dir),
-            "potts_model": potts_model_rel,
-            "cluster_npz": _relativize_path(cluster_path),
-            "metadata_json": _relativize_path(run_result.get("metadata_path")) if run_result.get("metadata_path") else None,
-        }
+            unassigned_policy = fit_params.get("unassigned_policy")
+            if unassigned_policy:
+                args_list += ["--unassigned-policy", str(unassigned_policy)]
+
+            for key, flag in (
+                ("delta_epochs", "--epochs"),
+                ("delta_lr", "--lr"),
+                ("delta_lr_min", "--lr-min"),
+                ("delta_lr_schedule", "--lr-schedule"),
+                ("delta_batch_size", "--batch-size"),
+                ("delta_seed", "--seed"),
+                ("delta_device", "--device"),
+                ("delta_l2", "--delta-l2"),
+                ("delta_group_h", "--delta-group-h"),
+                ("delta_group_j", "--delta-group-j"),
+            ):
+                val = fit_params.get(key)
+                if val is not None:
+                    args_list += [flag, str(val)]
+            if fit_params.get("delta_no_combined"):
+                args_list.append("--no-combined")
+
+            save_progress("Fitting delta Potts models", 20)
+            try:
+                delta_fit_main.main(args_list)
+            except SystemExit as exc:
+                raise ValueError("Invalid delta potts fit arguments.") from exc
+
+            cluster_name = entry.get("name") if isinstance(entry, dict) else None
+            name_root = None
+            if isinstance(model_name, str) and model_name.strip():
+                name_root = model_name.strip()
+            elif base_model_name:
+                name_root = f"{base_model_name} Delta"
+            elif cluster_name:
+                name_root = f"{cluster_name} Delta"
+            if not name_root:
+                name_root = f"{cluster_id} Delta"
+            if state_ids:
+                name_root = f"{name_root} ({','.join(state_ids)})"
+
+            persisted_models: List[Dict[str, Any]] = []
+
+            def persist_delta_model(path: Path, kind: str, name: str) -> None:
+                if not path.exists():
+                    return
+                model_id = str(uuid.uuid4())
+                model_params = dict(fit_params)
+                model_params.update(
+                    {
+                        "fit_mode": "delta",
+                        "delta_kind": kind,
+                        "state_ids": state_ids or None,
+                        "base_model_id": base_model_id,
+                        "base_model_path": base_model_rel,
+                    }
+                )
+                rel = _persist_potts_model(
+                    project_id,
+                    system_id,
+                    cluster_id,
+                    path,
+                    model_params,
+                    source="potts_delta_fit",
+                    model_id=model_id,
+                    model_name=name,
+                )
+                persisted_models.append({"model_id": model_id, "name": name, "path": rel, "kind": kind})
+
+            if state_ids:
+                persist_delta_model(results_dir / "delta_model.npz", "delta_patch", f"{name_root} (delta)")
+                persist_delta_model(results_dir / "model_combined.npz", "model_patch", f"{name_root} (combined)")
+            else:
+                persist_delta_model(results_dir / "delta_active.npz", "delta_active", f"{name_root} (delta active)")
+                persist_delta_model(results_dir / "delta_inactive.npz", "delta_inactive", f"{name_root} (delta inactive)")
+                persist_delta_model(results_dir / "model_active.npz", "model_active", f"{name_root} (combined active)")
+                persist_delta_model(results_dir / "model_inactive.npz", "model_inactive", f"{name_root} (combined inactive)")
+
+            meta_path = results_dir / "delta_fit_metadata.json"
+            meta_rel = _relativize_path(meta_path) if meta_path.exists() else None
+            if cluster_name:
+                result_payload["system_reference"]["cluster_name"] = cluster_name
+
+            result_payload["status"] = "finished"
+            result_payload["results"] = {
+                "results_dir": _relativize_path(results_dir),
+                "potts_model": persisted_models[0]["path"] if persisted_models else None,
+                "potts_models": persisted_models or None,
+                "cluster_npz": _relativize_path(cluster_path),
+                "metadata_json": meta_rel,
+            }
+        else:
+            model_id = str(uuid.uuid4())
+            display_name = None
+            if isinstance(model_name, str) and model_name.strip():
+                display_name = model_name.strip()
+            elif isinstance(entry, dict):
+                cluster_name = entry.get("name")
+                if isinstance(cluster_name, str) and cluster_name.strip():
+                    display_name = f"{cluster_name} Potts Model"
+            if not display_name:
+                display_name = f"{cluster_id} Potts Model"
+            cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+            model_dir = cluster_dirs["potts_models_dir"] / model_id
+            model_dir.mkdir(parents=True, exist_ok=True)
+            model_path = model_dir / f"{_sanitize_model_filename(display_name)}.npz"
+
+            args_list = [
+                "--npz",
+                str(cluster_path),
+                "--results-dir",
+                str(model_dir),
+                "--fit-only",
+                "--model-out",
+                str(model_path),
+            ]
+
+            fit_method = fit_params.get("fit_method")
+            if fit_method is not None:
+                args_list += ["--fit", str(fit_method)]
+
+            contact_mode = fit_params.get("contact_atom_mode") or fit_params.get("contact_mode") or "CA"
+            contact_cutoff = fit_params.get("contact_cutoff") or 10.0
+            contact_pdbs = _resolve_contact_pdbs(
+                project_id,
+                system_id,
+                _collect_contact_pdbs(
+                    system_meta,
+                    entry.get("state_ids") or entry.get("metastable_ids") or [],
+                    system_meta.analysis_mode,
+                ),
+            )
+            if contact_pdbs:
+                pdb_flag = None
+                if _supports_sim_arg("--pdbs"):
+                    pdb_flag = "--pdbs"
+                elif _supports_sim_arg("--contact-pdb"):
+                    pdb_flag = "--contact-pdb"
+                if pdb_flag:
+                    args_list += [
+                        pdb_flag,
+                        ",".join(str(p) for p in contact_pdbs),
+                        "--contact-cutoff",
+                        str(float(contact_cutoff)),
+                        "--contact-atom-mode",
+                        str(contact_mode),
+                    ]
+                else:
+                    print("[potts-sample] warning: simulation args do not support contact PDBs; skipping edge build.")
+
+            for key, flag in (
+                ("plm_epochs", "--plm-epochs"),
+                ("plm_lr", "--plm-lr"),
+                ("plm_lr_min", "--plm-lr-min"),
+                ("plm_lr_schedule", "--plm-lr-schedule"),
+                ("plm_l2", "--plm-l2"),
+                ("plm_batch_size", "--plm-batch-size"),
+                ("plm_progress_every", "--plm-progress-every"),
+                ("plm_device", "--plm-device"),
+            ):
+                val = fit_params.get(key)
+                if val is not None:
+                    args_list += [flag, str(val)]
+
+            save_progress("Fitting Potts model", 20)
+            try:
+                sim_args = parse_simulation_args(args_list)
+            except SystemExit as exc:
+                raise ValueError("Invalid potts fit arguments.") from exc
+            run_result = run_simulation_pipeline(sim_args, progress_callback=save_progress)
+
+            potts_model_rel = _persist_potts_model(
+                project_id,
+                system_id,
+                cluster_id,
+                Path(model_path),
+                fit_params,
+                source="potts_fit",
+                model_id=model_id,
+                model_name=display_name,
+            )
+
+            result_payload["status"] = "finished"
+            result_payload["results"] = {
+                "results_dir": _relativize_path(model_dir),
+                "potts_model": potts_model_rel,
+                "cluster_npz": _relativize_path(cluster_path),
+                "metadata_json": _relativize_path(run_result.get("metadata_path")) if run_result.get("metadata_path") else None,
+            }
 
     except Exception as e:
         print(f"[PottsFit {job_uuid}] FAILED: {e}")

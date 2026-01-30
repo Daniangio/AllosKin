@@ -15,6 +15,7 @@ const DOC_FILES = {
   potts_gibbs: '/docs/potts_gibbs.md',
   potts_sa_qubo: '/docs/potts_sa_qubo.md',
   potts_beta_eff: '/docs/potts_beta_eff.md',
+  plotting: '/docs/plotting.md',
   storage_layout: '/docs/storage_layout.md',
 };
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Info, SlidersHorizontal } from 'lucide-react';
+import { Info } from 'lucide-react';
 import ErrorMessage from '../common/ErrorMessage';
 
 export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
@@ -14,17 +14,13 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
   const [saReads, setSaReads] = useState('');
   const [saSweeps, setSaSweeps] = useState('');
   const [saSchedules, setSaSchedules] = useState([]);
-  const [pottsModelId, setPottsModelId] = useState('');
+  const [saInit, setSaInit] = useState('md');
+  const [saInitMdFrame, setSaInitMdFrame] = useState('');
+  const [saRestart, setSaRestart] = useState('independent');
+  const [saRestartTopk, setSaRestartTopk] = useState('');
+  const [pottsModelIds, setPottsModelIds] = useState([]);
   const [samplingMethod, setSamplingMethod] = useState('gibbs');
   const [sampleName, setSampleName] = useState('');
-  const [plmEpochs, setPlmEpochs] = useState('');
-  const [plmLr, setPlmLr] = useState('');
-  const [plmLrMin, setPlmLrMin] = useState('');
-  const [plmLrSchedule, setPlmLrSchedule] = useState('cosine');
-  const [plmL2, setPlmL2] = useState('');
-  const [plmBatchSize, setPlmBatchSize] = useState('');
-  const [plmProgressEvery, setPlmProgressEvery] = useState('');
-  const [showAdvanced, setShowAdvanced] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState(null);
 
@@ -36,11 +32,22 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
   const modelOptions = useMemo(() => {
     if (!selectedCluster) return [];
     const models = selectedCluster.potts_models || [];
+    const nameById = new Map(
+      models.map((model) => {
+        const raw = model.name || (model.path ? model.path.split('/').pop() : '') || 'Potts model';
+        return [model.model_id, raw.replace(/\.npz$/i, '')];
+      })
+    );
     return models.map((model) => {
       const rawLabel = model.name || (model.path ? model.path.split('/').pop() : '') || 'Potts model';
+      const isDelta = !!model?.params?.delta_kind || model?.params?.fit_mode === 'delta';
+      const baseModelId = model?.params?.base_model_id;
+      const baseLabel = baseModelId ? nameById.get(baseModelId) : null;
       return {
         value: model.model_id,
         label: rawLabel.replace(/\.npz$/i, ''),
+        isDelta,
+        baseLabel,
       };
     });
   }, [selectedCluster]);
@@ -58,13 +65,19 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
 
   useEffect(() => {
     if (!modelOptions.length) {
-      setPottsModelId('');
+      if (pottsModelIds.length) setPottsModelIds([]);
       return;
     }
-    if (!pottsModelId || !modelOptions.some((opt) => opt.value === pottsModelId)) {
-      setPottsModelId(modelOptions[0].value);
+    const allowed = new Set(modelOptions.map((opt) => opt.value));
+    const filtered = pottsModelIds.filter((id) => allowed.has(id));
+    if (filtered.length !== pottsModelIds.length) {
+      setPottsModelIds(filtered);
+      return;
     }
-  }, [modelOptions, pottsModelId]);
+    if (!filtered.length) {
+      setPottsModelIds([modelOptions[0].value]);
+    }
+  }, [modelOptions, pottsModelIds]);
 
   const parseBetaList = (raw) =>
     raw
@@ -87,12 +100,13 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
       if (!clusterId) {
         throw new Error('Select a saved cluster NPZ to run Potts analysis.');
       }
-      if (!pottsModelId) {
-        throw new Error('Select a fitted Potts model before sampling.');
+      if (!pottsModelIds.length) {
+        throw new Error('Select at least one fitted Potts model before sampling.');
       }
       const payload = { cluster_id: clusterId };
       payload.use_potts_model = true;
-      payload.potts_model_id = pottsModelId;
+      payload.potts_model_ids = pottsModelIds;
+      if (pottsModelIds.length === 1) payload.potts_model_id = pottsModelIds[0];
       payload.sampling_method = samplingMethod;
       if (sampleName.trim()) payload.sample_name = sampleName.trim();
 
@@ -115,6 +129,27 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
       } else {
         if (saReads !== '') payload.sa_reads = Number(saReads);
         if (saSweeps !== '') payload.sa_sweeps = Number(saSweeps);
+        if (saInit) payload.sa_init = saInit;
+        if (saInit === 'md-frame') {
+          if (saInitMdFrame === '') {
+            throw new Error('Provide an MD frame index when using a fixed MD warm-start.');
+          }
+          const frameIndex = Number(saInitMdFrame);
+          if (!Number.isInteger(frameIndex) || frameIndex < 0) {
+            throw new Error('MD frame index must be a non-negative integer.');
+          }
+          payload.sa_init_md_frame = frameIndex;
+        }
+        if (saRestart) payload.sa_restart = saRestart;
+        if (saRestart === 'prev-topk') {
+          if (saRestartTopk !== '') {
+            const topk = Number(saRestartTopk);
+            if (!Number.isInteger(topk) || topk < 1) {
+              throw new Error('SA restart top-k must be a positive integer.');
+            }
+            payload.sa_restart_topk = topk;
+          }
+        }
         const customSchedules = [];
         for (const schedule of saSchedules) {
           const hotRaw = String(schedule.betaHot ?? '').trim();
@@ -140,14 +175,6 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
         }
         if (customSchedules.length) payload.sa_beta_schedules = customSchedules;
       }
-      if (plmEpochs !== '') payload.plm_epochs = Number(plmEpochs);
-      if (plmLr !== '') payload.plm_lr = Number(plmLr);
-      if (plmLrMin !== '') payload.plm_lr_min = Number(plmLrMin);
-      if (plmLrSchedule) payload.plm_lr_schedule = plmLrSchedule;
-      if (plmL2 !== '') payload.plm_l2 = Number(plmL2);
-      if (plmBatchSize !== '') payload.plm_batch_size = Number(plmBatchSize);
-      if (plmProgressEvery !== '') payload.plm_progress_every = Number(plmProgressEvery);
-
       await onSubmit(payload);
     } catch (err) {
       setError(err.message || 'Failed to submit simulation.');
@@ -188,23 +215,47 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
       </div>
 
       <div>
-        <label className="block text-sm text-gray-300 mb-1">Potts model</label>
-        <select
-          value={pottsModelId}
-          onChange={(event) => setPottsModelId(event.target.value)}
-          disabled={!modelOptions.length}
-          className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500 disabled:opacity-60"
-        >
-          {!modelOptions.length && <option value="">No fitted models available</option>}
-          {modelOptions.map((opt) => (
-            <option key={opt.value} value={opt.value}>
-              {opt.label}
-            </option>
-          ))}
-        </select>
-        <p className="text-xs text-gray-500 mt-1">
-          Select a pre-fit model (webserver or uploaded) to run sampling.
-        </p>
+        <label className="block text-sm text-gray-300 mb-1">Potts models</label>
+        {!modelOptions.length && (
+          <p className="text-xs text-gray-500">No fitted models available for this cluster.</p>
+        )}
+        {modelOptions.length > 0 && (
+          <div className="space-y-2">
+            {modelOptions.map((opt) => {
+              const checked = pottsModelIds.includes(opt.value);
+              return (
+                <label key={opt.value} className="flex items-center gap-2 text-xs text-gray-200">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() =>
+                      setPottsModelIds((prev) =>
+                        checked ? prev.filter((id) => id !== opt.value) : [...prev, opt.value]
+                      )
+                    }
+                    className="h-4 w-4 text-cyan-500 rounded border-gray-600 bg-gray-900"
+                  />
+                  <div className="flex flex-col">
+                    <span className="flex items-center gap-2">
+                      <span>{opt.label}</span>
+                      {opt.isDelta && (
+                        <span className="px-1.5 py-0.5 rounded-full text-[10px] font-semibold text-cyan-200 border border-cyan-500/40 bg-cyan-500/10">
+                          Δ patch
+                        </span>
+                      )}
+                    </span>
+                    {opt.isDelta && opt.baseLabel && (
+                      <span className="text-[10px] text-gray-500">base: {opt.baseLabel}</span>
+                    )}
+                  </div>
+                </label>
+              );
+            })}
+            <p className="text-xs text-gray-500">
+              Select one or more models. Multiple selections will be combined (summed) for sampling.
+            </p>
+          </div>
+        )}
       </div>
 
       <div>
@@ -345,6 +396,59 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
               />
             </div>
           </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm text-gray-300 mb-1">SA init</label>
+              <select
+                value={saInit}
+                onChange={(event) => setSaInit(event.target.value)}
+                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+              >
+                <option value="md">MD warm-start (random frame)</option>
+                <option value="md-frame">MD warm-start (fixed frame)</option>
+                <option value="random-h">Random from h(s) (independent)</option>
+                <option value="random-uniform">Random uniform</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm text-gray-300 mb-1">MD frame index</label>
+              <input
+                type="number"
+                min={0}
+                placeholder="Only for fixed MD init"
+                value={saInitMdFrame}
+                onChange={(event) => setSaInitMdFrame(event.target.value)}
+                disabled={saInit !== 'md-frame'}
+                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500 disabled:opacity-60"
+              />
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm text-gray-300 mb-1">SA restart</label>
+              <select
+                value={saRestart}
+                onChange={(event) => setSaRestart(event.target.value)}
+                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+              >
+                <option value="independent">Independent (default)</option>
+                <option value="prev-topk">Restart from previous SA top-k</option>
+                <option value="prev-uniform">Restart from previous SA uniform</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm text-gray-300 mb-1">Restart top-k</label>
+              <input
+                type="number"
+                min={1}
+                placeholder="Default: 200"
+                value={saRestartTopk}
+                onChange={(event) => setSaRestartTopk(event.target.value)}
+                disabled={saRestart !== 'prev-topk'}
+                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500 disabled:opacity-60"
+              />
+            </div>
+          </div>
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <label className="flex items-center gap-2 text-sm text-gray-300">
@@ -418,109 +522,10 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
         </>
       )}
 
-      <button
-        type="button"
-        onClick={() => setShowAdvanced((prev) => !prev)}
-        className="flex items-center gap-2 text-xs text-cyan-300 hover:text-cyan-200"
-      >
-        <SlidersHorizontal className="h-4 w-4" />
-        {showAdvanced ? 'Hide' : 'Show'} advanced Potts settings
-      </button>
-
-      {showAdvanced && (
-        <div className="border border-gray-700 rounded-md p-3 space-y-3">
-          <div>
-            <h4 className="text-sm font-semibold text-white">PLM hyperparameters</h4>
-            <p className="text-xs text-gray-500 mt-1">
-              Defaults match the script. Leave blank to keep defaults.
-            </p>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-sm text-gray-300 mb-1">Epochs</label>
-              <input
-                type="number"
-                min={1}
-                placeholder="Default: 200"
-                value={plmEpochs}
-                onChange={(event) => setPlmEpochs(event.target.value)}
-                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-300 mb-1">Batch size</label>
-              <input
-                type="number"
-                min={1}
-                placeholder="Default: 512"
-                value={plmBatchSize}
-                onChange={(event) => setPlmBatchSize(event.target.value)}
-                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-300 mb-1">Learning rate</label>
-              <input
-                type="number"
-                step="0.0001"
-                placeholder="Default: 1e-2"
-                value={plmLr}
-                onChange={(event) => setPlmLr(event.target.value)}
-                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-300 mb-1">LR schedule</label>
-              <select
-                value={plmLrSchedule}
-                onChange={(event) => setPlmLrSchedule(event.target.value)}
-                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
-              >
-                <option value="cosine">Cosine decay</option>
-                <option value="none">Fixed LR</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm text-gray-300 mb-1">Min LR (cosine)</label>
-              <input
-                type="number"
-                step="0.0001"
-                placeholder="Default: 1e-3"
-                value={plmLrMin}
-                onChange={(event) => setPlmLrMin(event.target.value)}
-                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-300 mb-1">L2 weight decay</label>
-              <input
-                type="number"
-                step="0.0001"
-                placeholder="Default: 1e-5"
-                value={plmL2}
-                onChange={(event) => setPlmL2(event.target.value)}
-                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-gray-300 mb-1">Progress every N epochs</label>
-              <input
-                type="number"
-                min={1}
-                placeholder="Default: 10"
-                value={plmProgressEvery}
-                onChange={(event) => setPlmProgressEvery(event.target.value)}
-                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
-              />
-            </div>
-          </div>
-        </div>
-      )}
-
       <ErrorMessage message={error} />
       <button
         type="submit"
-        disabled={isSubmitting || !clusterOptions.length || !pottsModelId}
+        disabled={isSubmitting || !clusterOptions.length || pottsModelIds.length === 0}
         className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-semibold py-2 rounded-md transition-colors disabled:opacity-50"
       >
         {isSubmitting ? 'Submitting…' : 'Run Potts Sampling'}

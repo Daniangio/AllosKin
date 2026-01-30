@@ -22,10 +22,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument("--base-model", required=True, help="Base Potts model NPZ (shared core).")
     ap.add_argument("--npz", help="Cluster NPZ containing frame_state_ids.")
-    ap.add_argument("--active-state-id", help="State ID for active frames (used with --npz).")
-    ap.add_argument("--inactive-state-id", help="State ID for inactive frames (used with --npz).")
-    ap.add_argument("--active-npz", help="Optional NPZ with active frames (overrides --npz).")
-    ap.add_argument("--inactive-npz", help="Optional NPZ with inactive frames (overrides --npz).")
+    ap.add_argument(
+        "--state-ids",
+        help="Comma-separated state IDs to include in the delta fit (used with --npz).",
+    )
+    ap.add_argument("--state-label", help="Optional label for the selected state set.")
+    ap.add_argument("--active-state-id", help="Legacy: state ID for active frames (used with --npz).")
+    ap.add_argument("--inactive-state-id", help="Legacy: state ID for inactive frames (used with --npz).")
+    ap.add_argument("--active-npz", help="Legacy: NPZ with active frames (overrides --npz).")
+    ap.add_argument("--inactive-npz", help="Legacy: NPZ with inactive frames (overrides --npz).")
     ap.add_argument("--results-dir", required=True, help="Output directory for delta models.")
 
     ap.add_argument("--unassigned-policy", default="drop_frames", choices=["drop_frames", "treat_as_state", "error"])
@@ -45,17 +50,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
-def _load_labels_from_npz(path: Path, *, state_id: Optional[str], unassigned_policy: str) -> np.ndarray:
+def _load_labels_from_npz(
+    path: Path,
+    *,
+    state_ids: Optional[list[str]] = None,
+    unassigned_policy: str,
+) -> np.ndarray:
     ds = load_npz(str(path), unassigned_policy=unassigned_policy, allow_missing_edges=True)
     labels = ds.labels
-    if state_id is None:
+    if not state_ids:
         return labels
     if ds.frame_state_ids is None:
         raise ValueError("frame_state_ids missing in NPZ; cannot filter by state.")
     frame_ids = np.asarray(ds.frame_state_ids).astype(str)
-    mask = frame_ids == str(state_id)
+    state_set = {str(state_id) for state_id in state_ids if state_id is not None}
+    mask = np.isin(frame_ids, list(state_set))
     if not np.any(mask):
-        raise ValueError(f"No frames matched state_id='{state_id}'.")
+        raise ValueError(f"No frames matched state_ids={sorted(state_set)}.")
     return labels[mask]
 
 
@@ -74,60 +85,60 @@ def main(argv: list[str] | None = None) -> int:
     base_model = load_potts_model(args.base_model)
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
+    state_ids = []
+    if args.state_ids:
+        state_ids = [s.strip() for s in str(args.state_ids).split(",") if s.strip()]
 
-    if args.active_npz and args.inactive_npz:
-        active_labels = _load_labels_from_npz(Path(args.active_npz), state_id=None, unassigned_policy=args.unassigned_policy)
-        inactive_labels = _load_labels_from_npz(Path(args.inactive_npz), state_id=None, unassigned_policy=args.unassigned_policy)
+    single_mode = bool(state_ids)
+
+    if single_mode:
+        if not args.npz:
+            raise ValueError("Provide --npz when using --state-ids.")
+        npz_path = Path(args.npz)
+        labels = _load_labels_from_npz(npz_path, state_ids=state_ids, unassigned_policy=args.unassigned_policy)
+    elif args.active_npz and args.inactive_npz:
+        active_labels = _load_labels_from_npz(
+            Path(args.active_npz),
+            state_ids=None,
+            unassigned_policy=args.unassigned_policy,
+        )
+        inactive_labels = _load_labels_from_npz(
+            Path(args.inactive_npz),
+            state_ids=None,
+            unassigned_policy=args.unassigned_policy,
+        )
     else:
         if not args.npz:
             raise ValueError("Provide --npz or both --active-npz/--inactive-npz.")
         if not args.active_state_id or not args.inactive_state_id:
-            raise ValueError("Provide --active-state-id and --inactive-state-id when using --npz.")
+            raise ValueError("Provide --state-ids or both --active-state-id/--inactive-state-id when using --npz.")
         npz_path = Path(args.npz)
-        active_labels = _load_labels_from_npz(npz_path, state_id=args.active_state_id, unassigned_policy=args.unassigned_policy)
-        inactive_labels = _load_labels_from_npz(npz_path, state_id=args.inactive_state_id, unassigned_policy=args.unassigned_policy)
+        active_labels = _load_labels_from_npz(
+            npz_path,
+            state_ids=[args.active_state_id],
+            unassigned_policy=args.unassigned_policy,
+        )
+        inactive_labels = _load_labels_from_npz(
+            npz_path,
+            state_ids=[args.inactive_state_id],
+            unassigned_policy=args.unassigned_policy,
+        )
 
-    if active_labels.shape[1] != len(base_model.h):
-        raise ValueError("Active labels do not match base model size.")
-    if inactive_labels.shape[1] != len(base_model.h):
-        raise ValueError("Inactive labels do not match base model size.")
+    if single_mode:
+        if labels.shape[1] != len(base_model.h):
+            raise ValueError("Labels do not match base model size.")
+    else:
+        if active_labels.shape[1] != len(base_model.h):
+            raise ValueError("Active labels do not match base model size.")
+        if inactive_labels.shape[1] != len(base_model.h):
+            raise ValueError("Inactive labels do not match base model size.")
 
     device = _device_arg(args.device)
 
-    print("[delta] fitting active delta model...")
-    delta_active = fit_potts_delta_pseudolikelihood_torch(
-        base_model,
-        active_labels,
-        l2=args.delta_l2,
-        lambda_h=args.delta_group_h,
-        lambda_J=args.delta_group_j,
-        lr=args.lr,
-        lr_min=args.lr_min,
-        lr_schedule=args.lr_schedule,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        device=device,
-    )
-
-    print("[delta] fitting inactive delta model...")
-    delta_inactive = fit_potts_delta_pseudolikelihood_torch(
-        base_model,
-        inactive_labels,
-        l2=args.delta_l2,
-        lambda_h=args.delta_group_h,
-        lambda_J=args.delta_group_j,
-        lr=args.lr,
-        lr_min=args.lr_min,
-        lr_schedule=args.lr_schedule,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        seed=args.seed,
-        device=device,
-    )
-
     meta = {
         "base_model": str(Path(args.base_model)),
+        "state_ids": state_ids or None,
+        "state_label": args.state_label,
         "active_state_id": args.active_state_id,
         "inactive_state_id": args.inactive_state_id,
         "active_npz": args.active_npz,
@@ -146,22 +157,84 @@ def main(argv: list[str] | None = None) -> int:
         },
     }
 
-    active_delta_path = results_dir / "delta_active.npz"
-    inactive_delta_path = results_dir / "delta_inactive.npz"
-    save_potts_model(delta_active, active_delta_path, metadata={**meta, "kind": "delta_active"})
-    save_potts_model(delta_inactive, inactive_delta_path, metadata={**meta, "kind": "delta_inactive"})
-    print(f"[delta] saved {active_delta_path}")
-    print(f"[delta] saved {inactive_delta_path}")
+    if single_mode:
+        label = args.state_label or "delta_patch"
+        print(f"[delta] fitting delta model for states={state_ids}...")
+        delta_model = fit_potts_delta_pseudolikelihood_torch(
+            base_model,
+            labels,
+            l2=args.delta_l2,
+            lambda_h=args.delta_group_h,
+            lambda_J=args.delta_group_j,
+            lr=args.lr,
+            lr_min=args.lr_min,
+            lr_schedule=args.lr_schedule,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            seed=args.seed,
+            device=device,
+        )
+        delta_path = results_dir / "delta_model.npz"
+        save_potts_model(delta_model, delta_path, metadata={**meta, "kind": "delta_patch", "label": label})
+        print(f"[delta] saved {delta_path}")
+        if not args.no_combined:
+            combined_model = add_potts_models(base_model, delta_model)
+            combined_path = results_dir / "model_combined.npz"
+            save_potts_model(
+                combined_model,
+                combined_path,
+                metadata={**meta, "kind": "model_patch", "label": label},
+            )
+            print(f"[delta] saved {combined_path}")
+    else:
+        print("[delta] fitting active delta model...")
+        delta_active = fit_potts_delta_pseudolikelihood_torch(
+            base_model,
+            active_labels,
+            l2=args.delta_l2,
+            lambda_h=args.delta_group_h,
+            lambda_J=args.delta_group_j,
+            lr=args.lr,
+            lr_min=args.lr_min,
+            lr_schedule=args.lr_schedule,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            seed=args.seed,
+            device=device,
+        )
 
-    if not args.no_combined:
-        active_model = add_potts_models(base_model, delta_active)
-        inactive_model = add_potts_models(base_model, delta_inactive)
-        active_model_path = results_dir / "model_active.npz"
-        inactive_model_path = results_dir / "model_inactive.npz"
-        save_potts_model(active_model, active_model_path, metadata={**meta, "kind": "model_active"})
-        save_potts_model(inactive_model, inactive_model_path, metadata={**meta, "kind": "model_inactive"})
-        print(f"[delta] saved {active_model_path}")
-        print(f"[delta] saved {inactive_model_path}")
+        print("[delta] fitting inactive delta model...")
+        delta_inactive = fit_potts_delta_pseudolikelihood_torch(
+            base_model,
+            inactive_labels,
+            l2=args.delta_l2,
+            lambda_h=args.delta_group_h,
+            lambda_J=args.delta_group_j,
+            lr=args.lr,
+            lr_min=args.lr_min,
+            lr_schedule=args.lr_schedule,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            seed=args.seed,
+            device=device,
+        )
+
+        active_delta_path = results_dir / "delta_active.npz"
+        inactive_delta_path = results_dir / "delta_inactive.npz"
+        save_potts_model(delta_active, active_delta_path, metadata={**meta, "kind": "delta_active"})
+        save_potts_model(delta_inactive, inactive_delta_path, metadata={**meta, "kind": "delta_inactive"})
+        print(f"[delta] saved {active_delta_path}")
+        print(f"[delta] saved {inactive_delta_path}")
+
+        if not args.no_combined:
+            active_model = add_potts_models(base_model, delta_active)
+            inactive_model = add_potts_models(base_model, delta_inactive)
+            active_model_path = results_dir / "model_active.npz"
+            inactive_model_path = results_dir / "model_inactive.npz"
+            save_potts_model(active_model, active_model_path, metadata={**meta, "kind": "model_active"})
+            save_potts_model(inactive_model, inactive_model_path, metadata={**meta, "kind": "model_inactive"})
+            print(f"[delta] saved {active_model_path}")
+            print(f"[delta] saved {inactive_model_path}")
 
     meta_path = results_dir / "delta_fit_metadata.json"
     meta_path.write_text(json.dumps(meta, indent=2))

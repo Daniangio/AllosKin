@@ -161,6 +161,12 @@ offline_select_model() {
   offline_choose_one "Available Potts models:" "$lines"
 }
 
+offline_select_models() {
+  local lines
+  lines="$(_offline_list list-models --project-id "$OFFLINE_PROJECT_ID" --system-id "$OFFLINE_SYSTEM_ID")"
+  offline_choose_multi "Available Potts models:" "$lines"
+}
+
 offline_select_descriptors() {
   local lines
   lines="$(_offline_list list-descriptors --project-id "$OFFLINE_PROJECT_ID" --system-id "$OFFLINE_SYSTEM_ID")"

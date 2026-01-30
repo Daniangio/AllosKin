@@ -27,7 +27,8 @@ The edge list comes from `contact_edge_index` in the NPZ file.
 Use `--fit-only` to save a model without running sampling. The model is written to
 `potts_model.npz` in the results directory (or `--model-out`).
 
-Use `--model-npz` in a later run to reuse a pre-fit model and skip fitting.
+Use `--model-npz` in a later run to reuse a pre-fit model and skip fitting. You can repeat
+`--model-npz` (or pass a comma-separated list) to combine multiple models.
 
 ## Notes
 - PLM requires PyTorch; GPU is used automatically when available.

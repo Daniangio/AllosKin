@@ -59,7 +59,11 @@ export default function HealthPage() {
       {cleanupInfo && (
         <div className="text-xs text-gray-400">
           Removed {cleanupInfo.empty_result_dirs_removed} empty result folders and{' '}
-          {cleanupInfo.tmp_artifacts_removed} tmp artifacts.
+          {cleanupInfo.tmp_artifacts_removed} tmp artifacts
+          {cleanupInfo.orphan_simulation_results_removed !== undefined
+            ? `, ${cleanupInfo.orphan_simulation_results_removed} orphan sampling results`
+            : ''}
+          .
         </div>
       )}
       <section className="grid md:grid-cols-3 gap-4">

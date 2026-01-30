@@ -159,6 +159,25 @@ async def submit_simulation_job(
             if float(hot) > float(cold):
                 raise HTTPException(status_code=400, detail=f"sa_beta_schedules[{idx}] must satisfy hot <= cold.")
 
+    if payload.sa_init is not None:
+        sa_init = str(payload.sa_init)
+        if sa_init not in {"md", "md-frame", "random-h", "random-uniform"}:
+            raise HTTPException(status_code=400, detail="sa_init must be one of: md, md-frame, random-h, random-uniform.")
+        if sa_init == "md-frame":
+            if payload.sa_init_md_frame is None:
+                raise HTTPException(status_code=400, detail="sa_init_md_frame is required when sa_init is md-frame.")
+            if int(payload.sa_init_md_frame) < 0:
+                raise HTTPException(status_code=400, detail="sa_init_md_frame must be >= 0.")
+    if payload.sa_init_md_frame is not None and int(payload.sa_init_md_frame) < 0:
+        raise HTTPException(status_code=400, detail="sa_init_md_frame must be >= 0.")
+
+    if payload.sa_restart is not None:
+        sa_restart = str(payload.sa_restart)
+        if sa_restart not in {"independent", "prev-topk", "prev-uniform"}:
+            raise HTTPException(status_code=400, detail="sa_restart must be one of: independent, prev-topk, prev-uniform.")
+    if payload.sa_restart_topk is not None and int(payload.sa_restart_topk) < 1:
+        raise HTTPException(status_code=400, detail="sa_restart_topk must be >= 1.")
+
     try:
         project_meta = project_store.get_project(payload.project_id)
         project_name = project_meta.name
@@ -174,6 +193,7 @@ async def submit_simulation_job(
     }
 
     params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
+    params["fit_mode"] = fit_mode
 
     try:
         job_uuid = str(uuid.uuid4())
@@ -204,25 +224,84 @@ async def submit_potts_fit_job(
 
     get_cluster_entry(system_meta, payload.cluster_id)
 
-    if payload.fit_method is not None and payload.fit_method not in {"pmi", "plm", "pmi+plm"}:
-        raise HTTPException(status_code=400, detail="fit_method must be 'pmi', 'plm', or 'pmi+plm'.")
+    fit_mode = payload.fit_mode
+    if not fit_mode:
+        if (
+            payload.base_model_id
+            or payload.base_model_path
+            or payload.state_ids
+            or payload.active_state_id
+            or payload.inactive_state_id
+        ):
+            fit_mode = "delta"
+        elif payload.active_npz or payload.inactive_npz:
+            fit_mode = "delta"
+        else:
+            fit_mode = "standard"
+    if fit_mode not in {"standard", "delta"}:
+        raise HTTPException(status_code=400, detail="fit_mode must be 'standard' or 'delta'.")
 
-    for name, value in {
-        "plm_epochs": payload.plm_epochs,
-        "plm_batch_size": payload.plm_batch_size,
-        "plm_progress_every": payload.plm_progress_every,
-    }.items():
-        if value is not None and int(value) < 1:
-            raise HTTPException(status_code=400, detail=f"{name} must be >= 1.")
+    if fit_mode != "delta":
+        if payload.fit_method is not None and payload.fit_method not in {"pmi", "plm", "pmi+plm"}:
+            raise HTTPException(status_code=400, detail="fit_method must be 'pmi', 'plm', or 'pmi+plm'.")
 
-    if payload.plm_lr is not None and float(payload.plm_lr) <= 0:
-        raise HTTPException(status_code=400, detail="plm_lr must be > 0.")
-    if payload.plm_lr_min is not None and float(payload.plm_lr_min) < 0:
-        raise HTTPException(status_code=400, detail="plm_lr_min must be >= 0.")
-    if payload.plm_l2 is not None and float(payload.plm_l2) < 0:
-        raise HTTPException(status_code=400, detail="plm_l2 must be >= 0.")
-    if payload.plm_lr_schedule is not None and payload.plm_lr_schedule not in {"cosine", "none"}:
-        raise HTTPException(status_code=400, detail="plm_lr_schedule must be 'cosine' or 'none'.")
+        for name, value in {
+            "plm_epochs": payload.plm_epochs,
+            "plm_batch_size": payload.plm_batch_size,
+            "plm_progress_every": payload.plm_progress_every,
+        }.items():
+            if value is not None and int(value) < 1:
+                raise HTTPException(status_code=400, detail=f"{name} must be >= 1.")
+
+        if payload.plm_lr is not None and float(payload.plm_lr) <= 0:
+            raise HTTPException(status_code=400, detail="plm_lr must be > 0.")
+        if payload.plm_lr_min is not None and float(payload.plm_lr_min) < 0:
+            raise HTTPException(status_code=400, detail="plm_lr_min must be >= 0.")
+        if payload.plm_l2 is not None and float(payload.plm_l2) < 0:
+            raise HTTPException(status_code=400, detail="plm_l2 must be >= 0.")
+        if payload.plm_lr_schedule is not None and payload.plm_lr_schedule not in {"cosine", "none"}:
+            raise HTTPException(status_code=400, detail="plm_lr_schedule must be 'cosine' or 'none'.")
+    else:
+        if not payload.base_model_id and not payload.base_model_path:
+            raise HTTPException(status_code=400, detail="Delta fit requires base_model_id or base_model_path.")
+        if payload.active_npz or payload.inactive_npz:
+            if not (payload.active_npz and payload.inactive_npz):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Provide both active_npz and inactive_npz for delta fit.",
+                )
+        elif payload.state_ids:
+            if not isinstance(payload.state_ids, list) or len(payload.state_ids) < 1:
+                raise HTTPException(status_code=400, detail="state_ids must contain at least one entry.")
+        else:
+            if not (payload.active_state_id and payload.inactive_state_id):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Provide state_ids (preferred) or active_state_id and inactive_state_id for delta fit.",
+                )
+        if payload.unassigned_policy is not None and payload.unassigned_policy not in {"drop_frames", "treat_as_state", "error"}:
+            raise HTTPException(
+                status_code=400,
+                detail="unassigned_policy must be 'drop_frames', 'treat_as_state', or 'error'.",
+            )
+        for name, value in {
+            "delta_epochs": payload.delta_epochs,
+            "delta_batch_size": payload.delta_batch_size,
+        }.items():
+            if value is not None and int(value) < 1:
+                raise HTTPException(status_code=400, detail=f"{name} must be >= 1.")
+        if payload.delta_lr is not None and float(payload.delta_lr) <= 0:
+            raise HTTPException(status_code=400, detail="delta_lr must be > 0.")
+        if payload.delta_lr_min is not None and float(payload.delta_lr_min) < 0:
+            raise HTTPException(status_code=400, detail="delta_lr_min must be >= 0.")
+        if payload.delta_l2 is not None and float(payload.delta_l2) < 0:
+            raise HTTPException(status_code=400, detail="delta_l2 must be >= 0.")
+        if payload.delta_group_h is not None and float(payload.delta_group_h) < 0:
+            raise HTTPException(status_code=400, detail="delta_group_h must be >= 0.")
+        if payload.delta_group_j is not None and float(payload.delta_group_j) < 0:
+            raise HTTPException(status_code=400, detail="delta_group_j must be >= 0.")
+        if payload.delta_lr_schedule is not None and payload.delta_lr_schedule not in {"cosine", "none"}:
+            raise HTTPException(status_code=400, detail="delta_lr_schedule must be 'cosine' or 'none'.")
 
     try:
         project_meta = project_store.get_project(payload.project_id)

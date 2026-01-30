@@ -165,3 +165,28 @@ def decode_onehot(
                 # arbitrary but explicit:
                 x[r] = 0
     return x, valid
+
+
+def encode_onehot(
+    x: np.ndarray,
+    qubo: QUBO,
+) -> np.ndarray:
+    """
+    Encode label assignments into a one-hot QUBO bitstring.
+    Accepts x shaped (N,) or (S, N) where N = # residues.
+    Returns z shaped (M,) or (S, M) where M = # QUBO variables.
+    """
+    x = np.asarray(x, dtype=int)
+    single = False
+    if x.ndim == 1:
+        single = True
+        x = x[None, :]
+    if x.ndim != 2 or x.shape[1] != len(qubo.var_slices):
+        raise ValueError("encode_onehot expects shape (N,) or (S, N) matching qubo.var_slices.")
+
+    n_samples = x.shape[0]
+    z = np.zeros((n_samples, qubo.num_vars()), dtype=int)
+    for r, sl in enumerate(qubo.var_slices):
+        idx = sl.start + x[:, r]
+        z[np.arange(n_samples), idx] = 1
+    return z[0] if single else z

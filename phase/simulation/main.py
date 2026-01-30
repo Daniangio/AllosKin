@@ -12,6 +12,8 @@ import numpy as np
 
 from phase.io.data import load_npz
 from phase.simulation.potts_model import (
+    PottsModel,
+    add_potts_models,
     compute_pseudolikelihood_loss_torch,
     compute_pseudolikelihood_scores,
     fit_potts_pmi,
@@ -19,7 +21,7 @@ from phase.simulation.potts_model import (
     load_potts_model,
     save_potts_model,
 )
-from phase.simulation.qubo import potts_to_qubo_onehot, decode_onehot
+from phase.simulation.qubo import potts_to_qubo_onehot, decode_onehot, encode_onehot
 from phase.simulation.sampling import (
     gibbs_sample_potts,
     make_beta_ladder,
@@ -45,6 +47,25 @@ from phase.simulation.plotting import (
 def _parse_float_list(s: str) -> list[float]:
     parts = [p.strip() for p in s.split(",") if p.strip()]
     return [float(p) for p in parts]
+
+
+def _normalize_model_npz_list(raw: object) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        values = raw
+    else:
+        values = [raw]
+    paths: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        if isinstance(value, str):
+            parts = [p.strip() for p in value.split(",") if p.strip()]
+            paths.extend(parts)
+        else:
+            paths.append(str(value))
+    return paths
 
 
 def _parse_contact_pdbs(raw: str) -> list[Path]:
@@ -569,6 +590,103 @@ def _build_sample_sources(
     return sources
 
 
+def _sample_labels_uniform(
+    K_list: Sequence[int],
+    n_samples: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    n_res = len(K_list)
+    out = np.zeros((n_samples, n_res), dtype=int)
+    for r, k in enumerate(K_list):
+        out[:, r] = rng.integers(0, int(k), size=n_samples)
+    return out
+
+
+def _sample_labels_from_fields(
+    model: PottsModel,
+    *,
+    beta: float,
+    n_samples: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    n_res = len(model.h)
+    out = np.zeros((n_samples, n_res), dtype=int)
+    for r, hr in enumerate(model.h):
+        hr = np.asarray(hr, dtype=float)
+        if hr.size == 0 or not np.all(np.isfinite(hr)):
+            out[:, r] = rng.integers(0, max(1, hr.size), size=n_samples)
+            continue
+        logits = -float(beta) * hr
+        logits = logits - np.max(logits)
+        probs = np.exp(logits)
+        total = float(np.sum(probs))
+        if total <= 0 or not np.isfinite(total):
+            out[:, r] = rng.integers(0, hr.shape[0], size=n_samples)
+            continue
+        probs = probs / total
+        out[:, r] = rng.choice(hr.shape[0], size=n_samples, p=probs)
+    return out
+
+
+def _build_sa_initial_labels(
+    *,
+    mode: str,
+    labels: np.ndarray,
+    model: PottsModel,
+    beta: float,
+    n_reads: int,
+    md_frame: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    mode = (mode or "md").lower()
+    if mode in {"md", "md-frame"}:
+        if labels is None or labels.size == 0:
+            if mode == "md-frame":
+                raise ValueError("SA init set to md-frame, but MD labels are unavailable.")
+            print("[sa] warning: MD labels empty; falling back to random-h init.")
+            return _sample_labels_from_fields(model, beta=beta, n_samples=n_reads, rng=rng)
+        if mode == "md-frame":
+            if md_frame < 0:
+                raise ValueError("--sa-init md-frame requires --sa-init-md-frame >= 0.")
+            if md_frame >= labels.shape[0]:
+                raise ValueError(f"--sa-init-md-frame {md_frame} out of range (0..{labels.shape[0]-1}).")
+            return np.repeat(labels[md_frame : md_frame + 1], n_reads, axis=0)
+        idx = rng.integers(0, labels.shape[0], size=n_reads)
+        return labels[idx]
+    if mode in {"random-h", "h"}:
+        return _sample_labels_from_fields(model, beta=beta, n_samples=n_reads, rng=rng)
+    if mode in {"random-uniform", "uniform"}:
+        return _sample_labels_uniform(model.K_list(), n_reads, rng)
+    raise ValueError(f"Unknown sa-init mode: {mode}")
+
+
+def _restart_sa_labels(
+    *,
+    mode: str,
+    prev_labels: np.ndarray | None,
+    model: PottsModel,
+    n_reads: int,
+    topk: int,
+    rng: np.random.Generator,
+) -> np.ndarray | None:
+    mode = (mode or "independent").lower()
+    if mode == "independent":
+        return None
+    if prev_labels is None or prev_labels.size == 0:
+        return None
+    if mode == "prev-uniform":
+        idx = rng.integers(0, prev_labels.shape[0], size=n_reads)
+        return prev_labels[idx]
+    if mode == "prev-topk":
+        energies = model.energy_batch(prev_labels)
+        order = np.argsort(energies)
+        k = max(1, min(int(topk), len(order)))
+        pool = prev_labels[order[:k]]
+        idx = rng.integers(0, pool.shape[0], size=n_reads)
+        return pool[idx]
+    raise ValueError(f"Unknown sa-restart mode: {mode}")
+
+
 def _compute_energy_histograms(
     *,
     model,
@@ -926,7 +1044,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--summary-file", default="", help="Optional explicit path to a summary npz (defaults to results-dir/run_summary.npz).")
     ap.add_argument("--unassigned-policy", default="drop_frames", choices=["drop_frames", "treat_as_state", "error"])
     ap.add_argument("--fit-only", action="store_true", help="Fit and save the Potts model, then exit.")
-    ap.add_argument("--model-npz", default="", help="Optional pre-fit Potts model npz to skip fitting.")
+    ap.add_argument(
+        "--model-npz",
+        action="append",
+        default=[],
+        help="Optional pre-fit Potts model npz to skip fitting. Repeat or pass comma-separated paths to combine models.",
+    )
     ap.add_argument("--model-out", default="", help="Where to save potts_model.npz (defaults to results-dir/potts_model.npz).")
     ap.add_argument(
         "--pdbs",
@@ -1018,6 +1141,40 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=[],
         help="Additional SA beta schedules as 'hot,cold' or 'hot:cold'. Repeat to add multiple schedules.",
     )
+    ap.add_argument(
+        "--sa-init",
+        type=str,
+        default="md",
+        choices=["md", "md-frame", "random-h", "random-uniform"],
+        help=(
+            "Initial state for SA reads. md: warm-start from random MD frame (default). "
+            "md-frame: use a specific MD frame (--sa-init-md-frame). "
+            "random-h: sample residues independently from exp(-beta*h_r). "
+            "random-uniform: sample residues uniformly."
+        ),
+    )
+    ap.add_argument(
+        "--sa-init-md-frame",
+        type=int,
+        default=-1,
+        help="If --sa-init md-frame, use this MD frame index (0-based).",
+    )
+    ap.add_argument(
+        "--sa-restart",
+        type=str,
+        default="independent",
+        choices=["independent", "prev-topk", "prev-uniform"],
+        help=(
+            "How to initialize subsequent SA schedules: independent (default) or "
+            "restart from previous schedule samples (top-k or uniform)."
+        ),
+    )
+    ap.add_argument(
+        "--sa-restart-topk",
+        type=int,
+        default=200,
+        help="If --sa-restart prev-topk, sample initial states from the top-k lowest-energy previous samples.",
+    )
     ap.add_argument("--penalty-safety", type=float, default=3.0, help="Controls how strong the one-hot constraint penalties are in the QUBO. Higher = fewer invalid assignments, but can make the QUBO landscape harder.")
     ap.add_argument("--repair", type=str, default="none", choices=["none", "argmax"], help="What to do when a QUBO bitstring violates one-hot constraints: none: decode invalid slices as “invalid” (still assigns label 0, but validity is tracked; best for honesty). argmax: forcibly repair each residue by picking the largest bit (hides violations but produces a valid label vector).")
 
@@ -1104,6 +1261,7 @@ def run_pipeline(
     default_plot_path = results_dir / "marginals.html"
     beta_scan_plot_path = None
     model_out_path = Path(args.model_out) if args.model_out else results_dir / "potts_model.npz"
+    model_npz_list = _normalize_model_npz_list(args.model_npz)
 
     if args.plot_only:
         if not default_summary_path.exists():
@@ -1139,7 +1297,7 @@ def run_pipeline(
             parser.error(msg)
         raise ValueError(msg)
 
-    if args.fit_only and args.model_npz:
+    if args.fit_only and model_npz_list:
         raise ValueError("Use --fit-only without --model-npz.")
 
     ds = load_npz(
@@ -1186,9 +1344,11 @@ def run_pipeline(
     model = None
     model_pmi = None
     pmi_loss = None
-    if args.model_npz:
+    if model_npz_list:
         report("Loading Potts model", 15)
-        model = load_potts_model(args.model_npz)
+        model = load_potts_model(model_npz_list[0])
+        for extra_path in model_npz_list[1:]:
+            model = add_potts_models(model, load_potts_model(extra_path))
     else:
         if args.fit in ("pmi", "pmi+plm", "plm"):
             report("Fitting Potts model (PMI)", 15)
@@ -1275,7 +1435,7 @@ def run_pipeline(
         metadata={
             "data_npz": args.npz,
             "fit_method": args.fit,
-            "source_model": args.model_npz or None,
+            "source_model": model_npz_list if model_npz_list else None,
         },
     )
     report("Potts model fit complete", 40)
@@ -1536,6 +1696,11 @@ def run_pipeline(
         report("Sampling SA/QUBO", 70)
         qubo = potts_to_qubo_onehot(model, beta=args.beta, penalty_safety=args.penalty_safety)
 
+        sa_init_mode = str(getattr(args, "sa_init", "md") or "md")
+        sa_restart_mode = str(getattr(args, "sa_restart", "independent") or "independent")
+        sa_restart_topk = int(getattr(args, "sa_restart_topk", 200) or 200)
+        sa_init_md_frame = int(getattr(args, "sa_init_md_frame", -1))
+
         sa_schedule_specs: list[dict[str, object]] = [{"label": "SA auto", "beta_range": None}]
         seen_schedules: set[tuple[float, float]] = set()
 
@@ -1564,10 +1729,38 @@ def run_pipeline(
 
         total_sa = len(sa_schedule_specs)
         repair = None if args.repair == "none" else args.repair
+        prev_sa_labels: np.ndarray | None = None
         for idx, spec in enumerate(sa_schedule_specs):
             label = str(spec["label"])
             beta_range = spec["beta_range"]
             report(f"Sampling SA/QUBO ({label})", 70 + 8 * idx / max(1, total_sa))
+
+            init_rng = np.random.default_rng(args.seed + 1000 + idx)
+            init_labels = _restart_sa_labels(
+                mode=sa_restart_mode,
+                prev_labels=prev_sa_labels,
+                model=model,
+                n_reads=int(args.sa_reads),
+                topk=sa_restart_topk,
+                rng=init_rng,
+            )
+            init_source = f"restart:{sa_restart_mode}"
+            if init_labels is None:
+                init_labels = _build_sa_initial_labels(
+                    mode=sa_init_mode,
+                    labels=labels,
+                    model=model,
+                    beta=float(args.beta),
+                    n_reads=int(args.sa_reads),
+                    md_frame=sa_init_md_frame,
+                    rng=init_rng,
+                )
+                init_source = f"init:{sa_init_mode}"
+            if init_labels is not None and init_labels.size:
+                print(f"[sa] {label}: {init_source} n_reads={init_labels.shape[0]}")
+                init_states = encode_onehot(init_labels, qubo)
+            else:
+                init_states = None
 
             Z_sa = sa_sample_qubo_neal(
                 qubo,
@@ -1576,6 +1769,7 @@ def run_pipeline(
                 seed=args.seed + idx,
                 progress=args.progress,
                 beta_range=beta_range if isinstance(beta_range, tuple) else None,
+                initial_states=init_states,
             )
 
             X_sa_local = np.zeros((Z_sa.shape[0], len(qubo.var_slices)), dtype=int)
@@ -1594,6 +1788,7 @@ def run_pipeline(
             sa_samples.append(X_sa_local)
             sa_valid_counts_list.append(valid_counts)
             sa_invalid_mask_list.append(viol)
+            prev_sa_labels = X_sa_local if X_sa_local.size else prev_sa_labels
 
     # --- Compare to MD ---
     report("Computing summary metrics", 80)

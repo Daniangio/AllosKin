@@ -373,12 +373,14 @@ def sa_sample_qubo_neal(
     seed: int = 0,
     progress: bool = False,
     beta_range: Optional[Tuple[float, float]] = None,
+    initial_states: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Use neal (if installed) to sample a QUBO/BQM.
 
     NOTE: neal's SA schedule differs from our numpy implementation; do not interpret
     its sweeps/temperature as directly comparable to a physical beta.
+    If initial_states is provided, it is used to seed each read (when supported).
     """
     try:
         import dimod  # type: ignore
@@ -395,18 +397,64 @@ def sa_sample_qubo_neal(
         print(f"[neal] sampling QUBO: reads={n_reads}, sweeps={sweeps}, vars={qubo.num_vars()}")
 
     sampler = neal.SimulatedAnnealingSampler()
-    kwargs = {
-        "num_reads": n_reads,
+    n_reads_eff = int(n_reads)
+    kwargs: Dict[str, object] = {
+        "num_reads": n_reads_eff,
         "num_sweeps": sweeps,
         "seed": seed,
     }
     if beta_range is not None:
         kwargs["beta_range"] = beta_range
+    if initial_states is not None:
+        init = np.asarray(initial_states, dtype=np.int8)
+        if init.ndim == 1:
+            init = init[None, :]
+        if init.ndim != 2 or init.shape[1] != qubo.num_vars():
+            raise ValueError("initial_states must have shape (M,) or (S, M) matching QUBO variables.")
+        # neal converts BQM to SPIN before parsing initial states
+        # so convert binary 0/1 -> spin -1/+1 when needed.
+        init_min = int(init.min()) if init.size else 0
+        init_max = int(init.max()) if init.size else 0
+        if init_min >= 0 and init_max <= 1:
+            init = (init * 2 - 1).astype(np.int8, copy=False)
+        elif init_min < -1 or init_max > 1:
+            raise ValueError("initial_states must be binary (0/1) or spin (-1/1).")
+        init = np.ascontiguousarray(init, dtype=np.int8)
+        n_reads_eff = int(init.shape[0])
+        kwargs["num_reads"] = n_reads_eff
+        kwargs["initial_states"] = init
 
-    ss = sampler.sample(bqm, **kwargs)
+    def _sample_with_kwargs(sample_kwargs: Dict[str, object]):
+        return sampler.sample(bqm, **sample_kwargs)
 
-    arr = np.zeros((n_reads, qubo.num_vars()), dtype=int)
-    for idx, sample in enumerate(ss.samples()):
+    try:
+        ss = _sample_with_kwargs(kwargs)
+    except TypeError:
+        if "initial_states" not in kwargs:
+            raise
+        init = kwargs.get("initial_states")
+        if isinstance(init, np.ndarray):
+            init_list = []
+            for row in init:
+                init_list.append({i: int(row[i]) for i in range(qubo.num_vars())})
+            retry = dict(kwargs)
+            retry["initial_states"] = init_list
+            try:
+                ss = _sample_with_kwargs(retry)
+            except Exception:
+                print("[neal] warning: initial_states unsupported; falling back to random init.")
+                fallback = dict(kwargs)
+                fallback.pop("initial_states", None)
+                ss = _sample_with_kwargs(fallback)
+        else:
+            print("[neal] warning: initial_states unsupported; falling back to random init.")
+            fallback = dict(kwargs)
+            fallback.pop("initial_states", None)
+            ss = _sample_with_kwargs(fallback)
+
+    samples = list(ss.samples())
+    arr = np.zeros((len(samples), qubo.num_vars()), dtype=int)
+    for idx, sample in enumerate(samples):
         for i in range(qubo.num_vars()):
             arr[idx, i] = int(sample[i])
     return arr

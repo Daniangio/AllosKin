@@ -632,6 +632,70 @@ def _cleanup_tmp_artifacts(tmp_root: Path) -> int:
     return removed
 
 
+def _infer_sample_id_from_paths(results_payload: dict) -> str | None:
+    for key in ("results_dir", "summary_npz"):
+        value = results_payload.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        parts = Path(value).parts
+        if "samples" in parts:
+            idx = parts.index("samples")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    return None
+
+
+def _cleanup_orphan_simulation_results() -> int:
+    removed = 0
+    for result_file in _iter_result_files():
+        try:
+            payload = json.loads(result_file.read_text())
+        except Exception:
+            continue
+        if payload.get("analysis_type") != "simulation":
+            continue
+        system_ref = payload.get("system_reference") or {}
+        results_payload = payload.get("results") or {}
+        params_payload = payload.get("params") or {}
+        project_id = system_ref.get("project_id")
+        system_id = system_ref.get("system_id")
+        cluster_id = system_ref.get("cluster_id")
+        sample_id = system_ref.get("sample_id") or _infer_sample_id_from_paths(results_payload)
+        model_id = system_ref.get("potts_model_id") or params_payload.get("potts_model_id")
+
+        if not (sample_id or model_id):
+            continue
+
+        orphan = False
+        system_dir = None
+        try:
+            if not project_id or not system_id or not cluster_id:
+                orphan = True
+            else:
+                system_meta = project_store.get_system(project_id, system_id)
+                entry = get_cluster_entry(system_meta, cluster_id)
+                samples = entry.get("samples") if isinstance(entry, dict) else []
+                models = entry.get("potts_models") if isinstance(entry, dict) else []
+                if sample_id and not any(s.get("sample_id") == sample_id for s in samples or []):
+                    orphan = True
+                if model_id and not any(m.get("model_id") == model_id for m in models or []):
+                    orphan = True
+                system_dir = project_store.resolve_path(project_id, system_id, "")
+        except Exception:
+            orphan = True
+
+        if not orphan:
+            continue
+
+        try:
+            _remove_results_dir(results_payload.get("results_dir"), system_dir=system_dir)
+            result_file.unlink(missing_ok=True)
+            removed += 1
+        except Exception:
+            continue
+    return removed
+
+
 @router.get("/results", summary="List all available analysis results")
 async def get_results_list():
     """
@@ -649,6 +713,29 @@ async def get_results_list():
                 system_ref = data.get("system_reference") or {}
                 state_ref = system_ref.get("states") or {}
                 results_payload = data.get("results") or {}
+                params_payload = data.get("params") or {}
+                sample_id = system_ref.get("sample_id")
+                sample_name = system_ref.get("sample_name") or params_payload.get("sample_name")
+                if (not sample_id or not sample_name) and data.get("analysis_type") == "simulation":
+                    inferred_sample_id = _infer_sample_id_from_paths(results_payload)
+                    sample_id = sample_id or inferred_sample_id
+                    try:
+                        if inferred_sample_id:
+                            project_id = system_ref.get("project_id")
+                            system_id = system_ref.get("system_id")
+                            cluster_id = system_ref.get("cluster_id")
+                            if project_id and system_id and cluster_id:
+                                system_meta = project_store.get_system(project_id, system_id)
+                                entry = get_cluster_entry(system_meta, cluster_id)
+                                samples = entry.get("samples") if isinstance(entry, dict) else []
+                                match = next(
+                                    (s for s in samples if isinstance(s, dict) and s.get("sample_id") == inferred_sample_id),
+                                    None,
+                                )
+                                if match and not sample_name:
+                                    sample_name = match.get("name")
+                    except Exception:
+                        pass
                 results_list.append(
                     {
                         "job_id": data.get("job_id"),
@@ -664,6 +751,10 @@ async def get_results_list():
                         "system_name": system_ref.get("system_name"),
                         "cluster_id": system_ref.get("cluster_id"),
                         "cluster_name": system_ref.get("cluster_name"),
+                        "sample_id": sample_id,
+                        "sample_name": sample_name,
+                        "potts_model_id": system_ref.get("potts_model_id"),
+                        "potts_model_name": system_ref.get("potts_model_name"),
                         "cluster_npz": results_payload.get("cluster_npz"),
                         "potts_model": results_payload.get("potts_model"),
                         "state_a_id": state_ref.get("state_a", {}).get("id"),
@@ -733,38 +824,6 @@ async def download_result_artifact(job_uuid: str, artifact: str, download: bool 
         raise HTTPException(status_code=404, detail="Unknown artifact.")
 
     path_value = results.get(key)
-    if (not isinstance(path_value, str) or not path_value) and artifact in ("sampling_report", "cross_likelihood_report"):
-        summary_value = results.get("summary_npz")
-        if not isinstance(summary_value, str) or not summary_value:
-            report_name = "sampling report" if artifact == "sampling_report" else "cross-likelihood report"
-            raise HTTPException(status_code=404, detail=f"{report_name} unavailable (missing summary NPZ).")
-        summary_path = _resolve_result_artifact_path(summary_value)
-        if artifact == "sampling_report":
-            report_path = summary_path.parent / "sampling_report.html"
-        else:
-            report_path = summary_path.parent / "cross_likelihood_report.html"
-        try:
-            if artifact == "sampling_report":
-                from phase.simulation.plotting import plot_sampling_report_from_npz
-                plot_sampling_report_from_npz(summary_path=summary_path, out_path=report_path)
-            else:
-                from phase.simulation.plotting import plot_cross_likelihood_report_from_npz
-                plot_cross_likelihood_report_from_npz(summary_path=summary_path, out_path=report_path)
-        except Exception as exc:
-            report_name = "sampling report" if artifact == "sampling_report" else "cross-likelihood report"
-            raise HTTPException(status_code=500, detail=f"Failed to generate {report_name}: {exc}") from exc
-        try:
-            rel_path = str(report_path.relative_to(DATA_ROOT))
-        except ValueError:
-            rel_path = str(report_path)
-        results[key] = rel_path
-        payload["results"] = results
-        try:
-            result_file.write_text(json.dumps(payload, indent=2))
-        except Exception:
-            pass
-        path_value = rel_path
-
     if not isinstance(path_value, str) or not path_value:
         raise HTTPException(status_code=404, detail="Artifact not available for this job.")
 
@@ -912,46 +971,17 @@ async def upload_simulation_result(
             system_id=system_id,
         )
 
-        from phase.simulation.plotting import (
-            plot_beta_scan_curve,
-            plot_cross_likelihood_report_from_npz,
-            plot_marginal_summary_from_npz,
-            plot_sampling_report_from_npz,
-        )
-
-        plot_path = plot_marginal_summary_from_npz(
-            summary_path=summary_path,
-            out_path=results_dir / "marginals.html",
-            annotate=False,
-        )
-        report_path = plot_sampling_report_from_npz(
-            summary_path=summary_path,
-            out_path=results_dir / "sampling_report.html",
-        )
-        cross_likelihood_report_path = plot_cross_likelihood_report_from_npz(
-            summary_path=summary_path,
-            out_path=results_dir / "cross_likelihood_report.html",
-        )
-        beta_scan_path = None
         beta_eff_value = None
         with np.load(summary_path, allow_pickle=False) as data:
             beta_eff = data["beta_eff"] if "beta_eff" in data else np.array([])
             if beta_eff.size:
                 beta_eff_value = float(beta_eff[0])
-            grid = data["beta_eff_grid"] if "beta_eff_grid" in data else np.array([])
-            distances = data["beta_eff_distances_by_schedule"] if "beta_eff_distances_by_schedule" in data else np.array([])
-            if grid.size and distances.size:
-                labels = data["sa_schedule_labels"] if "sa_schedule_labels" in data else None
-                if labels is not None:
-                    labels = [str(v) for v in labels.tolist()]
-                beta_scan_path = plot_beta_scan_curve(
-                    betas=grid,
-                    distances=distances,
-                    labels=labels,
-                    out_path=results_dir / "beta_scan.html",
-                )
+        plot_path = None
+        report_path = None
+        cross_likelihood_report_path = None
+        beta_scan_path = None
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to generate sampling plots: {exc}") from exc
+        raise HTTPException(status_code=500, detail=f"Failed to process sampling summary: {exc}") from exc
 
     try:
         project_meta = project_store.get_project(project_id)
@@ -960,6 +990,13 @@ async def upload_simulation_result(
         project_name = None
 
     cluster_name = entry.get("name") if isinstance(entry, dict) else None
+    potts_model_name = None
+    if potts_model_id:
+        match = next((m for m in entry.get("potts_models") or [] if m.get("model_id") == potts_model_id), None)
+        if match:
+            potts_model_name = match.get("name") or potts_model_name
+    elif model_path:
+        potts_model_name = Path(model_path).stem
     result_payload = {
         "job_id": job_uuid,
         "rq_job_id": f"upload-{job_uuid}",
@@ -990,6 +1027,10 @@ async def upload_simulation_result(
             "system_name": system_meta.name,
             "cluster_id": cluster_id,
             "cluster_name": cluster_name,
+            "sample_id": sample_id,
+            "sample_name": sample_label or f"Sampling {datetime.utcnow().strftime('%Y%m%d %H:%M')}",
+            "potts_model_id": model_id,
+            "potts_model_name": potts_model_name,
             "structures": {},
             "states": {},
         },
@@ -1047,6 +1088,7 @@ async def cleanup_results(include_tmp: bool = Query(True)):
     Remove empty job result folders and stale tmp artifacts.
     """
     empty_removed = _cleanup_empty_result_dirs()
+    orphan_removed = _cleanup_orphan_simulation_results()
     tmp_removed = 0
     tmp_root_value = None
     if include_tmp:
@@ -1060,6 +1102,7 @@ async def cleanup_results(include_tmp: bool = Query(True)):
             tmp_removed = _cleanup_tmp_artifacts(tmp_root)
     return {
         "empty_result_dirs_removed": empty_removed,
+        "orphan_simulation_results_removed": orphan_removed,
         "tmp_artifacts_removed": tmp_removed,
         "tmp_root": tmp_root_value,
     }

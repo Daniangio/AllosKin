@@ -110,7 +110,7 @@ python main.py \
   * `pmi+plm`: fast heuristic from co-occurrences as initial guess + pseudolikelihood fit (recommended baseline; requires torch)
 * `--beta`: target inverse temperature for sampling
 * `--fit-only`: fit and save `potts_model.npz` then exit
-* `--model-npz`: reuse a pre-fit Potts model and skip fitting
+* `--model-npz`: reuse a pre-fit Potts model and skip fitting (repeat or comma-separate to combine models)
 * `--plm-device`: device for PLM training (`auto`, `cpu`, `cuda`, or torch device string)
 
 ### Local fitting

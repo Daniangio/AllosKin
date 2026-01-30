@@ -112,6 +112,9 @@ export default function SystemDetailPage() {
   const [pottsFitContactCutoff, setPottsFitContactCutoff] = useState(10);
   const [pottsFitAdvanced, setPottsFitAdvanced] = useState(false);
   const [pottsFitMode, setPottsFitMode] = useState('run');
+  const [pottsFitKind, setPottsFitKind] = useState('standard');
+  const [pottsDeltaBaseModelId, setPottsDeltaBaseModelId] = useState('');
+  const [pottsDeltaStateIds, setPottsDeltaStateIds] = useState([]);
   const [pottsModelName, setPottsModelName] = useState('');
   const [pottsFitParams, setPottsFitParams] = useState({
     plm_epochs: '',
@@ -121,6 +124,20 @@ export default function SystemDetailPage() {
     plm_l2: '',
     plm_batch_size: '',
     plm_progress_every: '',
+  });
+  const [pottsDeltaParams, setPottsDeltaParams] = useState({
+    delta_epochs: '',
+    delta_lr: '',
+    delta_lr_min: '',
+    delta_lr_schedule: 'cosine',
+    delta_batch_size: '',
+    delta_seed: '',
+    delta_device: 'auto',
+    delta_l2: '',
+    delta_group_h: '',
+    delta_group_j: '',
+    delta_no_combined: false,
+    unassigned_policy: 'drop_frames',
   });
   const [samplingMode, setSamplingMode] = useState('run');
   const [samplingUploadBusy, setSamplingUploadBusy] = useState(false);
@@ -328,6 +345,17 @@ export default function SystemDetailPage() {
       setPottsFitClusterId(readyClusterRuns[readyClusterRuns.length - 1].cluster_id);
     }
   }, [readyClusterRuns, pottsFitClusterId]);
+
+  useEffect(() => {
+    if (!pottsModels.length) {
+      if (pottsDeltaBaseModelId) setPottsDeltaBaseModelId('');
+      return;
+    }
+    const exists = pottsModels.some((model) => model.model_id === pottsDeltaBaseModelId);
+    if (!pottsDeltaBaseModelId || !exists) {
+      setPottsDeltaBaseModelId(pottsModels[pottsModels.length - 1].model_id);
+    }
+  }, [pottsModels, pottsDeltaBaseModelId]);
 
   useEffect(() => {
     if (!activeClusterJobs.length) return;
@@ -593,28 +621,67 @@ export default function SystemDetailPage() {
         project_id: projectId,
         system_id: systemId,
         cluster_id: pottsFitClusterId,
-        fit_method: pottsFitMethod,
-        contact_atom_mode: pottsFitContactMode,
-        contact_cutoff: pottsFitContactCutoff,
+        fit_mode: pottsFitKind === 'delta' ? 'delta' : 'standard',
       };
       if (pottsModelName.trim()) payload.model_name = pottsModelName.trim();
-      const numericKeys = new Set([
-        'plm_epochs',
-        'plm_lr',
-        'plm_lr_min',
-        'plm_l2',
-        'plm_batch_size',
-        'plm_progress_every',
-      ]);
-      Object.entries(pottsFitParams).forEach(([key, value]) => {
-        if (value === '' || value === null || value === undefined) return;
-        if (numericKeys.has(key)) {
-          const num = Number(value);
-          if (Number.isFinite(num)) payload[key] = num;
+      if (pottsFitKind === 'delta') {
+        if (!pottsDeltaBaseModelId) {
+          setPottsFitError('Select a base Potts model to fit a delta.');
+          setPottsFitSubmitting(false);
           return;
         }
-        payload[key] = value;
-      });
+        if (!pottsDeltaStateIds.length) {
+          setPottsFitError('Select at least one state to fit the delta.');
+          setPottsFitSubmitting(false);
+          return;
+        }
+        payload.base_model_id = pottsDeltaBaseModelId;
+        payload.state_ids = pottsDeltaStateIds;
+        const numericKeys = new Set([
+          'delta_epochs',
+          'delta_lr',
+          'delta_lr_min',
+          'delta_batch_size',
+          'delta_seed',
+          'delta_l2',
+          'delta_group_h',
+          'delta_group_j',
+        ]);
+        Object.entries(pottsDeltaParams).forEach(([key, value]) => {
+          if (value === '' || value === null || value === undefined) return;
+          if (key === 'delta_no_combined') {
+            if (value) payload.delta_no_combined = true;
+            return;
+          }
+          if (numericKeys.has(key)) {
+            const num = Number(value);
+            if (Number.isFinite(num)) payload[key] = num;
+            return;
+          }
+          payload[key] = value;
+        });
+      } else {
+        payload.fit_method = pottsFitMethod;
+        payload.contact_atom_mode = pottsFitContactMode;
+        payload.contact_cutoff = pottsFitContactCutoff;
+        const numericKeys = new Set([
+          'plm_epochs',
+          'plm_lr',
+          'plm_lr_min',
+          'plm_l2',
+          'plm_batch_size',
+          'plm_progress_every',
+        ]);
+        Object.entries(pottsFitParams).forEach(([key, value]) => {
+          if (value === '' || value === null || value === undefined) return;
+          if (numericKeys.has(key)) {
+            const num = Number(value);
+            if (Number.isFinite(num)) payload[key] = num;
+            return;
+          }
+          payload[key] = value;
+        });
+      }
       const response = await submitPottsFitJob(payload);
       loadResults();
       navigate(`/jobs/${response.job_id}`, { state: { analysis_uuid: response.analysis_uuid } });
@@ -1370,6 +1437,12 @@ export default function SystemDetailPage() {
               pottsFitClusterId={pottsFitClusterId}
               pottsFitMode={pottsFitMode}
               setPottsFitMode={setPottsFitMode}
+              pottsFitKind={pottsFitKind}
+              setPottsFitKind={setPottsFitKind}
+              pottsDeltaBaseModelId={pottsDeltaBaseModelId}
+              setPottsDeltaBaseModelId={setPottsDeltaBaseModelId}
+              pottsDeltaStateIds={pottsDeltaStateIds}
+              setPottsDeltaStateIds={setPottsDeltaStateIds}
               setPottsFitClusterId={setPottsFitClusterId}
               readyClusterRuns={readyClusterRuns}
               pottsModelName={pottsModelName}
@@ -1390,6 +1463,8 @@ export default function SystemDetailPage() {
               setPottsFitAdvanced={setPottsFitAdvanced}
               pottsFitParams={pottsFitParams}
               setPottsFitParams={setPottsFitParams}
+              pottsDeltaParams={pottsDeltaParams}
+              setPottsDeltaParams={setPottsDeltaParams}
               pottsFitError={pottsFitError}
               enqueuePottsFitJob={enqueuePottsFitJob}
               pottsFitSubmitting={pottsFitSubmitting}

@@ -47,7 +47,9 @@ class SimulationJobRequest(BaseModel):
     sample_name: Optional[str] = None
     use_potts_model: Optional[bool] = True
     potts_model_path: Optional[str] = None
+    potts_model_paths: Optional[List[str]] = None
     potts_model_id: Optional[str] = None
+    potts_model_ids: Optional[List[str]] = None
     contact_cutoff: Optional[float] = None
     contact_atom_mode: Optional[str] = None
     rex_betas: Optional[Union[str, List[float]]] = None
@@ -62,6 +64,10 @@ class SimulationJobRequest(BaseModel):
     sa_beta_hot: Optional[float] = None
     sa_beta_cold: Optional[float] = None
     sa_beta_schedules: Optional[List[Tuple[float, float]]] = None
+    sa_init: Optional[str] = None
+    sa_init_md_frame: Optional[int] = None
+    sa_restart: Optional[str] = None
+    sa_restart_topk: Optional[int] = None
     plm_epochs: Optional[int] = None
     plm_lr: Optional[float] = None
     plm_lr_min: Optional[float] = None
@@ -78,6 +84,26 @@ class PottsFitJobRequest(BaseModel):
     cluster_id: str
     model_name: Optional[str] = None
     fit_method: Optional[str] = None
+    fit_mode: Optional[str] = None
+    base_model_id: Optional[str] = None
+    base_model_path: Optional[str] = None
+    state_ids: Optional[List[str]] = None
+    active_state_id: Optional[str] = None
+    inactive_state_id: Optional[str] = None
+    active_npz: Optional[str] = None
+    inactive_npz: Optional[str] = None
+    unassigned_policy: Optional[str] = None
+    delta_epochs: Optional[int] = None
+    delta_lr: Optional[float] = None
+    delta_lr_min: Optional[float] = None
+    delta_lr_schedule: Optional[str] = None
+    delta_batch_size: Optional[int] = None
+    delta_seed: Optional[int] = None
+    delta_device: Optional[str] = None
+    delta_l2: Optional[float] = None
+    delta_group_h: Optional[float] = None
+    delta_group_j: Optional[float] = None
+    delta_no_combined: Optional[bool] = None
     contact_cutoff: Optional[float] = None
     contact_atom_mode: Optional[str] = None
     plm_epochs: Optional[int] = None

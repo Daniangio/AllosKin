@@ -20,6 +20,28 @@ Controls:
 
 An "SA auto" schedule is always run using neal's defaults.
 
+### SA initialization (warm-start)
+Each SA read can start from a user-chosen initial label assignment. This is useful when you want SA to explore near MD basins instead of fully random initial states.
+
+Options (`sa-init`):
+- `md` (default): warm-start each read from a random MD frame in the cluster NPZ.
+- `md-frame`: warm-start all reads from a fixed MD frame index (`sa-init-md-frame`).
+- `random-h`: sample residues independently from `p(x_r) ∝ exp(-beta * h_r)` (uses only local fields).
+- `random-uniform`: sample residues uniformly, independently per residue.
+
+If MD labels are unavailable and `sa-init=md`, the sampler falls back to `random-h` and logs a warning.
+If `sa-init=md-frame` but the frame index is invalid or labels are missing, the run fails early.
+
+Note: initial states are passed to neal when supported; older neal versions may ignore them and fall back to random initialization (a warning is logged).
+
+### Restarting across SA schedules
+If you add multiple SA schedules, you can choose how to initialize later schedules from earlier ones (`sa-restart`):
+- `independent` (default): each schedule starts from its own init (no carryover).
+- `prev-topk`: initialize from the lowest-energy top-k samples of the previous schedule (`sa-restart-topk`).
+- `prev-uniform`: initialize from a uniform random subset of previous schedule samples.
+
+If you only run the default "SA auto" schedule, restart has no effect.
+
 ## Validity and repair
 Samples can violate one-hot constraints. The pipeline reports invalid rates.
 If `repair=argmax`, invalid samples are coerced to a valid label per residue.

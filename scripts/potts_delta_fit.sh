@@ -62,56 +62,34 @@ offline_select_project
 offline_select_system
 MODEL_ROW="$(offline_select_model)"
 BASE_MODEL="$(printf "%s" "$MODEL_ROW" | awk -F'|' '{print $3}')"
+CLUSTER_ID="$(printf "%s" "$MODEL_ROW" | awk -F'|' '{print $4}')"
 if [ -z "$BASE_MODEL" ] || [ ! -f "$BASE_MODEL" ]; then
   echo "Base model not found: $BASE_MODEL"
   exit 1
 fi
 
 RESULTS_DIR="$(prompt "Results directory" "${DEFAULT_RESULTS}")"
-
-USE_SPLIT="false"
-if prompt_bool "Provide separate active/inactive NPZ files? (y/N)" "N"; then
-  USE_SPLIT="true"
-fi
+MODEL_NAME="$(prompt "Model name (base for delta models)" "")"
 
 NPZ_PATH=""
-ACTIVE_STATE=""
-INACTIVE_STATE=""
-ACTIVE_NPZ=""
-INACTIVE_NPZ=""
+STATE_IDS=""
 
-if [ "$USE_SPLIT" = "true" ]; then
-  ACTIVE_ROW="$(offline_select_descriptor_one)"
-  ACTIVE_NPZ="$(printf "%s" "$ACTIVE_ROW" | awk -F'|' '{print $3}')"
-  if [ -z "$ACTIVE_NPZ" ] || [ ! -f "$ACTIVE_NPZ" ]; then
-    echo "Active NPZ file is required."
-    exit 1
-  fi
-  INACTIVE_ROW="$(offline_select_descriptor_one)"
-  INACTIVE_NPZ="$(printf "%s" "$INACTIVE_ROW" | awk -F'|' '{print $3}')"
-  if [ -z "$INACTIVE_NPZ" ] || [ ! -f "$INACTIVE_NPZ" ]; then
-    echo "Inactive NPZ file is required."
-    exit 1
-  fi
-else
+CLUSTER_ROW="$(_offline_list list-clusters --project-id "$OFFLINE_PROJECT_ID" --system-id "$OFFLINE_SYSTEM_ID" | awk -F'|' -v cid="$CLUSTER_ID" '$1==cid {print; exit}')"
+if [ -z "$CLUSTER_ROW" ]; then
   CLUSTER_ROW="$(offline_select_cluster)"
-  NPZ_PATH="$(printf "%s" "$CLUSTER_ROW" | awk -F'|' '{print $3}')"
-  if [ -z "$NPZ_PATH" ] || [ ! -f "$NPZ_PATH" ]; then
-    echo "Cluster NPZ file is required."
-    exit 1
-  fi
-  ACTIVE_ROW="$(offline_select_state_one)"
-  ACTIVE_STATE="$(printf "%s" "$ACTIVE_ROW" | awk -F'|' '{print $1}')"
-  if [ -z "$ACTIVE_STATE" ]; then
-    echo "Active state ID is required."
-    exit 1
-  fi
-  INACTIVE_ROW="$(offline_select_state_one)"
-  INACTIVE_STATE="$(printf "%s" "$INACTIVE_ROW" | awk -F'|' '{print $1}')"
-  if [ -z "$INACTIVE_STATE" ]; then
-    echo "Inactive state ID is required."
-    exit 1
-  fi
+  CLUSTER_ID="$(printf "%s" "$CLUSTER_ROW" | awk -F'|' '{print $1}')"
+fi
+NPZ_PATH="$(printf "%s" "$CLUSTER_ROW" | awk -F'|' '{print $3}')"
+if [ -z "$NPZ_PATH" ] || [ ! -f "$NPZ_PATH" ]; then
+  echo "Cluster NPZ file is required."
+  exit 1
+fi
+
+STATE_ROWS="$(offline_select_analysis_states)"
+STATE_IDS="$(printf "%s\n" "$STATE_ROWS" | awk -F'|' '{print $1}' | paste -sd, -)"
+if [ -z "$STATE_IDS" ]; then
+  echo "Select at least one state ID."
+  exit 1
 fi
 
 EPOCHS="$(prompt "Epochs" "200")"
@@ -128,7 +106,10 @@ DELTA_GROUP_H="$(prompt "Delta group sparsity (fields)" "0.0")"
 DELTA_GROUP_J="$(prompt "Delta group sparsity (couplings)" "0.0")"
 
 CMD=(
-  "$PYTHON_BIN" -m phase.simulation.delta_fit
+  "$PYTHON_BIN" -m phase.scripts.potts_delta_fit
+  --project-id "$OFFLINE_PROJECT_ID"
+  --system-id "$OFFLINE_SYSTEM_ID"
+  --cluster-id "$CLUSTER_ID"
   --base-model "$BASE_MODEL"
   --results-dir "$RESULTS_DIR"
   --epochs "$EPOCHS"
@@ -142,15 +123,15 @@ CMD=(
   --delta-group-j "$DELTA_GROUP_J"
 )
 
+if [ -n "$MODEL_NAME" ]; then
+  CMD+=(--model-name "$MODEL_NAME")
+fi
+
 if [ "$DEVICE" != "auto" ] && [ -n "$DEVICE" ]; then
   CMD+=(--device "$DEVICE")
 fi
 
-if [ "$USE_SPLIT" = "true" ]; then
-  CMD+=(--active-npz "$ACTIVE_NPZ" --inactive-npz "$INACTIVE_NPZ")
-else
-  CMD+=(--npz "$NPZ_PATH" --active-state-id "$ACTIVE_STATE" --inactive-state-id "$INACTIVE_STATE")
-fi
+CMD+=(--npz "$NPZ_PATH" --state-ids "$STATE_IDS")
 
 if prompt_bool "Skip saving combined models? (y/N)" "N"; then
   CMD+=(--no-combined)

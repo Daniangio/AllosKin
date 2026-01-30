@@ -44,8 +44,11 @@ export default function ResultDetailPage() {
 
   const canVisualize =
     result.residue_selections_mapping && result.analysis_type === 'static' && typeof result.results === 'object';
-  const canVisualizeSimulation =
-    result.analysis_type === 'simulation' && Boolean(result.results?.marginals_plot);
+  const canOpenSamplingViz =
+    result.analysis_type === 'simulation' &&
+    systemRef.project_id &&
+    systemRef.system_id &&
+    systemRef.cluster_id;
   const sampledConformationsUrl =
     result.analysis_type === 'simulation' && result.results?.summary_npz
       ? resultArtifactUrl(result.job_id, 'summary_npz')
@@ -58,11 +61,17 @@ export default function ResultDetailPage() {
       </button>
 
       <section className="bg-gray-800 border border-gray-700 rounded-lg p-4">
-        <h1 className="text-2xl font-bold text-white mb-2">Job {result.job_id}</h1>
+        <h1 className="text-2xl font-bold text-white mb-2">
+          {result.analysis_type === 'simulation'
+            ? systemRef.sample_name || systemRef.potts_model_name || 'Potts sampling run'
+            : `Job ${result.job_id}`}
+        </h1>
         <dl className="grid md:grid-cols-2 gap-4 text-sm text-gray-300">
           <div>
             <dt className="text-gray-400">Type</dt>
-            <dd className="capitalize">{result.analysis_type}</dd>
+            <dd className="capitalize">
+              {result.analysis_type === 'simulation' ? 'potts sampling' : result.analysis_type}
+            </dd>
           </div>
           <div>
             <dt className="text-gray-400">Status</dt>
@@ -114,12 +123,18 @@ export default function ResultDetailPage() {
                 Visualize
               </button>
             )}
-            {canVisualizeSimulation && (
+            {canOpenSamplingViz && (
               <button
-                onClick={() => navigate(`/simulation/${result.job_id}`)}
+                onClick={() => {
+                  const params = new URLSearchParams({ cluster_id: systemRef.cluster_id });
+                  if (systemRef.sample_id) params.set('sample_id', systemRef.sample_id);
+                  navigate(
+                    `/projects/${systemRef.project_id}/systems/${systemRef.system_id}/sampling/visualize?${params}`
+                  );
+                }}
                 className="px-3 py-1 bg-cyan-600 rounded-md text-white text-sm"
               >
-                Simulation View
+                Sampling viz
               </button>
             )}
             {sampledConformationsUrl && (
