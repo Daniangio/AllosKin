@@ -1364,6 +1364,7 @@ def run_pipeline(
     labels = ds.labels
     K = ds.cluster_counts
     edges = ds.edges
+    edges_from_model = False
     residue_labels = getattr(ds, "residue_keys", np.arange(labels.shape[1]))
     if len(edges) == 0:
         if args.contact_all_vs_all:
@@ -1386,10 +1387,6 @@ def run_pipeline(
             except Exception as exc:
                 print(f"[data] Failed to compute contact edges: {exc}")
 
-    if len(edges) == 0 and not args.contact_all_vs_all and not args.pdbs:
-        print("[data] contact edges empty; pairwise terms disabled (provide --pdbs to compute edges).")
-    train_points = int(labels.shape[0] * labels.shape[1])
-    print(f"[data] T={labels.shape[0]}  N={labels.shape[1]}  edges={len(edges)}  train_points={train_points}")
     plm_device = (args.plm_device or "").strip()
     if plm_device.lower() == "auto":
         plm_device = ""
@@ -1446,8 +1443,13 @@ def run_pipeline(
                     start_best_val_loss = _coerce_float(resume_meta.get("plm_best_val_loss"))
             if init_model.edges:
                 edges = list(init_model.edges)
-                print("[fit] using edges from init model.")
+                edges_from_model = True
+                print(f"[fit] using edges from init model ({len(edges)} edges).")
 
+        if len(edges) == 0 and not args.contact_all_vs_all and not args.pdbs and not edges_from_model:
+            print("[data] contact edges empty; pairwise terms disabled (provide --pdbs to compute edges).")
+        train_points = int(labels.shape[0] * labels.shape[1])
+        print(f"[data] T={labels.shape[0]}  N={labels.shape[1]}  edges={len(edges)}  train_points={train_points}")
         do_pmi = args.fit == "pmi" or (args.fit == "pmi+plm" and plm_init == "pmi")
         if do_pmi:
             report("Fitting Potts model (PMI)", 15)

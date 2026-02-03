@@ -142,6 +142,39 @@ def main(argv: list[str] | None = None) -> int:
         model_path = Path(results.get("model_path")) if results else None
         if model_path:
             params = vars(args) if hasattr(args, "__dict__") else {}
+            store = ProjectStore(base_dir=Path(os.getenv("PHASE_DATA_ROOT", "/app/data")) / "projects")
+            resume_path = None
+            if args.plm_resume_model:
+                resume_path = Path(args.plm_resume_model)
+                if not resume_path.is_absolute():
+                    resume_path = store.resolve_path(project_id, system_id, str(args.plm_resume_model))
+            if resume_path and resume_path.resolve() == model_path.resolve():
+                try:
+                    system_meta = store.get_system(project_id, system_id)
+                except FileNotFoundError:
+                    system_meta = None
+                if system_meta:
+                    entry = next(
+                        (c for c in (system_meta.metastable_clusters or []) if c.get("cluster_id") == cluster_id),
+                        None,
+                    )
+                    if isinstance(entry, dict):
+                        models = entry.get("potts_models") or []
+                        updated = False
+                        for model in models:
+                            rel_path = model.get("path")
+                            if not rel_path:
+                                continue
+                            abs_path = store.resolve_path(project_id, system_id, rel_path)
+                            if abs_path.resolve() == resume_path.resolve():
+                                model["params"] = params
+                                updated = True
+                                break
+                        if updated:
+                            entry["potts_models"] = models
+                            store.save_system(system_meta)
+                            return 0
+                return 0
             _persist_model(
                 project_id=project_id,
                 system_id=system_id,
