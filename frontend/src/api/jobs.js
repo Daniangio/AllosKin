@@ -21,6 +21,20 @@ export function submitPottsFitJob(payload) {
   });
 }
 
+export function submitPottsAnalysisJob(payload) {
+  return requestJSON('/submit/potts_analysis', {
+    method: 'POST',
+    body: payload,
+  });
+}
+
+export function submitMdSamplesRefreshJob(payload) {
+  return requestJSON('/submit/md_samples_refresh', {
+    method: 'POST',
+    body: payload,
+  });
+}
+
 export function fetchResults() {
   return requestJSON('/results');
 }

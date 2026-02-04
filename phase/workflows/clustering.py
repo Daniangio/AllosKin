@@ -19,6 +19,7 @@ from dadapy import Data
 
 from phase.io.descriptors import load_descriptor_npz
 from phase.services.project_store import DescriptorState, ProjectStore, SystemMetadata
+from phase.potts.sample_io import SAMPLE_NPZ_FILENAME, save_sample_npz
 
 
 def _slug(value: str) -> str:
@@ -555,31 +556,42 @@ def assign_cluster_labels_to_states(
         else:
             frame_indices = np.arange(labels_halo.shape[0], dtype=np.int64)
 
-        payload: Dict[str, Any] = {
-            "residue_keys": np.asarray(residue_keys),
-            "assigned__labels": labels_halo,
-            "assigned__cluster_counts": merged_counts,
-            "assigned__frame_state_id": np.array([state_id]),
-            "assigned__frame_indices": frame_indices,
-            "metadata_json": np.array(
-                json.dumps(
-                    {
-                        "source_cluster": cluster_path.name,
-                        "state_id": state_id,
-                        "generated_at": datetime.utcnow().isoformat(),
-                    }
-                )
-            ),
-        }
-        if labels_assigned is not None:
-            payload["assigned__labels_assigned"] = labels_assigned
-
         sample_id = str(uuid.uuid4())
         sample_dir = assign_root / sample_id
         sample_dir.mkdir(parents=True, exist_ok=True)
-        out_path = sample_dir / "md_eval.npz"
-        np.savez_compressed(out_path, **payload)
+        out_path = sample_dir / SAMPLE_NPZ_FILENAME
+        labels_primary = labels_assigned if labels_assigned is not None else labels_halo
+        keep = np.all(labels_primary >= 0, axis=1)
+        if keep.size and not np.all(keep):
+            labels_primary = labels_primary[keep]
+            labels_halo = labels_halo[keep]
+            frame_indices = frame_indices[keep]
+        save_sample_npz(
+            out_path,
+            labels=labels_primary,
+            labels_halo=labels_halo,
+            frame_indices=frame_indices,
+            frame_state_ids=np.full(frame_indices.shape[0], str(state_id), dtype=str),
+        )
         assigned_state_paths[state_id] = str(out_path.relative_to(cluster_path.parent))
+        system_dir = cluster_path.parent.parent.parent
+        try:
+            rel_system = str(out_path.relative_to(system_dir))
+        except Exception:
+            rel_system = str(out_path)
+        sample_meta = {
+            "sample_id": sample_id,
+            "name": f"MD {getattr(state, 'name', state_id)}",
+            "type": "md_eval",
+            "method": "md_eval",
+            "source": "clustering",
+            "state_id": state_id,
+            "created_at": datetime.utcnow().isoformat(),
+            "path": rel_system,
+            "paths": {"summary_npz": rel_system},
+            "params": {},
+        }
+        (sample_dir / "sample_metadata.json").write_text(json.dumps(sample_meta, indent=2), encoding="utf-8")
         samples.append(
             {
                 "sample_id": sample_id,
@@ -623,32 +635,46 @@ def assign_cluster_labels_to_states(
             else np.arange(labels_halo.shape[0], dtype=np.int64)
         )
 
-        payload = {
-            "residue_keys": np.asarray(residue_keys),
-            "assigned__labels": labels_halo,
-            "assigned__cluster_counts": merged_counts,
-            "assigned__frame_state_id": frame_state_ids,
-            "assigned__frame_indices": frame_indices,
-            "assigned__frame_metastable_id": np.array([str(meta_id)]),
-            "metadata_json": np.array(
-                json.dumps(
-                    {
-                        "source_cluster": cluster_path.name,
-                        "metastable_id": str(meta_id),
-                        "generated_at": datetime.utcnow().isoformat(),
-                    }
-                )
-            ),
-        }
-        if labels_assigned is not None:
-            payload["assigned__labels_assigned"] = labels_assigned
-
         sample_id = str(uuid.uuid4())
         sample_dir = assign_root / sample_id
         sample_dir.mkdir(parents=True, exist_ok=True)
-        out_path = sample_dir / "md_eval.npz"
-        np.savez_compressed(out_path, **payload)
+        out_path = sample_dir / SAMPLE_NPZ_FILENAME
+        labels_primary = labels_assigned if labels_assigned is not None else labels_halo
+        frame_state_ids_arr = frame_state_ids
+        if frame_state_ids_arr.size != frame_indices.shape[0]:
+            frame_state_ids_arr = np.full(frame_indices.shape[0], "", dtype=str)
+        keep = np.all(labels_primary >= 0, axis=1)
+        if keep.size and not np.all(keep):
+            labels_primary = labels_primary[keep]
+            labels_halo = labels_halo[keep]
+            frame_indices = frame_indices[keep]
+            frame_state_ids_arr = frame_state_ids_arr[keep] if frame_state_ids_arr.size == keep.shape[0] else frame_state_ids_arr
+        save_sample_npz(
+            out_path,
+            labels=labels_primary,
+            labels_halo=labels_halo,
+            frame_indices=frame_indices,
+            frame_state_ids=frame_state_ids_arr,
+        )
         assigned_meta_paths[str(meta_id)] = str(out_path.relative_to(cluster_path.parent))
+        system_dir = cluster_path.parent.parent.parent
+        try:
+            rel_system = str(out_path.relative_to(system_dir))
+        except Exception:
+            rel_system = str(out_path)
+        sample_meta = {
+            "sample_id": sample_id,
+            "name": f"MD {meta_lookup.get(meta_id, {}).get('label') or meta_id}",
+            "type": "md_eval",
+            "method": "md_eval",
+            "source": "clustering",
+            "metastable_id": str(meta_id),
+            "created_at": datetime.utcnow().isoformat(),
+            "path": rel_system,
+            "paths": {"summary_npz": rel_system},
+            "params": {},
+        }
+        (sample_dir / "sample_metadata.json").write_text(json.dumps(sample_meta, indent=2), encoding="utf-8")
         meta_label = meta_lookup.get(meta_id, {}).get("label") if isinstance(meta_id, str) else None
         samples.append(
             {
@@ -677,6 +703,7 @@ def evaluate_state_with_models(
     state_id: str,
     *,
     store: ProjectStore | None = None,
+    sample_id: str | None = None,
 ) -> Dict[str, Any]:
     store = store or ProjectStore()
     system = store.get_system(project_id, system_id)
@@ -773,43 +800,42 @@ def evaluate_state_with_models(
         if np.any(labels_assigned[:, idx] >= 0):
             cluster_counts[idx] = int(labels_assigned[:, idx].max()) + 1
 
-    frame_indices = np.arange(labels_halo.shape[0], dtype=np.int64)
-    payload: Dict[str, Any] = {
-        "residue_keys": np.asarray(residue_keys),
-        "assigned__labels": labels_halo,
-        "assigned__labels_assigned": labels_assigned,
-        "assigned__cluster_counts": cluster_counts,
-        "assigned__frame_state_id": np.array([state_id]),
-        "assigned__frame_indices": frame_indices,
-        "metadata_json": np.array(
-            json.dumps(
-                {
-                    "source_cluster": cluster_path.name,
-                    "state_id": state_id,
-                    "generated_at": datetime.utcnow().isoformat(),
-                }
-            )
-        ),
-    }
-    sample_id = str(uuid.uuid4())
+    sample_id = str(sample_id) if sample_id else str(uuid.uuid4())
     sample_dir = cluster_dirs["samples_dir"] / sample_id
     sample_dir.mkdir(parents=True, exist_ok=True)
-    out_path = sample_dir / "md_eval.npz"
-    np.savez_compressed(out_path, **payload)
+    out_path = sample_dir / SAMPLE_NPZ_FILENAME
+    frame_indices = np.arange(labels_halo.shape[0], dtype=np.int64)
+    keep = np.all(labels_assigned >= 0, axis=1)
+    if keep.size and not np.all(keep):
+        labels_assigned = labels_assigned[keep]
+        labels_halo = labels_halo[keep]
+        frame_indices = frame_indices[keep]
+    save_sample_npz(
+        out_path,
+        labels=labels_assigned,
+        labels_halo=labels_halo,
+        frame_indices=frame_indices,
+        frame_state_ids=np.full(frame_indices.shape[0], str(state_id), dtype=str),
+    )
     try:
         rel = str(out_path.relative_to(cluster_dirs["system_dir"]))
     except Exception:
         rel = str(out_path)
-    return {
+    sample_entry = {
         "sample_id": sample_id,
         "name": f"MD {state.name or state_id}",
         "type": "md_eval",
         "method": "md_eval",
+        "source": "clustering",
         "state_id": state_id,
-        "path": rel,
         "created_at": datetime.utcnow().isoformat(),
-        "summary": {"state_id": state_id},
+        "path": rel,
+        "paths": {"summary_npz": rel},
+        "params": {},
     }
+    # Sample metadata is persisted via ProjectStore.save_system(). We return the full entry so
+    # both offline scripts and the webserver can append/update it in cluster metadata.
+    return sample_entry
 
 
 def update_cluster_metadata_with_assignments(

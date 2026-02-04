@@ -29,6 +29,25 @@ from backend.tasks import run_cluster_job, run_backmapping_job
 
 router = APIRouter()
 
+def _convert_nan_to_none(obj: Any):
+    """
+    Recursively converts NaN/Inf values into None so API responses remain valid JSON.
+    """
+    if isinstance(obj, dict):
+        return {k: _convert_nan_to_none(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_convert_nan_to_none(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _convert_nan_to_none(obj.tolist())
+    if isinstance(obj, (np.floating, np.integer)):
+        val = obj.item()
+        if isinstance(val, float) and not np.isfinite(val):
+            return None
+        return val
+    if isinstance(obj, float) and not np.isfinite(obj):
+        return None
+    return obj
+
 
 def _remove_results_dir(path_value: str | None, *, system_dir: Path | None = None) -> None:
     if not isinstance(path_value, str) or not path_value:
@@ -197,10 +216,25 @@ async def get_sampling_summary(
         raise HTTPException(status_code=404, detail="Sample summary NPZ is missing.")
     summary_path = project_store.resolve_path(project_id, system_id, summary_rel)
     if not summary_path.exists():
+        # Legacy metadata sometimes stored paths relative to the cluster directory.
+        cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+        alt = cluster_dirs["cluster_dir"] / summary_rel
+        if alt.exists():
+            summary_path = alt
+    if not summary_path.exists():
         raise HTTPException(status_code=404, detail="Sample summary NPZ not found on disk.")
 
     try:
         with np.load(summary_path, allow_pickle=True) as data:
+            # New sampling runs store a minimal `sample.npz` (labels only). The legacy visualization
+            # endpoint expects a full run_summary bundle; return an explicit error instead of
+            # silently serving empty arrays.
+            if "labels" in data and "js_md_sample" not in data and "X_gibbs" not in data and "X_sa" not in data:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This sample contains a minimal sample.npz (labels only). Run a Potts analysis job to generate analyses for visualization.",
+                )
+
             def _get(name, default=None):
                 if name not in data:
                     return default
@@ -266,7 +300,259 @@ async def get_sampling_summary(
     except Exception:
         pass
 
-    return payload
+    return _convert_nan_to_none(payload)
+
+
+@router.get(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/potts/cluster_info",
+    summary="Load cluster info needed for Potts sample visualization (residues, K, edges).",
+)
+async def get_potts_cluster_info(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    model_id: str | None = None,
+):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="System not found.")
+
+    entry = get_cluster_entry(system_meta, cluster_id)
+    rel_path = entry.get("path") if isinstance(entry, dict) else None
+    cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    cluster_path = cluster_dirs["cluster_dir"] / "cluster.npz"
+    if not cluster_path.exists() and rel_path:
+        cluster_path = project_store.resolve_path(project_id, system_id, rel_path)
+    if not cluster_path.exists():
+        raise HTTPException(status_code=404, detail="Cluster NPZ not found on disk.")
+
+    residue_keys: list[str] = []
+    cluster_counts: list[int] = []
+    edges: list[list[int]] = []
+    edges_source = "none"
+    model_name: str | None = None
+
+    try:
+        with np.load(cluster_path, allow_pickle=True) as data:
+            residue_keys = data["residue_keys"].tolist() if "residue_keys" in data else []
+            cluster_counts = data["merged__cluster_counts"].tolist() if "merged__cluster_counts" in data else []
+            if "contact_edge_index" in data:
+                edge_index = np.asarray(data["contact_edge_index"], dtype=int)
+                if edge_index.ndim == 2 and edge_index.shape[0] == 2:
+                    edges = edge_index.T.tolist()
+            elif "edges" in data:
+                edges = np.asarray(data["edges"], dtype=int).tolist()
+            if edges:
+                edges_source = "cluster"
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load cluster NPZ: {exc}") from exc
+
+    # If a model_id is provided, use the Potts model edges (these define the "meaningful" edge set).
+    if isinstance(model_id, str) and model_id.strip():
+        model_id = model_id.strip()
+        models = project_store.list_potts_models(project_id, system_id, cluster_id)
+        model_entry = next((m for m in models if m.get("model_id") == model_id), None)
+        if not model_entry or not model_entry.get("path"):
+            raise HTTPException(status_code=404, detail=f"Potts model '{model_id}' not found.")
+        model_name = model_entry.get("name")
+        model_path = project_store.resolve_path(project_id, system_id, str(model_entry.get("path")))
+        if not model_path.exists():
+            raise HTTPException(status_code=404, detail="Potts model NPZ not found on disk.")
+        try:
+            with np.load(model_path, allow_pickle=False) as data:
+                if "edges" in data:
+                    edges = np.asarray(data["edges"], dtype=int).tolist()
+                    edges_source = "potts_model"
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to load Potts model NPZ: {exc}") from exc
+
+    return {
+        "cluster_id": cluster_id,
+        "n_residues": int(len(residue_keys)),
+        "n_edges": int(len(edges)),
+        "residue_keys": residue_keys,
+        "cluster_counts": cluster_counts,
+        "edges": edges,
+        "edges_source": edges_source,
+        "model_id": model_id,
+        "model_name": model_name,
+    }
+
+
+@router.get(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/analyses",
+    summary="List derived Potts analyses stored under clusters/<cluster_id>/analyses/.",
+)
+async def list_cluster_analyses(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    analysis_type: str | None = None,
+):
+    try:
+        project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="System not found.")
+
+    cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    analyses_root = cluster_dirs["cluster_dir"] / "analyses"
+    if not analyses_root.exists():
+        return {"cluster_id": cluster_id, "analyses": []}
+
+    wanted = analysis_type.strip().lower() if isinstance(analysis_type, str) and analysis_type.strip() else None
+
+    analyses: list[dict[str, Any]] = []
+    for kind_dir in sorted((p for p in analyses_root.iterdir() if p.is_dir()), key=lambda p: p.name):
+        kind = kind_dir.name
+        if wanted and kind != wanted:
+            continue
+        for analysis_dir in sorted((p for p in kind_dir.iterdir() if p.is_dir()), key=lambda p: p.name):
+            meta_path = analysis_dir / "analysis_metadata.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            # Ensure stable keys for the UI.
+            meta.setdefault("analysis_type", kind)
+            meta.setdefault("analysis_id", analysis_dir.name)
+            analyses.append(_convert_nan_to_none(meta))
+
+    def _sort_key(m: dict[str, Any]):
+        return str(m.get("created_at") or "")
+
+    analyses.sort(key=_sort_key, reverse=True)
+    return {"cluster_id": cluster_id, "analyses": analyses}
+
+
+@router.get(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/analyses/{analysis_type}/{analysis_id}/data",
+    summary="Load a stored analysis.npz as JSON arrays for visualization.",
+)
+async def get_cluster_analysis_data(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    analysis_type: str,
+    analysis_id: str,
+):
+    try:
+        project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="System not found.")
+
+    cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    analysis_dir = cluster_dirs["cluster_dir"] / "analyses" / analysis_type / analysis_id
+    meta_path = analysis_dir / "analysis_metadata.json"
+    npz_path = analysis_dir / "analysis.npz"
+    if not meta_path.exists() or not npz_path.exists():
+        raise HTTPException(status_code=404, detail="Analysis not found on disk.")
+
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read analysis metadata: {exc}") from exc
+
+    try:
+        with np.load(npz_path, allow_pickle=False) as data:
+            payload: dict[str, Any] = {}
+            for key in data.files:
+                value = data[key]
+                if isinstance(value, np.ndarray):
+                    payload[key] = value.tolist()
+                else:
+                    payload[key] = value
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load analysis NPZ: {exc}") from exc
+
+    return {"metadata": _convert_nan_to_none(meta), "data": _convert_nan_to_none(payload)}
+
+
+@router.get(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/samples/{sample_id}/stats",
+    summary="Load basic stats for a saved sample NPZ (sample.npz or legacy).",
+)
+async def get_sample_stats(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    sample_id: str,
+):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="System not found.")
+
+    entry = get_cluster_entry(system_meta, cluster_id)
+    samples = entry.get("samples") if isinstance(entry, dict) else None
+    if not isinstance(samples, list):
+        raise HTTPException(status_code=404, detail="No samples recorded for this cluster.")
+    sample_entry = next((s for s in samples if isinstance(s, dict) and s.get("sample_id") == sample_id), None)
+    if not sample_entry:
+        raise HTTPException(status_code=404, detail="Sample not found in cluster metadata.")
+    paths = sample_entry.get("paths") if isinstance(sample_entry, dict) else None
+    summary_rel = paths.get("summary_npz") if isinstance(paths, dict) else None
+    summary_rel = summary_rel or sample_entry.get("path")
+    if not summary_rel:
+        raise HTTPException(status_code=404, detail="Sample NPZ path is missing.")
+
+    npz_path = project_store.resolve_path(project_id, system_id, str(summary_rel))
+    if not npz_path.exists():
+        cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+        alt = cluster_dirs["cluster_dir"] / str(summary_rel)
+        if alt.exists():
+            npz_path = alt
+    if not npz_path.exists():
+        raise HTTPException(status_code=404, detail="Sample NPZ not found on disk.")
+
+    keys: list[str] = []
+    n_frames = 0
+    n_residues = 0
+    invalid_count = 0
+    has_halo = False
+    try:
+        with np.load(npz_path, allow_pickle=True) as data:
+            keys = list(data.files)
+            labels = None
+            if "labels" in data:
+                labels = np.asarray(data["labels"])
+                has_halo = "labels_halo" in data
+                if "invalid_mask" in data:
+                    invalid_mask = np.asarray(data["invalid_mask"], dtype=bool).ravel()
+                    invalid_count = int(np.count_nonzero(invalid_mask))
+            elif "assigned__labels_assigned" in data:
+                labels = np.asarray(data["assigned__labels_assigned"])
+                has_halo = "assigned__labels" in data
+            elif "assigned__labels" in data:
+                labels = np.asarray(data["assigned__labels"])
+                has_halo = True
+            elif "X_sa" in data:
+                labels = np.asarray(data["X_sa"])
+                if "sa_invalid_mask" in data:
+                    invalid_mask = np.asarray(data["sa_invalid_mask"], dtype=bool).ravel()
+                    invalid_count = int(np.count_nonzero(invalid_mask))
+            elif "X_gibbs" in data:
+                labels = np.asarray(data["X_gibbs"])
+            if isinstance(labels, np.ndarray) and labels.ndim == 2:
+                n_frames = int(labels.shape[0])
+                n_residues = int(labels.shape[1])
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read sample NPZ: {exc}") from exc
+
+    invalid_fraction = float(invalid_count) / float(n_frames) if n_frames else 0.0
+    return {
+        "sample_id": sample_id,
+        "cluster_id": cluster_id,
+        "path": str(summary_rel),
+        "keys": keys,
+        "n_frames": n_frames,
+        "n_residues": n_residues,
+        "invalid_count": invalid_count,
+        "invalid_fraction": invalid_fraction,
+        "has_halo": bool(has_halo),
+    }
 
 
 @router.get(
@@ -310,6 +596,11 @@ async def download_sampling_artifact(
     if not rel_path:
         raise HTTPException(status_code=404, detail="Artifact not available for this sample.")
     artifact_path = project_store.resolve_path(project_id, system_id, rel_path)
+    if not artifact_path.exists():
+        cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+        alt = cluster_dirs["cluster_dir"] / rel_path
+        if alt.exists():
+            artifact_path = alt
     if not artifact_path.exists():
         raise HTTPException(status_code=404, detail="Artifact file not found on disk.")
 
@@ -1137,15 +1428,39 @@ async def evaluate_state_against_cluster(
     if not entry:
         raise HTTPException(status_code=404, detail="Cluster NPZ not found.")
 
-    try:
-        sample_entry = evaluate_state_with_models(project_id, system_id, cluster_id, state_id)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     samples = entry.get("samples")
     if not isinstance(samples, list):
         samples = []
-    samples.append(sample_entry)
+    existing = [
+        s
+        for s in samples
+        if isinstance(s, dict)
+        and (s.get("type") or "") == "md_eval"
+        and (s.get("state_id") or "") == state_id
+        and s.get("sample_id")
+    ]
+    reuse_id = None
+    if existing:
+        existing.sort(key=lambda s: str(s.get("created_at") or ""))
+        reuse_id = str(existing[-1].get("sample_id"))
+        dup_ids = {str(s.get("sample_id")) for s in existing[:-1] if s.get("sample_id")}
+        if dup_ids:
+            samples = [s for s in samples if not (isinstance(s, dict) and s.get("sample_id") in dup_ids)]
+
+    try:
+        sample_entry = evaluate_state_with_models(project_id, system_id, cluster_id, state_id, sample_id=reuse_id)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    out_id = sample_entry.get("sample_id")
+    replaced = False
+    for idx, s in enumerate(samples):
+        if isinstance(s, dict) and s.get("sample_id") == out_id:
+            samples[idx] = sample_entry
+            replaced = True
+            break
+    if not replaced:
+        samples.append(sample_entry)
     entry["samples"] = samples
     system_meta.metastable_clusters = clusters
     project_store.save_system(system_meta)

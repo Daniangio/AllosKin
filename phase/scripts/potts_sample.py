@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
-from phase.potts import pipeline as sim_main
+from phase.potts.sampling_run import run_sampling
 from phase.scripts.potts_utils import persist_sample
 
 
@@ -25,7 +26,7 @@ def _filter_sampling_params(args: object, parser) -> dict:
     sampling_method = raw.get("sampling_method") or "gibbs"
     gibbs_method = raw.get("gibbs_method") or "single"
 
-    allow = {"sampling_method", "beta", "seed", "estimate_beta_eff"}
+    allow = {"sampling_method", "beta", "seed"}
     if sampling_method == "gibbs":
         allow |= {"gibbs_method"}
         if gibbs_method == "single":
@@ -49,17 +50,11 @@ def _filter_sampling_params(args: object, parser) -> dict:
             "sa_sweeps",
             "sa_beta_hot",
             "sa_beta_cold",
-            "sa_beta_schedule",
             "sa_init",
             "sa_init_md_frame",
-            "sa_restart",
-            "sa_restart_topk",
             "penalty_safety",
             "repair",
         }
-
-    if raw.get("estimate_beta_eff"):
-        allow |= {"beta_eff_grid", "beta_eff_w_marg", "beta_eff_w_pair"}
 
     out = {"sampling_method": sampling_method}
     if sampling_method == "gibbs":
@@ -80,44 +75,107 @@ def _filter_sampling_params(args: object, parser) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = sim_main._build_arg_parser()
+    parser = argparse.ArgumentParser(description="Sample a fitted Potts model (Gibbs or SA) and persist a minimal sample.npz.")
+    parser.add_argument("--npz", required=True, help="Input cluster NPZ file (for SA init + metadata linkage).")
+    parser.add_argument("--results-dir", required=True, help="Output directory (will contain sample.npz).")
+    parser.add_argument(
+        "--model-npz",
+        action="append",
+        default=[],
+        help="Potts model NPZ path. Repeat or pass comma-separated paths to combine multiple models.",
+    )
+    parser.add_argument("--sampling-method", default="gibbs", choices=["gibbs", "sa"])
+    parser.add_argument("--beta", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--progress", action="store_true")
+
+    # Gibbs / REX-Gibbs
+    parser.add_argument("--gibbs-method", default="single", choices=["single", "rex"])
+    parser.add_argument("--gibbs-samples", type=int, default=500)
+    parser.add_argument("--gibbs-burnin", type=int, default=50)
+    parser.add_argument("--gibbs-thin", type=int, default=2)
+    parser.add_argument("--gibbs-chains", type=int, default=1)
+    parser.add_argument("--rex-betas", type=str, default="")
+    parser.add_argument("--rex-n-replicas", type=int, default=8)
+    parser.add_argument("--rex-beta-min", type=float, default=0.2)
+    parser.add_argument("--rex-beta-max", type=float, default=1.0)
+    parser.add_argument("--rex-spacing", type=str, default="geom", choices=["geom", "lin"])
+    parser.add_argument("--rex-rounds", type=int, default=2000)
+    parser.add_argument("--rex-burnin-rounds", type=int, default=50)
+    parser.add_argument("--rex-sweeps-per-round", type=int, default=2)
+    parser.add_argument("--rex-thin-rounds", type=int, default=1)
+    parser.add_argument("--rex-chains", type=int, default=1)
+
+    # SA/QUBO
+    parser.add_argument("--sa-reads", type=int, default=2000)
+    parser.add_argument("--sa-sweeps", type=int, default=2000)
+    parser.add_argument("--sa-beta-hot", type=float, default=0.0)
+    parser.add_argument("--sa-beta-cold", type=float, default=0.0)
+    parser.add_argument("--sa-init", type=str, default="md", choices=["md", "md-frame", "random-h", "random-uniform"])
+    parser.add_argument("--sa-init-md-frame", type=int, default=-1)
+    parser.add_argument("--penalty-safety", type=float, default=3.0)
+    parser.add_argument("--repair", type=str, default="none", choices=["none", "argmax"])
+
     parser.add_argument("--project-id", default="")
     parser.add_argument("--system-id", default="")
     parser.add_argument("--cluster-id", default="")
     parser.add_argument("--sample-id", default="")
     parser.add_argument("--sample-name", default="")
     args = parser.parse_args(argv)
-    args.fit_only = False
-    if not getattr(args, "plot_only", False):
-        args.no_plots = True
-    args.no_save_model = True
     try:
-        results = sim_main.run_pipeline(args, parser=parser)
+        results = run_sampling(
+            cluster_npz=str(args.npz),
+            results_dir=str(args.results_dir),
+            model_npz=getattr(args, "model_npz", []) or [],
+            sampling_method=str(args.sampling_method),
+            beta=float(args.beta),
+            seed=int(args.seed),
+            progress=bool(args.progress),
+            gibbs_method=str(args.gibbs_method),
+            gibbs_samples=int(args.gibbs_samples),
+            gibbs_burnin=int(args.gibbs_burnin),
+            gibbs_thin=int(args.gibbs_thin),
+            gibbs_chains=int(args.gibbs_chains),
+            rex_betas=str(args.rex_betas),
+            rex_n_replicas=int(args.rex_n_replicas),
+            rex_beta_min=float(args.rex_beta_min),
+            rex_beta_max=float(args.rex_beta_max),
+            rex_spacing=str(args.rex_spacing),
+            rex_rounds=int(args.rex_rounds),
+            rex_burnin_rounds=int(args.rex_burnin_rounds),
+            rex_sweeps_per_round=int(args.rex_sweeps_per_round),
+            rex_thin_rounds=int(args.rex_thin_rounds),
+            rex_chains=int(args.rex_chains),
+            sa_reads=int(args.sa_reads),
+            sa_sweeps=int(args.sa_sweeps),
+            sa_beta_hot=float(args.sa_beta_hot),
+            sa_beta_cold=float(args.sa_beta_cold),
+            sa_init=str(args.sa_init),
+            sa_init_md_frame=int(args.sa_init_md_frame),
+            penalty_safety=float(args.penalty_safety),
+            repair=str(args.repair),
+        )
     except SystemExit as exc:
         return int(exc.code) if exc.code is not None else 1
     project_id = (args.project_id or "").strip()
     system_id = (args.system_id or "").strip()
     cluster_id = (args.cluster_id or "").strip()
-    if project_id and system_id and cluster_id and results and not getattr(args, "plot_only", False):
-        summary_path = results.get("summary_path")
-        summary = Path(summary_path) if summary_path is not None else None
-        if summary is not None:
-            model_paths = []
-            for raw in getattr(args, "model_npz", []) or []:
-                model_paths.append(Path(str(raw)))
-            persist_sample(
-                project_id=project_id,
-                system_id=system_id,
-                cluster_id=cluster_id,
-                summary_path=summary,
-                metadata_path=None,
-                sample_name=args.sample_name or None,
-                sample_type="potts_sampling",
-                method=str(args.sampling_method) if getattr(args, "sampling_method", None) else None,
-                params=_filter_sampling_params(args, parser),
-                model_paths=model_paths,
-                sample_id=args.sample_id or None,
-            )
+    if project_id and system_id and cluster_id and results:
+        summary = Path(results.sample_path)
+        model_paths = [Path(str(raw)) for raw in getattr(args, "model_npz", []) or []]
+        persist_sample(
+            project_id=project_id,
+            system_id=system_id,
+            cluster_id=cluster_id,
+            summary_path=summary,
+            metadata_path=None,
+            sample_name=args.sample_name or None,
+            sample_type="potts_sampling",
+            method=str(args.sampling_method) if getattr(args, "sampling_method", None) else None,
+            params=_filter_sampling_params(args, parser),
+            model_paths=model_paths,
+            sample_id=args.sample_id or None,
+        )
     return 0
 
 

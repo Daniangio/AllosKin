@@ -18,14 +18,6 @@ def main(argv: list[str] | None = None) -> int:
 
     root = Path(args.root).expanduser().resolve() / "projects"
     store = ProjectStore(base_dir=root)
-    _ = store.get_system(args.project_id, args.system_id)
-    sample_entry = evaluate_state_with_models(
-        args.project_id,
-        args.system_id,
-        args.cluster_id,
-        args.state_id,
-        store=store,
-    )
     system_meta = store.get_system(args.project_id, args.system_id)
     clusters = system_meta.metastable_clusters or []
     entry = next((c for c in clusters if c.get("cluster_id") == args.cluster_id), None)
@@ -34,7 +26,43 @@ def main(argv: list[str] | None = None) -> int:
     samples = entry.get("samples")
     if not isinstance(samples, list):
         samples = []
-    samples.append(sample_entry)
+
+    existing = [
+        s
+        for s in samples
+        if isinstance(s, dict)
+        and (s.get("type") or "") == "md_eval"
+        and (s.get("state_id") or "") == args.state_id
+        and s.get("sample_id")
+    ]
+    reuse_id = None
+    if existing:
+        existing.sort(key=lambda s: str(s.get("created_at") or ""))
+        reuse_id = str(existing[-1].get("sample_id"))
+        # Drop duplicates from the metadata list (keeps the latest sample_id stable).
+        dup_ids = {str(s.get("sample_id")) for s in existing[:-1] if s.get("sample_id")}
+        if dup_ids:
+            samples = [s for s in samples if not (isinstance(s, dict) and s.get("sample_id") in dup_ids)]
+
+    sample_entry = evaluate_state_with_models(
+        args.project_id,
+        args.system_id,
+        args.cluster_id,
+        args.state_id,
+        store=store,
+        sample_id=reuse_id,
+    )
+
+    out_id = sample_entry.get("sample_id")
+    replaced = False
+    for idx, s in enumerate(samples):
+        if isinstance(s, dict) and s.get("sample_id") == out_id:
+            samples[idx] = sample_entry
+            replaced = True
+            break
+    if not replaced:
+        samples.append(sample_entry)
+
     entry["samples"] = samples
     store.save_system(system_meta)
     print(f"[evaluate] sample saved: {sample_entry.get('path')}")

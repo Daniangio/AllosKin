@@ -19,6 +19,8 @@ if str(REPO_ROOT) not in sys.path:
 from phase.pipeline.runner import run_analysis
 from phase.potts.pipeline import parse_args as parse_simulation_args
 from phase.potts.pipeline import run_pipeline as run_simulation_pipeline
+from phase.potts.sampling_run import run_sampling
+from phase.potts.analysis_run import analyze_cluster_samples
 from phase.common.runtime import RuntimePolicy
 from phase.potts import pipeline as sim_main
 from phase.potts import delta_fit as delta_fit_main
@@ -28,6 +30,7 @@ from phase.workflows.clustering import (
     reduce_cluster_workspace,
     run_cluster_chunk,
     assign_cluster_labels_to_states,
+    evaluate_state_with_models,
     update_cluster_metadata_with_assignments,
     build_cluster_output_path,
 )
@@ -654,20 +657,6 @@ def run_simulation_job(
             except (TypeError, ValueError):
                 pass
 
-        args_list = [
-            "--npz",
-            str(cluster_path),
-            "--results-dir",
-            str(results_dir),
-            "--gibbs-method",
-            gibbs_method,
-            "--sampling-method",
-            str(sampling_method),
-            "--estimate-beta-eff",
-        ]
-        if beta_override is not None:
-            args_list += ["--beta", str(float(beta_override))]
-
         model_paths: List[Path] = []
         if model_rels:
             missing_paths: List[str] = []
@@ -677,191 +666,66 @@ def run_simulation_job(
                     model_path = project_store.resolve_path(project_id, system_id, rel)
                 if model_path.exists():
                     model_paths.append(model_path)
-                    args_list += ["--model-npz", str(model_path)]
                 else:
                     missing_paths.append(rel)
             if missing_paths:
                 raise FileNotFoundError(f"Potts model file(s) missing on disk: {', '.join(missing_paths)}")
-            args_list.append("--no-save-model")
-        model_path = model_paths[0] if model_paths else None
+        if not model_paths:
+            raise FileNotFoundError("No Potts model selected for sampling.")
+        model_path = model_paths[0]
 
-        contact_mode = sim_params.get("contact_atom_mode") or sim_params.get("contact_mode") or "CA"
-        contact_cutoff = sim_params.get("contact_cutoff") or 10.0
-        contact_pdbs = _resolve_contact_pdbs(
-            project_id,
-            system_id,
-            _collect_contact_pdbs(
-                system_meta,
-                entry.get("state_ids") or entry.get("metastable_ids") or [],
-                system_meta.analysis_mode,
-            ),
-        )
-        if contact_pdbs:
-            pdb_flag = None
-            if _supports_sim_arg("--pdbs"):
-                pdb_flag = "--pdbs"
-            elif _supports_sim_arg("--contact-pdb"):
-                pdb_flag = "--contact-pdb"
-            if pdb_flag:
-                args_list += [
-                    pdb_flag,
-                    ",".join(str(p) for p in contact_pdbs),
-                    "--contact-cutoff",
-                    str(float(contact_cutoff)),
-                    "--contact-atom-mode",
-                    str(contact_mode),
-                ]
-            else:
-                print("[potts-fit] warning: simulation args do not support contact PDBs; skipping edge build.")
+        effective_beta = float(beta_override) if beta_override is not None else float(sim_params.get("beta", 1.0))
+        effective_seed = int(sim_params.get("seed", 0) or 0)
 
-        if gibbs_method == "rex":
-            if isinstance(rex_betas, str) and rex_betas.strip():
-                args_list += ["--rex-betas", rex_betas.strip()]
-            else:
-                rex_beta_min = sim_params.get("rex_beta_min")
-                rex_beta_max = sim_params.get("rex_beta_max")
-                rex_spacing = sim_params.get("rex_spacing")
-                if rex_beta_min is not None:
-                    args_list += ["--rex-beta-min", str(float(rex_beta_min))]
-                if rex_beta_max is not None:
-                    args_list += ["--rex-beta-max", str(float(rex_beta_max))]
-                if rex_spacing is not None:
-                    args_list += ["--rex-spacing", str(rex_spacing)]
-
-        rex_samples = sim_params.get("rex_samples")
-        if rex_samples is not None:
-            args_list += ["--rex-rounds", str(int(rex_samples))]
-        rex_burnin = sim_params.get("rex_burnin")
-        if rex_burnin is not None:
-            args_list += ["--rex-burnin-rounds", str(int(rex_burnin))]
-        rex_thin = sim_params.get("rex_thin")
-        if rex_thin is not None:
-            args_list += ["--rex-thin-rounds", str(int(rex_thin))]
-
-        sa_reads = sim_params.get("sa_reads")
-        if sa_reads is not None:
-            args_list += ["--sa-reads", str(int(sa_reads))]
-        sa_sweeps = sim_params.get("sa_sweeps")
-        if sa_sweeps is not None:
-            args_list += ["--sa-sweeps", str(int(sa_sweeps))]
-        sa_init = sim_params.get("sa_init")
-        if sa_init:
-            args_list += ["--sa-init", str(sa_init)]
-        sa_init_md_frame = sim_params.get("sa_init_md_frame")
-        if sa_init_md_frame is not None:
-            args_list += ["--sa-init-md-frame", str(int(sa_init_md_frame))]
-        sa_restart = sim_params.get("sa_restart")
-        if sa_restart:
-            args_list += ["--sa-restart", str(sa_restart)]
-        sa_restart_topk = sim_params.get("sa_restart_topk")
-        if sa_restart_topk is not None:
-            args_list += ["--sa-restart-topk", str(int(sa_restart_topk))]
-        sa_beta_schedules = []
-        raw_schedules = sim_params.get("sa_beta_schedules") or []
-        for schedule in raw_schedules:
-            if schedule is None:
-                continue
-            if isinstance(schedule, dict):
-                hot = schedule.get("beta_hot")
-                cold = schedule.get("beta_cold")
-            else:
+        # Backwards-compatible support for the UI's SA schedule editor: we only run one SA range.
+        if sampling_method == "sa":
+            schedules = sim_params.get("sa_beta_schedules")
+            if isinstance(schedules, list) and schedules:
+                first = schedules[0]
                 try:
-                    hot, cold = schedule
+                    hot, cold = first
                 except Exception:
-                    continue
-            if hot is None or cold is None:
-                continue
-            sa_beta_schedules.append((float(hot), float(cold)))
+                    hot, cold = None, None
+                if hot is not None and cold is not None:
+                    sim_params.setdefault("sa_beta_hot", hot)
+                    sim_params.setdefault("sa_beta_cold", cold)
 
-        sa_beta_hot = sim_params.get("sa_beta_hot")
-        sa_beta_cold = sim_params.get("sa_beta_cold")
-        if sa_beta_hot is not None and sa_beta_cold is not None:
-            sa_beta_schedules.append((float(sa_beta_hot), float(sa_beta_cold)))
-
-        for hot, cold in sa_beta_schedules:
-            args_list += ["--sa-beta-schedule", f"{float(hot)},{float(cold)}"]
-
-        plm_epochs = sim_params.get("plm_epochs")
-        if plm_epochs is not None:
-            args_list += ["--plm-epochs", str(int(plm_epochs))]
-        plm_lr = sim_params.get("plm_lr")
-        if plm_lr is not None:
-            args_list += ["--plm-lr", str(float(plm_lr))]
-        plm_lr_min = sim_params.get("plm_lr_min")
-        if plm_lr_min is not None:
-            args_list += ["--plm-lr-min", str(float(plm_lr_min))]
-        plm_lr_schedule = sim_params.get("plm_lr_schedule")
-        if plm_lr_schedule is not None:
-            args_list += ["--plm-lr-schedule", str(plm_lr_schedule)]
-        plm_l2 = sim_params.get("plm_l2")
-        if plm_l2 is not None:
-            args_list += ["--plm-l2", str(float(plm_l2))]
-        plm_batch_size = sim_params.get("plm_batch_size")
-        if plm_batch_size is not None:
-            args_list += ["--plm-batch-size", str(int(plm_batch_size))]
-        plm_progress_every = sim_params.get("plm_progress_every")
-        if plm_progress_every is not None:
-            args_list += ["--plm-progress-every", str(int(plm_progress_every))]
-        plm_device = sim_params.get("plm_device")
-        if plm_device is not None:
-            args_list += ["--plm-device", str(plm_device)]
-        plm_init = sim_params.get("plm_init")
-        if plm_init is not None:
-            args_list += ["--plm-init", str(plm_init)]
-        plm_init_model = sim_params.get("plm_init_model")
-        if plm_init_model is not None:
-            args_list += ["--plm-init-model", str(plm_init_model)]
-        plm_resume_model = sim_params.get("plm_resume_model")
-        if plm_resume_model is not None:
-            args_list += ["--plm-resume-model", str(plm_resume_model)]
-        plm_val_frac = sim_params.get("plm_val_frac")
-        if plm_val_frac is not None:
-            args_list += ["--plm-val-frac", str(float(plm_val_frac))]
-
-        save_progress("Running Potts simulation", 20)
-        try:
-            sim_args = parse_simulation_args(args_list)
-        except SystemExit as exc:
-            raise ValueError("Invalid simulation arguments.") from exc
-
-        run_result = run_simulation_pipeline(
-            sim_args,
+        save_progress("Running Potts sampling", 20)
+        run_sampling(
+            cluster_npz=str(cluster_path),
+            results_dir=results_dir,
+            model_npz=[str(p) for p in model_paths],
+            sampling_method=str(sampling_method),
+            beta=effective_beta,
+            seed=effective_seed,
+            progress=False,
+            gibbs_method=str(sim_params.get("gibbs_method") or gibbs_method),
+            gibbs_samples=int(sim_params.get("gibbs_samples") or 500),
+            gibbs_burnin=int(sim_params.get("gibbs_burnin") or 50),
+            gibbs_thin=int(sim_params.get("gibbs_thin") or 2),
+            gibbs_chains=int(sim_params.get("gibbs_chains") or 1),
+            rex_betas=str(rex_betas or ""),
+            rex_n_replicas=int(sim_params.get("rex_n_replicas") or 8),
+            rex_beta_min=float(sim_params.get("rex_beta_min") or 0.2),
+            rex_beta_max=float(sim_params.get("rex_beta_max") or 1.0),
+            rex_spacing=str(sim_params.get("rex_spacing") or "geom"),
+            rex_rounds=int(sim_params.get("rex_samples") or sim_params.get("rex_rounds") or 2000),
+            rex_burnin_rounds=int(sim_params.get("rex_burnin") or sim_params.get("rex_burnin_rounds") or 50),
+            rex_sweeps_per_round=int(sim_params.get("rex_sweeps_per_round") or 2),
+            rex_thin_rounds=int(sim_params.get("rex_thin") or sim_params.get("rex_thin_rounds") or 1),
+            rex_chains=int(sim_params.get("rex_chains") or sim_params.get("rex_chain_count") or 1),
+            sa_reads=int(sim_params.get("sa_reads") or 2000),
+            sa_sweeps=int(sim_params.get("sa_sweeps") or 2000),
+            sa_beta_hot=float(sim_params.get("sa_beta_hot") or 0.0),
+            sa_beta_cold=float(sim_params.get("sa_beta_cold") or 0.0),
+            sa_init=str(sim_params.get("sa_init") or "md"),
+            sa_init_md_frame=int(sim_params.get("sa_init_md_frame") or -1),
+            penalty_safety=float(sim_params.get("penalty_safety") or 3.0),
+            repair=str(sim_params.get("repair") or "none"),
             progress_callback=save_progress,
-            runtime=RuntimePolicy(allow_multiprocessing=False),
         )
-
-        def _coerce_path(value: object) -> Path | None:
-            if value is None:
-                return None
-            if isinstance(value, Path):
-                return value
-            return Path(str(value))
-
-        summary_path = _coerce_path(run_result.get("summary_path"))
-        plot_path = _coerce_path(run_result.get("plot_path"))
-        report_path = _coerce_path(run_result.get("report_path"))
-        cross_likelihood_report_path = _coerce_path(run_result.get("cross_likelihood_report_path"))
-        meta_path = _coerce_path(run_result.get("metadata_path"))
-        beta_scan_path = _coerce_path(run_result.get("beta_scan_path"))
-        model_artifact = _coerce_path(run_result.get("model_path"))
 
         potts_model_rels = [str(rel) for rel in model_rels] if model_rels else []
-        if not potts_model_rels and model_artifact and model_artifact.exists():
-            potts_model_rel = _persist_potts_model(
-                project_id,
-                system_id,
-                cluster_id,
-                model_artifact,
-                params,
-                source="simulation",
-                model_id=str(uuid.uuid4()),
-                model_name=None,
-            )
-            if potts_model_rel:
-                potts_model_rels = [potts_model_rel]
-                model_names = [Path(potts_model_rel).stem]
-                model_name = None
-
         cluster_name = entry.get("name") if isinstance(entry, dict) else None
         if cluster_name:
             result_payload["system_reference"]["cluster_name"] = cluster_name
@@ -871,84 +735,74 @@ def run_simulation_job(
                 model_name = " + ".join(Path(rel).stem for rel in potts_model_rels)
 
         sample_paths: Dict[str, str] = {}
-        for path in [plot_path, report_path, cross_likelihood_report_path, beta_scan_path]:
-            if path and path.exists():
-                try:
-                    path.unlink()
-                except Exception:
-                    pass
-        plot_path = None
-        report_path = None
-        cross_likelihood_report_path = None
-        beta_scan_path = None
-
-        for key, path in {
-            "summary_npz": summary_path,
-            "marginals_plot": plot_path,
-            "sampling_report": report_path,
-            "cross_likelihood_report": cross_likelihood_report_path,
-            "beta_scan_plot": beta_scan_path,
-        }.items():
-            if path and path.exists():
-                dest = path
-                if dest.parent.resolve() != sample_dir.resolve():
-                    dest = sample_dir / path.name
-                    if dest.resolve() != path.resolve():
-                        shutil.copy2(path, dest)
-                try:
-                    sample_paths[key] = str(dest.relative_to(cluster_dirs["system_dir"]))
-                except Exception:
-                    sample_paths[key] = str(dest)
-
+        summary_path = sample_dir / "sample.npz"
+        if summary_path.exists():
+            try:
+                sample_paths["summary_npz"] = str(summary_path.relative_to(cluster_dirs["system_dir"]))
+            except Exception:
+                sample_paths["summary_npz"] = str(summary_path)
         primary_path = sample_paths.get("summary_npz")
         sample_label = sim_params.get("sample_name")
         if isinstance(sample_label, str):
             sample_label = sample_label.strip() or None
 
         def _filter_sampling_params(raw: Dict[str, Any]) -> Dict[str, Any]:
-            effective_method = raw.get("sampling_method") or ("sa" if sampling_method == "sa" else "gibbs")
-            gibbs_method = raw.get("gibbs_method") or "single"
-            allow = {"sampling_method", "beta", "seed", "estimate_beta_eff"}
-            if effective_method == "gibbs":
-                allow |= {"gibbs_method", "gibbs_samples", "gibbs_burnin", "gibbs_thin", "gibbs_chains"}
-                if gibbs_method != "single":
-                    allow |= {
-                        "rex_betas",
-                        "rex_n_replicas",
-                        "rex_beta_min",
-                        "rex_beta_max",
-                        "rex_spacing",
-                        "rex_rounds",
-                        "rex_burnin_rounds",
-                        "rex_sweeps_per_round",
-                        "rex_thin_rounds",
-                        "rex_chains",
-                    }
+            # Store a normalized, minimal sampler configuration consistent with offline runs.
+            method = (raw.get("sampling_method") or sampling_method or "gibbs").lower()
+            out: Dict[str, Any] = {"sampling_method": method}
+
+            defaults = {
+                "rex_spacing": "geom",
+                "rex_rounds": 2000,
+                "rex_burnin_rounds": 50,
+                "rex_thin_rounds": 1,
+                "rex_n_replicas": 8,
+                "rex_beta_min": 0.2,
+                "rex_beta_max": 1.0,
+                "sa_reads": 2000,
+                "sa_sweeps": 2000,
+                "sa_init": "md",
+                "sa_restart": "independent",
+            }
+
+            def _maybe(key: str, value: Any) -> None:
+                if value in (None, "", [], {}):
+                    return
+                if key in defaults and value == defaults[key]:
+                    return
+                out[key] = value
+
+            if method == "gibbs":
+                gm = str(raw.get("gibbs_method") or gibbs_method or "rex").lower()
+                _maybe("gibbs_method", gm)
+                _maybe("beta", float(effective_beta))
+
+                # Prefer storing the explicit ladder (if any), otherwise the generation params.
+                if rex_betas:
+                    _maybe("rex_betas", str(rex_betas))
+                else:
+                    _maybe("rex_beta_min", float(raw.get("rex_beta_min")) if raw.get("rex_beta_min") is not None else None)
+                    _maybe("rex_beta_max", float(raw.get("rex_beta_max")) if raw.get("rex_beta_max") is not None else None)
+                    _maybe("rex_n_replicas", int(raw.get("rex_n_replicas")) if raw.get("rex_n_replicas") is not None else None)
+                    _maybe("rex_spacing", str(raw.get("rex_spacing") or "geom"))
+
+                # UI uses rex_samples/burnin/thin naming; normalize to *_rounds.
+                rounds = raw.get("rex_samples") if raw.get("rex_samples") is not None else raw.get("rex_rounds")
+                burnin = raw.get("rex_burnin") if raw.get("rex_burnin") is not None else raw.get("rex_burnin_rounds")
+                thin = raw.get("rex_thin") if raw.get("rex_thin") is not None else raw.get("rex_thin_rounds")
+                _maybe("rex_rounds", int(rounds) if rounds is not None else None)
+                _maybe("rex_burnin_rounds", int(burnin) if burnin is not None else None)
+                _maybe("rex_thin_rounds", int(thin) if thin is not None else None)
             else:
-                allow |= {
-                    "sa_reads",
-                    "sa_sweeps",
-                    "sa_beta_hot",
-                    "sa_beta_cold",
-                    "sa_beta_schedule",
-                    "sa_init",
-                    "sa_init_md_frame",
-                    "sa_restart",
-                    "sa_restart_topk",
-                    "penalty_safety",
-                    "repair",
-                }
-            if raw.get("estimate_beta_eff"):
-                allow |= {"beta_eff_grid", "beta_eff_w_marg", "beta_eff_w_pair"}
-            out: Dict[str, Any] = {}
-            out["sampling_method"] = effective_method
-            for key in allow:
-                if key not in raw:
-                    continue
-                val = raw.get(key)
-                if val in (None, "", [], {}):
-                    continue
-                out[key] = val
+                _maybe("sa_reads", int(raw.get("sa_reads")) if raw.get("sa_reads") is not None else None)
+                _maybe("sa_sweeps", int(raw.get("sa_sweeps")) if raw.get("sa_sweeps") is not None else None)
+                _maybe("sa_beta_hot", float(raw.get("sa_beta_hot")) if raw.get("sa_beta_hot") is not None else None)
+                _maybe("sa_beta_cold", float(raw.get("sa_beta_cold")) if raw.get("sa_beta_cold") is not None else None)
+                _maybe("sa_init", str(raw.get("sa_init") or "md"))
+                _maybe("sa_init_md_frame", int(raw.get("sa_init_md_frame")) if raw.get("sa_init_md_frame") is not None else None)
+                _maybe("sa_restart", str(raw.get("sa_restart") or "independent"))
+                _maybe("sa_restart_topk", int(raw.get("sa_restart_topk")) if raw.get("sa_restart_topk") is not None else None)
+
             return out
 
         sample_entry = {
@@ -983,14 +837,9 @@ def run_simulation_job(
         result_payload["results"] = {
             "results_dir": _relativize_path(results_dir),
             "summary_npz": _relativize_path(summary_path) if summary_path else None,
-            "marginals_plot": _relativize_path(plot_path) if plot_path else None,
-            "sampling_report": _relativize_path(report_path) if report_path else None,
-            "cross_likelihood_report": _relativize_path(cross_likelihood_report_path) if cross_likelihood_report_path else None,
-            "beta_scan_plot": _relativize_path(beta_scan_path) if beta_scan_path else None,
             "cluster_npz": _relativize_path(cluster_path),
             "potts_model": potts_model_rels[0] if potts_model_rels else (_relativize_path(model_path) if model_path else None),
             "potts_models": potts_model_rels or None,
-            "beta_eff": run_result.get("beta_eff"),
         }
 
     except Exception as e:
@@ -1007,6 +856,304 @@ def run_simulation_job(
         write_result_to_disk(sanitized_payload)
 
     save_progress("Simulation completed", 100)
+    return sanitized_payload
+
+
+def run_potts_analysis_job(
+    job_uuid: str,
+    dataset_ref: Dict[str, str],
+    params: Dict[str, Any],
+):
+    """
+    Compute Potts sample analyses for one cluster:
+      - MD-vs-sample distribution metrics (node/edge JS)
+      - optional per-sample energies under a chosen model
+
+    Results are written under clusters/<cluster_id>/analyses/.
+    """
+    job = get_current_job()
+    start_time = datetime.utcnow()
+    rq_job_id = job.id if job else f"potts-analysis-{job_uuid}"
+
+    result_payload = {
+        "job_id": job_uuid,
+        "rq_job_id": rq_job_id,
+        "analysis_type": "potts_analysis",
+        "status": "started",
+        "created_at": start_time.isoformat(),
+        "params": params,
+        "results": None,
+        "system_reference": {
+            "project_id": dataset_ref.get("project_id"),
+            "system_id": dataset_ref.get("system_id"),
+            "cluster_id": dataset_ref.get("cluster_id"),
+        },
+        "error": None,
+        "completed_at": None,
+    }
+
+    project_id = dataset_ref.get("project_id")
+    system_id = dataset_ref.get("system_id")
+    cluster_id = dataset_ref.get("cluster_id")
+    if not project_id or not system_id or not cluster_id:
+        raise ValueError("Potts analysis dataset reference missing project_id/system_id/cluster_id.")
+
+    results_dirs = project_store.ensure_results_directories(project_id, system_id)
+    result_filepath = results_dirs["jobs_dir"] / f"{job_uuid}.json"
+
+    def save_progress(status_msg: str, progress: int):
+        if job:
+            job.meta["status"] = status_msg
+            job.meta["progress"] = progress
+            job.save_meta()
+        print(f"[PottsAnalysis {job_uuid}] {status_msg}")
+
+    def write_result_to_disk(payload: Dict[str, Any]):
+        try:
+            with open(result_filepath, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            payload["status"] = "failed"
+            payload["error"] = f"Failed to save result file: {e}"
+
+    try:
+        save_progress("Initializing...", 0)
+        write_result_to_disk(result_payload)
+
+        # Validate cluster existence
+        system_meta = project_store.get_system(project_id, system_id)
+        clusters = system_meta.metastable_clusters or []
+        entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+        if not entry:
+            raise FileNotFoundError(f"Cluster '{cluster_id}' not found.")
+
+        model_ref = None
+        model_id = params.get("model_id")
+        model_path = params.get("model_path")
+        if model_path:
+            model_ref = str(model_path)
+        elif model_id:
+            model_ref = str(model_id)
+
+        md_label_mode = (params.get("md_label_mode") or "assigned").lower()
+        keep_invalid = bool(params.get("keep_invalid", False))
+
+        save_progress("Running analyses...", 20)
+        summary = analyze_cluster_samples(
+            project_id=project_id,
+            system_id=system_id,
+            cluster_id=cluster_id,
+            model_ref=model_ref,
+            md_label_mode=md_label_mode,
+            drop_invalid=not keep_invalid,
+        )
+
+        cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+        analyses_dir = cluster_dirs["cluster_dir"] / "analyses"
+
+        result_payload["status"] = "finished"
+        result_payload["results"] = {
+            "analyses_dir": _relativize_path(analyses_dir),
+            "summary": summary,
+        }
+
+    except Exception as e:
+        print(f"[PottsAnalysis {job_uuid}] FAILED: {e}")
+        traceback.print_exc()
+        result_payload["status"] = "failed"
+        result_payload["error"] = str(e)
+        raise e
+    finally:
+        save_progress("Saving final result", 95)
+        result_payload["completed_at"] = datetime.utcnow().isoformat()
+        sanitized_payload = _convert_nan_to_none(result_payload)
+        write_result_to_disk(sanitized_payload)
+
+    save_progress("Potts analysis completed", 100)
+    return sanitized_payload
+
+
+def run_md_samples_refresh_job(
+    job_uuid: str,
+    dataset_ref: Dict[str, str],
+    params: Dict[str, Any],
+):
+    """
+    Recompute md_eval samples for all descriptor-ready states of a system, for a given cluster.
+
+    This overwrites existing md_eval sample folders by default (stable sample_id per state)
+    and updates sample metadata so the UI/offline console immediately see refreshed MD samples.
+    """
+    job = get_current_job()
+    start_time = datetime.utcnow()
+    rq_job_id = job.id if job else f"md-samples-refresh-{job_uuid}"
+
+    project_id = dataset_ref.get("project_id")
+    system_id = dataset_ref.get("system_id")
+    cluster_id = dataset_ref.get("cluster_id")
+    if not project_id or not system_id or not cluster_id:
+        raise ValueError("md_samples_refresh requires project_id/system_id/cluster_id.")
+
+    results_dirs = project_store.ensure_results_directories(project_id, system_id)
+    result_filepath = results_dirs["jobs_dir"] / f"{job_uuid}.json"
+
+    result_payload: Dict[str, Any] = {
+        "job_id": job_uuid,
+        "rq_job_id": rq_job_id,
+        "analysis_type": "md_samples_refresh",
+        "status": "started",
+        "created_at": start_time.isoformat(),
+        "params": params,
+        "results": None,
+        "system_reference": {
+            "project_id": project_id,
+            "system_id": system_id,
+            "cluster_id": cluster_id,
+        },
+        "error": None,
+        "completed_at": None,
+    }
+
+    def save_progress(status_msg: str, progress: int):
+        if job:
+            job.meta["status"] = status_msg
+            job.meta["progress"] = progress
+            job.save_meta()
+        print(f"[MdSamplesRefresh {job_uuid}] {status_msg}")
+
+    def write_result_to_disk(payload: Dict[str, Any]):
+        try:
+            with open(result_filepath, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            print(f"CRITICAL: Failed to save result file {result_filepath}: {e}")
+            payload["status"] = "failed"
+            payload["error"] = f"Failed to save result file: {e}"
+
+    overwrite = bool(params.get("overwrite", True))
+    cleanup = bool(params.get("cleanup", True))
+
+    try:
+        save_progress("Initializing...", 0)
+        write_result_to_disk(result_payload)
+
+        system_meta = project_store.get_system(project_id, system_id)
+        clusters = system_meta.metastable_clusters or []
+        entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+        if not isinstance(entry, dict):
+            raise FileNotFoundError(f"Cluster '{cluster_id}' not found.")
+
+        cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+        samples_dir = cluster_dirs["samples_dir"]
+
+        samples = entry.get("samples")
+        if not isinstance(samples, list):
+            samples = []
+
+        descriptor_states = [s for s in system_meta.states.values() if getattr(s, "descriptor_file", None)]
+        total = len(descriptor_states)
+        if total == 0:
+            result_payload["status"] = "finished"
+            result_payload["results"] = {"refreshed": 0, "states": 0, "sample_ids": []}
+            return result_payload
+
+        refreshed_ids: List[str] = []
+        for idx, state in enumerate(descriptor_states, start=1):
+            state_id = getattr(state, "state_id", None) or ""
+            if not state_id:
+                continue
+
+            pct = 5 + int(85 * (idx - 1) / max(1, total))
+            save_progress(f"Evaluating {state_id} ({idx}/{total})", pct)
+
+            existing = [
+                s
+                for s in samples
+                if isinstance(s, dict) and (s.get("type") or "") == "md_eval" and (s.get("state_id") or "") == state_id and s.get("sample_id")
+            ]
+            keep_id = None
+            dup_ids: List[str] = []
+            if existing:
+                existing.sort(key=lambda s: str(s.get("created_at") or ""))
+                keep = existing[-1]
+                keep_id = str(keep.get("sample_id")) if keep.get("sample_id") else None
+                dup_ids = [str(s.get("sample_id")) for s in existing[:-1] if s.get("sample_id")]
+
+            reuse_id = keep_id if overwrite else None
+            if cleanup and dup_ids:
+                for sid in dup_ids:
+                    try:
+                        shutil.rmtree(samples_dir / sid, ignore_errors=True)
+                    except Exception:
+                        pass
+                dup_set = set(dup_ids)
+                samples = [
+                    s
+                    for s in samples
+                    if not (
+                        isinstance(s, dict)
+                        and (s.get("type") or "") == "md_eval"
+                        and (s.get("state_id") or "") == state_id
+                        and s.get("sample_id") in dup_set
+                    )
+                ]
+
+            sample_entry = evaluate_state_with_models(
+                project_id,
+                system_id,
+                cluster_id,
+                state_id,
+                store=project_store,
+                sample_id=reuse_id,
+            )
+
+            out_id = sample_entry.get("sample_id")
+            replaced = False
+            for j, existing_entry in enumerate(samples):
+                if not isinstance(existing_entry, dict):
+                    continue
+                if existing_entry.get("sample_id") == out_id:
+                    samples[j] = sample_entry
+                    replaced = True
+                    break
+            if not replaced:
+                if overwrite:
+                    # Drop any md_eval entries for this state (malformed or missing ids).
+                    samples = [
+                        s
+                        for s in samples
+                        if not (isinstance(s, dict) and (s.get("type") or "") == "md_eval" and (s.get("state_id") or "") == state_id)
+                    ]
+                samples.append(sample_entry)
+
+            entry["samples"] = samples
+            system_meta.metastable_clusters = clusters
+            project_store.save_system(system_meta)
+
+            if out_id:
+                refreshed_ids.append(str(out_id))
+
+        result_payload["status"] = "finished"
+        result_payload["results"] = {
+            "refreshed": len(refreshed_ids),
+            "states": total,
+            "sample_ids": refreshed_ids,
+        }
+
+    except Exception as e:
+        print(f"[MdSamplesRefresh {job_uuid}] FAILED: {e}")
+        traceback.print_exc()
+        result_payload["status"] = "failed"
+        result_payload["error"] = str(e)
+        raise e
+
+    finally:
+        save_progress("Saving final result", 95)
+        result_payload["completed_at"] = datetime.utcnow().isoformat()
+        sanitized_payload = _convert_nan_to_none(result_payload)
+        write_result_to_disk(sanitized_payload)
+
+    save_progress("MD sample refresh completed", 100)
     return sanitized_payload
 
 

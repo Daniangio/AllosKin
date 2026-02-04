@@ -182,6 +182,9 @@ def persist_sample(
 ) -> str | None:
     data_root = Path(os.getenv("PHASE_DATA_ROOT", "/app/data"))
     store = ProjectStore(base_dir=data_root / "projects")
+    summary_path = Path(summary_path).expanduser().resolve()
+    if metadata_path is not None:
+        metadata_path = Path(metadata_path).expanduser().resolve()
     try:
         system_meta = store.get_system(project_id, system_id)
     except FileNotFoundError:
@@ -240,10 +243,28 @@ def persist_sample(
     model_names: list[str] = []
     model_id = None
     if model_paths:
+        potts_models_dir = cluster_dirs["potts_models_dir"]
         for path in model_paths:
-            abs_path = path
+            abs_path = Path(path).expanduser()
             if not abs_path.is_absolute():
-                abs_path = store.resolve_path(project_id, system_id, str(path))
+                # Prefer an on-disk path relative to CWD (offline scripts often pass absolute paths,
+                # but notebooks may pass workspace-relative ones).
+                if abs_path.exists():
+                    abs_path = abs_path.resolve()
+                else:
+                    abs_path = store.resolve_path(project_id, system_id, str(abs_path))
+            try:
+                if abs_path.resolve().is_relative_to(potts_models_dir.resolve()):
+                    guess_id = abs_path.parent.name
+                    match = next((m for m in entry.get("potts_models") or [] if m.get("model_id") == guess_id), None)
+                    if match:
+                        model_ids.append(str(guess_id))
+                        name = match.get("name")
+                        if name:
+                            model_names.append(str(name))
+                        continue
+            except Exception:
+                pass
             for model in entry.get("potts_models") or []:
                 rel = model.get("path")
                 if not rel:

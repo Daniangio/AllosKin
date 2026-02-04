@@ -1,31 +1,24 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { Info, Maximize2, Trash2, X } from 'lucide-react';
+import { Info, Play, RefreshCw, Trash2, X } from 'lucide-react';
 import Plot from 'react-plotly.js';
+
 import Loader from '../components/common/Loader';
 import ErrorMessage from '../components/common/ErrorMessage';
-import { DocOverlay } from '../components/system/SystemDetailOverlays';
-import { deleteSamplingSample, fetchSamplingSummary, fetchSystem } from '../api/projects';
+import {
+  deleteSamplingSample,
+  fetchClusterAnalyses,
+  fetchClusterAnalysisData,
+  fetchPottsClusterInfo,
+  fetchSampleStats,
+  fetchSystem,
+} from '../api/projects';
+import { fetchJobStatus, submitMdSamplesRefreshJob, submitPottsAnalysisJob } from '../api/jobs';
 
-const palette = ['#22d3ee', '#f97316', '#a855f7', '#10b981', '#f43f5e', '#fde047', '#60a5fa', '#f59e0b'];
+const palette = ['#22d3ee', '#f97316', '#10b981', '#f43f5e', '#60a5fa', '#f59e0b', '#a855f7', '#84cc16'];
 
 function pickColor(idx) {
   return palette[idx % palette.length];
-}
-
-function computeAuc(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || !a.length || !b.length) return null;
-  let wins = 0;
-  let ties = 0;
-  for (let i = 0; i < a.length; i += 1) {
-    for (let j = 0; j < b.length; j += 1) {
-      if (a[i] > b[j]) wins += 1;
-      else if (a[i] === b[j]) ties += 1;
-    }
-  }
-  const total = a.length * b.length;
-  if (!total) return null;
-  return (wins + 0.5 * ties) / total;
 }
 
 function buildEdgeMatrix(n, edges, values) {
@@ -80,279 +73,91 @@ function PlotOverlay({ overlay, onClose }) {
   );
 }
 
-function PairwiseMacroPanel({
-  pairSourceOptions,
-  pairSourceA,
-  pairSourceB,
-  setPairSourceA,
-  setPairSourceB,
-  pairA,
-  pairB,
-  residueLabels,
-  jsResidue,
-  topResidues,
-  edges,
-  jsEdges,
-  topEdges,
-  edgeMatrix,
-  edgeStrength,
-  edgeMatrixHasValues,
-  onOpenOverlay,
-}) {
-  const invalidPair = pairA && pairB && pairA.kind === pairB.kind;
-  const residuePlot = {
-    data: [
-      {
-        x: residueLabels,
-        y: jsResidue,
-        type: 'bar',
-        marker: { color: '#22d3ee' },
-      },
-    ],
-    layout: {
-      height: 220,
-      margin: { l: 40, r: 10, t: 10, b: 40 },
-      paper_bgcolor: '#ffffff',
-      plot_bgcolor: '#ffffff',
-      font: { color: '#111827' },
-      xaxis: { tickfont: { size: 9 }, color: '#111827' },
-      yaxis: { title: 'JS divergence', color: '#111827' },
-    },
-  };
-  const edgeBarcodePlot = {
-    data: [
-      {
-        x: edges.map((edge) => `${residueLabels[edge[0]]}-${residueLabels[edge[1]]}`),
-        y: jsEdges,
-        type: 'bar',
-        marker: { color: '#f97316' },
-      },
-    ],
-    layout: {
-      height: 220,
-      margin: { l: 40, r: 10, t: 10, b: 90 },
-      paper_bgcolor: '#ffffff',
-      plot_bgcolor: '#ffffff',
-      font: { color: '#111827' },
-      xaxis: { tickangle: -45, tickfont: { size: 8 }, color: '#111827' },
-      yaxis: { title: 'JS2 divergence', color: '#111827' },
-    },
-  };
-  let edgeHeatmapReady = false;
-  let edgeHeatmapData = null;
-  let edgeHeatmapLayout = {
-    height: 260,
-    margin: { l: 60, r: 20, t: 10, b: 60 },
-    paper_bgcolor: '#ffffff',
-    plot_bgcolor: '#ffffff',
-    font: { color: '#111827' },
-    xaxis: { tickfont: { size: 7 }, color: '#111827' },
-    yaxis: { tickfont: { size: 7 }, color: '#111827' },
-  };
-  if (edgeMatrixHasValues && Array.isArray(edgeMatrix) && edgeMatrix.length) {
-    const z = edgeMatrix.map((row) =>
-      Array.isArray(row) ? row.map((val) => (Number.isFinite(val) ? val : null)) : []
-    );
-    const flat = z.flat().filter((val) => Number.isFinite(val));
-    if (flat.length) {
-      let zmin = Math.min(...flat);
-      let zmax = Math.max(...flat);
-      if (!Number.isFinite(zmin) || !Number.isFinite(zmax)) {
-        zmin = null;
-        zmax = null;
-      } else if (zmin === zmax) {
-        const pad = Math.abs(zmin) * 0.1 || 1;
-        zmin -= pad;
-        zmax += pad;
-      }
-      edgeHeatmapReady = true;
-      edgeHeatmapData = [
-        {
-          z,
-          type: 'heatmap',
-          colorscale: 'YlOrRd',
-          showscale: true,
-          zmin: zmin ?? undefined,
-          zmax: zmax ?? undefined,
-          zauto: zmin == null || zmax == null,
-        },
-      ];
-    }
-  }
-  const edgeMismatchPlot = {
-    data: [
-      {
-        x: edgeStrength,
-        y: jsEdges,
-        mode: 'markers',
-        type: 'scatter',
-        marker: { color: '#a855f7' },
-      },
-    ],
-    layout: {
-      height: 220,
-      margin: { l: 40, r: 10, t: 10, b: 40 },
-      paper_bgcolor: '#ffffff',
-      plot_bgcolor: '#ffffff',
-      font: { color: '#111827' },
-      xaxis: { title: '|J|', color: '#111827' },
-      yaxis: { title: 'JS2', color: '#111827' },
-    },
-  };
-
+function SampleInfoPanel({ sample, stats, onClose }) {
+  if (!sample) return null;
   return (
-    <section className="bg-gray-900 border border-gray-800 rounded-lg p-4 space-y-4">
-      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+    <div className="rounded-md border border-gray-800 bg-gray-950/60 p-2 text-[11px] text-gray-300 space-y-2">
+      <div className="flex items-start justify-between gap-2">
         <div>
-          <h2 className="text-sm font-semibold text-gray-200">Residue + edge diagnostics</h2>
+          <p className="text-xs font-semibold text-white">{sample.name || sample.sample_id}</p>
+          <p className="text-[10px] text-gray-500">Sample info</p>
         </div>
-        <div className="grid sm:grid-cols-2 gap-3 w-full md:w-auto">
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">Source A</label>
-            <select
-              value={pairSourceA}
-              onChange={(event) => setPairSourceA(event.target.value)}
-              className="w-full bg-gray-950 border border-gray-700 rounded-md px-3 py-2 text-white text-sm"
-            >
-              {pairSourceOptions.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="block text-xs text-gray-400 mb-1">Source B</label>
-            <select
-              value={pairSourceB}
-              onChange={(event) => setPairSourceB(event.target.value)}
-              className="w-full bg-gray-950 border border-gray-700 rounded-md px-3 py-2 text-white text-sm"
-            >
-              {pairSourceOptions.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
-          </div>
-        </div>
+        <button
+          type="button"
+          onClick={onClose}
+          className="text-gray-400 hover:text-gray-200"
+          aria-label="Close sample info"
+        >
+          <X className="h-3.5 w-3.5" />
+        </button>
       </div>
-      {invalidPair && (
-        <p className="text-xs text-amber-300">
-          Pairwise plots currently support MD vs Sample comparisons. Pick one MD and one Sample.
-        </p>
-      )}
-      <div className="grid lg:grid-cols-2 gap-4">
-        <div className="bg-gray-950/60 border border-gray-800 rounded-md p-3 space-y-3 min-w-0 overflow-hidden">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-gray-200">Residue barcode</h3>
-            <button
-              type="button"
-              onClick={() => onOpenOverlay('Residue barcode', residuePlot.data, residuePlot.layout)}
-              className="text-gray-400 hover:text-gray-200"
-              aria-label="Open residue barcode overlay"
-            >
-              <Maximize2 className="h-4 w-4" />
-            </button>
+
+      <div className="space-y-1">
+        <div>
+          <span className="text-gray-400">id:</span> {sample.sample_id}
+        </div>
+        {sample.created_at && (
+          <div>
+            <span className="text-gray-400">created:</span> {sample.created_at}
           </div>
-          <Plot
-            data={residuePlot.data}
-            layout={residuePlot.layout}
-            config={{ displayModeBar: false, responsive: true }}
-            useResizeHandler
-            style={{ width: '100%', height: '100%' }}
-          />
-        </div>
-        <div className="bg-gray-950/60 border border-gray-800 rounded-md p-3 space-y-3 min-w-0 overflow-hidden">
-          <h3 className="text-sm font-semibold text-gray-200">Top residues</h3>
-          <ul className="grid gap-1 text-xs text-gray-300">
-            {topResidues.map(([val, label], idx) => (
-              <li key={`${label}-${idx}`} className="flex justify-between">
-                <span>{label}</span>
-                <span>{val.toFixed(4)}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-        <div className="bg-gray-950/60 border border-gray-800 rounded-md p-3 space-y-3 min-w-0 overflow-hidden">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-gray-200">Edge barcode</h3>
-            <button
-              type="button"
-              onClick={() => onOpenOverlay('Edge barcode', edgeBarcodePlot.data, edgeBarcodePlot.layout)}
-              className="text-gray-400 hover:text-gray-200"
-              aria-label="Open edge barcode overlay"
-            >
-              <Maximize2 className="h-4 w-4" />
-            </button>
+        )}
+        {sample.type && (
+          <div>
+            <span className="text-gray-400">type:</span> {sample.type}
           </div>
-          <Plot
-            data={edgeBarcodePlot.data}
-            layout={edgeBarcodePlot.layout}
-            config={{ displayModeBar: false, responsive: true }}
-            useResizeHandler
-            style={{ width: '100%', height: '100%' }}
-          />
-        </div>
-        <div className="bg-gray-950/60 border border-gray-800 rounded-md p-3 space-y-3 min-w-0 overflow-hidden">
-          <h3 className="text-sm font-semibold text-gray-200">Top edges</h3>
-          <ul className="grid gap-1 text-xs text-gray-300">
-            {topEdges.map(([val, label], idx) => (
-              <li key={`${label}-${idx}`} className="flex justify-between">
-                <span>{label}</span>
-                <span>{val.toFixed(4)}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-        <div className="bg-gray-950/60 border border-gray-800 rounded-md p-3 space-y-3 min-w-0 overflow-hidden">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-gray-200">Edge heatmap</h3>
-            {edgeHeatmapReady ? (
-              <button
-                type="button"
-                onClick={() => onOpenOverlay('Edge heatmap', edgeHeatmapData, edgeHeatmapLayout)}
-                className="text-gray-400 hover:text-gray-200"
-                aria-label="Open edge heatmap overlay"
-              >
-                <Maximize2 className="h-4 w-4" />
-              </button>
-            ) : null}
+        )}
+        {sample.method && (
+          <div>
+            <span className="text-gray-400">method:</span> {sample.method}
           </div>
-          {edgeHeatmapReady ? (
-            <Plot
-              data={edgeHeatmapData}
-              layout={edgeHeatmapLayout}
-              config={{ displayModeBar: false, responsive: true }}
-              useResizeHandler
-              style={{ width: '100%', height: '100%' }}
-            />
-          ) : (
-            <p className="text-xs text-gray-400">No edge heatmap data available for this selection.</p>
+        )}
+        {sample.source && (
+          <div>
+            <span className="text-gray-400">source:</span> {sample.source}
+          </div>
+        )}
+        {sample.model_names && sample.model_names.length > 0 && (
+          <div>
+            <span className="text-gray-400">models:</span> {sample.model_names.join(', ')}
+          </div>
+        )}
+        {sample.path && (
+          <div className="break-all">
+            <span className="text-gray-400">path:</span> {sample.path}
+          </div>
+        )}
+      </div>
+
+      {stats && (
+        <div className="space-y-1">
+          <p className="text-[10px] text-gray-500">NPZ stats</p>
+          <div>
+            <span className="text-gray-400">frames:</span> {stats.n_frames}
+          </div>
+          <div>
+            <span className="text-gray-400">residues:</span> {stats.n_residues}
+          </div>
+          {typeof stats.invalid_count === 'number' && typeof stats.invalid_fraction === 'number' && (
+            <div>
+              <span className="text-gray-400">invalid:</span> {stats.invalid_count} (
+              {(stats.invalid_fraction * 100).toFixed(2)}%)
+            </div>
           )}
-        </div>
-        <div className="bg-gray-950/60 border border-gray-800 rounded-md p-3 space-y-3 min-w-0 overflow-hidden">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-gray-200">Edge mismatch vs strength</h3>
-            <button
-              type="button"
-              onClick={() => onOpenOverlay('Edge mismatch vs strength', edgeMismatchPlot.data, edgeMismatchPlot.layout)}
-              className="text-gray-400 hover:text-gray-200"
-              aria-label="Open edge mismatch overlay"
-            >
-              <Maximize2 className="h-4 w-4" />
-            </button>
+          <div>
+            <span className="text-gray-400">has halo labels:</span> {stats.has_halo ? 'yes' : 'no'}
           </div>
-          <Plot
-            data={edgeMismatchPlot.data}
-            layout={edgeMismatchPlot.layout}
-            config={{ displayModeBar: false, responsive: true }}
-            useResizeHandler
-            style={{ width: '100%', height: '100%' }}
-          />
         </div>
-      </div>
-    </section>
+      )}
+
+      {sample.params && (
+        <details className="text-[11px] text-gray-300">
+          <summary className="cursor-pointer text-gray-200">Params</summary>
+          <pre className="mt-2 max-h-56 overflow-auto rounded bg-gray-900 p-2 text-[10px] text-gray-300">
+            {JSON.stringify(sample.params, null, 2)}
+          </pre>
+        </details>
+      )}
+    </div>
   );
 }
 
@@ -366,16 +171,36 @@ export default function SamplingVizPage() {
   const [systemError, setSystemError] = useState(null);
 
   const [selectedClusterId, setSelectedClusterId] = useState('');
-  const [summaryCache, setSummaryCache] = useState({});
-  const [summaryError, setSummaryError] = useState(null);
-  const [summaryLoading, setSummaryLoading] = useState(false);
-  const [deleteBusyId, setDeleteBusyId] = useState(null);
-  const [selectedModelIds, setSelectedModelIds] = useState([]);
-  const [pairSourceA, setPairSourceA] = useState('');
-  const [pairSourceB, setPairSourceB] = useState('');
-  const [overlayPlot, setOverlayPlot] = useState(null);
-  const [showPlotDoc, setShowPlotDoc] = useState(false);
+
+  const [clusterInfo, setClusterInfo] = useState(null);
+  const [clusterInfoLoading, setClusterInfoLoading] = useState(false);
+  const [clusterInfoError, setClusterInfoError] = useState(null);
+
+  const [analyses, setAnalyses] = useState([]);
+  const [analysesLoading, setAnalysesLoading] = useState(false);
+  const [analysesError, setAnalysesError] = useState(null);
+  const [analysisDataCache, setAnalysisDataCache] = useState({});
+
+  const [mdLabelMode, setMdLabelMode] = useState('assigned');
+  const [keepInvalid, setKeepInvalid] = useState(false);
+
+  const [selectedModelId, setSelectedModelId] = useState('');
+
+  const [selectedMdSampleId, setSelectedMdSampleId] = useState('');
+  const [selectedSampleId, setSelectedSampleId] = useState('');
+
+  const [analysisJob, setAnalysisJob] = useState(null);
+  const [analysisJobStatus, setAnalysisJobStatus] = useState(null);
+
+  const [mdRefreshJob, setMdRefreshJob] = useState(null);
+  const [mdRefreshJobStatus, setMdRefreshJobStatus] = useState(null);
+  const [mdRefreshError, setMdRefreshError] = useState(null);
+
   const [infoSampleId, setInfoSampleId] = useState('');
+  const [sampleStatsCache, setSampleStatsCache] = useState({});
+  const [sampleStatsError, setSampleStatsError] = useState(null);
+
+  const [overlayPlot, setOverlayPlot] = useState(null);
 
   const clusterOptions = useMemo(
     () => (system?.metastable_clusters || []).filter((run) => run.path && run.status !== 'failed'),
@@ -388,20 +213,18 @@ export default function SamplingVizPage() {
   );
 
   const sampleEntries = useMemo(() => selectedCluster?.samples || [], [selectedCluster]);
-  const mdSamples = useMemo(() => sampleEntries.filter((s) => s.type === 'md_eval'), [sampleEntries]);
   const pottsModels = useMemo(() => selectedCluster?.potts_models || [], [selectedCluster]);
+
+  const mdSamples = useMemo(() => sampleEntries.filter((s) => s.type === 'md_eval'), [sampleEntries]);
   const filteredSamples = useMemo(() => {
-    if (!selectedModelIds.length) return sampleEntries;
+    if (!selectedModelId) return sampleEntries;
     return sampleEntries.filter((s) => {
-      const ids = Array.isArray(s.model_ids)
-        ? s.model_ids
-        : s.model_id
-          ? [s.model_id]
-          : [];
+      if (s.type === 'md_eval') return true;
+      const ids = Array.isArray(s.model_ids) ? s.model_ids : s.model_id ? [s.model_id] : [];
       if (!ids.length) return true;
-      return ids.some((id) => selectedModelIds.includes(id));
+      return ids.includes(selectedModelId);
     });
-  }, [sampleEntries, selectedModelIds]);
+  }, [sampleEntries, selectedModelId]);
   const gibbsSamples = useMemo(
     () => filteredSamples.filter((s) => s.type === 'potts_sampling' && s.method === 'gibbs'),
     [filteredSamples]
@@ -410,6 +233,10 @@ export default function SamplingVizPage() {
     () => filteredSamples.filter((s) => s.type === 'potts_sampling' && s.method === 'sa'),
     [filteredSamples]
   );
+  const pottsSamples = useMemo(() => [...gibbsSamples, ...saSamples], [gibbsSamples, saSamples]);
+
+  const infoSample = useMemo(() => sampleEntries.find((s) => s.sample_id === infoSampleId) || null, [sampleEntries, infoSampleId]);
+  const infoSampleStats = useMemo(() => (infoSampleId ? sampleStatsCache[infoSampleId] : null), [sampleStatsCache, infoSampleId]);
 
   useEffect(() => {
     const loadSystem = async () => {
@@ -430,7 +257,9 @@ export default function SamplingVizPage() {
   useEffect(() => {
     const params = new URLSearchParams(location.search || '');
     const clusterId = params.get('cluster_id');
+    const sampleId = params.get('sample_id');
     if (clusterId) setSelectedClusterId(clusterId);
+    if (sampleId) setSelectedSampleId(sampleId);
   }, [location.search]);
 
   useEffect(() => {
@@ -442,853 +271,926 @@ export default function SamplingVizPage() {
 
   useEffect(() => {
     if (!pottsModels.length) {
-      if (selectedModelIds.length) {
-        setSelectedModelIds([]);
-      }
+      setSelectedModelId('');
       return;
     }
-    if (!selectedModelIds.length) {
-      setSelectedModelIds(pottsModels.map((m) => m.model_id));
-      return;
+    if (!selectedModelId) {
+      setSelectedModelId(pottsModels[0]?.model_id || '');
+    } else if (!pottsModels.some((m) => m.model_id === selectedModelId)) {
+      setSelectedModelId(pottsModels[0]?.model_id || '');
     }
-    const allowed = new Set(pottsModels.map((m) => m.model_id));
-    const filtered = selectedModelIds.filter((id) => allowed.has(id));
-    if (filtered.length !== selectedModelIds.length) {
-      setSelectedModelIds(filtered);
-    }
-  }, [pottsModels, selectedModelIds]);
+  }, [pottsModels, selectedModelId]);
 
-  const loadSummary = useCallback(
-    async (sampleId) => {
-      if (!sampleId || summaryCache[sampleId]) return;
-      setSummaryLoading(true);
-      setSummaryError(null);
-      try {
-        const data = await fetchSamplingSummary(projectId, systemId, selectedClusterId, sampleId);
-        setSummaryCache((prev) => ({ ...prev, [sampleId]: data }));
-      } catch (err) {
-        setSummaryError(err.message);
-      } finally {
-        setSummaryLoading(false);
-      }
-    },
-    [projectId, systemId, selectedClusterId, summaryCache]
-  );
+  const loadClusterInfo = useCallback(async (modelIdOverride) => {
+    if (!selectedClusterId) return;
+    setClusterInfoLoading(true);
+    setClusterInfoError(null);
+    try {
+      const modelId = typeof modelIdOverride === 'string' && modelIdOverride ? modelIdOverride : '';
+      const data = await fetchPottsClusterInfo(projectId, systemId, selectedClusterId, { modelId: modelId || undefined });
+      setClusterInfo(data);
+    } catch (err) {
+      setClusterInfoError(err.message || 'Failed to load cluster info.');
+      setClusterInfo(null);
+    } finally {
+      setClusterInfoLoading(false);
+    }
+  }, [projectId, systemId, selectedClusterId]);
+
+  const loadAnalyses = useCallback(async () => {
+    if (!selectedClusterId) return;
+    setAnalysesLoading(true);
+    setAnalysesError(null);
+    try {
+      const data = await fetchClusterAnalyses(projectId, systemId, selectedClusterId);
+      setAnalyses(Array.isArray(data?.analyses) ? data.analyses : []);
+    } catch (err) {
+      setAnalysesError(err.message || 'Failed to load analyses.');
+      setAnalyses([]);
+    } finally {
+      setAnalysesLoading(false);
+    }
+  }, [projectId, systemId, selectedClusterId]);
 
   useEffect(() => {
-    const ids = [...gibbsSamples, ...saSamples].map((s) => s.sample_id);
-    ids.forEach((id) => loadSummary(id));
-  }, [gibbsSamples, saSamples, loadSummary]);
-
-  const stateNameById = useMemo(() => {
-    const map = {};
-    Object.values(system?.states || {}).forEach((state) => {
-      if (state?.state_id) map[state.state_id] = state.name || state.state_id;
-    });
-    (system?.metastable_states || []).forEach((state) => {
-      if (state?.metastable_id) map[state.metastable_id] = state.name || state.metastable_id;
-    });
-    return map;
-  }, [system]);
-
-  const normalizeMdLabel = useCallback(
-    (label, idx, mdSourceIds = []) => {
-      if (!label) return label;
-      const idFromList = mdSourceIds?.[idx];
-      if (idFromList && typeof idFromList === 'string') {
-        if (idFromList.startsWith('state:')) {
-          const stateId = idFromList.split(':', 2)[1];
-          return stateNameById[stateId] || label;
-        }
-        if (idFromList.startsWith('meta:')) {
-          const metaId = idFromList.split(':', 2)[1];
-          return stateNameById[metaId] || label;
-        }
-      }
-      const cleaned = label.replace(/^Macro:\s*/i, '').replace(/^MD cluster:\s*/i, '').trim();
-      if (stateNameById[cleaned]) return stateNameById[cleaned];
-      return cleaned || label;
-    },
-    [stateNameById]
-  );
-
-  const samplingSamples = useMemo(() => [...gibbsSamples, ...saSamples], [gibbsSamples, saSamples]);
-  const summaryEntries = useMemo(
-    () =>
-      samplingSamples
-        .map((sample) => ({ sample, summary: summaryCache[sample.sample_id] }))
-        .filter((entry) => entry.summary),
-    [samplingSamples, summaryCache]
-  );
-  const summaryBySampleId = useMemo(() => {
-    const map = {};
-    summaryEntries.forEach(({ sample, summary }) => {
-      map[sample.sample_id] = summary;
-    });
-    return map;
-  }, [summaryEntries]);
-
-  const infoSample = useMemo(() => {
-    if (!infoSampleId) return null;
-    return sampleEntries.find((s) => s.sample_id === infoSampleId) || null;
-  }, [infoSampleId, sampleEntries]);
-
-  const infoSummary = useMemo(() => {
-    if (!infoSample) return null;
-    return infoSample.summary || infoSample.params || null;
-  }, [infoSample]);
-
-  const toggleInfo = useCallback((sampleId) => {
-    setInfoSampleId((prev) => (prev === sampleId ? '' : sampleId));
-  }, []);
-  const baseSummary = summaryEntries[0]?.summary || null;
-
-  const handleDeleteSample = useCallback(
-    async (sampleId) => {
-      if (!selectedClusterId || !sampleId) return;
-      const ok = window.confirm('Delete this sampling result? This cannot be undone.');
-      if (!ok) return;
-      try {
-        setDeleteBusyId(sampleId);
-        await deleteSamplingSample(projectId, systemId, selectedClusterId, sampleId);
-        const data = await fetchSystem(projectId, systemId);
-        setSystem(data);
-        setSummaryCache((prev) => {
-          const next = { ...prev };
-          delete next[sampleId];
-          return next;
-        });
-      } catch (err) {
-        setSummaryError(err.message || 'Failed to delete sampling run.');
-      } finally {
-        setDeleteBusyId(null);
-      }
-    },
-    [projectId, systemId, selectedClusterId]
-  );
-
-  const mdSourceLabels = useMemo(() => {
-    const labels = baseSummary?.md_source_labels || [];
-    const ids = baseSummary?.md_source_ids || [];
-    return labels.map((label, idx) => normalizeMdLabel(label, idx, ids));
-  }, [baseSummary, normalizeMdLabel]);
-
-  const pairSourceOptions = useMemo(() => {
-    const mdOpts = mdSourceLabels.map((label, idx) => ({
-      value: `md:${idx}`,
-      label: `MD: ${label}`,
-      kind: 'md',
-      idx,
-    }));
-    const sampleOpts = [];
-    summaryEntries.forEach(({ sample, summary }) => {
-      const sampleLabel = sample.name || summary.sample_name || sample.sample_id;
-      (summary.sample_source_labels || []).forEach((label, idx) => {
-        sampleOpts.push({
-          value: `sample:${sample.sample_id}:${idx}`,
-          label: `Sample: ${sampleLabel} · ${label}`,
-          kind: 'sample',
-          idx,
-          sampleId: sample.sample_id,
-        });
-      });
-    });
-    return [...mdOpts, ...sampleOpts];
-  }, [mdSourceLabels, summaryEntries]);
+    if (!selectedClusterId) return;
+    loadClusterInfo(selectedModelId);
+    loadAnalyses();
+    setAnalysisDataCache({});
+    setSelectedMdSampleId('');
+    setInfoSampleId('');
+  }, [selectedClusterId, loadClusterInfo, loadAnalyses]);
 
   useEffect(() => {
-    if (!pairSourceOptions.length) {
-      setPairSourceA('');
-      setPairSourceB('');
+    if (!selectedClusterId) return;
+    // Update edge count/info when switching the active Potts model.
+    loadClusterInfo(selectedModelId);
+  }, [selectedModelId, selectedClusterId, loadClusterInfo]);
+
+  useEffect(() => {
+    if (!mdSamples.length) {
+      setSelectedMdSampleId('');
       return;
     }
-    const values = new Set(pairSourceOptions.map((opt) => opt.value));
-    const firstMd = pairSourceOptions.find((opt) => opt.kind === 'md');
-    const firstSample = pairSourceOptions.find((opt) => opt.kind === 'sample');
-    if (!pairSourceA || !values.has(pairSourceA)) {
-      setPairSourceA(firstMd ? firstMd.value : pairSourceOptions[0].value);
+    if (!selectedMdSampleId || !mdSamples.some((s) => s.sample_id === selectedMdSampleId)) {
+      setSelectedMdSampleId(mdSamples[0].sample_id);
     }
-    if (!pairSourceB || !values.has(pairSourceB)) {
-      setPairSourceB(firstSample ? firstSample.value : pairSourceOptions[0].value);
-    }
-  }, [pairSourceOptions, pairSourceA, pairSourceB]);
+  }, [mdSamples, selectedMdSampleId]);
 
-  const pairA = pairSourceOptions.find((opt) => opt.value === pairSourceA) || null;
-  const pairB = pairSourceOptions.find((opt) => opt.value === pairSourceB) || null;
-  const pairSummary = useMemo(() => {
-    if (pairA?.kind === 'sample') {
-      return summaryBySampleId[pairA.sampleId] || null;
+  useEffect(() => {
+    if (!pottsSamples.length) {
+      setSelectedSampleId('');
+      return;
     }
-    if (pairB?.kind === 'sample') {
-      return summaryBySampleId[pairB.sampleId] || null;
+    if (!selectedSampleId || !pottsSamples.some((s) => s.sample_id === selectedSampleId)) {
+      setSelectedSampleId(pottsSamples[0].sample_id);
     }
-    return baseSummary;
-  }, [pairA, pairB, summaryBySampleId, baseSummary]);
+  }, [pottsSamples, selectedSampleId]);
 
-  const jsPair = useMemo(() => {
-    if (!pairA || !pairB) return null;
-    if (pairA.kind === 'md' && pairB.kind === 'sample') {
-      const summary = summaryBySampleId[pairB.sampleId];
-      return summary?.js_md_sample?.[pairA.idx]?.[pairB.idx] || null;
-    }
-    if (pairA.kind === 'sample' && pairB.kind === 'md') {
-      const summary = summaryBySampleId[pairA.sampleId];
-      return summary?.js_md_sample?.[pairB.idx]?.[pairA.idx] || null;
-    }
-    return null;
-  }, [pairA, pairB, summaryBySampleId]);
+  const mdVsSampleAnalyses = useMemo(
+    () => analyses.filter((a) => a.analysis_type === 'md_vs_sample'),
+    [analyses]
+  );
+  const modelEnergyAnalyses = useMemo(
+    () => analyses.filter((a) => a.analysis_type === 'model_energy'),
+    [analyses]
+  );
 
-  const jsPairEdges = useMemo(() => {
-    if (!pairA || !pairB) return null;
-    if (pairA.kind === 'md' && pairB.kind === 'sample') {
-      const summary = summaryBySampleId[pairB.sampleId];
-      return summary?.js2_md_sample?.[pairA.idx]?.[pairB.idx] || null;
-    }
-    if (pairA.kind === 'sample' && pairB.kind === 'md') {
-      const summary = summaryBySampleId[pairA.sampleId];
-      return summary?.js2_md_sample?.[pairB.idx]?.[pairA.idx] || null;
-    }
-    return null;
-  }, [pairA, pairB, summaryBySampleId]);
+  const dropInvalid = !keepInvalid;
 
-  const residueLabels = pairSummary?.residue_labels || [];
-  const edges = pairSummary?.edges || [];
-  const jsResidue = jsPair || [];
-  const jsEdges = jsPairEdges || [];
-  const edgeStrength = pairSummary?.edge_strength || [];
+  const selectedMdVsMeta = useMemo(() => {
+    if (!selectedMdSampleId || !selectedSampleId) return null;
+    const candidates = mdVsSampleAnalyses.filter((a) => {
+      const mode = (a.md_label_mode || 'assigned').toLowerCase();
+      return (
+        a.md_sample_id === selectedMdSampleId &&
+        a.sample_id === selectedSampleId &&
+        mode === mdLabelMode &&
+        Boolean(a.drop_invalid) === Boolean(dropInvalid)
+      );
+    });
+    if (!candidates.length) return null;
+    if (selectedModelId) {
+      const withModel = candidates.find((a) => a.model_id === selectedModelId);
+      if (withModel) return withModel;
+    }
+    return candidates[0];
+  }, [mdVsSampleAnalyses, selectedMdSampleId, selectedSampleId, mdLabelMode, dropInvalid, selectedModelId]);
+
+  const loadAnalysisData = useCallback(
+    async (analysisType, analysisId) => {
+      if (!analysisType || !analysisId) return null;
+      const cacheKey = `${analysisType}:${analysisId}`;
+      if (analysisDataCache[cacheKey]) return analysisDataCache[cacheKey];
+      const payload = await fetchClusterAnalysisData(projectId, systemId, selectedClusterId, analysisType, analysisId);
+      setAnalysisDataCache((prev) => ({ ...prev, [cacheKey]: payload }));
+      return payload;
+    },
+    [analysisDataCache, projectId, systemId, selectedClusterId]
+  );
+
+  const [comparisonData, setComparisonData] = useState(null);
+  const [comparisonError, setComparisonError] = useState(null);
+  const [comparisonLoading, setComparisonLoading] = useState(false);
+
+  useEffect(() => {
+    const run = async () => {
+      setComparisonError(null);
+      setComparisonData(null);
+      if (!selectedMdVsMeta) return;
+      setComparisonLoading(true);
+      try {
+        const payload = await loadAnalysisData('md_vs_sample', selectedMdVsMeta.analysis_id);
+        setComparisonData(payload);
+      } catch (err) {
+        setComparisonError(err.message || 'Failed to load analysis.');
+      } finally {
+        setComparisonLoading(false);
+      }
+    };
+    run();
+  }, [selectedMdVsMeta, loadAnalysisData]);
+
+  const residueLabels = useMemo(() => {
+    const keys = clusterInfo?.residue_keys || [];
+    if (Array.isArray(keys) && keys.length) return keys;
+    const n = clusterInfo?.n_residues || 0;
+    return Array.from({ length: n }, (_, i) => String(i));
+  }, [clusterInfo]);
+
+  const edges = useMemo(() => {
+    const fromAnalysis = comparisonData?.data?.edges;
+    if (Array.isArray(fromAnalysis) && fromAnalysis.length) return fromAnalysis;
+    return Array.isArray(clusterInfo?.edges) ? clusterInfo.edges : [];
+  }, [clusterInfo, comparisonData]);
+
+  const nodeJs = useMemo(() => {
+    const arr = comparisonData?.data?.node_js || [];
+    return Array.isArray(arr) ? arr : [];
+  }, [comparisonData]);
+  const edgeJs = useMemo(() => {
+    const arr = comparisonData?.data?.edge_js || [];
+    return Array.isArray(arr) ? arr : [];
+  }, [comparisonData]);
+
+  const topResidues = useMemo(() => topK(nodeJs, residueLabels, 10), [nodeJs, residueLabels]);
+  const topEdges = useMemo(() => {
+    if (!edges.length || !edgeJs.length) return [];
+    const labels = edges.map((e) => `${residueLabels[e[0]] ?? e[0]} — ${residueLabels[e[1]] ?? e[1]}`);
+    return topK(edgeJs, labels, 10);
+  }, [edges, edgeJs, residueLabels]);
+
   const edgeMatrix = useMemo(
-    () => buildEdgeMatrix(residueLabels.length, edges, jsEdges),
-    [residueLabels, edges, jsEdges]
+    () => buildEdgeMatrix(residueLabels.length, edges, edgeJs),
+    [residueLabels, edges, edgeJs]
   );
   const edgeMatrixHasValues = useMemo(
     () => edgeMatrix?.some((row) => row?.some((val) => Number.isFinite(val))),
     [edgeMatrix]
   );
 
-  const crossLikelihoodTraces = useMemo(() => {
-    const traces = [];
-    let colorIdx = 0;
-    const baseActive = baseSummary?.xlik_delta_active || [];
-    if (Array.isArray(baseActive) && baseActive.length) {
-      traces.push({
-        x: baseActive,
-        type: 'histogram',
-        name: 'MD (fit)',
-        opacity: 0.6,
-        marker: { color: pickColor(colorIdx) },
-      });
-      colorIdx += 1;
+  const handleRunAnalysis = useCallback(async () => {
+    if (!selectedClusterId) return;
+    setAnalysesError(null);
+    setAnalysisJob(null);
+    setAnalysisJobStatus(null);
+    try {
+      const payload = {
+        project_id: projectId,
+        system_id: systemId,
+        cluster_id: selectedClusterId,
+        md_label_mode: mdLabelMode,
+        keep_invalid: keepInvalid,
+      };
+      if (selectedModelId) payload.model_id = selectedModelId;
+      const res = await submitPottsAnalysisJob(payload);
+      setAnalysisJob(res);
+    } catch (err) {
+      setAnalysesError(err.message || 'Failed to submit analysis job.');
     }
-    summaryEntries.forEach(({ sample, summary }) => {
-      const active = summary.xlik_delta_active || [];
-      const labelPrefix = sample.name || summary.sample_name || sample.sample_id;
-      if (active.length) {
-        traces.push({
-          x: active,
-          type: 'histogram',
-          name: labelPrefix,
-          opacity: 0.6,
-          marker: { color: pickColor(colorIdx) },
-        });
-        colorIdx += 1;
-      }
-    });
-    return traces;
-  }, [summaryEntries, baseSummary]);
+  }, [projectId, systemId, selectedClusterId, mdLabelMode, keepInvalid, selectedModelId]);
 
-  const crossLikelihoodMatrix = useMemo(() => {
-    const entries = [];
-    const baseActive = baseSummary?.xlik_delta_active || [];
-    if (Array.isArray(baseActive) && baseActive.length) {
-      entries.push({ label: 'MD (fit)', values: baseActive });
+  const handleRefreshMdSamples = useCallback(async () => {
+    if (!selectedClusterId) return;
+    setMdRefreshError(null);
+    setMdRefreshJob(null);
+    setMdRefreshJobStatus(null);
+    try {
+      const payload = {
+        project_id: projectId,
+        system_id: systemId,
+        cluster_id: selectedClusterId,
+        overwrite: true,
+        cleanup: true,
+      };
+      const res = await submitMdSamplesRefreshJob(payload);
+      setMdRefreshJob(res);
+    } catch (err) {
+      setMdRefreshError(err.message || 'Failed to submit MD refresh job.');
     }
-    summaryEntries.forEach(({ sample, summary }) => {
-      const active = summary.xlik_delta_active || [];
-      if (Array.isArray(active) && active.length) {
-        entries.push({
-          label: sample.name || summary.sample_name || sample.sample_id,
-          values: active,
-        });
-      }
-    });
-    if (!entries.length) {
-      return { labels: [], auc: [], delta: [] };
-    }
-    const labels = entries.map((e) => e.label);
-    const auc = labels.map(() => labels.map(() => null));
-    const delta = labels.map(() => labels.map(() => null));
-    for (let i = 0; i < entries.length; i += 1) {
-      for (let j = 0; j < entries.length; j += 1) {
-        const a = entries[i].values;
-        const b = entries[j].values;
-        const aucVal = computeAuc(a, b);
-        if (aucVal != null) auc[i][j] = aucVal;
-        const meanA = a.length ? a.reduce((sum, v) => sum + v, 0) / a.length : null;
-        const meanB = b.length ? b.reduce((sum, v) => sum + v, 0) / b.length : null;
-        if (meanA != null && meanB != null) delta[i][j] = meanA - meanB;
-      }
-    }
-    return { labels, auc, delta };
-  }, [summaryEntries, baseSummary]);
+  }, [projectId, systemId, selectedClusterId]);
 
-  const topResidues = useMemo(() => topK(jsResidue, residueLabels, 12), [jsResidue, residueLabels]);
-  const topEdges = useMemo(() => {
-    const labels = edges.map((edge) => {
-      const r = residueLabels[edge[0]] || `res_${edge[0]}`;
-      const s = residueLabels[edge[1]] || `res_${edge[1]}`;
-      return `${r}-${s}`;
-    });
-    return topK(jsEdges, labels, 12);
-  }, [edges, jsEdges, residueLabels]);
+  useEffect(() => {
+    if (!analysisJob?.job_id) return;
+    let cancelled = false;
+    const terminal = new Set(['finished', 'failed', 'canceled']);
+    const poll = async () => {
+      try {
+        const status = await fetchJobStatus(analysisJob.job_id);
+        if (cancelled) return;
+        setAnalysisJobStatus(status);
+        if (terminal.has(status?.status)) {
+          // Stop polling once the job is done.
+          clearInterval(timer);
+          if (status?.status === 'finished') await loadAnalyses();
+        }
+      } catch (err) {
+        if (!cancelled) setAnalysesError(err.message || 'Failed to poll analysis job.');
+      }
+    };
+    const timer = setInterval(poll, 2000);
+    poll();
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [analysisJob, loadAnalyses]);
 
-  const openOverlay = useCallback((title, data, layout) => {
-    if (!data || !layout) return;
-    setOverlayPlot({ title, data, layout });
+  useEffect(() => {
+    if (!mdRefreshJob?.job_id) return;
+    let cancelled = false;
+    const terminal = new Set(['finished', 'failed', 'canceled']);
+    const poll = async () => {
+      try {
+        const status = await fetchJobStatus(mdRefreshJob.job_id);
+        if (cancelled) return;
+        setMdRefreshJobStatus(status);
+        if (terminal.has(status?.status)) {
+          clearInterval(timer);
+          if (status?.status === 'finished') {
+            const data = await fetchSystem(projectId, systemId);
+            if (!cancelled) setSystem(data);
+          }
+        }
+      } catch (err) {
+        if (!cancelled) setMdRefreshError(err.message || 'Failed to poll MD refresh job.');
+      }
+    };
+    const timer = setInterval(poll, 2000);
+    poll();
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [mdRefreshJob, projectId, systemId]);
+
+  const handleDeleteSample = useCallback(
+    async (sampleId) => {
+      if (!selectedClusterId || !sampleId) return;
+      const ok = window.confirm('Delete this sample? This cannot be undone.');
+      if (!ok) return;
+      try {
+        await deleteSamplingSample(projectId, systemId, selectedClusterId, sampleId);
+        const data = await fetchSystem(projectId, systemId);
+        setSystem(data);
+        setInfoSampleId('');
+      } catch (err) {
+        setSystemError(err.message || 'Failed to delete sample.');
+      }
+    },
+    [projectId, systemId, selectedClusterId]
+  );
+
+  const toggleInfo = useCallback((sampleId) => {
+    setInfoSampleId((prev) => (prev === sampleId ? '' : sampleId));
   }, []);
 
-  const energyTraces = useMemo(() => {
-    const traces = [];
-    let colorIdx = 0;
-    const mdSeen = new Set();
-    summaryEntries.forEach(({ sample, summary }) => {
-      const bins = summary.energy_bins || [];
-      if (!bins.length) return;
-      const xVals = bins.slice(0, -1);
-      const sampleLabel = sample.name || summary.sample_name || sample.sample_id;
-      const modelKey =
-        summary.model_id ||
-        (Array.isArray(sample.model_ids) ? sample.model_ids.join('+') : sample.model_id) ||
-        sample.sample_id;
+  useEffect(() => {
+    const load = async () => {
+      if (!infoSampleId) return;
+      if (sampleStatsCache[infoSampleId]) return;
+      setSampleStatsError(null);
+      try {
+        const stats = await fetchSampleStats(projectId, systemId, selectedClusterId, infoSampleId);
+        setSampleStatsCache((prev) => ({ ...prev, [infoSampleId]: stats }));
+      } catch (err) {
+        setSampleStatsError(err.message || 'Failed to load sample stats.');
+      }
+    };
+    load();
+  }, [infoSampleId, sampleStatsCache, projectId, systemId, selectedClusterId]);
 
-      if (!mdSeen.has(modelKey)) {
-        const mdLabels = summary.md_source_labels || [];
-        const mdIds = summary.md_source_ids || [];
-        const mdHists = summary.energy_hist_md || [];
-        mdHists.forEach((hist, idx) => {
-          if (!Array.isArray(hist) || !hist.length) return;
-          const mdLabel = normalizeMdLabel(mdLabels[idx] || `MD ${idx + 1}`, idx, mdIds);
-          traces.push({
-            x: xVals,
-            y: hist,
-            type: 'scatter',
-            mode: 'lines',
-            name: `MD · ${mdLabel}`,
-            line: { color: pickColor(colorIdx) },
+  const energyAnalysesForModel = useMemo(() => {
+    if (!selectedModelId) return [];
+    // Dedupe: repeated runs create multiple analysis entries per sample_id.
+    // Analyses are already sorted newest-first by the backend, so keep the first per sample_id.
+    const out = [];
+    const seen = new Set();
+    for (const a of modelEnergyAnalyses) {
+      if (a.model_id !== selectedModelId) continue;
+      if ((a.md_label_mode || 'assigned') !== mdLabelMode) continue;
+      if (Boolean(a.drop_invalid) !== Boolean(dropInvalid)) continue;
+      const sid = a.sample_id || '';
+      if (!sid) continue;
+      if (seen.has(sid)) continue;
+      seen.add(sid);
+      out.push(a);
+    }
+    return out;
+  }, [modelEnergyAnalyses, selectedModelId, mdLabelMode, dropInvalid]);
+
+  const [energySeries, setEnergySeries] = useState([]);
+  const [energyError, setEnergyError] = useState(null);
+  const [energyLoading, setEnergyLoading] = useState(false);
+
+  useEffect(() => {
+    const run = async () => {
+      setEnergyError(null);
+      setEnergySeries([]);
+      if (!selectedModelId) return;
+      const metas = energyAnalysesForModel;
+      if (!metas.length) return;
+      setEnergyLoading(true);
+      try {
+        const series = [];
+        // Load energies for all samples (MD + Potts) that have an analysis for this model.
+        for (let idx = 0; idx < metas.length; idx += 1) {
+          const meta = metas[idx];
+          const payload = await loadAnalysisData('model_energy', meta.analysis_id);
+          const energies = payload?.data?.energies || [];
+          if (!Array.isArray(energies) || !energies.length) continue;
+          const sample = sampleEntries.find((s) => s.sample_id === meta.sample_id);
+          series.push({
+            sample_id: meta.sample_id,
+            label: sample?.name || meta.sample_id,
+            energies,
           });
-          colorIdx += 1;
-        });
-        mdSeen.add(modelKey);
-      }
-
-      const sampleLabels = summary.sample_source_labels || [];
-      const sampleHists = summary.energy_hist_sample || [];
-      sampleHists.forEach((hist, idx) => {
-        if (!Array.isArray(hist) || !hist.length) return;
-        const label = sampleLabels[idx] || `Sample ${idx + 1}`;
-        traces.push({
-          x: xVals,
-          y: hist,
-          type: 'scatter',
-          mode: 'lines',
-          name: `${sampleLabel} · ${label}`,
-          line: { color: pickColor(colorIdx) },
-        });
-        colorIdx += 1;
-      });
-    });
-    return traces;
-  }, [summaryEntries, normalizeMdLabel]);
-
-  const betaEffScanTraces = useMemo(() => {
-    const traces = [];
-    summaryEntries.forEach(({ sample, summary }, idx) => {
-      const grid = summary.beta_eff_grid || [];
-      const scheduleLabels = summary.sa_schedule_labels || [];
-      const sampleLabel = sample.name || summary.sample_name || sample.sample_id;
-      let rows = [];
-      const bySchedule = summary.beta_eff_distances_by_schedule;
-      if (Array.isArray(bySchedule) && bySchedule.length) {
-        rows = Array.isArray(bySchedule[0]) ? bySchedule : [bySchedule];
-      }
-      if (!rows.length) {
-        const flat = summary.beta_eff_distances;
-        if (Array.isArray(flat) && flat.length) {
-          rows = [flat];
         }
+        setEnergySeries(series);
+      } catch (err) {
+        setEnergyError(err.message || 'Failed to load energies.');
+      } finally {
+        setEnergyLoading(false);
       }
-      if (!grid.length || !rows.length) return;
-      rows.forEach((row, rowIdx) => {
-        if (!Array.isArray(row) || !row.length) return;
-        traces.push({
-          x: grid,
-          y: row,
-          type: 'scatter',
-          mode: 'lines+markers',
-          name: `${sampleLabel} · ${scheduleLabels[rowIdx] || `Schedule ${rowIdx + 1}`}`,
-          line: { color: pickColor(idx) },
-        });
-      });
-    });
-    return traces;
-  }, [summaryEntries]);
+    };
+    run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedModelId, energyAnalysesForModel, loadAnalysisData]);
 
-  const betaEffMarkers = useMemo(() => {
-    const traces = [];
-    summaryEntries.forEach(({ sample, summary }, summaryIdx) => {
-      const grid = summary.beta_eff_grid || [];
-      const scheduleLabels = summary.sa_schedule_labels || [];
-      const sampleLabel = sample.name || summary.sample_name || sample.sample_id;
-      let rows = [];
-      const bySchedule = summary.beta_eff_distances_by_schedule;
-      if (Array.isArray(bySchedule) && bySchedule.length) {
-        rows = Array.isArray(bySchedule[0]) ? bySchedule : [bySchedule];
-      }
-      if (!rows.length) {
-        const flat = summary.beta_eff_distances;
-        if (Array.isArray(flat) && flat.length) {
-          rows = [flat];
-        }
-      }
-      if (grid.length && rows.length) {
-        rows.forEach((row, rowIdx) => {
-          if (!Array.isArray(row) || !row.length) return;
-          let minIdx = 0;
-          let minVal = row[0];
-          for (let i = 1; i < row.length; i += 1) {
-            if (row[i] < minVal) {
-              minVal = row[i];
-              minIdx = i;
-            }
-          }
-          const betaEff = grid[minIdx];
-          if (betaEff === undefined || betaEff === null || Number.isNaN(Number(betaEff))) return;
-          traces.push({
-            x: [Number(betaEff)],
-            y: [Number(minVal)],
-            type: 'scatter',
-            mode: 'markers',
-            name: `${sampleLabel} · ${scheduleLabels[rowIdx] || `Schedule ${rowIdx + 1}`} (β_eff)`,
-            marker: { color: pickColor(summaryIdx), size: 10, symbol: 'circle' },
-          });
-        });
-        return;
-      }
+  const energyPlot = useMemo(() => {
+    if (!energySeries.length) return null;
 
-      const betaEffBySchedule = summary.beta_eff_by_schedule || [];
-      if (Array.isArray(betaEffBySchedule) && betaEffBySchedule.length) {
-        betaEffBySchedule.forEach((betaEff, rowIdx) => {
-          if (betaEff === undefined || betaEff === null || Number.isNaN(Number(betaEff))) return;
-          traces.push({
-            x: [Number(betaEff)],
-            y: [0],
-            type: 'scatter',
-            mode: 'markers',
-            name: `${sampleLabel} · ${scheduleLabels[rowIdx] || `Schedule ${rowIdx + 1}`} (β_eff)`,
-            marker: { color: pickColor(summaryIdx), size: 10, symbol: 'circle' },
-          });
-        });
-        return;
+    // Use a shared xbins across traces so histograms align.
+    let globalMin = Infinity;
+    let globalMax = -Infinity;
+    let minBinSize = Infinity;
+    for (const s of energySeries) {
+      const arr = Array.isArray(s.energies) ? s.energies : [];
+      if (!arr.length) continue;
+      let localMin = Infinity;
+      let localMax = -Infinity;
+      for (let i = 0; i < arr.length; i += 1) {
+        const v = arr[i];
+        if (!Number.isFinite(v)) continue;
+        if (v < localMin) localMin = v;
+        if (v > localMax) localMax = v;
       }
-
-      const betaEff = summary.beta_eff;
-      const betaValue = Array.isArray(betaEff) ? betaEff[0] : betaEff;
-      if (betaValue !== undefined && betaValue !== null && !Number.isNaN(Number(betaValue))) {
-        traces.push({
-          x: [Number(betaValue)],
-          y: [0],
-          type: 'scatter',
-          mode: 'markers',
-          name: `${sampleLabel} (β_eff)`,
-          marker: { color: pickColor(summaryIdx), size: 10, symbol: 'circle' },
-        });
+      if (!Number.isFinite(localMin) || !Number.isFinite(localMax)) continue;
+      if (Number.isFinite(localMin)) globalMin = Math.min(globalMin, localMin);
+      if (Number.isFinite(localMax)) globalMax = Math.max(globalMax, localMax);
+      const range = localMax - localMin;
+      if (Number.isFinite(range) && range > 0) {
+        // "Thinner binning among all distributions": pick the smallest implied bin size.
+        minBinSize = Math.min(minBinSize, range / 40);
       }
-    });
-    return traces;
-  }, [summaryEntries]);
+    }
+    if (!Number.isFinite(globalMin) || !Number.isFinite(globalMax)) return null;
+    const globalRange = globalMax - globalMin;
+    if (!Number.isFinite(minBinSize) || minBinSize <= 0) {
+      minBinSize = globalRange > 0 ? globalRange / 40 : 1.0;
+    }
+    if (globalRange > 0) {
+      const maxBins = 200;
+      const impliedBins = globalRange / minBinSize;
+      if (Number.isFinite(impliedBins) && impliedBins > maxBins) {
+        minBinSize = globalRange / maxBins;
+      }
+    }
 
-  if (loadingSystem) {
-    return <Loader label="Loading sampling explorer..." />;
-  }
-  if (systemError) {
-    return <ErrorMessage message={systemError} />;
-  }
+    return {
+      data: energySeries.map((s, idx) => ({
+        x: s.energies,
+        type: 'histogram',
+        name: s.label,
+        opacity: 0.55,
+        marker: { color: pickColor(idx) },
+        autobinx: false,
+        xbins: { start: globalMin, end: globalMax, size: minBinSize },
+        bingroup: 'energies',
+      })),
+      layout: {
+        height: 260,
+        margin: { l: 40, r: 10, t: 10, b: 40 },
+        paper_bgcolor: '#ffffff',
+        plot_bgcolor: '#ffffff',
+        font: { color: '#111827' },
+        barmode: 'overlay',
+        xaxis: { title: 'Energy', color: '#111827' },
+        yaxis: { title: 'Count', color: '#111827' },
+      },
+    };
+  }, [energySeries]);
 
-  const energyPlotLayout = {
-    height: 280,
-    margin: { l: 40, r: 10, t: 10, b: 40 },
-    paper_bgcolor: '#ffffff',
-    plot_bgcolor: '#ffffff',
-    font: { color: '#111827' },
-    xaxis: { title: 'Energy', color: '#111827' },
-    yaxis: { title: 'Density', color: '#111827' },
-  };
-  const crossLikelihoodLayout = {
-    height: 260,
-    margin: { l: 40, r: 10, t: 10, b: 40 },
-    barmode: 'overlay',
-    paper_bgcolor: '#ffffff',
-    plot_bgcolor: '#ffffff',
-    font: { color: '#111827' },
-    xaxis: { title: 'Δ log-likelihood', color: '#111827' },
-  };
-  const crossLikelihoodMatrixLayout = {
-    height: 200,
-    margin: { l: 70, r: 20, t: 20, b: 70 },
-    paper_bgcolor: '#ffffff',
-    plot_bgcolor: '#ffffff',
-    font: { color: '#111827', size: 10 },
-    xaxis: { tickfont: { size: 9 }, color: '#111827' },
-    yaxis: { tickfont: { size: 9 }, color: '#111827' },
-  };
-  const betaEffLayout = {
-    height: 260,
-    margin: { l: 40, r: 10, t: 10, b: 40 },
-    paper_bgcolor: '#ffffff',
-    plot_bgcolor: '#ffffff',
-    font: { color: '#111827' },
-    xaxis: { title: 'beta_eff', color: '#111827' },
-    yaxis: { title: 'distance', color: '#111827' },
-  };
+  if (loadingSystem) return <Loader message="Loading sampling explorer..." />;
+  if (systemError) return <ErrorMessage message={systemError} />;
+
+  const canCompare = Boolean(selectedMdSampleId && selectedSampleId);
+  const comparisonMissing = canCompare && !selectedMdVsMeta;
 
   return (
-    <div className="p-6 space-y-6 text-white">
-      <div className="flex items-center justify-between">
+    <div className="space-y-4">
+      <PlotOverlay overlay={overlayPlot} onClose={() => setOverlayPlot(null)} />
+
+      <div className="flex items-start justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold">Sampling Explorer</h1>
-          <p className="text-sm text-gray-400 mt-1">Interactive sampling diagnostics for Gibbs and SA runs.</p>
+          <h1 className="text-2xl font-semibold text-white">Sampling Explorer</h1>
+          <p className="text-sm text-gray-400">
+            Sampling runs save only <code>sample.npz</code>. Use the analysis job to generate derived metrics under{' '}
+            <code>clusters/&lt;cluster_id&gt;/analyses/</code>.
+          </p>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setShowPlotDoc(true)}
-            className="inline-flex items-center gap-2 text-xs px-3 py-2 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/40"
-            aria-label="Open plotting documentation"
-          >
-            <Info className="h-4 w-4" />
-            Plot guide
-          </button>
-          <button
-            type="button"
-            onClick={() => navigate(`/projects/${projectId}/systems/${systemId}`)}
-            className="text-xs px-3 py-2 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/40"
-          >
-            Back to system
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={() => navigate(`/projects/${projectId}/systems/${systemId}`)}
+          className="text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:border-gray-500"
+        >
+          Back to system
+        </button>
       </div>
 
-      <div className="grid md:grid-cols-[260px_1fr] gap-6">
-        <aside className="space-y-4">
-          <div>
-            <label className="block text-sm text-gray-300 mb-1">Cluster</label>
-            <select
-              value={selectedClusterId}
-              onChange={(event) => setSelectedClusterId(event.target.value)}
-              className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
-            >
-              {clusterOptions.map((run) => (
-                <option key={run.cluster_id} value={run.cluster_id}>
-                  {run.name || run.cluster_id}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div>
-            <p className="text-xs font-semibold text-gray-300">Potts models</p>
-            <div className="space-y-1 mt-2 text-xs text-gray-300">
-              {pottsModels.length === 0 && <p className="text-gray-500">None</p>}
-              {pottsModels.map((model) => {
-                const checked = selectedModelIds.includes(model.model_id);
-                const label = model.name || model.path?.split('/').pop() || model.model_id;
-                return (
-                  <label key={model.model_id} className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={() =>
-                        setSelectedModelIds((prev) =>
-                          prev.includes(model.model_id)
-                            ? prev.filter((id) => id !== model.model_id)
-                            : [...prev, model.model_id]
-                        )
-                      }
-                    />
-                    <span className="truncate">{label}</span>
-                  </label>
-                );
-              })}
-            </div>
-          </div>
-
-          <div>
-            <p className="text-xs font-semibold text-gray-300">MD samples</p>
-            <div className="space-y-1 mt-2 text-xs text-gray-300">
-              {mdSamples.length === 0 && <p className="text-gray-500">None</p>}
-              {mdSamples.map((s) => (
-                <div key={s.sample_id} className="flex items-center justify-between gap-2">
-                  <span className="truncate">{s.name || s.sample_id}</span>
-                  <button
-                    type="button"
-                    onClick={() => toggleInfo(s.sample_id)}
-                    className="text-gray-400 hover:text-gray-200"
-                    aria-label={`Show info for ${s.name || s.sample_id}`}
-                  >
-                    ℹ
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <p className="text-xs font-semibold text-gray-300">Gibbs samples</p>
-            <div className="space-y-1 mt-2 text-xs text-gray-300">
-              {gibbsSamples.length === 0 && <p className="text-gray-500">None</p>}
-              {gibbsSamples.map((s) => (
-                <div key={s.sample_id} className="flex items-center justify-between gap-2">
-                  <span className="truncate">{s.name || s.sample_id}</span>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => toggleInfo(s.sample_id)}
-                      className="text-gray-400 hover:text-gray-200"
-                      aria-label={`Show info for ${s.name || s.sample_id}`}
-                    >
-                      ℹ
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteSample(s.sample_id)}
-                      className="text-gray-400 hover:text-red-300"
-                      aria-label={`Delete ${s.name || s.sample_id}`}
-                      disabled={deleteBusyId === s.sample_id}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <p className="text-xs font-semibold text-gray-300">SA samples</p>
-            <div className="space-y-1 mt-2 text-xs text-gray-300">
-              {saSamples.length === 0 && <p className="text-gray-500">None</p>}
-              {saSamples.map((s) => (
-                <div key={s.sample_id} className="flex items-center justify-between gap-2">
-                  <span className="truncate">{s.name || s.sample_id}</span>
-                  <div className="flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => toggleInfo(s.sample_id)}
-                      className="text-gray-400 hover:text-gray-200"
-                      aria-label={`Show info for ${s.name || s.sample_id}`}
-                    >
-                      ℹ
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => handleDeleteSample(s.sample_id)}
-                      className="text-gray-400 hover:text-red-300"
-                      aria-label={`Delete ${s.name || s.sample_id}`}
-                      disabled={deleteBusyId === s.sample_id}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {infoSample && (
-            <div className="bg-gray-900 border border-gray-800 rounded-lg p-3 text-xs text-gray-300 space-y-2">
-              <div className="flex items-start justify-between gap-2">
-                <div>
-                  <p className="text-sm font-semibold text-white">{infoSample.name || infoSample.sample_id}</p>
-                  <p className="text-[11px] text-gray-400">Sample info</p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setInfoSampleId('')}
-                  className="text-gray-400 hover:text-gray-200"
-                  aria-label="Close sample info"
-                >
-                  ✕
-                </button>
-              </div>
-              <div className="space-y-1">
-                <div><span className="text-gray-400">id:</span> {infoSample.sample_id}</div>
-                {infoSample.created_at && <div><span className="text-gray-400">created:</span> {infoSample.created_at}</div>}
-                {infoSample.method && <div><span className="text-gray-400">method:</span> {infoSample.method}</div>}
-                {infoSample.model_names && infoSample.model_names.length > 0 && (
-                  <div><span className="text-gray-400">models:</span> {infoSample.model_names.join(', ')}</div>
-                )}
-                {infoSample.model_id && !infoSample.model_names && (
-                  <div><span className="text-gray-400">model id:</span> {infoSample.model_id}</div>
-                )}
-                {infoSample.path && <div><span className="text-gray-400">path:</span> {infoSample.path}</div>}
-              </div>
-              {infoSummary && (
-                <details className="text-xs text-gray-300">
-                  <summary className="cursor-pointer text-gray-200">Run details</summary>
-                  <pre className="mt-2 max-h-64 overflow-auto rounded bg-gray-950 p-2 text-[11px] text-gray-300">
-                    {JSON.stringify(infoSummary, null, 2)}
-                  </pre>
-                </details>
+      <div className="grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-4">
+        <aside className="space-y-3">
+          <div className="rounded-lg border border-gray-800 bg-gray-900/40 p-3 space-y-3">
+            <div className="space-y-1">
+              <label className="block text-xs text-gray-400">Cluster</label>
+              <select
+                value={selectedClusterId}
+                onChange={(e) => setSelectedClusterId(e.target.value)}
+                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+              >
+                {clusterOptions.map((run) => {
+                  const name = run.name || run.path?.split('/').pop() || run.cluster_id;
+                  return (
+                    <option key={run.cluster_id} value={run.cluster_id}>
+                      {name}
+                    </option>
+                  );
+                })}
+              </select>
+              {clusterInfoLoading && <p className="text-[11px] text-gray-500">Loading cluster info…</p>}
+              {clusterInfoError && <p className="text-[11px] text-red-300">{clusterInfoError}</p>}
+              {clusterInfo && (
+                <p className="text-[11px] text-gray-500">
+                  Residues: {clusterInfo.n_residues} · Edges: {clusterInfo.n_edges}
+                  {clusterInfo.edges_source ? ` (${clusterInfo.edges_source})` : ''}
+                </p>
               )}
             </div>
-          )}
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs text-gray-400">MD label mode</label>
+                <select
+                  value={mdLabelMode}
+                  onChange={(e) => setMdLabelMode(e.target.value)}
+                  className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-2 text-white"
+                >
+                  <option value="assigned">Assigned</option>
+                  <option value="halo">Halo</option>
+                </select>
+              </div>
+              <div className="flex items-end">
+                <label className="flex items-center gap-2 text-xs text-gray-300">
+                  <input
+                    type="checkbox"
+                    checked={keepInvalid}
+                    onChange={(e) => setKeepInvalid(e.target.checked)}
+                    className="h-4 w-4 rounded border-gray-500 bg-gray-900 text-cyan-500 focus:ring-cyan-500"
+                  />
+                  Keep invalid SA
+                </label>
+              </div>
+            </div>
+
+            <div className="space-y-1">
+              <label className="block text-xs text-gray-400">Potts model (edges + energies + sample filter)</label>
+              <select
+                value={selectedModelId}
+                onChange={(e) => setSelectedModelId(e.target.value)}
+                disabled={!pottsModels.length}
+                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white disabled:opacity-60"
+              >
+                {!pottsModels.length && <option value="">No models</option>}
+                {pottsModels.map((m) => (
+                  <option key={m.model_id} value={m.model_id}>
+                    {m.name || m.model_id}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleRunAnalysis}
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-cyan-600 hover:bg-cyan-500 text-white text-sm"
+              >
+                <Play className="h-4 w-4" />
+                Run analysis
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  await loadClusterInfo(selectedModelId);
+                  await loadAnalyses();
+                }}
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-md border border-gray-700 text-gray-200 text-sm hover:border-gray-500"
+              >
+                <RefreshCw className="h-4 w-4" />
+                Refresh
+              </button>
+            </div>
+
+            {analysisJob?.job_id && (
+              <div className="text-[11px] text-gray-300">
+                Job: <span className="text-gray-200">{analysisJob.job_id}</span>{' '}
+                {analysisJobStatus?.meta?.status ? `· ${analysisJobStatus.meta.status}` : ''}
+                {typeof analysisJobStatus?.meta?.progress === 'number' ? ` · ${analysisJobStatus.meta.progress}%` : ''}
+              </div>
+            )}
+            {analysesError && <ErrorMessage message={analysesError} />}
+          </div>
+
+          <div className="rounded-lg border border-gray-800 bg-gray-900/40 p-3 space-y-3">
+            <div>
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-semibold text-gray-300">MD samples</p>
+                <button
+                  type="button"
+                  onClick={handleRefreshMdSamples}
+                  className="inline-flex items-center gap-1 text-[11px] text-gray-300 hover:text-white disabled:opacity-50"
+                  disabled={!selectedClusterId || mdRefreshJobStatus?.status === 'started' || mdRefreshJobStatus?.status === 'queued'}
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Recompute
+                </button>
+              </div>
+              {mdRefreshJob?.job_id && (
+                <div className="text-[11px] text-gray-400 mt-1">
+                  Refresh job: <span className="text-gray-200">{mdRefreshJob.job_id}</span>{' '}
+                  {mdRefreshJobStatus?.meta?.status ? `· ${mdRefreshJobStatus.meta.status}` : ''}
+                  {typeof mdRefreshJobStatus?.meta?.progress === 'number' ? ` · ${mdRefreshJobStatus.meta.progress}%` : ''}
+                </div>
+              )}
+              {mdRefreshError && <ErrorMessage message={mdRefreshError} />}
+              {mdSamples.length === 0 && <p className="text-[11px] text-gray-500 mt-1">No MD samples yet.</p>}
+              {mdSamples.length > 0 && (
+                <div className="space-y-1 mt-2">
+                  {mdSamples.map((sample) => (
+                    <div
+                      key={sample.sample_id || sample.path}
+                      className="flex items-center justify-between gap-2 rounded-md border border-gray-800 bg-gray-950/40 px-2 py-1 text-[11px] text-gray-300"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setSelectedMdSampleId(sample.sample_id)}
+                        className={`truncate text-left ${selectedMdSampleId === sample.sample_id ? 'text-cyan-200' : ''}`}
+                      >
+                        {sample.name || 'MD sample'} • {sample.created_at || ''}
+                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => toggleInfo(sample.sample_id)}
+                          className="text-gray-400 hover:text-gray-200"
+                          aria-label={`Show info for ${sample.name || 'MD sample'}`}
+                        >
+                          <Info className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div>
+              <p className="text-xs font-semibold text-gray-300">Potts samples</p>
+              {pottsSamples.length === 0 && <p className="text-[11px] text-gray-500 mt-1">No Potts samples yet.</p>}
+              {pottsSamples.length > 0 && (
+                <div className="space-y-1 mt-2">
+                  {pottsSamples.map((sample) => (
+                    <div
+                      key={sample.sample_id || sample.path}
+                      className="flex items-center justify-between gap-2 rounded-md border border-gray-800 bg-gray-950/40 px-2 py-1 text-[11px] text-gray-300"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setSelectedSampleId(sample.sample_id)}
+                        className={`truncate text-left ${selectedSampleId === sample.sample_id ? 'text-cyan-200' : ''}`}
+                      >
+                        {sample.name || 'Potts sample'} • {sample.created_at || ''}
+                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => toggleInfo(sample.sample_id)}
+                          className="text-gray-400 hover:text-gray-200"
+                          aria-label={`Show info for ${sample.name || 'Potts sample'}`}
+                        >
+                          <Info className="h-4 w-4" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteSample(sample.sample_id)}
+                          className="text-gray-400 hover:text-red-300"
+                          aria-label={`Delete ${sample.name || 'Potts sample'}`}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {sampleStatsError && <ErrorMessage message={sampleStatsError} />}
+            <SampleInfoPanel
+              sample={infoSample}
+              stats={infoSampleStats}
+              onClose={() => setInfoSampleId('')}
+            />
+          </div>
         </aside>
 
-        <main className="space-y-6">
+        <main className="space-y-4">
+          <section className="rounded-lg border border-gray-800 bg-gray-900/40 p-4 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-gray-200">MD vs sample</h2>
+                <p className="text-[11px] text-gray-500">
+                  Shows JS divergence on nodes/edges for the selected MD sample and Potts sample.
+                </p>
+              </div>
+              {analysesLoading && <p className="text-[11px] text-gray-500">Loading analyses…</p>}
+            </div>
 
-          {summaryError && <ErrorMessage message={summaryError} />}
-          {summaryLoading && <Loader label="Loading summary..." />}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">MD sample</label>
+                <select
+                  value={selectedMdSampleId}
+                  onChange={(e) => setSelectedMdSampleId(e.target.value)}
+                  className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
+                >
+                  {mdSamples.map((s) => (
+                    <option key={s.sample_id} value={s.sample_id}>
+                      {s.name || s.sample_id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">Potts sample</label>
+                <select
+                  value={selectedSampleId}
+                  onChange={(e) => setSelectedSampleId(e.target.value)}
+                  className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
+                >
+                  {pottsSamples.map((s) => (
+                    <option key={s.sample_id} value={s.sample_id}>
+                      {s.name || s.sample_id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
 
-          {summaryEntries.length > 0 && (
-            <>
-              <PairwiseMacroPanel
-                pairSourceOptions={pairSourceOptions}
-                pairSourceA={pairSourceA}
-                pairSourceB={pairSourceB}
-                setPairSourceA={setPairSourceA}
-                setPairSourceB={setPairSourceB}
-                pairA={pairA}
-                pairB={pairB}
-                residueLabels={residueLabels}
-                jsResidue={jsResidue}
-                topResidues={topResidues}
-                edges={edges}
-                jsEdges={jsEdges}
-                topEdges={topEdges}
-                edgeMatrix={edgeMatrix}
-                edgeStrength={edgeStrength}
-                edgeMatrixHasValues={edgeMatrixHasValues}
-                onOpenOverlay={openOverlay}
-              />
+            {comparisonMissing && (
+              <div className="rounded-md border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200">
+                No analysis found for this pair/settings. Click <span className="font-semibold">Run analysis</span> to compute it.
+              </div>
+            )}
+            {comparisonError && <ErrorMessage message={comparisonError} />}
+            {comparisonLoading && <p className="text-sm text-gray-400">Loading…</p>}
 
-              <section className="bg-gray-900 border border-gray-800 rounded-lg p-4 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-lg font-semibold">Energy histogram</h2>
-                  <button
-                    type="button"
-                    onClick={() => openOverlay('Energy histogram', energyTraces, energyPlotLayout)}
-                    className="text-gray-400 hover:text-gray-200"
-                    aria-label="Open energy histogram overlay"
-                  >
-                    <Maximize2 className="h-4 w-4" />
-                  </button>
-                </div>
-                <Plot
-                  data={energyTraces}
-                  layout={energyPlotLayout}
-                  config={{ displayModeBar: false, responsive: true }}
-                  useResizeHandler
-                  style={{ width: '100%', height: '100%' }}
-                />
-              </section>
-
-              <section className="bg-gray-900 border border-gray-800 rounded-lg p-4 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-lg font-semibold">Cross-likelihood classification</h2>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      openOverlay('Cross-likelihood classification', crossLikelihoodTraces, crossLikelihoodLayout)
-                    }
-                    className="text-gray-400 hover:text-gray-200"
-                    aria-label="Open cross-likelihood overlay"
-                  >
-                    <Maximize2 className="h-4 w-4" />
-                  </button>
-                </div>
-                <div className="grid lg:grid-cols-[1.2fr_1fr] gap-4">
+            {comparisonData && (
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                <div className="rounded-md border border-gray-800 bg-white p-3">
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <p className="text-xs font-semibold text-gray-800">Node JS</p>
+                    <button
+                      type="button"
+                      className="text-[11px] text-gray-600 hover:text-gray-800"
+                      onClick={() =>
+                        setOverlayPlot({
+                          title: 'Node JS',
+                          data: [
+                            {
+                              x: residueLabels,
+                              y: nodeJs,
+                              type: 'bar',
+                              marker: { color: '#22d3ee' },
+                            },
+                          ],
+                          layout: {
+                            margin: { l: 40, r: 10, t: 20, b: 80 },
+                            paper_bgcolor: '#ffffff',
+                            plot_bgcolor: '#ffffff',
+                            font: { color: '#111827' },
+                            xaxis: { tickfont: { size: 9 }, color: '#111827' },
+                            yaxis: { title: 'JS divergence', color: '#111827' },
+                          },
+                        })
+                      }
+                    >
+                      Maximize
+                    </button>
+                  </div>
                   <Plot
-                    data={crossLikelihoodTraces}
-                    layout={crossLikelihoodLayout}
+                    data={[
+                      {
+                        x: residueLabels,
+                        y: nodeJs,
+                        type: 'bar',
+                        marker: { color: '#22d3ee' },
+                      },
+                    ]}
+                    layout={{
+                      margin: { l: 40, r: 10, t: 10, b: 60 },
+                      paper_bgcolor: '#ffffff',
+                      plot_bgcolor: '#ffffff',
+                      font: { color: '#111827' },
+                      xaxis: { tickfont: { size: 9 }, color: '#111827' },
+                      yaxis: { title: 'JS', color: '#111827' },
+                    }}
                     config={{ displayModeBar: false, responsive: true }}
                     useResizeHandler
-                    style={{ width: '100%', height: '100%' }}
+                    style={{ width: '100%', height: '220px' }}
                   />
-                  <div className="grid gap-3">
-                    <div className="bg-white rounded-md border border-gray-200 p-2">
-                      <h4 className="text-xs font-semibold text-gray-700 mb-2">AUC separability</h4>
-                      <Plot
-                        data={[
-                          {
-                            z: crossLikelihoodMatrix.auc,
-                            x: crossLikelihoodMatrix.labels,
-                            y: crossLikelihoodMatrix.labels,
-                            type: 'heatmap',
-                            colorscale: 'Viridis',
-                            zmin: 0,
-                            zmax: 1,
-                            showscale: true,
-                          },
-                        ]}
-                        layout={crossLikelihoodMatrixLayout}
-                        config={{ displayModeBar: false, responsive: true }}
-                        useResizeHandler
-                        style={{ width: '100%', height: '100%' }}
-                      />
-                    </div>
-                    <div className="bg-white rounded-md border border-gray-200 p-2">
-                      <h4 className="text-xs font-semibold text-gray-700 mb-2">Δ mean separability</h4>
-                      <Plot
-                        data={[
-                          {
-                            z: crossLikelihoodMatrix.delta,
-                            x: crossLikelihoodMatrix.labels,
-                            y: crossLikelihoodMatrix.labels,
-                            type: 'heatmap',
-                            colorscale: 'RdBu',
-                            zmid: 0,
-                            showscale: true,
-                          },
-                        ]}
-                        layout={crossLikelihoodMatrixLayout}
-                        config={{ displayModeBar: false, responsive: true }}
-                        useResizeHandler
-                        style={{ width: '100%', height: '100%' }}
-                      />
+                  <div className="mt-2 text-[11px] text-gray-700">
+                    <p className="font-semibold">Top residues</p>
+                    <div className="grid grid-cols-2 gap-x-4 gap-y-1 mt-1">
+                      {topResidues.map(([v, label]) => (
+                        <div key={label} className="flex items-center justify-between gap-2">
+                          <span className="truncate">{label}</span>
+                          <span className="font-mono">{Number(v).toFixed(4)}</span>
+                        </div>
+                      ))}
                     </div>
                   </div>
                 </div>
-              </section>
 
-              <section className="bg-gray-900 border border-gray-800 rounded-lg p-4 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-lg font-semibold">Beta-eff scan</h2>
+                <div className="rounded-md border border-gray-800 bg-white p-3">
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <p className="text-xs font-semibold text-gray-800">Edge JS</p>
+                    {edgeMatrixHasValues && (
+                      <button
+                        type="button"
+                        className="text-[11px] text-gray-600 hover:text-gray-800"
+                        onClick={() =>
+                          setOverlayPlot({
+                            title: 'Edge JS heatmap',
+                          data: [
+                              {
+                                z: edgeMatrix,
+                                x: residueLabels,
+                                y: residueLabels,
+                                type: 'heatmap',
+                                colorscale: 'Viridis',
+                                zmin: 0,
+                                hovertemplate: 'x: %{x}<br>y: %{y}<br>JS: %{z:.4f}<extra></extra>',
+                              },
+                            ],
+                            layout: {
+                              margin: { l: 60, r: 10, t: 20, b: 60 },
+                              paper_bgcolor: '#ffffff',
+                              plot_bgcolor: '#ffffff',
+                              font: { color: '#111827' },
+                              xaxis: { title: 'Residue', color: '#111827' },
+                              yaxis: { title: 'Residue', color: '#111827' },
+                            },
+                          })
+                        }
+                      >
+                        Maximize
+                      </button>
+                    )}
+                  </div>
+
+                  {!edgeMatrixHasValues && (
+                    <p className="text-[11px] text-gray-600">
+                      {!selectedModelId
+                        ? 'Select a Potts model to compute edge metrics.'
+                        : !edges.length
+                          ? 'Selected Potts model has no edges.'
+                          : 'No edge JS available yet. Run analysis for this model.'}
+                    </p>
+                  )}
+                  {edgeMatrixHasValues && (
+                    <Plot
+                      data={[
+                        {
+                          z: edgeMatrix,
+                          x: residueLabels,
+                          y: residueLabels,
+                          type: 'heatmap',
+                          colorscale: 'Viridis',
+                          zmin: 0,
+                          hovertemplate: 'x: %{x}<br>y: %{y}<br>JS: %{z:.4f}<extra></extra>',
+                        },
+                      ]}
+                      layout={{
+                        margin: { l: 50, r: 10, t: 10, b: 50 },
+                        paper_bgcolor: '#ffffff',
+                        plot_bgcolor: '#ffffff',
+                        font: { color: '#111827' },
+                      }}
+                      config={{ displayModeBar: false, responsive: true }}
+                      useResizeHandler
+                      style={{ width: '100%', height: '220px' }}
+                    />
+                  )}
+                  {!!topEdges.length && (
+                    <div className="mt-2 text-[11px] text-gray-700">
+                      <p className="font-semibold">Top edges</p>
+                      <div className="space-y-1 mt-1">
+                        {topEdges.map(([v, label]) => (
+                          <div key={label} className="flex items-center justify-between gap-2">
+                            <span className="truncate">{label}</span>
+                            <span className="font-mono">{Number(v).toFixed(4)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+
+          <section className="rounded-lg border border-gray-800 bg-gray-900/40 p-4 space-y-2">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-sm font-semibold text-gray-200">Energies</h2>
+                <p className="text-[11px] text-gray-500">
+                  Energy distributions are computed on-demand for all samples under the selected model.
+                </p>
+              </div>
+              <div className="text-[11px] text-gray-500">
+                {energyAnalysesForModel.length ? `${energyAnalysesForModel.length} analyses` : 'no analyses'}
+              </div>
+            </div>
+
+            {!selectedModelId && (
+              <div className="rounded-md border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200">
+                Select a Potts model to compute energies.
+              </div>
+            )}
+            {!!selectedModelId && !energyAnalysesForModel.length && (
+              <div className="rounded-md border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200">
+                No energy analyses found for this model/settings. Click <span className="font-semibold">Run analysis</span>{' '}
+                to compute them.
+              </div>
+            )}
+            {energyError && <ErrorMessage message={energyError} />}
+            {energyLoading && <p className="text-sm text-gray-400">Loading…</p>}
+
+            {energyPlot && (
+              <div className="rounded-md border border-gray-800 bg-white p-3">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <p className="text-xs font-semibold text-gray-800">Energy histograms</p>
                   <button
                     type="button"
-                    onClick={() =>
-                      openOverlay('Beta-eff scan', [...betaEffScanTraces, ...betaEffMarkers], betaEffLayout)
-                    }
-                    className="text-gray-400 hover:text-gray-200"
-                    aria-label="Open beta-eff overlay"
+                    className="text-[11px] text-gray-600 hover:text-gray-800"
+                    onClick={() => setOverlayPlot({ ...energyPlot, title: 'Energy histograms (overlay)' })}
                   >
-                    <Maximize2 className="h-4 w-4" />
+                    Maximize
                   </button>
                 </div>
                 <Plot
-                  data={[...betaEffScanTraces, ...betaEffMarkers]}
-                  layout={betaEffLayout}
+                  data={energyPlot.data}
+                  layout={energyPlot.layout}
                   config={{ displayModeBar: false, responsive: true }}
                   useResizeHandler
-                  style={{ width: '100%', height: '100%' }}
+                  style={{ width: '100%', height: '260px' }}
                 />
-              </section>
-            </>
-          )}
+              </div>
+            )}
+          </section>
         </main>
       </div>
-      <PlotOverlay overlay={overlayPlot} onClose={() => setOverlayPlot(null)} />
-      {showPlotDoc && (
-        <DocOverlay docId="plotting" onClose={() => setShowPlotDoc(false)} onNavigate={() => {}} />
-      )}
     </div>
   );
 }

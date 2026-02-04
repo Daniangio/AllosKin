@@ -173,7 +173,7 @@ if [ "$SAMPLING_METHOD" = "gibbs" ]; then
   GIBBS_METHOD="$(printf "%s" "$GIBBS_METHOD" | tr '[:upper:]' '[:lower:]')"
 fi
 
-BETA="$(prompt "Target beta (used for report)" "1.0")"
+BETA="$(prompt "Target beta" "1.0")"
 
 GIBBS_SAMPLES=""
 GIBBS_BURNIN=""
@@ -217,16 +217,6 @@ else
   SA_BETA_COLD="$(prompt "SA beta cold (0 = default)" "0")"
 fi
 
-ESTIMATE_BETA_EFF="false"
-if [ "$SAMPLING_METHOD" = "gibbs" ]; then
-  if prompt_bool "Estimate beta_eff? (y/N)" "N"; then
-    ESTIMATE_BETA_EFF="true"
-    BETA_EFF_GRID="$(prompt "beta_eff grid (comma separated, blank=auto)" "")"
-    BETA_EFF_W_MARG="$(prompt "beta_eff weight for marginals" "1.0")"
-    BETA_EFF_W_PAIR="$(prompt "beta_eff weight for pairs" "1.0")"
-  fi
-fi
-
 SEED="$(prompt "Random seed" "0")"
 SHOW_PROGRESS="false"
 if prompt_bool "Show progress bars? (Y/n)" "Y"; then
@@ -246,7 +236,6 @@ CMD=(
   --gibbs-method "$GIBBS_METHOD"
   --beta "$BETA"
   --seed "$SEED"
-  --no-plots
 )
 for model_path in "${MODEL_PATHS[@]}"; do
   CMD+=(--model-npz "$model_path")
@@ -270,7 +259,7 @@ elif [ "$SAMPLING_METHOD" = "gibbs" ]; then
     --rex-burnin-rounds "$REX_BURNIN_ROUNDS"
     --rex-sweeps-per-round "$REX_SWEEPS_PER_ROUND"
     --rex-thin-rounds "$REX_THIN_ROUNDS"
-    --rex-chain-count "$REX_CHAINS"
+    --rex-chains "$REX_CHAINS"
   )
 fi
 
@@ -282,13 +271,6 @@ if [ "$SAMPLING_METHOD" = "sa" ] && [ "$SA_BETA_HOT" != "0" ] && [ "$SA_BETA_COL
   CMD+=(--sa-beta-hot "$SA_BETA_HOT" --sa-beta-cold "$SA_BETA_COLD")
 fi
 
-if [ "$ESTIMATE_BETA_EFF" = "true" ]; then
-  CMD+=(--estimate-beta-eff --beta-eff-w-marg "$BETA_EFF_W_MARG" --beta-eff-w-pair "$BETA_EFF_W_PAIR")
-  if [ -n "$(trim "$BETA_EFF_GRID")" ]; then
-    CMD+=(--beta-eff-grid "$(trim "$BETA_EFF_GRID")")
-  fi
-fi
-
 if [ "$SHOW_PROGRESS" = "true" ]; then
   CMD+=(--progress)
 fi
@@ -298,4 +280,4 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
   PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}" "${CMD[@]}"
 
 echo "Done. Sampling outputs in: ${RESULTS_DIR}"
-echo "Summary: ${RESULTS_DIR}/run_summary.npz"
+echo "Sample: ${RESULTS_DIR}/sample.npz"

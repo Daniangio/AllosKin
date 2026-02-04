@@ -5,9 +5,9 @@ This page summarizes the reduced-state Potts pipeline used by the Potts analysis
 ## Pipeline steps
 1) Load a cluster NPZ file produced by the clustering workflow.
 2) Build a Potts model over residue microstate labels (or reuse a pre-fit model).
-3) Sample the model (Gibbs or replica exchange) and a QUBO proxy (SA).
-4) Compare samples to MD marginals and pairwise edge statistics.
-5) Save summary artifacts for visualization.
+3) Sample the model (Gibbs/replica-exchange or SA) and save a minimal `sample.npz`.
+4) Run a separate analysis step (offline or via the webserver) to compute MD-vs-sample metrics and energetics.
+5) Visualize plots from the analysis outputs (webserver).
 
 ## Inputs (cluster NPZ)
 - `merged__labels`: shape (T, N) integer labels per frame and residue.
@@ -16,10 +16,10 @@ This page summarizes the reduced-state Potts pipeline used by the Potts analysis
 - `residue_keys`: optional labels for plotting.
 
 ## Outputs
-- `run_summary.npz`: full sampling summaries, marginals, JS divergences, and metadata.
 - `potts_model.npz`: fitted Potts model (h/J/edges/K) for reuse.
-- `marginals.html`: interactive comparison plot.
-- `beta_scan.html`: only if beta_eff calibration is enabled.
+- `sample.npz`: minimal sample artifact (labels per sampled frame; plus optional validity masks for SA).
+- `sample_metadata.json`: metadata for each sample folder (model reference + sampler params).
+- `clusters/<cluster_id>/analyses/`: on-demand analyses (MD-vs-sample metrics, energies, etc.).
 
 ## Offline fitting (optional)
 You can fit a Potts model offline (e.g., with CUDA) and then reuse it for sampling.
@@ -68,10 +68,9 @@ other Potts models.
 ## Diagnostics
 - Per-residue marginals and JS divergence versus MD.
 - Pairwise edge joint distributions for additional validation.
-- Optional beta_eff calibration for SA schedules.
+
 
 ## Related docs
 - [Potts model fitting](doc:potts_model)
 - [Gibbs and replica exchange](doc:potts_gibbs)
 - [SA/QUBO sampling](doc:potts_sa_qubo)
-- [beta_eff calibration](doc:potts_beta_eff)

@@ -70,8 +70,7 @@ If you want to run local CLI scripts against the same datasets used by the webse
 
 ```bash
 export PHASE_DATA_ROOT=/scratch/docker/phase-data
-export UID="$(id -u)"
-export GID="$(id -g)"
+./scripts/compose_env.sh
 docker compose up --build
 ```
 

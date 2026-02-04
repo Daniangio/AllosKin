@@ -180,6 +180,8 @@ def _pad_marginals_for_save(margs: Sequence[np.ndarray]) -> np.ndarray:
 def _load_assigned_labels(path: Path) -> np.ndarray | None:
     try:
         with np.load(path, allow_pickle=False) as data:
+            if "labels" in data:
+                return np.asarray(data["labels"], dtype=int)
             if "assigned__labels_assigned" in data:
                 return np.asarray(data["assigned__labels_assigned"], dtype=int)
             if "assigned__labels" in data:

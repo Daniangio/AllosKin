@@ -4,8 +4,20 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, HTTPException
 
 from backend.api.v1.common import ensure_system_ready, get_cluster_entry, get_queue, project_store
-from backend.api.v1.schemas import PottsFitJobRequest, SimulationJobRequest, StaticJobRequest
-from backend.tasks import run_analysis_job, run_potts_fit_job, run_simulation_job
+from backend.api.v1.schemas import (
+    MdSamplesRefreshJobRequest,
+    PottsAnalysisJobRequest,
+    PottsFitJobRequest,
+    SimulationJobRequest,
+    StaticJobRequest,
+)
+from backend.tasks import (
+    run_analysis_job,
+    run_md_samples_refresh_job,
+    run_potts_analysis_job,
+    run_potts_fit_job,
+    run_simulation_job,
+)
 
 
 router = APIRouter()
@@ -202,6 +214,82 @@ async def submit_simulation_job(
             job_timeout="2h",
             result_ttl=86400,
             job_id=f"simulation-{job_uuid}",
+        )
+        return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"Job submission failed: {exc}") from exc
+
+
+@router.post("/submit/potts_analysis", summary="Submit a Potts sample analysis job")
+async def submit_potts_analysis_job(
+    payload: PottsAnalysisJobRequest,
+    task_queue: Any = Depends(get_queue),
+):
+    try:
+        system_meta = project_store.get_system(payload.project_id, payload.system_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"System '{payload.system_id}' not found in project '{payload.project_id}'.",
+        )
+
+    get_cluster_entry(system_meta, payload.cluster_id)
+
+    md_label_mode = (payload.md_label_mode or "assigned").lower()
+    if md_label_mode not in {"assigned", "halo"}:
+        raise HTTPException(status_code=400, detail="md_label_mode must be 'assigned' or 'halo'.")
+
+    params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
+    dataset_ref = {
+        "project_id": payload.project_id,
+        "system_id": payload.system_id,
+        "cluster_id": payload.cluster_id,
+    }
+
+    try:
+        job_uuid = str(uuid.uuid4())
+        job = task_queue.enqueue(
+            run_potts_analysis_job,
+            args=(job_uuid, dataset_ref, params),
+            job_timeout="2h",
+            result_ttl=86400,
+            job_id=f"potts-analysis-{job_uuid}",
+        )
+        return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"Job submission failed: {exc}") from exc
+
+
+@router.post("/submit/md_samples_refresh", summary="Recompute MD evaluation samples (md_eval) for all states in a cluster")
+async def submit_md_samples_refresh_job(
+    payload: MdSamplesRefreshJobRequest,
+    task_queue: Any = Depends(get_queue),
+):
+    try:
+        system_meta = project_store.get_system(payload.project_id, payload.system_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"System '{payload.system_id}' not found in project '{payload.project_id}'.",
+        )
+
+    get_cluster_entry(system_meta, payload.cluster_id)
+
+    params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
+    dataset_ref = {
+        "project_id": payload.project_id,
+        "system_id": payload.system_id,
+        "cluster_id": payload.cluster_id,
+    }
+
+    try:
+        job_uuid = str(uuid.uuid4())
+        job = task_queue.enqueue(
+            run_md_samples_refresh_job,
+            args=(job_uuid, dataset_ref, params),
+            job_timeout="2h",
+            result_ttl=86400,
+            job_id=f"md-samples-refresh-{job_uuid}",
         )
         return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
     except Exception as exc:  # pragma: no cover

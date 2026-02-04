@@ -166,22 +166,17 @@ async def get_state_descriptors(
             sample_path = project_store.resolve_path(project_id, system_id, sample_entry["path"])
             if sample_path.exists():
                 sample_npz = np.load(sample_path, allow_pickle=True)
-                try:
-                    sample_residue_keys = [str(v) for v in sample_npz["residue_keys"].tolist()]
-                    cluster_residue_indices = {k: i for i, k in enumerate(sample_residue_keys)}
-                except Exception:
-                    sample_residue_keys = []
-                labels_key = "assigned__labels" if label_mode == "halo" else "assigned__labels_assigned"
+                labels_key = "labels_halo" if label_mode == "halo" else "labels"
                 if labels_key in sample_npz:
                     state_labels_arr = sample_npz[labels_key]
-                if "assigned__frame_indices" in sample_npz:
+                elif "labels" in sample_npz:
+                    state_labels_arr = sample_npz["labels"]
+                if "frame_indices" in sample_npz:
+                    frame_indices = np.asarray(sample_npz["frame_indices"], dtype=int)
+                    state_frame_lookup = {int(fidx): idx for idx, fidx in enumerate(frame_indices)}
+                elif "assigned__frame_indices" in sample_npz:
                     frame_indices = np.asarray(sample_npz["assigned__frame_indices"], dtype=int)
                     state_frame_lookup = {int(fidx): idx for idx, fidx in enumerate(frame_indices)}
-                if "assigned__cluster_counts" in sample_npz:
-                    counts = np.asarray(sample_npz["assigned__cluster_counts"], dtype=np.int32)
-                    max_k = int(np.max(counts)) if counts.size else 0
-                    if max_k > 0:
-                        cluster_legend = [{"id": c, "label": f"Merged c{c}"} for c in range(max_k)]
         rel_path = entry.get("path")
         if not rel_path:
             raise HTTPException(status_code=404, detail="Cluster NPZ path missing.")

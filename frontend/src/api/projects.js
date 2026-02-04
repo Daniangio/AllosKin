@@ -124,6 +124,32 @@ export function fetchSamplingSummary(projectId, systemId, clusterId, sampleId) {
   );
 }
 
+export function fetchPottsClusterInfo(projectId, systemId, clusterId, options = {}) {
+  const { modelId } = options;
+  const query = modelId ? `?model_id=${encodeURIComponent(modelId)}` : '';
+  return requestJSON(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/potts/cluster_info${query}`
+  );
+}
+
+export function fetchClusterAnalyses(projectId, systemId, clusterId, options = {}) {
+  const { analysisType } = options;
+  const query = analysisType ? `?analysis_type=${encodeURIComponent(analysisType)}` : '';
+  return requestJSON(`/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/analyses${query}`);
+}
+
+export function fetchClusterAnalysisData(projectId, systemId, clusterId, analysisType, analysisId) {
+  return requestJSON(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/analyses/${analysisType}/${analysisId}/data`
+  );
+}
+
+export function fetchSampleStats(projectId, systemId, clusterId, sampleId) {
+  return requestJSON(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/samples/${sampleId}/stats`
+  );
+}
+
 export function deleteSamplingSample(projectId, systemId, clusterId, sampleId) {
   return requestJSON(
     `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/samples/${sampleId}`,

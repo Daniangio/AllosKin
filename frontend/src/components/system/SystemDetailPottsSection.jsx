@@ -1,9 +1,10 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Check, Download, Eye, Info, Pencil, Plus, SlidersHorizontal, Trash2, UploadCloud, X } from 'lucide-react';
 import ErrorMessage from '../common/ErrorMessage';
 import { AnalysisResultsList, InfoTooltip } from './SystemDetailWidgets';
 import SimulationAnalysisForm from '../analysis/SimulationAnalysisForm';
 import SimulationUploadForm from '../analysis/SimulationUploadForm';
+import { fetchSampleStats } from '../../api/projects';
 
 export default function SystemDetailPottsSection(props) {
   const {
@@ -140,6 +141,23 @@ export default function SystemDetailPottsSection(props) {
     () => allSamples.find((sample) => sample.sample_id === infoSampleId) || null,
     [allSamples, infoSampleId]
   );
+  const [infoSampleStats, setInfoSampleStats] = useState(null);
+  const [infoSampleStatsError, setInfoSampleStatsError] = useState(null);
+
+  useEffect(() => {
+    const load = async () => {
+      setInfoSampleStats(null);
+      setInfoSampleStatsError(null);
+      if (!infoSampleId || !pottsFitClusterId) return;
+      try {
+        const stats = await fetchSampleStats(projectId, systemId, pottsFitClusterId, infoSampleId);
+        setInfoSampleStats(stats);
+      } catch (err) {
+        setInfoSampleStatsError(err.message || 'Failed to load sample stats.');
+      }
+    };
+    load();
+  }, [infoSampleId, pottsFitClusterId, projectId, systemId]);
 
   return (
     <div className="space-y-4">
@@ -569,6 +587,19 @@ export default function SystemDetailPottsSection(props) {
                     <div><span className="text-gray-400">models:</span> {infoSample.model_names.join(', ')}</div>
                   )}
                   {infoSample.path && <div><span className="text-gray-400">path:</span> {infoSample.path}</div>}
+                  {infoSampleStats && (
+                    <>
+                      <div><span className="text-gray-400">frames:</span> {infoSampleStats.n_frames}</div>
+                      <div><span className="text-gray-400">residues:</span> {infoSampleStats.n_residues}</div>
+                      <div>
+                        <span className="text-gray-400">invalid:</span>{' '}
+                        {infoSampleStats.invalid_count} ({(infoSampleStats.invalid_fraction * 100).toFixed(2)}%)
+                      </div>
+                    </>
+                  )}
+                  {infoSampleStatsError && (
+                    <div className="text-red-300">{infoSampleStatsError}</div>
+                  )}
                 </div>
                 {(infoSample.summary || infoSample.params) && (
                   <details className="text-[11px] text-gray-300">

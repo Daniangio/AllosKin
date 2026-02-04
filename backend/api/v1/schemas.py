@@ -118,7 +118,25 @@ class PottsFitJobRequest(BaseModel):
     plm_batch_size: Optional[int] = None
     plm_progress_every: Optional[int] = None
     plm_device: Optional[str] = None
+
+
+class PottsAnalysisJobRequest(BaseModel):
+    project_id: str
+    system_id: str
+    cluster_id: str
+    model_id: Optional[str] = None
+    model_path: Optional[str] = None
+    md_label_mode: Optional[str] = None  # assigned|halo
+    keep_invalid: Optional[bool] = None
     plm_init: Optional[str] = None
     plm_init_model: Optional[str] = None
     plm_resume_model: Optional[str] = None
     plm_val_frac: Optional[float] = None
+
+
+class MdSamplesRefreshJobRequest(BaseModel):
+    project_id: str
+    system_id: str
+    cluster_id: str
+    overwrite: Optional[bool] = True
+    cleanup: Optional[bool] = True

@@ -14,6 +14,7 @@ Common fields
 - `name` (string)
 - `type` (string) – e.g. `md_eval`, `potts_sampling`, `upload`
 - `method` (string or null) – e.g. `gibbs`, `sa`, `upload`
+- `source` (string or null) – e.g. `offline`, `simulation`, `clustering`, `upload`
 - `state_id` (string or null) – for MD evaluations
 - `metastable_id` (string or null) – for MD evaluations
 - `model_id` (string or null) – single model reference
@@ -22,16 +23,10 @@ Common fields
 - `paths` (object) – relative paths to artifacts in the sample folder
 - `path` (string or null) – optional shortcut to the primary NPZ
 - `params` (object, optional) – sampling hyperparameters
-- `summary` (object, optional) – normalized run info (beta, counts, schedules, beta_eff)
 
 Typical `paths` keys
 - `summary_npz`
-- `metadata_json`
-- `marginals_plot`
-- `sampling_report`
-- `cross_likelihood_report`
-- `beta_scan_plot`
 
 Notes
-- The sample folder should contain one primary `.npz` artifact (e.g. `run_summary.npz` or `md_eval.npz`).
+- The sample folder should contain one primary `.npz` artifact: `sample.npz`.
 - If `path` is omitted, the loader will fall back to the single `.npz` file in the folder.

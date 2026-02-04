@@ -72,6 +72,10 @@ def _resolve_cluster_path(project_id: str, system_id: str, entry: dict) -> Path:
 def _load_assigned_labels(path: Path) -> np.ndarray | None:
     try:
         with np.load(path, allow_pickle=False) as data:
+            if "labels" in data:
+                return np.asarray(data["labels"], dtype=int)
+            if "assigned__labels_assigned" in data:
+                return np.asarray(data["assigned__labels_assigned"], dtype=int)
             if "assigned__labels" in data:
                 return np.asarray(data["assigned__labels"], dtype=int)
     except Exception:
@@ -874,7 +878,7 @@ async def upload_simulation_result(
     sample_dir.mkdir(parents=True, exist_ok=True)
     results_dir = sample_dir
 
-    summary_path = results_dir / "run_summary.npz"
+    summary_path = results_dir / "sample.npz"
     await stream_upload(summary_npz, summary_path)
 
     model_path = None
@@ -937,6 +941,7 @@ async def upload_simulation_result(
             "name": sample_label or f"Sampling {datetime.utcnow().strftime('%Y%m%d %H:%M')}",
             "type": "potts_sampling",
             "method": method_label,
+            "source": "upload",
             "model_id": model_id,
             "model_ids": [model_id] if model_id else None,
             "model_names": [model_name] if model_name else None,
@@ -944,52 +949,15 @@ async def upload_simulation_result(
             "path": sample_paths.get("summary_npz"),
             "paths": sample_paths,
             "params": {"sampling_method": method_label, "source": "upload"},
-            "summary": {"sampling_method": method_label, "source": "upload"},
         }
     )
     entry["samples"] = samples
     project_store.save_system(system_meta)
-
-    compare_ids = []
-    for cid in compare_cluster_ids or []:
-        cid = str(cid).strip()
-        if not cid or cid == cluster_id or cid in compare_ids:
-            continue
-        compare_ids.append(cid)
-    compare_clusters = []
-    for cid in compare_ids:
-        other_entry = get_cluster_entry(system_meta, cid)
-        compare_clusters.append(
-            {
-                "cluster_id": cid,
-                "name": other_entry.get("name"),
-                "path": _resolve_cluster_path(project_id, system_id, other_entry),
-            }
-        )
-
-    try:
-        _augment_sampling_summary(
-            summary_path,
-            base_cluster_path=cluster_path,
-            base_cluster_id=cluster_id,
-            base_cluster_name=entry.get("name"),
-            compare_clusters=compare_clusters,
-            model_path=model_path,
-            project_id=project_id,
-            system_id=system_id,
-        )
-
-        beta_eff_value = None
-        with np.load(summary_path, allow_pickle=False) as data:
-            beta_eff = data["beta_eff"] if "beta_eff" in data else np.array([])
-            if beta_eff.size:
-                beta_eff_value = float(beta_eff[0])
-        plot_path = None
-        report_path = None
-        cross_likelihood_report_path = None
-        beta_scan_path = None
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to process sampling summary: {exc}") from exc
+    beta_eff_value = None
+    plot_path = None
+    report_path = None
+    cross_likelihood_report_path = None
+    beta_scan_path = None
 
     try:
         project_meta = project_store.get_project(project_id)
@@ -1014,19 +982,13 @@ async def upload_simulation_result(
         "completed_at": datetime.utcnow().isoformat(),
         "params": {
             "source": "upload",
-            "compare_cluster_ids": compare_ids,
+            "compare_cluster_ids": [str(cid) for cid in compare_cluster_ids or []],
         },
         "results": {
             "results_dir": _relativize_path(results_dir),
             "summary_npz": _relativize_path(summary_path),
-            "metadata_json": None,
-            "marginals_plot": _relativize_path(plot_path) if plot_path else None,
-            "sampling_report": _relativize_path(report_path) if report_path else None,
-            "cross_likelihood_report": _relativize_path(cross_likelihood_report_path) if cross_likelihood_report_path else None,
-            "beta_scan_plot": _relativize_path(beta_scan_path) if beta_scan_path else None,
             "cluster_npz": _relativize_path(cluster_path),
             "potts_model": _relativize_path(model_path) if model_path else None,
-            "beta_eff": beta_eff_value,
         },
         "system_reference": {
             "project_id": project_id,

@@ -63,7 +63,7 @@ export default function SimulationUploadForm({ clusterRuns, onSubmit, isBusy = f
         throw new Error('Select a saved cluster NPZ to attach the sampling results.');
       }
       if (!summaryFile) {
-        throw new Error('Upload the sampling summary NPZ (run_summary.npz).');
+        throw new Error('Upload the sampling NPZ (sample.npz).');
       }
       if (!pottsModelId) {
         throw new Error('Select the Potts model used for sampling.');
@@ -192,7 +192,7 @@ export default function SimulationUploadForm({ clusterRuns, onSubmit, isBusy = f
           disabled={busy}
           className="w-full text-sm text-gray-300 file:mr-3 file:py-2 file:px-3 file:rounded-md file:border-0 file:bg-gray-700 file:text-gray-100 hover:file:bg-gray-600"
         />
-        <p className="text-xs text-gray-500 mt-1">Upload the `run_summary.npz` produced by local sampling.</p>
+        <p className="text-xs text-gray-500 mt-1">Upload the `sample.npz` produced by local sampling.</p>
       </div>
 
       <div>
