@@ -17,7 +17,6 @@ This page summarizes the reduced-state Potts pipeline used by the Potts analysis
 
 ## Outputs
 - `run_summary.npz`: full sampling summaries, marginals, JS divergences, and metadata.
-- `run_metadata.json`: human-readable settings and quick stats.
 - `potts_model.npz`: fitted Potts model (h/J/edges/K) for reuse.
 - `marginals.html`: interactive comparison plot.
 - `beta_scan.html`: only if beta_eff calibration is enabled.

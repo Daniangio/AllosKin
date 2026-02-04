@@ -67,9 +67,9 @@ def _write_index(out_dir: Path, items: List[tuple[str, str]]) -> Path:
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="Generate offline Plotly HTML reports for a PHASE Potts sampling run.")
-    ap.add_argument("--results-dir", required=True, help="Directory containing run_summary.npz and run_metadata.json")
+    ap.add_argument("--results-dir", required=True, help="Directory containing run_summary.npz")
     ap.add_argument("--summary-file", default="", help="Optional explicit path to run_summary.npz")
-    ap.add_argument("--metadata-file", default="", help="Optional explicit path to run_metadata.json")
+    ap.add_argument("--metadata-file", default="", help="(Deprecated) Optional explicit path to run_metadata.json")
     ap.add_argument("--offline", action="store_true", help="Inline plotly.js into HTML so it works without internet.")
     ap.add_argument("--model-npz", default="", help="Optional comma-separated list: base,delta1,delta2,... (for Experiment C).")
     ap.add_argument("--no-index", action="store_true", help="Do not write index.html")
@@ -86,7 +86,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise FileNotFoundError(f"Summary file not found: {summary_path}")
 
     metadata_path = Path(args.metadata_file).expanduser().resolve() if args.metadata_file else results_dir / "run_metadata.json"
-    meta = _load_run_metadata(metadata_path)
+    meta = _load_run_metadata(metadata_path) if metadata_path.exists() else {}
 
     from phase.potts.plotting import (
         plot_marginal_summary_from_npz,

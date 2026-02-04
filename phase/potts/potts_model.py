@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import os
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -201,6 +202,7 @@ def fit_potts_pseudolikelihood_torch(
     start_best_val_loss: Optional[float] = None,
     best_model_path: str | "os.PathLike[str]" | None = None,
     best_model_metadata: Optional[dict] = None,
+    model_metadata_path: str | "os.PathLike[str]" | None = None,
     progress_callback: "callable | None" = None,
     progress_every: int = 10,
     batch_progress_callback: "callable | None" = None,
@@ -400,9 +402,29 @@ def fit_potts_pseudolikelihood_torch(
                         "plm_best_loss": best_loss,
                         "plm_best_val_loss": best_val_loss,
                         "plm_best_epoch": best_epoch,
+                        "plm_avg_loss": float(train_loss),
+                        "plm_val_loss": float(val_loss) if val_loss is not None else None,
                     }
                 )
                 save_potts_model(_export_model(), best_model_path, metadata=meta)
+                if model_metadata_path:
+                    try:
+                        mm_path = Path(model_metadata_path)
+                        existing = {}
+                        if mm_path.exists():
+                            existing = json.loads(mm_path.read_text(encoding="utf-8"))
+                        existing.update(
+                            {
+                                "plm_best_loss": best_loss,
+                                "plm_best_val_loss": best_val_loss,
+                                "plm_best_epoch": best_epoch,
+                                "plm_avg_loss": float(train_loss),
+                                "plm_val_loss": float(val_loss) if val_loss is not None else None,
+                            }
+                        )
+                        mm_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
 
     for ep in range(1, epochs + 1):
         rng.shuffle(idx)

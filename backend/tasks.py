@@ -211,24 +211,79 @@ def _persist_potts_model(
         rel_path = str(dest_path.relative_to(system_dir))
     except Exception:
         rel_path = str(dest_path)
+    def _relativize_path_value(value: object) -> object:
+        if value is None:
+            return None
+        if isinstance(value, str) and "," in value:
+            parts = [p.strip() for p in value.split(",") if p.strip()]
+            updated = []
+            for part in parts:
+                updated.append(str(_relativize_path_value(part)))
+            return ",".join(updated)
+        try:
+            path = Path(str(value))
+        except Exception:
+            return value
+        if not path.is_absolute():
+            return value
+        try:
+            return str(path.relative_to(system_dir))
+        except Exception:
+            return value
+
+    def _normalize_params(raw: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(raw, dict):
+            return {}
+        path_keys = {
+            "npz",
+            "data_npz",
+            "plm_init_model",
+            "plm_resume_model",
+            "pdbs",
+            "base_model",
+            "active_npz",
+            "inactive_npz",
+        }
+        cleaned = dict(raw)
+        for key in path_keys:
+            if key in cleaned:
+                cleaned[key] = _relativize_path_value(cleaned[key])
+        return cleaned
+
+    params = _normalize_params(params)
+
+    model_entry = {
+        "model_id": model_id,
+        "name": display_name,
+        "path": rel_path,
+        "created_at": datetime.utcnow().isoformat(),
+        "source": source,
+        "params": params,
+    }
     if isinstance(entry, dict):
         models = entry.get("potts_models")
         if not isinstance(models, list):
             models = []
         existing = next((m for m in models if m.get("model_id") == model_id), None)
-        model_entry = {
-            "model_id": model_id,
-            "name": display_name,
-            "path": rel_path,
-            "created_at": datetime.utcnow().isoformat(),
-            "source": source,
-            "params": params,
-        }
         if existing:
             existing.update(model_entry)
         else:
             models.append(model_entry)
         _update_cluster_entry(project_id, system_id, cluster_id, {"potts_models": models})
+    meta_path = model_bucket / "model_metadata.json"
+    meta = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    for key, value in model_entry.items():
+        if value is None:
+            continue
+        if key == "created_at" and meta.get("created_at"):
+            continue
+        meta[key] = value
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return rel_path
 
 
@@ -829,7 +884,6 @@ def run_simulation_job(
 
         for key, path in {
             "summary_npz": summary_path,
-            "metadata_json": meta_path,
             "marginals_plot": plot_path,
             "sampling_report": report_path,
             "cross_likelihood_report": cross_likelihood_report_path,
@@ -846,59 +900,70 @@ def run_simulation_job(
                 except Exception:
                     sample_paths[key] = str(dest)
 
-        primary_path = sample_paths.get("summary_npz") or sample_paths.get("metadata_json")
+        primary_path = sample_paths.get("summary_npz")
         sample_label = sim_params.get("sample_name")
         if isinstance(sample_label, str):
             sample_label = sample_label.strip() or None
 
-        summary = {}
-        if meta_path and meta_path.exists():
-            try:
-                meta_payload = json.loads(meta_path.read_text())
-            except Exception:
-                meta_payload = {}
-            args_payload = meta_payload.get("args") if isinstance(meta_payload, dict) else None
-            if isinstance(args_payload, dict):
-                summary = {
-                    "sampling_method": args_payload.get("sampling_method"),
-                    "gibbs_method": args_payload.get("gibbs_method"),
-                    "beta": args_payload.get("beta"),
-                    "gibbs_samples": args_payload.get("gibbs_samples"),
-                    "gibbs_burnin": args_payload.get("gibbs_burnin"),
-                    "gibbs_thin": args_payload.get("gibbs_thin"),
-                    "gibbs_chains": args_payload.get("gibbs_chains"),
-                    "rex_rounds": args_payload.get("rex_rounds"),
-                    "rex_burnin_rounds": args_payload.get("rex_burnin_rounds"),
-                    "rex_thin_rounds": args_payload.get("rex_thin_rounds"),
-                    "rex_n_replicas": args_payload.get("rex_n_replicas"),
-                    "rex_beta_min": args_payload.get("rex_beta_min"),
-                    "rex_beta_max": args_payload.get("rex_beta_max"),
-                    "rex_spacing": args_payload.get("rex_spacing"),
-                    "rex_betas": args_payload.get("rex_betas"),
-                    "sa_reads": args_payload.get("sa_reads"),
-                    "sa_sweeps": args_payload.get("sa_sweeps"),
-                    "sa_beta_hot": args_payload.get("sa_beta_hot"),
-                    "sa_beta_cold": args_payload.get("sa_beta_cold"),
-                    "sa_beta_schedule": args_payload.get("sa_beta_schedule"),
-                    "beta_eff": meta_payload.get("beta_eff"),
-                    "beta_eff_by_schedule": meta_payload.get("beta_eff_by_schedule"),
+        def _filter_sampling_params(raw: Dict[str, Any]) -> Dict[str, Any]:
+            effective_method = raw.get("sampling_method") or ("sa" if sampling_method == "sa" else "gibbs")
+            gibbs_method = raw.get("gibbs_method") or "single"
+            allow = {"sampling_method", "beta", "seed", "estimate_beta_eff"}
+            if effective_method == "gibbs":
+                allow |= {"gibbs_method", "gibbs_samples", "gibbs_burnin", "gibbs_thin", "gibbs_chains"}
+                if gibbs_method != "single":
+                    allow |= {
+                        "rex_betas",
+                        "rex_n_replicas",
+                        "rex_beta_min",
+                        "rex_beta_max",
+                        "rex_spacing",
+                        "rex_rounds",
+                        "rex_burnin_rounds",
+                        "rex_sweeps_per_round",
+                        "rex_thin_rounds",
+                        "rex_chains",
+                    }
+            else:
+                allow |= {
+                    "sa_reads",
+                    "sa_sweeps",
+                    "sa_beta_hot",
+                    "sa_beta_cold",
+                    "sa_beta_schedule",
+                    "sa_init",
+                    "sa_init_md_frame",
+                    "sa_restart",
+                    "sa_restart_topk",
+                    "penalty_safety",
+                    "repair",
                 }
-            if isinstance(meta_payload, dict) and meta_payload.get("beta_eff") is not None:
-                summary["beta_eff"] = meta_payload.get("beta_eff")
+            if raw.get("estimate_beta_eff"):
+                allow |= {"beta_eff_grid", "beta_eff_w_marg", "beta_eff_w_pair"}
+            out: Dict[str, Any] = {}
+            out["sampling_method"] = effective_method
+            for key in allow:
+                if key not in raw:
+                    continue
+                val = raw.get(key)
+                if val in (None, "", [], {}):
+                    continue
+                out[key] = val
+            return out
 
         sample_entry = {
             "sample_id": sample_id,
             "name": sample_label or f"Sampling {datetime.utcnow().strftime('%Y%m%d %H:%M')}",
             "type": "potts_sampling",
             "method": "sa" if sampling_method == "sa" else "gibbs",
+            "source": "simulation",
             "model_id": model_id,
             "model_ids": model_ids or None,
             "model_names": model_names or None,
             "created_at": datetime.utcnow().isoformat(),
             "path": primary_path,
             "paths": sample_paths,
-            "params": sim_params,
-            "summary": summary,
+            "params": _filter_sampling_params(sim_params),
         }
         if isinstance(entry, dict):
             samples = entry.get("samples")
@@ -918,7 +983,6 @@ def run_simulation_job(
         result_payload["results"] = {
             "results_dir": _relativize_path(results_dir),
             "summary_npz": _relativize_path(summary_path) if summary_path else None,
-            "metadata_json": _relativize_path(meta_path) if meta_path else None,
             "marginals_plot": _relativize_path(plot_path) if plot_path else None,
             "sampling_report": _relativize_path(report_path) if report_path else None,
             "cross_likelihood_report": _relativize_path(cross_likelihood_report_path) if cross_likelihood_report_path else None,

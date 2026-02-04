@@ -20,7 +20,6 @@ Weights are controlled by `beta-eff-w-marg` and `beta-eff-w-pair`.
 ## Outputs
 - `beta_scan.html`: D(beta) curves for each SA schedule.
 - `run_summary.npz`: `beta_eff`, `beta_eff_by_schedule`, `beta_eff_grid`, and distances.
-- `run_metadata.json`: quick access to the chosen beta_eff values.
 
 ## Related docs
 - [Potts analysis overview](doc:potts_overview)

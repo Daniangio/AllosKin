@@ -8,13 +8,54 @@ import re
 import shutil
 import uuid
 
-from phase.services.project_store import ProjectStore
+from phase.services.project_store import ProjectStore, MODEL_METADATA_FILENAME
 
 
 def sanitize_model_filename(name: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
     safe = safe.strip("._-")
     return safe or "potts_model"
+
+
+def _relativize_path_value(value: object, system_dir: Path) -> object:
+    if value is None:
+        return None
+    if isinstance(value, str) and "," in value:
+        parts = [p.strip() for p in value.split(",") if p.strip()]
+        updated = []
+        for part in parts:
+            updated.append(str(_relativize_path_value(part, system_dir)))
+        return ",".join(updated)
+    try:
+        path = Path(str(value))
+    except Exception:
+        return value
+    if not path.is_absolute():
+        return value
+    try:
+        return str(path.relative_to(system_dir))
+    except Exception:
+        return value
+
+
+def _normalize_model_params(params: dict, system_dir: Path) -> dict:
+    if not isinstance(params, dict):
+        return {}
+    path_keys = {
+        "npz",
+        "data_npz",
+        "plm_init_model",
+        "plm_resume_model",
+        "pdbs",
+        "base_model",
+        "active_npz",
+        "inactive_npz",
+    }
+    cleaned = dict(params)
+    for key in path_keys:
+        if key in cleaned:
+            cleaned[key] = _relativize_path_value(cleaned[key], system_dir)
+    return cleaned
 
 
 def persist_model(
@@ -77,26 +118,52 @@ def persist_model(
     except Exception:
         rel_path = str(dest_path)
 
+    params = _normalize_model_params(params, system_dir)
+    model_meta = {
+        "model_id": model_id,
+        "name": display_name,
+        "path": rel_path,
+        "created_at": datetime.utcnow().isoformat(),
+        "source": source,
+        "params": params,
+    }
+    _write_model_metadata(
+        model_dir=model_bucket,
+        model_meta=model_meta,
+    )
+
     if isinstance(entry, dict):
         models = entry.get("potts_models")
         if not isinstance(models, list):
             models = []
-        models.append(
-            {
-                "model_id": model_id,
-                "name": display_name,
-                "path": rel_path,
-                "created_at": datetime.utcnow().isoformat(),
-                "source": source,
-                "params": params,
-            }
-        )
+        existing = next((m for m in models if m.get("model_id") == model_id), None)
+        if existing:
+            existing.update(dict(model_meta))
+        else:
+            models.append(dict(model_meta))
         entry["potts_models"] = models
         store.save_system(system_meta)
     else:
         print("[potts] warning: cluster entry not found; model copied without metadata update.")
 
     return rel_path, model_id
+
+
+def _write_model_metadata(*, model_dir: Path, model_meta: dict) -> None:
+    meta_path = model_dir / MODEL_METADATA_FILENAME
+    meta = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    for key, value in model_meta.items():
+        if value is None:
+            continue
+        if key == "created_at" and meta.get("created_at"):
+            continue
+        meta[key] = value
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
 def persist_sample(
@@ -159,7 +226,7 @@ def persist_sample(
         return dest
 
     summary_dest = _copy_if_needed(summary_path)
-    meta_dest = _copy_if_needed(metadata_path) if metadata_path else None
+    meta_dest = None
 
     paths: dict[str, str] = {}
     if summary_dest:
@@ -167,13 +234,7 @@ def persist_sample(
             paths["summary_npz"] = str(summary_dest.relative_to(system_dir))
         except Exception:
             paths["summary_npz"] = str(summary_dest)
-    if meta_dest:
-        try:
-            paths["metadata_json"] = str(meta_dest.relative_to(system_dir))
-        except Exception:
-            paths["metadata_json"] = str(meta_dest)
-
-    primary_path = paths.get("summary_npz") or paths.get("metadata_json")
+    primary_path = paths.get("summary_npz")
 
     model_ids: list[str] = []
     model_names: list[str] = []
@@ -211,46 +272,12 @@ def persist_sample(
         samples = []
 
     existing = next((s for s in samples if s.get("sample_id") == resolved_sample_id), None)
-    summary = {}
-    if metadata_path and Path(metadata_path).exists():
-        try:
-            meta = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
-        except Exception:
-            meta = {}
-        args = meta.get("args") if isinstance(meta, dict) else None
-        if isinstance(args, dict):
-            summary = {
-                "sampling_method": args.get("sampling_method"),
-                "gibbs_method": args.get("gibbs_method"),
-                "beta": args.get("beta"),
-                "gibbs_samples": args.get("gibbs_samples"),
-                "gibbs_burnin": args.get("gibbs_burnin"),
-                "gibbs_thin": args.get("gibbs_thin"),
-                "gibbs_chains": args.get("gibbs_chains"),
-                "rex_rounds": args.get("rex_rounds"),
-                "rex_burnin_rounds": args.get("rex_burnin_rounds"),
-                "rex_thin_rounds": args.get("rex_thin_rounds"),
-                "rex_n_replicas": args.get("rex_n_replicas"),
-                "rex_beta_min": args.get("rex_beta_min"),
-                "rex_beta_max": args.get("rex_beta_max"),
-                "rex_spacing": args.get("rex_spacing"),
-                "rex_betas": args.get("rex_betas"),
-                "sa_reads": args.get("sa_reads"),
-                "sa_sweeps": args.get("sa_sweeps"),
-                "sa_beta_hot": args.get("sa_beta_hot"),
-                "sa_beta_cold": args.get("sa_beta_cold"),
-                "sa_beta_schedule": args.get("sa_beta_schedule"),
-                "beta_eff": meta.get("beta_eff"),
-                "beta_eff_by_schedule": meta.get("beta_eff_by_schedule"),
-            }
-        if "beta_eff" in meta and meta.get("beta_eff") is not None:
-            summary["beta_eff"] = meta.get("beta_eff")
-
     entry_payload = {
         "sample_id": resolved_sample_id,
         "name": display_name,
         "type": sample_type,
         "method": method,
+        "source": "offline",
         "model_id": model_id,
         "model_ids": model_ids or None,
         "model_names": model_names or None,
@@ -258,7 +285,6 @@ def persist_sample(
         "path": primary_path,
         "paths": paths,
         "params": params,
-        "summary": summary,
     }
     if existing is not None:
         existing.update(entry_payload)

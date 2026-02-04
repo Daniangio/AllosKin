@@ -299,4 +299,3 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
 echo "Done. Sampling outputs in: ${RESULTS_DIR}"
 echo "Summary: ${RESULTS_DIR}/run_summary.npz"
-echo "Metadata: ${RESULTS_DIR}/run_metadata.json"

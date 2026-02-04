@@ -901,12 +901,11 @@ def _save_run_summary(
     xlik_score_roc_counts: np.ndarray | None = None,
 ) -> Path:
     """
-    Save a compact summary bundle of inputs + sampling results into results_dir/run_summary.npz,
-    plus metadata JSON for quick inspection.
+    Save a compact summary bundle of inputs + sampling results into results_dir/run_summary.npz.
     """
     results_dir.mkdir(parents=True, exist_ok=True)
     summary_path = results_dir / "run_summary.npz"
-    meta_path = results_dir / "run_metadata.json"
+    legacy_meta_path = results_dir / "run_metadata.json"
 
     np.savez_compressed(
         summary_path,
@@ -1011,29 +1010,13 @@ def _save_run_summary(
             xlik_score_roc_counts if xlik_score_roc_counts is not None else np.array([], dtype=int)
         ),
     )
+    # Legacy artifact from older pipeline versions: keep results_dir clean.
+    try:
+        if legacy_meta_path.exists():
+            legacy_meta_path.unlink()
+    except Exception:
+        pass
 
-    metadata = {
-        "args": vars(args),
-        "summary_file": summary_path.name,
-        "data_npz": args.npz,
-    }
-    if model_path is not None:
-        metadata["potts_model_file"] = model_path.name
-    if swap_accept_rate is not None and len(swap_accept_rate):
-        metadata["swap_accept_rate_mean"] = float(np.mean(swap_accept_rate))
-    if beta_eff_value is not None:
-        metadata["beta_eff"] = float(beta_eff_value)
-    if beta_eff_by_schedule is not None:
-        metadata["beta_eff_by_schedule"] = [float(v) for v in beta_eff_by_schedule]
-    if sa_schedule_labels is not None:
-        metadata["sa_schedule_labels"] = [str(v) for v in sa_schedule_labels]
-    if xlik_auc is not None:
-        metadata["cross_likelihood_auc"] = float(xlik_auc)
-    if xlik_active_state_labels is not None:
-        metadata["cross_likelihood_active_states"] = [str(v) for v in xlik_active_state_labels]
-    if xlik_inactive_state_labels is not None:
-        metadata["cross_likelihood_inactive_states"] = [str(v) for v in xlik_inactive_state_labels]
-    meta_path.write_text(json.dumps(metadata, indent=2))
     return summary_path
 
 
@@ -1321,7 +1304,7 @@ def run_pipeline(
         print(f"[plot] loaded summary from {default_summary_path} -> {out_path}")
         return {
             "summary_path": default_summary_path,
-            "metadata_path": results_dir / "run_metadata.json",
+            "metadata_path": None,
             "plot_path": out_path,
             "report_path": report_path,
             "cross_likelihood_report_path": cross_likelihood_report_path,
@@ -1532,6 +1515,9 @@ def run_pipeline(
                     if show_batch_progress:
                         print(f"[plm] epoch {ep}/{total} avg_loss={avg_loss:.6f}")
 
+                model_metadata_path = None
+                if best_model_path:
+                    model_metadata_path = str(Path(best_model_path).with_name("model_metadata.json"))
                 model_plm = fit_potts_pseudolikelihood_torch(
                     labels_train,
                     K,
@@ -1553,6 +1539,7 @@ def run_pipeline(
                     start_best_val_loss=start_best_val_loss,
                     best_model_path=str(best_model_path) if best_model_path else None,
                     best_model_metadata=base_metadata,
+                    model_metadata_path=model_metadata_path,
                     device=plm_device,
                     progress_callback=_plm_progress,
                     progress_every=args.plm_progress_every,
@@ -1611,33 +1598,9 @@ def run_pipeline(
         report("Potts model fit complete", 40)
 
     if args.fit_only:
-        meta_path = results_dir / "potts_model_metadata.json"
-        fit_meta = {
-            "args": vars(args),
-            "model_file": model_out_path.name,
-            "data_npz": args.npz,
-        }
-        if metadata.get("plm_best_loss") is not None:
-            fit_meta["plm_best_loss"] = metadata["plm_best_loss"]
-        if metadata.get("plm_best_val_loss") is not None:
-            fit_meta["plm_best_val_loss"] = metadata["plm_best_val_loss"]
-        if metadata.get("plm_best_epoch") is not None:
-            fit_meta["plm_best_epoch"] = metadata["plm_best_epoch"]
-        if metadata.get("plm_last_loss") is not None:
-            fit_meta["plm_last_loss"] = metadata["plm_last_loss"]
-        if metadata.get("plm_last_val_loss") is not None:
-            fit_meta["plm_last_val_loss"] = metadata["plm_last_val_loss"]
-        if metadata.get("plm_val_frac") is not None:
-            fit_meta["plm_val_frac"] = metadata["plm_val_frac"]
-        meta_path.write_text(
-            json.dumps(
-                fit_meta,
-                indent=2,
-            )
-        )
         return {
             "model_path": model_out_path,
-            "metadata_path": meta_path,
+            "metadata_path": None,
         }
 
     betas: list[float] = []
@@ -2278,7 +2241,7 @@ def run_pipeline(
             print("[done]")
             return {
                 "summary_path": summary_path,
-                "metadata_path": results_dir / "run_metadata.json",
+                "metadata_path": None,
                 "plot_path": out_path,
                 "report_path": report_path,
                 "cross_likelihood_report_path": cross_likelihood_report_path,
@@ -2485,7 +2448,7 @@ def run_pipeline(
     report("Done", 100)
     return {
         "summary_path": summary_path,
-        "metadata_path": results_dir / "run_metadata.json",
+        "metadata_path": None,
         "plot_path": out_path,
         "report_path": report_path,
         "cross_likelihood_report_path": cross_likelihood_report_path,

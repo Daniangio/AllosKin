@@ -176,10 +176,10 @@ if [ "$FIT_METHOD" != "pmi" ]; then
   fi
   PLM_EPOCHS="$(prompt "PLM epochs" "200")"
   PLM_LR="$(prompt "PLM lr" "1e-2")"
-  PLM_LR_MIN="$(prompt "PLM lr min" "1e-3")"
+  PLM_LR_MIN="$(prompt "PLM lr min" "1e-4")"
   PLM_LR_SCHEDULE="$(prompt "PLM lr schedule (cosine/none)" "cosine")"
   PLM_L2="$(prompt "PLM L2" "1e-5")"
-  PLM_BATCH_SIZE="$(prompt "PLM batch size" "512")"
+  PLM_BATCH_SIZE="$(prompt "PLM batch size" "1024")"
   PLM_PROGRESS_EVERY="$(prompt "PLM progress every" "10")"
   if [ "$RESUME_EXISTING" = "true" ]; then
     PLM_INIT="model"
