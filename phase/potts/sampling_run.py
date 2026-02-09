@@ -26,6 +26,29 @@ class SamplingResult:
     n_residues: int
 
 
+def _normalize_sa_restart(value: object) -> str:
+    """
+    Normalize SA restart mode across legacy entry-points.
+
+    Sampling supports:
+    - previous: correlated chain where each sample warm-starts from the previous sample
+    - md: correlated chain where each sample warm-starts from a fresh MD frame
+    - independent: independent SA reads/chains
+
+    Older UI/CLI variants used "prev-topk"/"prev-uniform" (from the old multi-schedule pipeline);
+    we map those to "previous" here for compatibility.
+    """
+    raw = "" if value is None else str(value)
+    s = raw.strip().lower()
+    if s in {"previous", "prev", "chain", "prev-topk", "prev-uniform"}:
+        return "previous"
+    if s in {"md", "md-frame", "md-random", "md_random"}:
+        return "md"
+    if s in {"independent", "indep", "iid", "random", "rand"}:
+        return "independent"
+    return s
+
+
 def _normalize_model_paths(model_npz: Sequence[str]) -> List[str]:
     out: List[str] = []
     for raw in model_npz or []:
@@ -246,7 +269,7 @@ def _run_sa_chain_worker(payload: dict[str, object]) -> dict[str, object]:
     beta_range = payload.get("beta_range")  # type: ignore[assignment]
     sa_init = str(payload.get("sa_init", "md"))
     sa_init_md_frame = int(payload.get("sa_init_md_frame", -1))
-    sa_restart = str(payload.get("sa_restart", "previous")).strip().lower()
+    sa_restart = _normalize_sa_restart(payload.get("sa_restart", "previous"))
     repair = str(payload.get("repair", "none"))
 
     if sa_restart not in {"previous", "md"}:
@@ -539,7 +562,7 @@ def run_sampling(
     if sa_beta_hot and sa_beta_cold:
         beta_range = (float(sa_beta_hot), float(sa_beta_cold))
 
-    restart = str(sa_restart or "previous").strip().lower()
+    restart = _normalize_sa_restart(sa_restart or "previous")
     if restart not in {"previous", "md", "independent"}:
         raise ValueError("--sa-restart must be one of: previous, md, independent.")
 

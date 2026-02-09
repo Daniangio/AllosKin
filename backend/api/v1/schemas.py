@@ -218,3 +218,17 @@ class LambdaSweepJobRequest(BaseModel):
     rex_burnin_rounds: Optional[int] = None
     rex_sweeps_per_round: Optional[int] = None
     rex_thin_rounds: Optional[int] = None
+
+
+class LambdaPottsModelCreateRequest(BaseModel):
+    """
+    Create a derived Potts model by interpolating two existing endpoint models:
+      E_λ = (1-λ) * E_B + λ * E_A
+    where B corresponds to λ=0 and A corresponds to λ=1.
+    """
+
+    model_a_id: str
+    model_b_id: str
+    lam: float
+    name: Optional[str] = None
+    zero_sum_gauge: Optional[bool] = True

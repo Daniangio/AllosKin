@@ -4,7 +4,7 @@ import ErrorMessage from '../common/ErrorMessage';
 import { AnalysisResultsList, InfoTooltip } from './SystemDetailWidgets';
 import SimulationAnalysisForm from '../analysis/SimulationAnalysisForm';
 import SimulationUploadForm from '../analysis/SimulationUploadForm';
-import { fetchSampleStats } from '../../api/projects';
+import { createLambdaPottsModel, fetchSampleStats } from '../../api/projects';
 
 export default function SystemDetailPottsSection(props) {
   const {
@@ -99,6 +99,12 @@ export default function SystemDetailPottsSection(props) {
   const [backmappingFiles, setBackmappingFiles] = useState({});
   const [renameEditingId, setRenameEditingId] = useState(null);
   const [infoSampleId, setInfoSampleId] = useState(null);
+  const [lambdaCreateBusy, setLambdaCreateBusy] = useState(false);
+  const [lambdaCreateError, setLambdaCreateError] = useState(null);
+  const [lambdaModelAId, setLambdaModelAId] = useState('');
+  const [lambdaModelBId, setLambdaModelBId] = useState('');
+  const [lambdaValue, setLambdaValue] = useState(0.5);
+  const [lambdaModelName, setLambdaModelName] = useState('');
 
   const clusterLabel =
     selectedClusterName || selectedCluster?.name || selectedCluster?.cluster_id || '';
@@ -158,6 +164,57 @@ export default function SystemDetailPottsSection(props) {
     };
     load();
   }, [infoSampleId, pottsFitClusterId, projectId, systemId]);
+
+  useEffect(() => {
+    if (!fitOverlayOpen) return;
+    if (pottsFitMode !== 'lambda') return;
+    if (!pottsModels?.length) return;
+    if (!lambdaModelBId) setLambdaModelBId(pottsModels[0]?.model_id || '');
+    if (!lambdaModelAId) {
+      const fallback = pottsModels[Math.min(1, pottsModels.length - 1)]?.model_id || pottsModels[0]?.model_id || '';
+      setLambdaModelAId(fallback);
+    }
+  }, [fitOverlayOpen, pottsFitMode, pottsModels, lambdaModelAId, lambdaModelBId]);
+
+  const handleCreateLambdaModel = async () => {
+    setLambdaCreateError(null);
+    if (!pottsFitClusterId) {
+      setLambdaCreateError('Select a cluster first.');
+      return;
+    }
+    if (!lambdaModelAId || !lambdaModelBId) {
+      setLambdaCreateError('Select two endpoint models.');
+      return;
+    }
+    if (lambdaModelAId === lambdaModelBId) {
+      setLambdaCreateError('Endpoint models must be different.');
+      return;
+    }
+    const lam = Number(lambdaValue);
+    if (!Number.isFinite(lam) || lam < 0 || lam > 1) {
+      setLambdaCreateError('Lambda must be in [0,1].');
+      return;
+    }
+    setLambdaCreateBusy(true);
+    try {
+      await createLambdaPottsModel(projectId, systemId, pottsFitClusterId, {
+        model_a_id: lambdaModelAId,
+        model_b_id: lambdaModelBId,
+        lam,
+        name: lambdaModelName?.trim() ? lambdaModelName.trim() : undefined,
+        zero_sum_gauge: true,
+      });
+      if (typeof props.refreshSystem === 'function') {
+        await props.refreshSystem();
+      }
+      setLambdaModelName('');
+      setFitOverlayOpen(false);
+    } catch (err) {
+      setLambdaCreateError(err.message || 'Failed to create lambda model.');
+    } finally {
+      setLambdaCreateBusy(false);
+    }
+  };
 
   return (
     <div className="space-y-4">
@@ -620,8 +677,8 @@ export default function SystemDetailPottsSection(props) {
           <div className="w-full max-w-4xl bg-gray-900 border border-gray-700 rounded-lg p-4 space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <h3 className="text-lg font-semibold text-white">Fit Potts model</h3>
-                <p className="text-xs text-gray-500">Run on server or upload a fitted model.</p>
+                <h3 className="text-lg font-semibold text-white">New Potts model</h3>
+                <p className="text-xs text-gray-500">Run fitting, upload a model, or create a derived lambda model.</p>
               </div>
               <button
                 type="button"
@@ -654,6 +711,17 @@ export default function SystemDetailPottsSection(props) {
                 }`}
               >
                 Upload results
+              </button>
+              <button
+                type="button"
+                onClick={() => setPottsFitMode('lambda')}
+                className={`px-3 py-1 rounded-full border ${
+                  pottsFitMode === 'lambda'
+                    ? 'border-cyan-400 text-cyan-200 bg-cyan-500/10'
+                    : 'border-gray-700 text-gray-400 hover:border-gray-500'
+                }`}
+              >
+                Lambda model
               </button>
             </div>
             {pottsFitMode === 'run' && (
@@ -1094,6 +1162,98 @@ export default function SystemDetailPottsSection(props) {
                   className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-semibold py-2 rounded-md transition-colors disabled:opacity-50"
                 >
                   {pottsFitSubmitting ? 'Submitting…' : 'Run Potts fit'}
+                </button>
+              </div>
+            )}
+            {pottsFitMode === 'lambda' && (
+              <div className="space-y-3 border border-gray-700 rounded-md p-3">
+                <p className="text-xs text-gray-400">
+                  Create a new Potts model by interpolating two existing models and saving the result for later use (analysis/sampling).
+                </p>
+                {clusterLabel && <p className="text-[11px] text-gray-500">Selected cluster: {clusterLabel}</p>}
+                <div className="grid md:grid-cols-2 gap-3 text-sm">
+                  <label className="space-y-1">
+                    <span className="text-xs text-gray-400">Endpoint model B (λ=0)</span>
+                    <select
+                      value={lambdaModelBId}
+                      onChange={(event) => setLambdaModelBId(event.target.value)}
+                      disabled={!pottsModels.length}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500 disabled:opacity-60"
+                    >
+                      {!pottsModels.length && <option value="">No models available</option>}
+                      {pottsModels.map((model) => (
+                        <option key={model.model_id} value={model.model_id}>
+                          {formatPottsModelName(model)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-xs text-gray-400">Endpoint model A (λ=1)</span>
+                    <select
+                      value={lambdaModelAId}
+                      onChange={(event) => setLambdaModelAId(event.target.value)}
+                      disabled={!pottsModels.length}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500 disabled:opacity-60"
+                    >
+                      {!pottsModels.length && <option value="">No models available</option>}
+                      {pottsModels.map((model) => (
+                        <option key={model.model_id} value={model.model_id}>
+                          {formatPottsModelName(model)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+
+                <div className="grid md:grid-cols-[1fr_140px] gap-3 items-end">
+                  <label className="space-y-1">
+                    <span className="text-xs text-gray-400">λ (0..1)</span>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      value={lambdaValue}
+                      onChange={(event) => setLambdaValue(Number(event.target.value))}
+                      className="w-full"
+                    />
+                  </label>
+                  <label className="space-y-1">
+                    <span className="text-xs text-gray-400">λ value</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={1}
+                      step="0.01"
+                      value={lambdaValue}
+                      onChange={(event) => setLambdaValue(Number(event.target.value))}
+                      className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                    />
+                  </label>
+                </div>
+
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">Model name (optional)</label>
+                  <input
+                    type="text"
+                    value={lambdaModelName}
+                    onChange={(event) => setLambdaModelName(event.target.value)}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
+                    placeholder="Default: Lambda 0.300 ModelB -> ModelA"
+                  />
+                  <p className="text-[11px] text-gray-500 mt-1">Endpoints are zero-sum gauged before interpolation.</p>
+                </div>
+
+                {lambdaCreateError && <ErrorMessage message={lambdaCreateError} />}
+
+                <button
+                  type="button"
+                  onClick={handleCreateLambdaModel}
+                  disabled={lambdaCreateBusy || !pottsFitClusterId || !pottsModels.length}
+                  className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-semibold py-2 rounded-md transition-colors disabled:opacity-50"
+                >
+                  {lambdaCreateBusy ? 'Saving…' : 'Save lambda model'}
                 </button>
               </div>
             )}

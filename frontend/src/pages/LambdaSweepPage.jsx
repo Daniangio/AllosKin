@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { CircleHelp, Play, RefreshCw } from 'lucide-react';
 import Plot from 'react-plotly.js';
@@ -28,7 +28,9 @@ export default function LambdaSweepPage() {
   const [analysesLoading, setAnalysesLoading] = useState(false);
   const [analysesError, setAnalysesError] = useState(null);
   const [selectedAnalysisId, setSelectedAnalysisId] = useState('');
-  const [analysisDataCache, setAnalysisDataCache] = useState({});
+  const [, setAnalysisDataCache] = useState({});
+  const analysisDataCacheRef = useRef({});
+  const analysisDataInFlightRef = useRef({});
 
   const [helpOpen, setHelpOpen] = useState(false);
 
@@ -164,6 +166,8 @@ export default function LambdaSweepPage() {
   useEffect(() => {
     if (!selectedClusterId) return;
     setAnalysisDataCache({});
+    analysisDataCacheRef.current = {};
+    analysisDataInFlightRef.current = {};
     setSelectedAnalysisId('');
     loadAnalyses();
   }, [selectedClusterId, loadAnalyses]);
@@ -173,14 +177,32 @@ export default function LambdaSweepPage() {
     [analyses, selectedAnalysisId]
   );
 
-  const loadAnalysisData = useCallback(async (analysisId) => {
-    if (!analysisId) return null;
-    const cacheKey = `lambda_sweep:${analysisId}`;
-    if (analysisDataCache[cacheKey]) return analysisDataCache[cacheKey];
-    const payload = await fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'lambda_sweep', analysisId);
-    setAnalysisDataCache((prev) => ({ ...prev, [cacheKey]: payload }));
-    return payload;
-  }, [analysisDataCache, projectId, systemId, selectedClusterId]);
+  const loadAnalysisData = useCallback(
+    async (analysisId) => {
+      if (!analysisId) return null;
+      const cacheKey = `lambda_sweep:${analysisId}`;
+      const cached = analysisDataCacheRef.current;
+      if (Object.prototype.hasOwnProperty.call(cached, cacheKey)) return cached[cacheKey];
+
+      const inflight = analysisDataInFlightRef.current;
+      if (inflight[cacheKey]) return inflight[cacheKey];
+
+      const p = fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'lambda_sweep', analysisId)
+        .then((payload) => {
+          analysisDataCacheRef.current = { ...analysisDataCacheRef.current, [cacheKey]: payload };
+          setAnalysisDataCache((prev) => ({ ...prev, [cacheKey]: payload }));
+          delete analysisDataInFlightRef.current[cacheKey];
+          return payload;
+        })
+        .catch((err) => {
+          delete analysisDataInFlightRef.current[cacheKey];
+          throw err;
+        });
+      inflight[cacheKey] = p;
+      return p;
+    },
+    [projectId, systemId, selectedClusterId]
+  );
 
   const [analysisData, setAnalysisData] = useState(null);
   const [analysisDataError, setAnalysisDataError] = useState(null);

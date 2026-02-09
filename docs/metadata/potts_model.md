@@ -17,13 +17,17 @@ Common fields
 - `params` (object) – fit hyperparameters and provenance
 
 Typical `params` keys
-- `fit_mode` (string) – `"standard"` or `"delta"`
+- `fit_mode` (string) – `"standard"`, `"delta"`, or `"derived"`
 - `delta_kind` (string) – e.g. `delta_patch`, `model_patch`, `delta_active`, `delta_inactive`, `model_active`, `model_inactive`
 - `state_ids` (array of strings, optional)
 - `base_model_id` / `base_model_path` (string, optional)
 - PLM fit settings (epochs, lr, batch_size, etc.)
+- Derived model fields (when `fit_mode="derived"`)
+  - `derived_kind` (string) – e.g. `lambda_interpolation`
+  - `lambda` (float) – interpolation weight in [0,1]
+  - `endpoint_model_a_id` / `endpoint_model_b_id` (string)
+  - `zero_sum_gauge` (bool)
 
 Notes
 - The model folder should contain exactly one `.npz` model artifact.
 - If `path` is omitted, the loader will fall back to the single `.npz` file in the folder.
-

@@ -1529,6 +1529,7 @@ export default function SystemDetailPage() {
               pottsFitResults={pottsFitResults}
               pottsFitResultsWithClusters={pottsFitResultsWithClusters}
               handleDeleteResult={handleDeleteResult}
+              refreshSystem={refreshSystem}
               openDoc={openDoc}
               selectedCluster={selectedCluster}
               selectedClusterName={selectedClusterName}

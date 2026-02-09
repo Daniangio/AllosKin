@@ -190,9 +190,19 @@ async def submit_simulation_job(
         raise HTTPException(status_code=400, detail="sa_init_md_frame must be >= 0.")
 
     if payload.sa_restart is not None:
-        sa_restart = str(payload.sa_restart)
-        if sa_restart not in {"independent", "prev-topk", "prev-uniform"}:
-            raise HTTPException(status_code=400, detail="sa_restart must be one of: independent, prev-topk, prev-uniform.")
+        sa_restart = str(payload.sa_restart).strip().lower()
+        # Accept current sampling modes + legacy UI values.
+        if sa_restart in {"prev-topk", "prev-uniform", "prev", "chain"}:
+            sa_restart = "previous"
+        elif sa_restart in {"md-frame", "md_random", "md-random"}:
+            sa_restart = "md"
+        elif sa_restart in {"indep", "iid", "rand", "random"}:
+            sa_restart = "independent"
+        if sa_restart not in {"independent", "previous", "md"}:
+            raise HTTPException(
+                status_code=400,
+                detail="sa_restart must be one of: independent, previous, md.",
+            )
     if payload.sa_restart_topk is not None and int(payload.sa_restart_topk) < 1:
         raise HTTPException(status_code=400, detail="sa_restart_topk must be >= 1.")
 

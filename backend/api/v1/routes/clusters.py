@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 import numpy as np
 
 from backend.api.v1.common import DATA_ROOT, get_queue, project_store, stream_upload, get_cluster_entry
+from backend.api.v1.schemas import LambdaPottsModelCreateRequest
 from phase.workflows.clustering import (
     generate_metastable_cluster_npz,
     assign_cluster_labels_to_states,
@@ -25,6 +26,7 @@ from phase.workflows.clustering import (
 )
 from phase.workflows.backmapping import build_backmapping_npz
 from backend.tasks import run_cluster_job, run_backmapping_job
+from phase.potts.potts_model import interpolate_potts_models, load_potts_model, save_potts_model, zero_sum_gauge_model
 
 
 router = APIRouter()
@@ -1642,3 +1644,126 @@ async def delete_potts_model_npz(project_id: str, system_id: str, cluster_id: st
         model_id=model_id,
     )
     return {"status": "deleted", "cluster_id": cluster_id, "model_id": model_id}
+
+
+@router.post(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/potts_models/lambda",
+    summary="Create a derived lambda-interpolated Potts model (saved under potts_models/)",
+)
+async def create_lambda_potts_model(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    payload: LambdaPottsModelCreateRequest,
+):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+
+    clusters = system_meta.metastable_clusters or []
+    entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
+    if not isinstance(entry, dict):
+        raise HTTPException(status_code=404, detail="Cluster not found.")
+
+    lam = float(payload.lam)
+    if not (0.0 <= lam <= 1.0):
+        raise HTTPException(status_code=400, detail="lam must be in [0,1].")
+    model_a_id = str(payload.model_a_id).strip()
+    model_b_id = str(payload.model_b_id).strip()
+    if not model_a_id or not model_b_id:
+        raise HTTPException(status_code=400, detail="model_a_id and model_b_id are required.")
+    if model_a_id == model_b_id:
+        raise HTTPException(status_code=400, detail="Select two different endpoint models.")
+
+    models = entry.get("potts_models") or []
+    model_a_meta = next((m for m in models if m.get("model_id") == model_a_id), None)
+    model_b_meta = next((m for m in models if m.get("model_id") == model_b_id), None)
+    if not isinstance(model_a_meta, dict) or not isinstance(model_b_meta, dict):
+        raise HTTPException(status_code=404, detail="Could not locate both endpoint models in this cluster.")
+
+    for mid, meta in [(model_a_id, model_a_meta), (model_b_id, model_b_meta)]:
+        params = meta.get("params") or {}
+        if isinstance(params, dict):
+            dk = str(params.get("delta_kind") or "").strip().lower()
+            if dk.startswith("delta"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Endpoint model {mid} appears delta-only (params.delta_kind={dk!r}). "
+                        "Please select a sampleable endpoint model (standard or combined)."
+                    ),
+                )
+
+    rel_a = model_a_meta.get("path")
+    rel_b = model_b_meta.get("path")
+    if not rel_a or not rel_b:
+        raise HTTPException(status_code=404, detail="Endpoint model path missing in metadata.")
+
+    dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    system_dir = dirs["system_dir"]
+
+    abs_a = project_store.resolve_path(project_id, system_id, str(rel_a))
+    abs_b = project_store.resolve_path(project_id, system_id, str(rel_b))
+    if not abs_a.exists() or not abs_b.exists():
+        raise HTTPException(status_code=404, detail="Endpoint model NPZ missing on disk.")
+
+    try:
+        model_a = load_potts_model(str(abs_a))
+        model_b = load_potts_model(str(abs_b))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to load endpoint models: {exc}") from exc
+
+    do_gauge = bool(payload.zero_sum_gauge) if payload.zero_sum_gauge is not None else True
+    if do_gauge:
+        model_a = zero_sum_gauge_model(model_a)
+        model_b = zero_sum_gauge_model(model_b)
+    try:
+        derived = interpolate_potts_models(model_b, model_a, lam)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Cannot interpolate endpoint models: {exc}") from exc
+    if do_gauge:
+        derived = zero_sum_gauge_model(derived)
+
+    a_name = model_a_meta.get("name") or model_a_id
+    b_name = model_b_meta.get("name") or model_b_id
+    default_name = f"Lambda {lam:.3f} {b_name} -> {a_name}"
+    display_name = (payload.name or "").strip() or default_name
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", display_name).strip("._-") or "lambda_model"
+
+    model_id = str(uuid.uuid4())
+    model_dir = dirs["potts_models_dir"] / model_id
+    model_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = model_dir / f"{safe}.npz"
+    if dest_path.exists():
+        dest_path = model_dir / f"{safe}-{model_id[:8]}.npz"
+
+    params = {
+        "fit_mode": "derived",
+        "derived_kind": "lambda_interpolation",
+        "lambda": lam,
+        "endpoint_model_a_id": model_a_id,
+        "endpoint_model_b_id": model_b_id,
+        "endpoint_model_a_name": a_name,
+        "endpoint_model_b_name": b_name,
+        "zero_sum_gauge": do_gauge,
+    }
+    save_potts_model(derived, dest_path, metadata=params)
+    rel_path = str(dest_path.relative_to(system_dir))
+
+    if not isinstance(models, list):
+        models = []
+    models.append(
+        {
+            "model_id": model_id,
+            "name": display_name,
+            "path": rel_path,
+            "created_at": datetime.utcnow().isoformat(),
+            "source": "derived",
+            "params": params,
+        }
+    )
+    entry["potts_models"] = models
+    system_meta.metastable_clusters = clusters
+    project_store.save_system(system_meta)
+    return {"status": "created", "cluster_id": cluster_id, "model_id": model_id, "path": rel_path, "name": display_name}

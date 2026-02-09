@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { CircleHelp, Play, RefreshCw } from 'lucide-react';
 import Plot from 'react-plotly.js';
@@ -49,11 +49,15 @@ export default function DeltaEvalPage() {
 
   const [analyses, setAnalyses] = useState([]);
   const [analysesError, setAnalysesError] = useState(null);
-  const [analysisDataCache, setAnalysisDataCache] = useState({});
+  const [, setAnalysisDataCache] = useState({});
+  const analysisDataCacheRef = useRef({});
+  const analysisDataInFlightRef = useRef({});
 
   const [transitionAnalyses, setTransitionAnalyses] = useState([]);
   const [transitionAnalysesError, setTransitionAnalysesError] = useState(null);
-  const [transitionDataCache, setTransitionDataCache] = useState({});
+  const [, setTransitionDataCache] = useState({});
+  const transitionDataCacheRef = useRef({});
+  const transitionDataInFlightRef = useRef({});
 
   const [mdSampleId, setMdSampleId] = useState('');
   const [activeMdSampleId, setActiveMdSampleId] = useState('');
@@ -213,6 +217,10 @@ export default function DeltaEvalPage() {
     if (!selectedClusterId) return;
     setAnalysisDataCache({});
     setTransitionDataCache({});
+    analysisDataCacheRef.current = {};
+    analysisDataInFlightRef.current = {};
+    transitionDataCacheRef.current = {};
+    transitionDataInFlightRef.current = {};
     loadClusterInfo();
     loadAnalyses();
     loadTransitionAnalyses();
@@ -227,24 +235,54 @@ export default function DeltaEvalPage() {
     async (analysisId) => {
       if (!analysisId) return null;
       const cacheKey = `delta_eval:${analysisId}`;
-      if (analysisDataCache[cacheKey]) return analysisDataCache[cacheKey];
-      const payload = await fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'delta_eval', analysisId);
-      setAnalysisDataCache((prev) => ({ ...prev, [cacheKey]: payload }));
-      return payload;
+      const cached = analysisDataCacheRef.current;
+      if (Object.prototype.hasOwnProperty.call(cached, cacheKey)) return cached[cacheKey];
+
+      const inflight = analysisDataInFlightRef.current;
+      if (inflight[cacheKey]) return inflight[cacheKey];
+
+      const p = fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'delta_eval', analysisId)
+        .then((payload) => {
+          analysisDataCacheRef.current = { ...analysisDataCacheRef.current, [cacheKey]: payload };
+          setAnalysisDataCache((prev) => ({ ...prev, [cacheKey]: payload }));
+          delete analysisDataInFlightRef.current[cacheKey];
+          return payload;
+        })
+        .catch((err) => {
+          delete analysisDataInFlightRef.current[cacheKey];
+          throw err;
+        });
+      inflight[cacheKey] = p;
+      return p;
     },
-    [analysisDataCache, projectId, systemId, selectedClusterId]
+    [projectId, systemId, selectedClusterId]
   );
 
   const loadTransitionData = useCallback(
     async (analysisId) => {
       if (!analysisId) return null;
       const cacheKey = `delta_transition:${analysisId}`;
-      if (transitionDataCache[cacheKey]) return transitionDataCache[cacheKey];
-      const payload = await fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'delta_transition', analysisId);
-      setTransitionDataCache((prev) => ({ ...prev, [cacheKey]: payload }));
-      return payload;
+      const cached = transitionDataCacheRef.current;
+      if (Object.prototype.hasOwnProperty.call(cached, cacheKey)) return cached[cacheKey];
+
+      const inflight = transitionDataInFlightRef.current;
+      if (inflight[cacheKey]) return inflight[cacheKey];
+
+      const p = fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'delta_transition', analysisId)
+        .then((payload) => {
+          transitionDataCacheRef.current = { ...transitionDataCacheRef.current, [cacheKey]: payload };
+          setTransitionDataCache((prev) => ({ ...prev, [cacheKey]: payload }));
+          delete transitionDataInFlightRef.current[cacheKey];
+          return payload;
+        })
+        .catch((err) => {
+          delete transitionDataInFlightRef.current[cacheKey];
+          throw err;
+        });
+      inflight[cacheKey] = p;
+      return p;
     },
-    [transitionDataCache, projectId, systemId, selectedClusterId]
+    [projectId, systemId, selectedClusterId]
   );
 
   const dropInvalid = !keepInvalid;
@@ -1043,6 +1081,7 @@ export default function DeltaEvalPage() {
                   data={deltaEnergySeries.series.map((s) => ({
                     x: s.x,
                     type: 'histogram',
+                    histnorm: 'probability',
                     opacity: s.opacity,
                     marker: { color: s.color },
                     nbinsx: 60,
@@ -1057,7 +1096,7 @@ export default function DeltaEvalPage() {
                     font: { color: '#111827' },
                     barmode: 'overlay',
                     xaxis: { title: 'ΔE (A - B)', color: '#111827' },
-                    yaxis: { title: 'Count', color: '#111827' },
+                    yaxis: { title: 'Probability', color: '#111827' },
                   }}
                   config={{ displayModeBar: false, responsive: true }}
                   useResizeHandler
@@ -1179,6 +1218,7 @@ export default function DeltaEvalPage() {
                     data={tsZSeries.series.map((s) => ({
                       x: s.x,
                       type: 'histogram',
+                      histnorm: 'probability',
                       opacity: s.opacity,
                       marker: { color: s.color },
                       nbinsx: 60,
@@ -1193,7 +1233,7 @@ export default function DeltaEvalPage() {
                       font: { color: '#111827' },
                       barmode: 'overlay',
                       xaxis: { title: 'z', color: '#111827' },
-                      yaxis: { title: 'Count', color: '#111827' },
+                      yaxis: { title: 'Probability', color: '#111827' },
                       shapes:
                         Number.isFinite(tsTau) && tsTau !== null
                           ? [

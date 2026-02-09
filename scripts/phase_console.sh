@@ -221,7 +221,7 @@ cluster_menu() {
     echo "System: ${OFFLINE_SYSTEM_NAME:-$OFFLINE_SYSTEM_ID} (${OFFLINE_SYSTEM_ID})"
     echo "Cluster: ${OFFLINE_CLUSTER_NAME:-$OFFLINE_CLUSTER_ID} (${OFFLINE_CLUSTER_ID})"
     echo ""
-    ACTION_LINES=$'list-models|List Potts models\nlist-samples|List sampling runs\nfit|Fit Potts model\nfit-delta|Fit delta Potts model\nsample|Run sampling\nlambda-sweep|Lambda sweep sampling\nrefresh-md|Recompute MD samples\nevaluate|Evaluate state against cluster\nback|Back to systems'
+    ACTION_LINES=$'list-models|List Potts models\nlist-samples|List sampling runs\nfit|Fit Potts model\nfit-delta|Fit delta Potts model\nlambda-model|Create lambda model\nsample|Run sampling\nlambda-sweep|Lambda sweep sampling\nrefresh-md|Recompute MD samples\nevaluate|Evaluate state against cluster\nback|Back to systems'
     ACTION_ROW="$(offline_choose_one "Cluster actions:" "$ACTION_LINES")"
     ACTION="$(printf "%s" "$ACTION_ROW" | awk -F'|' '{print $1}')"
     case "$ACTION" in
@@ -257,6 +257,15 @@ cluster_menu() {
           --project-id "$OFFLINE_PROJECT_ID" \
           --system-id "$OFFLINE_SYSTEM_ID" \
           --cluster-id "$OFFLINE_CLUSTER_ID"
+        ;;
+      lambda-model)
+        ensure_env || return 0
+        "${ROOT_DIR}/scripts/potts_lambda_model.sh" \
+          --root "$OFFLINE_ROOT" \
+          --project-id "$OFFLINE_PROJECT_ID" \
+          --system-id "$OFFLINE_SYSTEM_ID" \
+          --cluster-id "$OFFLINE_CLUSTER_ID"
+        pause
         ;;
       sample)
         ensure_env || return 0

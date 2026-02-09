@@ -699,6 +699,16 @@ def run_simulation_job(
                     sim_params.setdefault("sa_beta_cold", cold)
 
         save_progress("Running Potts sampling", 20)
+
+        # Normalize legacy SA restart modes ("prev-topk"/"prev-uniform") emitted by older UIs.
+        raw_sa_restart = str(sim_params.get("sa_restart") or "previous").strip().lower()
+        if raw_sa_restart in {"prev-topk", "prev-uniform", "prev", "chain"}:
+            raw_sa_restart = "previous"
+        elif raw_sa_restart in {"md-frame", "md_random", "md-random"}:
+            raw_sa_restart = "md"
+        elif raw_sa_restart in {"indep", "iid", "rand", "random"}:
+            raw_sa_restart = "independent"
+
         run_sampling(
             cluster_npz=str(cluster_path),
             results_dir=results_dir,
@@ -729,7 +739,7 @@ def run_simulation_job(
             sa_beta_cold=float(sim_params.get("sa_beta_cold") or 0.0),
             sa_init=str(sim_params.get("sa_init") or "md"),
             sa_init_md_frame=int(sim_params.get("sa_init_md_frame") or -1),
-            sa_restart=str(sim_params.get("sa_restart") or "previous"),
+            sa_restart=raw_sa_restart,
             sa_md_state_ids=str(sim_params.get("sa_md_state_ids") or ""),
             penalty_safety=float(sim_params.get("penalty_safety") or 3.0),
             repair=str(sim_params.get("repair") or "none"),
@@ -808,7 +818,14 @@ def run_simulation_job(
             else:
                 # Keep a few key SA parameters even when defaults are used (mirrors offline sampling metadata).
                 out["beta"] = float(effective_beta)
-                out["sa_restart"] = str(raw.get("sa_restart") or "previous")
+                sr = str(raw.get("sa_restart") or "previous").strip().lower()
+                if sr in {"prev-topk", "prev-uniform", "prev", "chain"}:
+                    sr = "previous"
+                elif sr in {"md-frame", "md_random", "md-random"}:
+                    sr = "md"
+                elif sr in {"indep", "iid", "rand", "random"}:
+                    sr = "independent"
+                out["sa_restart"] = sr
                 out["sa_sweeps"] = int(raw.get("sa_sweeps") or 2000)
 
                 _maybe("sa_reads", int(raw.get("sa_reads")) if raw.get("sa_reads") is not None else None)

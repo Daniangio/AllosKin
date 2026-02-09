@@ -604,3 +604,13 @@ export function deletePottsModel(projectId, systemId, clusterId, modelId) {
     }
   );
 }
+
+export function createLambdaPottsModel(projectId, systemId, clusterId, payload) {
+  return requestJSON(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/potts_models/lambda`,
+    {
+      method: 'POST',
+      body: payload,
+    }
+  );
+}

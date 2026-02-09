@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import { CircleHelp, Info, Play, RefreshCw, Trash2, X } from 'lucide-react';
 import Plot from 'react-plotly.js';
@@ -195,7 +195,10 @@ export default function SamplingVizPage() {
   const [analyses, setAnalyses] = useState([]);
   const [analysesLoading, setAnalysesLoading] = useState(false);
   const [analysesError, setAnalysesError] = useState(null);
-  const [analysisDataCache, setAnalysisDataCache] = useState({});
+  const [, setAnalysisDataCache] = useState({});
+  // Avoid effect dependency loops and duplicate network calls by using refs for cache + in-flight tracking.
+  const analysisDataCacheRef = useRef({});
+  const analysisDataInFlightRef = useRef({});
 
   const [mdLabelMode, setMdLabelMode] = useState('assigned');
   const [keepInvalid, setKeepInvalid] = useState(false);
@@ -365,6 +368,8 @@ export default function SamplingVizPage() {
     loadClusterInfo(selectedModelId);
     loadAnalyses();
     setAnalysisDataCache({});
+    analysisDataCacheRef.current = {};
+    analysisDataInFlightRef.current = {};
     setSelectedMdSampleId('');
     setInfoSampleId('');
   }, [selectedClusterId, loadClusterInfo, loadAnalyses]);
@@ -429,12 +434,27 @@ export default function SamplingVizPage() {
     async (analysisType, analysisId) => {
       if (!analysisType || !analysisId) return null;
       const cacheKey = `${analysisType}:${analysisId}`;
-      if (analysisDataCache[cacheKey]) return analysisDataCache[cacheKey];
-      const payload = await fetchClusterAnalysisData(projectId, systemId, selectedClusterId, analysisType, analysisId);
-      setAnalysisDataCache((prev) => ({ ...prev, [cacheKey]: payload }));
-      return payload;
+      const cached = analysisDataCacheRef.current;
+      if (Object.prototype.hasOwnProperty.call(cached, cacheKey)) return cached[cacheKey];
+
+      const inflight = analysisDataInFlightRef.current;
+      if (inflight[cacheKey]) return inflight[cacheKey];
+
+      const p = fetchClusterAnalysisData(projectId, systemId, selectedClusterId, analysisType, analysisId)
+        .then((payload) => {
+          analysisDataCacheRef.current = { ...analysisDataCacheRef.current, [cacheKey]: payload };
+          setAnalysisDataCache((prev) => ({ ...prev, [cacheKey]: payload }));
+          delete analysisDataInFlightRef.current[cacheKey];
+          return payload;
+        })
+        .catch((err) => {
+          delete analysisDataInFlightRef.current[cacheKey];
+          throw err;
+        });
+      inflight[cacheKey] = p;
+      return p;
     },
-    [analysisDataCache, projectId, systemId, selectedClusterId]
+    [projectId, systemId, selectedClusterId]
   );
 
   const [comparisonData, setComparisonData] = useState(null);
@@ -729,6 +749,7 @@ export default function SamplingVizPage() {
       data: energySeries.map((s, idx) => ({
         x: s.energies,
         type: 'histogram',
+        histnorm: 'probability',
         name: s.label,
         opacity: 0.55,
         marker: { color: pickColor(idx) },
@@ -744,7 +765,7 @@ export default function SamplingVizPage() {
         font: { color: '#111827' },
         barmode: 'overlay',
         xaxis: { title: 'Energy', color: '#111827' },
-        yaxis: { title: 'Count', color: '#111827' },
+        yaxis: { title: 'Probability', color: '#111827' },
       },
     };
   }, [energySeries]);

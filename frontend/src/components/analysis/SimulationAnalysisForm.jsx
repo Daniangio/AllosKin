@@ -16,8 +16,7 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
   const [saSchedules, setSaSchedules] = useState([]);
   const [saInit, setSaInit] = useState('md');
   const [saInitMdFrame, setSaInitMdFrame] = useState('');
-  const [saRestart, setSaRestart] = useState('independent');
-  const [saRestartTopk, setSaRestartTopk] = useState('');
+  const [saRestart, setSaRestart] = useState('previous');
   const [pottsModelIds, setPottsModelIds] = useState([]);
   const [samplingMethod, setSamplingMethod] = useState('gibbs');
   const [sampleName, setSampleName] = useState('');
@@ -141,15 +140,6 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
           payload.sa_init_md_frame = frameIndex;
         }
         if (saRestart) payload.sa_restart = saRestart;
-        if (saRestart === 'prev-topk') {
-          if (saRestartTopk !== '') {
-            const topk = Number(saRestartTopk);
-            if (!Number.isInteger(topk) || topk < 1) {
-              throw new Error('SA restart top-k must be a positive integer.');
-            }
-            payload.sa_restart_topk = topk;
-          }
-        }
         const customSchedules = [];
         for (const schedule of saSchedules) {
           const hotRaw = String(schedule.betaHot ?? '').trim();
@@ -431,22 +421,10 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
                 onChange={(event) => setSaRestart(event.target.value)}
                 className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500"
               >
-                <option value="independent">Independent (default)</option>
-                <option value="prev-topk">Restart from previous SA top-k</option>
-                <option value="prev-uniform">Restart from previous SA uniform</option>
+                <option value="previous">Continue chain (default)</option>
+                <option value="md">Restart from MD each sample</option>
+                <option value="independent">Independent</option>
               </select>
-            </div>
-            <div>
-              <label className="block text-sm text-gray-300 mb-1">Restart top-k</label>
-              <input
-                type="number"
-                min={1}
-                placeholder="Default: 200"
-                value={saRestartTopk}
-                onChange={(event) => setSaRestartTopk(event.target.value)}
-                disabled={saRestart !== 'prev-topk'}
-                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500 disabled:opacity-60"
-              />
             </div>
           </div>
           <div className="space-y-2">
