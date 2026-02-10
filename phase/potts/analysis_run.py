@@ -26,6 +26,28 @@ from phase.services.project_store import ProjectStore
 ANALYSIS_METADATA_FILENAME = "analysis_metadata.json"
 
 
+def _convert_nan_to_none(obj: Any):
+    """
+    JSON helper: recursively replace NaN/inf and numpy scalar types with JSON-friendly values.
+    """
+    if isinstance(obj, dict):
+        return {k: _convert_nan_to_none(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_convert_nan_to_none(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_convert_nan_to_none(v) for v in obj)
+    if isinstance(obj, np.ndarray):
+        return _convert_nan_to_none(obj.tolist())
+    if isinstance(obj, (np.floating, float)):
+        v = float(obj)
+        if not np.isfinite(v):
+            return None
+        return v
+    if isinstance(obj, (np.integer, int)):
+        return int(obj)
+    return obj
+
+
 @dataclass(frozen=True)
 class AnalysisPaths:
     analysis_id: str
@@ -1137,3 +1159,308 @@ def compute_delta_transition_analysis(
         "q_edge": np.asarray(q_edge, dtype=float),
         "ensemble_labels": ensemble_labels,
     }
+
+
+def upsert_delta_commitment_analysis(
+    *,
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    model_a_ref: str,
+    model_b_ref: str,
+    sample_ids: Sequence[str],
+    md_label_mode: str = "assigned",
+    drop_invalid: bool = True,
+    top_k_residues: int = 20,
+    top_k_edges: int = 30,
+    ranking_method: str = "param_l2",
+    energy_bins: int = 80,
+) -> dict[str, Any]:
+    """
+    Incremental A–B commitment store.
+
+    Creates (or updates) a single analysis directory for a fixed (A,B,params) key and stores:
+      - Discriminative power (once per analysis key): D_residue, D_edge, top indices, edge list.
+      - Per-sample commitment: q_residue, q_edge (rows = samples).
+      - Per-sample ΔE histograms on the diff model (E_A - E_B), with a shared binning across samples.
+
+    Notes
+    -----
+    - We do NOT attempt to be backwards compatible with older delta_transition artifacts.
+    - For simplicity and robustness, each call recomputes all stored samples (existing ∪ requested)
+      and overwrites the analysis.npz.
+    """
+    md_label_mode = (md_label_mode or "assigned").strip().lower()
+    if md_label_mode not in {"assigned", "halo"}:
+        raise ValueError("md_label_mode must be 'assigned' or 'halo'.")
+    top_k_residues = int(top_k_residues)
+    top_k_edges = int(top_k_edges)
+    if top_k_residues < 1:
+        raise ValueError("top_k_residues must be >= 1.")
+    if top_k_edges < 1:
+        raise ValueError("top_k_edges must be >= 1.")
+    ranking_method = (ranking_method or "param_l2").strip().lower()
+    if ranking_method not in {"param_l2"}:
+        raise ValueError("ranking_method must be 'param_l2'.")
+    energy_bins = int(energy_bins)
+    if energy_bins < 5:
+        raise ValueError("energy_bins must be >= 5.")
+
+    data_root = Path(os.getenv("PHASE_DATA_ROOT", "/app/data"))
+    store = ProjectStore(base_dir=data_root / "projects")
+    cluster_dirs = store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    system_dir = cluster_dirs["system_dir"]
+    cluster_dir = cluster_dirs["cluster_dir"]
+
+    # Resolve model refs (id or path). We store cluster-relative paths for portability.
+    def _resolve_model(ref: str) -> tuple[PottsModel, str | None, str, str]:
+        model_id = None
+        model_name = None
+        model_path = Path(str(ref))
+        if not model_path.suffix:
+            model_id = str(ref)
+            models = store.list_potts_models(project_id, system_id, cluster_id)
+            entry = next((m for m in models if m.get("model_id") == model_id), None)
+            if not entry or not entry.get("path"):
+                raise FileNotFoundError(f"Potts model_id not found on this cluster: {model_id}")
+            model_name = str(entry.get("name") or model_id)
+            model_path = store.resolve_path(project_id, system_id, str(entry.get("path")))
+        else:
+            if not model_path.is_absolute():
+                model_path = store.resolve_path(project_id, system_id, str(model_path))
+            model_name = model_path.stem
+        if not model_path.exists():
+            raise FileNotFoundError(f"Potts model NPZ not found: {model_path}")
+        return load_potts_model(str(model_path)), model_id, str(model_name), _relativize(model_path, system_dir)
+
+    model_a, model_a_id, model_a_name, model_a_path = _resolve_model(model_a_ref)
+    model_b, model_b_id, model_b_name, model_b_path = _resolve_model(model_b_ref)
+    if model_a_id and model_b_id and model_a_id == model_b_id:
+        raise ValueError("Select two different models.")
+    if len(model_a.h) != len(model_b.h):
+        raise ValueError("Model sizes do not match.")
+
+    # Enforce same gauge before comparing parameters.
+    model_a = zero_sum_gauge_model(model_a)
+    model_b = zero_sum_gauge_model(model_b)
+
+    N = int(len(model_a.h))
+    K = int(len(np.asarray(model_a.h[0]).ravel())) if N > 0 else 0
+    if N <= 0 or K <= 0:
+        raise ValueError("Invalid Potts model size.")
+
+    edges_a = {(min(int(r), int(s)), max(int(r), int(s))) for r, s in (model_a.edges or []) if int(r) != int(s)}
+    edges_b = {(min(int(r), int(s)), max(int(r), int(s))) for r, s in (model_b.edges or []) if int(r) != int(s)}
+    edges = sorted(edges_a & edges_b)
+
+    dh_list: list[np.ndarray] = [
+        np.asarray(model_a.h[i], dtype=float) - np.asarray(model_b.h[i], dtype=float) for i in range(N)
+    ]
+    dJ: dict[tuple[int, int], np.ndarray] = {}
+    for (r, s) in edges:
+        dJ[(r, s)] = np.asarray(model_a.coupling(r, s), dtype=float) - np.asarray(model_b.coupling(r, s), dtype=float)
+    diff_model = PottsModel(h=dh_list, J=dJ, edges=list(edges))
+
+    # Discriminative power (parameter-only).
+    D_residue = np.zeros((N,), dtype=float)
+    for i in range(N):
+        D_residue[i] = float(np.linalg.norm(np.asarray(dh_list[i], dtype=float).ravel(), ord=2))
+    D_edge = np.zeros((len(edges),), dtype=float)
+    for idx, (r, s) in enumerate(edges):
+        D_edge[idx] = float(np.linalg.norm(np.asarray(dJ[(r, s)], dtype=float).ravel(), ord=2))
+
+    top_k_r = min(top_k_residues, N)
+    top_k_e = min(top_k_edges, len(edges))
+    top_residue_indices = np.argsort(D_residue)[::-1][:top_k_r].astype(int)
+    top_edge_indices = np.argsort(D_edge)[::-1][:top_k_e].astype(int) if top_k_e > 0 else np.zeros((0,), dtype=int)
+
+    # Locate analysis directory for this (A,B,params) key.
+    key = json.dumps(
+        {
+            "analysis_type": "delta_commitment",
+            "model_a_id": model_a_id or model_a_path,
+            "model_b_id": model_b_id or model_b_path,
+            "md_label_mode": md_label_mode,
+            "drop_invalid": bool(drop_invalid),
+            "ranking_method": ranking_method,
+        },
+        sort_keys=True,
+    )
+    analysis_id = str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+    analyses_root = _ensure_analysis_dir(cluster_dir, "delta_commitment")
+    analysis_dir = analyses_root / analysis_id
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = analysis_dir / "analysis.npz"
+    meta_path = analysis_dir / ANALYSIS_METADATA_FILENAME
+
+    # Determine which samples to store: existing ∪ requested.
+    existing_sample_ids: list[str] = []
+    if npz_path.exists():
+        try:
+            with np.load(npz_path, allow_pickle=False) as data:
+                if "sample_ids" in data:
+                    existing_sample_ids = [str(x) for x in np.asarray(data["sample_ids"], dtype=str).tolist()]
+        except Exception:
+            existing_sample_ids = []
+
+    requested = [str(s).strip() for s in sample_ids if str(s).strip()]
+    # Keep deterministic ordering: existing first, then new in request order.
+    seen = set()
+    merged: list[str] = []
+    for sid in existing_sample_ids + requested:
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        merged.append(sid)
+    if not merged:
+        raise ValueError("No samples selected.")
+
+    samples = store.list_samples(project_id, system_id, cluster_id)
+    sample_by_id: dict[str, dict[str, Any]] = {str(s.get("sample_id")): s for s in samples if s.get("sample_id")}
+
+    def _resolve_sample_path(entry: dict[str, Any]) -> Path:
+        paths = entry.get("paths") or {}
+        rel = None
+        if isinstance(paths, dict):
+            rel = paths.get("summary_npz") or paths.get("path")
+        rel = rel or entry.get("path")
+        if not rel:
+            raise FileNotFoundError("Sample entry missing path.")
+        p = Path(str(rel))
+        if not p.is_absolute():
+            resolved = store.resolve_path(project_id, system_id, str(rel))
+            if not resolved.exists():
+                alt = cluster_dir / str(rel)
+                p = alt if alt.exists() else resolved
+            else:
+                p = resolved
+        return p
+
+    def _load_labels(entry: dict[str, Any]) -> np.ndarray:
+        p = _resolve_sample_path(entry)
+        s = load_sample_npz(p)
+        X = s.labels
+        if md_label_mode in {"halo", "labels_halo"} and s.labels_halo is not None:
+            X = s.labels_halo
+        if drop_invalid and s.invalid_mask is not None:
+            keep = ~np.asarray(s.invalid_mask, dtype=bool)
+            if keep.shape[0] == X.shape[0]:
+                X = X[keep]
+        return np.asarray(X, dtype=int)
+
+    sample_labels: list[str] = []
+    sample_types: list[str] = []
+    # Store commitment for ALL residues (filtering is a visualization concern).
+    q_residue_all = np.zeros((len(merged), N), dtype=float)
+    q_edge = np.zeros((len(merged), top_k_e), dtype=float)
+    delta_energy_all: list[np.ndarray] = []
+    energy_mean = np.zeros((len(merged),), dtype=float)
+    energy_std = np.zeros((len(merged),), dtype=float)
+
+    for row, sid in enumerate(merged):
+        entry = sample_by_id.get(sid)
+        if not entry:
+            raise FileNotFoundError(f"Sample not found on this cluster: {sid}")
+        sample_labels.append(str(entry.get("name") or sid))
+        sample_types.append(str(entry.get("type") or "sample"))
+        X = _load_labels(entry)
+        if X.ndim != 2 or X.size == 0:
+            raise ValueError(f"Sample labels are empty: {sid}")
+        if int(X.shape[1]) != N:
+            raise ValueError(f"Sample labels do not match model size for {sid}: got N={X.shape[1]}, expected {N}")
+
+        # Commitment on all residues: q_i = Pr(dh_i(X_i) < 0)
+        for i in range(N):
+            vals = dh_list[i][X[:, i]]
+            q_residue_all[row, i] = float(np.mean(vals < 0)) if vals.size else np.nan
+
+        # Commitment on top edges: Pr(dJ_ij(X_i,X_j) < 0)
+        if top_k_e > 0 and edges:
+            for col, eidx in enumerate(top_edge_indices.tolist()):
+                r, s = edges[int(eidx)]
+                vals = dJ[(r, s)][X[:, r], X[:, s]]
+                q_edge[row, col] = float(np.mean(vals < 0)) if vals.size else np.nan
+
+        de = np.asarray(diff_model.energy_batch(X), dtype=float)
+        delta_energy_all.append(de)
+        energy_mean[row] = float(np.mean(de)) if de.size else np.nan
+        energy_std[row] = float(np.std(de)) if de.size else np.nan
+
+    # Shared energy binning across all samples in this analysis.
+    de_concat = np.concatenate(delta_energy_all, axis=0) if delta_energy_all else np.zeros((0,), dtype=float)
+    if de_concat.size == 0:
+        bins = np.linspace(-1.0, 1.0, energy_bins + 1, dtype=float)
+    else:
+        lo = float(np.min(de_concat))
+        hi = float(np.max(de_concat))
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            lo, hi = -1.0, 1.0
+        if hi <= lo:
+            hi = lo + 1.0
+        pad = 1e-6 * (hi - lo)
+        bins = np.linspace(lo - pad, hi + pad, energy_bins + 1, dtype=float)
+
+    energy_hist = np.zeros((len(merged), energy_bins), dtype=float)
+    for row, de in enumerate(delta_energy_all):
+        h, _ = np.histogram(np.asarray(de, dtype=float), bins=bins, density=True)
+        energy_hist[row] = np.asarray(h, dtype=float)
+
+    # Persist NPZ (single file per analysis key).
+    np.savez_compressed(
+        npz_path,
+        edges=np.asarray(edges, dtype=int),
+        D_residue=np.asarray(D_residue, dtype=float),
+        D_edge=np.asarray(D_edge, dtype=float),
+        top_residue_indices=np.asarray(top_residue_indices, dtype=int),
+        top_edge_indices=np.asarray(top_edge_indices, dtype=int),
+        sample_ids=np.asarray(merged, dtype=str),
+        sample_labels=np.asarray(sample_labels, dtype=str),
+        sample_types=np.asarray(sample_types, dtype=str),
+        q_residue_all=np.asarray(q_residue_all, dtype=float),
+        q_edge=np.asarray(q_edge, dtype=float),
+        energy_bins=np.asarray(bins, dtype=float),
+        energy_hist=np.asarray(energy_hist, dtype=float),
+        energy_mean=np.asarray(energy_mean, dtype=float),
+        energy_std=np.asarray(energy_std, dtype=float),
+    )
+
+    now = _utc_now()
+    created_at = now
+    if meta_path.exists():
+        try:
+            old = json.loads(meta_path.read_text(encoding="utf-8"))
+            created_at = str(old.get("created_at") or created_at)
+        except Exception:
+            created_at = now
+
+    meta = {
+        "analysis_id": analysis_id,
+        "analysis_type": "delta_commitment",
+        "created_at": created_at,
+        "updated_at": now,
+        "project_id": project_id,
+        "system_id": system_id,
+        "cluster_id": cluster_id,
+        "model_a_id": model_a_id,
+        "model_a_name": model_a_name,
+        "model_a_path": model_a_path,
+        "model_b_id": model_b_id,
+        "model_b_name": model_b_name,
+        "model_b_path": model_b_path,
+        "md_label_mode": md_label_mode,
+        "drop_invalid": bool(drop_invalid),
+        "top_k_residues": int(top_k_r),
+        "top_k_edges": int(top_k_e),
+        "ranking_method": ranking_method,
+        "energy_bins": int(energy_bins),
+        "paths": {"analysis_npz": str(npz_path.relative_to(system_dir))},
+        "summary": {
+            "n_residues": int(N),
+            "n_edges": int(len(edges)),
+            "n_samples": int(len(merged)),
+            "sample_ids": merged,
+        },
+    }
+    meta_path.write_text(json.dumps(_convert_nan_to_none(meta), indent=2), encoding="utf-8")
+
+    return {"metadata": _convert_nan_to_none(meta), "analysis_npz": str(npz_path), "analysis_dir": str(analysis_dir)}

@@ -170,6 +170,28 @@ class DeltaTransitionJobRequest(BaseModel):
     seed: Optional[int] = None
 
 
+class DeltaCommitmentJobRequest(BaseModel):
+    """
+    Incremental delta-commitment analysis for a fixed (model A, model B) pair.
+
+    The analysis stores discriminative power once for the pair and appends/overwrites
+    per-sample commitment for the selected samples.
+    """
+
+    project_id: str
+    system_id: str
+    cluster_id: str
+    model_a_id: str
+    model_b_id: str
+    sample_ids: List[str]
+    md_label_mode: Optional[str] = None  # assigned|halo
+    keep_invalid: Optional[bool] = None
+    top_k_residues: Optional[int] = None
+    top_k_edges: Optional[int] = None
+    ranking_method: Optional[str] = None
+    energy_bins: Optional[int] = None
+
+
 class LambdaSweepJobRequest(BaseModel):
     """
     Validation ladder 4: sample from an interpolated model E_λ between two endpoint Potts models.

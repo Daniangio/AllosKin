@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-import { CircleHelp, Play, RefreshCw } from 'lucide-react';
+import { CircleHelp, RefreshCw } from 'lucide-react';
 import { createPluginUI } from 'molstar/lib/mol-plugin-ui/index';
 import { renderReact18 } from 'molstar/lib/mol-plugin-ui/react18';
 import { Asset } from 'molstar/lib/mol-util/assets';
@@ -19,7 +19,6 @@ import {
   fetchPottsClusterInfo,
   fetchSystem,
 } from '../api/projects';
-import { fetchJobStatus, submitDeltaTransitionJob } from '../api/jobs';
 
 function clamp01(x) {
   if (!Number.isFinite(x)) return 0;
@@ -88,17 +87,12 @@ export default function DeltaCommitment3DPage() {
 
   const [modelAId, setModelAId] = useState('');
   const [modelBId, setModelBId] = useState('');
-  const [activeMdSampleId, setActiveMdSampleId] = useState('');
-  const [inactiveMdSampleId, setInactiveMdSampleId] = useState('');
-  const [pasMdSampleId, setPasMdSampleId] = useState('');
 
   const [mdLabelMode, setMdLabelMode] = useState('assigned');
   const [keepInvalid, setKeepInvalid] = useState(false);
   const dropInvalid = !keepInvalid;
 
-  const [bandFraction, setBandFraction] = useState(0.1);
-  const [topKResidues, setTopKResidues] = useState(20);
-  const [topKEdges, setTopKEdges] = useState(30);
+  // Note: commitment analysis stores all residues; filtering is done in visualization (not here).
 
   const [analyses, setAnalyses] = useState([]);
   const [analysesError, setAnalysesError] = useState(null);
@@ -106,10 +100,6 @@ export default function DeltaCommitment3DPage() {
   const [analysisData, setAnalysisData] = useState(null);
   const [analysisDataError, setAnalysisDataError] = useState(null);
   const [analysisDataLoading, setAnalysisDataLoading] = useState(false);
-
-  const [job, setJob] = useState(null);
-  const [jobStatus, setJobStatus] = useState(null);
-  const [jobError, setJobError] = useState(null);
 
   const [helpOpen, setHelpOpen] = useState(false);
   const [viewerError, setViewerError] = useState(null);
@@ -147,9 +137,15 @@ export default function DeltaCommitment3DPage() {
     [clusterOptions, selectedClusterId]
   );
 
-  const sampleEntries = useMemo(() => selectedCluster?.samples || [], [selectedCluster]);
-  const mdSamples = useMemo(() => sampleEntries.filter((s) => s.type === 'md_eval'), [sampleEntries]);
   const pottsModels = useMemo(() => selectedCluster?.potts_models || [], [selectedCluster]);
+  const deltaModels = useMemo(() => {
+    return pottsModels.filter((m) => {
+      const params = m.params || {};
+      if (params.fit_mode === 'delta') return true;
+      const kind = params.delta_kind || '';
+      return typeof kind === 'string' && kind.startsWith('delta_');
+    });
+  }, [pottsModels]);
 
   const stateOptions = useMemo(() => {
     const raw = system?.states;
@@ -159,10 +155,6 @@ export default function DeltaCommitment3DPage() {
     return [];
   }, [system]);
 
-  const ensemble1Name = useMemo(() => mdSamples.find((s) => s.sample_id === activeMdSampleId)?.name || '', [mdSamples, activeMdSampleId]);
-  const ensemble2Name = useMemo(() => mdSamples.find((s) => s.sample_id === inactiveMdSampleId)?.name || '', [mdSamples, inactiveMdSampleId]);
-  const ensemble3Name = useMemo(() => mdSamples.find((s) => s.sample_id === pasMdSampleId)?.name || '', [mdSamples, pasMdSampleId]);
-
   const residueLabels = useMemo(() => {
     const keys = clusterInfo?.residue_keys || [];
     if (Array.isArray(keys) && keys.length) return keys;
@@ -170,38 +162,27 @@ export default function DeltaCommitment3DPage() {
     return Array.from({ length: n }, (_, i) => `res_${i}`);
   }, [clusterInfo]);
 
-  const selectedTransitionMeta = useMemo(() => {
-    if (!activeMdSampleId || !inactiveMdSampleId || !pasMdSampleId || !modelAId || !modelBId) return null;
-    const wantBand = Number(bandFraction);
-    const wantTopK = Number(topKResidues);
-    const wantTopKE = Number(topKEdges);
+  const selectedCommitmentMeta = useMemo(() => {
+    if (!modelAId || !modelBId) return null;
     return (
       analyses.find((a) => {
         const mode = (a.md_label_mode || 'assigned').toLowerCase();
-        const band = typeof a.band_fraction === 'number' ? a.band_fraction : Number(a.band_fraction);
-        const topK = typeof a.top_k_residues === 'number' ? a.top_k_residues : Number(a.top_k_residues);
-        const topKE = typeof a.top_k_edges === 'number' ? a.top_k_edges : Number(a.top_k_edges);
         return (
-          a.active_md_sample_id === activeMdSampleId &&
-          a.inactive_md_sample_id === inactiveMdSampleId &&
-          a.pas_md_sample_id === pasMdSampleId &&
           a.model_a_id === modelAId &&
           a.model_b_id === modelBId &&
           mode === mdLabelMode &&
           Boolean(a.drop_invalid) === Boolean(dropInvalid) &&
-          Math.abs(Number(band) - wantBand) < 1e-6 &&
-          Number(topK) === wantTopK &&
-          Number(topKE) === wantTopKE
+          String(a.ranking_method || 'param_l2').toLowerCase() === 'param_l2'
         );
       }) || null
     );
-  }, [analyses, activeMdSampleId, inactiveMdSampleId, pasMdSampleId, modelAId, modelBId, mdLabelMode, dropInvalid, bandFraction, topKResidues, topKEdges]);
+  }, [analyses, modelAId, modelBId, mdLabelMode, dropInvalid]);
 
   const loadAnalyses = useCallback(async () => {
     if (!selectedClusterId) return;
     setAnalysesError(null);
     try {
-      const data = await fetchClusterAnalyses(projectId, systemId, selectedClusterId, { analysisType: 'delta_transition' });
+      const data = await fetchClusterAnalyses(projectId, systemId, selectedClusterId, { analysisType: 'delta_commitment' });
       setAnalyses(Array.isArray(data?.analyses) ? data.analyses : []);
     } catch (err) {
       setAnalysesError(err.message || 'Failed to load analyses.');
@@ -234,45 +215,20 @@ export default function DeltaCommitment3DPage() {
     if (!selectedClusterId) return;
     setAnalyses([]);
     setAnalysisData(null);
-    setJob(null);
-    setJobStatus(null);
-    setJobError(null);
     loadClusterInfo();
     loadAnalyses();
   }, [selectedClusterId, loadClusterInfo, loadAnalyses]);
 
   useEffect(() => {
-    if (!pottsModels.length) {
+    if (!deltaModels.length) {
       setModelAId('');
       setModelBId('');
       return;
     }
-    const ids = new Set(pottsModels.map((m) => m.model_id));
-    if (!modelAId || !ids.has(modelAId)) setModelAId(pottsModels[0].model_id);
-    if (!modelBId || !ids.has(modelBId)) setModelBId(pottsModels[0].model_id);
-  }, [pottsModels, modelAId, modelBId]);
-
-  useEffect(() => {
-    if (!mdSamples.length) {
-      setActiveMdSampleId('');
-      setInactiveMdSampleId('');
-      setPasMdSampleId('');
-      return;
-    }
-    const ids = new Set(mdSamples.map((s) => s.sample_id));
-    const pickDistinct = (fallbackIdx, avoid) => {
-      const found = mdSamples.find((s) => !avoid.includes(s.sample_id));
-      return found ? found.sample_id : mdSamples[fallbackIdx % mdSamples.length].sample_id;
-    };
-    let e1 = activeMdSampleId && ids.has(activeMdSampleId) ? activeMdSampleId : pickDistinct(0, []);
-    let e2 = inactiveMdSampleId && ids.has(inactiveMdSampleId) ? inactiveMdSampleId : pickDistinct(1, [e1]);
-    if (e2 === e1) e2 = pickDistinct(1, [e1]);
-    let e3 = pasMdSampleId && ids.has(pasMdSampleId) ? pasMdSampleId : pickDistinct(2, [e1, e2]);
-    if (e3 === e1 || e3 === e2) e3 = pickDistinct(2, [e1, e2]);
-    if (e1 !== activeMdSampleId) setActiveMdSampleId(e1);
-    if (e2 !== inactiveMdSampleId) setInactiveMdSampleId(e2);
-    if (e3 !== pasMdSampleId) setPasMdSampleId(e3);
-  }, [mdSamples, activeMdSampleId, inactiveMdSampleId, pasMdSampleId]);
+    const ids = new Set(deltaModels.map((m) => m.model_id));
+    if (!modelAId || !ids.has(modelAId)) setModelAId(deltaModels[0].model_id);
+    if (!modelBId || !ids.has(modelBId)) setModelBId(deltaModels[0].model_id);
+  }, [deltaModels, modelAId, modelBId]);
 
   // Mol* init
   useEffect(() => {
@@ -424,34 +380,6 @@ export default function DeltaCommitment3DPage() {
     loadStructure(loadedStructureStateId);
   }, [viewerStatus, loadedStructureStateId, loadStructure]);
 
-  // Poll job status (if we submit from this page).
-  useEffect(() => {
-    if (!job?.job_id) return;
-    let cancelled = false;
-    const terminal = new Set(['finished', 'failed', 'canceled']);
-    const poll = async () => {
-      try {
-        const status = await fetchJobStatus(job.job_id);
-        if (cancelled) return;
-        setJobStatus(status);
-        if (terminal.has(status?.status)) {
-          clearInterval(timer);
-          if (status?.status === 'finished') {
-            await loadAnalyses();
-          }
-        }
-      } catch (err) {
-        if (!cancelled) setJobError(err.message || 'Failed to poll job.');
-      }
-    };
-    const timer = setInterval(poll, 2000);
-    poll();
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [job, loadAnalyses]);
-
   // Load selected analysis payload.
   useEffect(() => {
     const run = async () => {
@@ -459,14 +387,14 @@ export default function DeltaCommitment3DPage() {
       setAnalysisData(null);
       // If the selection doesn't match an existing analysis, clear the overlay so the user
       // doesn't mistake previous coloring for the new selection.
-      if (!selectedTransitionMeta?.analysis_id) {
+      if (!selectedCommitmentMeta?.analysis_id) {
         await clearOverpaint();
         return;
       }
       setAnalysisDataLoading(true);
       try {
         await clearOverpaint();
-        const payload = await fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'delta_transition', selectedTransitionMeta.analysis_id);
+        const payload = await fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'delta_commitment', selectedCommitmentMeta.analysis_id);
         setAnalysisData(payload);
       } catch (err) {
         setAnalysisDataError(err.message || 'Failed to load analysis.');
@@ -475,23 +403,18 @@ export default function DeltaCommitment3DPage() {
       }
     };
     run();
-  }, [projectId, systemId, selectedClusterId, selectedTransitionMeta, clearOverpaint]);
+  }, [projectId, systemId, selectedClusterId, selectedCommitmentMeta, clearOverpaint]);
 
   const commitmentLabels = useMemo(() => {
-    const raw = analysisData?.data?.ensemble_labels;
-    const base = Array.isArray(raw) && raw.length ? raw : ['Ensemble 1', 'Ensemble 2', 'Ensemble 3', 'TS-band'];
-    // Replace generic ensemble labels with selected sample names when available.
-    return base.map((name) => {
-      if (name === 'Ensemble 1' && ensemble1Name) return ensemble1Name;
-      if (name === 'Ensemble 2' && ensemble2Name) return ensemble2Name;
-      if (name === 'Ensemble 3' && ensemble3Name) return ensemble3Name;
-      return name;
-    });
-  }, [analysisData, ensemble1Name, ensemble2Name, ensemble3Name]);
+    const raw = analysisData?.data?.sample_labels;
+    if (Array.isArray(raw) && raw.length) return raw.map(String);
+    const ids = analysisData?.data?.sample_ids;
+    if (Array.isArray(ids) && ids.length) return ids.map(String);
+    return [];
+  }, [analysisData]);
 
-  const commitmentMatrix = useMemo(() => (Array.isArray(analysisData?.data?.q_residue) ? analysisData.data.q_residue : []), [analysisData]);
-  const topResidueIndices = useMemo(
-    () => (Array.isArray(analysisData?.data?.top_residue_indices) ? analysisData.data.top_residue_indices : []),
+  const commitmentMatrix = useMemo(
+    () => (Array.isArray(analysisData?.data?.q_residue_all) ? analysisData.data.q_residue_all : []),
     [analysisData]
   );
 
@@ -505,7 +428,6 @@ export default function DeltaCommitment3DPage() {
   }, [commitmentLabels]);
 
   const coloringPayload = useMemo(() => {
-    if (!Array.isArray(topResidueIndices) || !topResidueIndices.length) return null;
     if (!Array.isArray(commitmentMatrix) || !commitmentMatrix.length) return null;
     const row = commitmentMatrix[commitmentRowIndex];
     if (!Array.isArray(row) || !row.length) return null;
@@ -514,10 +436,9 @@ export default function DeltaCommitment3DPage() {
     const residueIdsLabel = [];
     const qValues = [];
 
-    for (let col = 0; col < topResidueIndices.length; col += 1) {
-      const ridx = Number(topResidueIndices[col]);
-      const q = Number(row[col]);
-      if (!Number.isFinite(ridx) || ridx < 0) continue;
+    // Color all residues; filtering is a visualization concern.
+    for (let ridx = 0; ridx < residueLabels.length; ridx += 1) {
+      const q = Number(row[ridx]);
       const label = residueLabels[ridx];
       const auth = parseResidueId(label);
       if (auth !== null) residueIdsAuth.push(auth);
@@ -525,7 +446,7 @@ export default function DeltaCommitment3DPage() {
       qValues.push(Number.isFinite(q) ? q : NaN);
     }
     return { residueIdsAuth, residueIdsLabel, qValues };
-  }, [topResidueIndices, commitmentMatrix, commitmentRowIndex, residueLabels]);
+  }, [commitmentMatrix, commitmentRowIndex, residueLabels]);
 
   const applyColoring = useCallback(async () => {
     if (viewerStatus !== 'ready') {
@@ -623,48 +544,6 @@ export default function DeltaCommitment3DPage() {
     applyColoring();
   }, [commitmentRowIndex, residueIdMode, analysisData, viewerStatus, structureLoading, applyColoring]);
 
-  const handleRun = useCallback(async () => {
-    if (!selectedClusterId) return;
-    setJobError(null);
-    setJob(null);
-    setJobStatus(null);
-    try {
-      const payload = {
-        project_id: projectId,
-        system_id: systemId,
-        cluster_id: selectedClusterId,
-        active_md_sample_id: activeMdSampleId,
-        inactive_md_sample_id: inactiveMdSampleId,
-        pas_md_sample_id: pasMdSampleId,
-        model_a_id: modelAId,
-        model_b_id: modelBId,
-        md_label_mode: mdLabelMode,
-        keep_invalid: keepInvalid,
-        band_fraction: Number(bandFraction),
-        top_k_residues: Number(topKResidues),
-        top_k_edges: Number(topKEdges),
-      };
-      const res = await submitDeltaTransitionJob(payload);
-      setJob(res);
-    } catch (err) {
-      setJobError(err.message || 'Failed to submit job.');
-    }
-  }, [
-    projectId,
-    systemId,
-    selectedClusterId,
-    activeMdSampleId,
-    inactiveMdSampleId,
-    pasMdSampleId,
-    modelAId,
-    modelBId,
-    mdLabelMode,
-    keepInvalid,
-    bandFraction,
-    topKResidues,
-    topKEdges,
-  ]);
-
   if (loadingSystem) return <Loader message="Loading 3D commitment viewer..." />;
   if (systemError) return <ErrorMessage message={systemError} />;
 
@@ -672,10 +551,7 @@ export default function DeltaCommitment3DPage() {
     selectedClusterId &&
       modelAId &&
       modelBId &&
-      activeMdSampleId &&
-      inactiveMdSampleId &&
-      pasMdSampleId &&
-      !selectedTransitionMeta
+      !selectedCommitmentMeta
   );
 
   return (
@@ -786,7 +662,7 @@ export default function DeltaCommitment3DPage() {
                   onChange={(e) => setModelAId(e.target.value)}
                   className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
                 >
-                  {pottsModels.map((m) => (
+                  {deltaModels.map((m) => (
                     <option key={m.model_id} value={m.model_id}>
                       {m.name || m.model_id}
                     </option>
@@ -800,54 +676,9 @@ export default function DeltaCommitment3DPage() {
                   onChange={(e) => setModelBId(e.target.value)}
                   className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
                 >
-                  {pottsModels.map((m) => (
+                  {deltaModels.map((m) => (
                     <option key={m.model_id} value={m.model_id}>
                       {m.name || m.model_id}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">Ensemble 1 (MD)</label>
-                <select
-                  value={activeMdSampleId}
-                  onChange={(e) => setActiveMdSampleId(e.target.value)}
-                  className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-                >
-                  {mdSamples.map((s) => (
-                    <option key={s.sample_id} value={s.sample_id}>
-                      {s.name || s.sample_id}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">Ensemble 2 (MD)</label>
-                <select
-                  value={inactiveMdSampleId}
-                  onChange={(e) => setInactiveMdSampleId(e.target.value)}
-                  className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-                >
-                  {mdSamples.map((s) => (
-                    <option key={s.sample_id} value={s.sample_id}>
-                      {s.name || s.sample_id}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="md:col-span-2">
-                <label className="block text-xs text-gray-400 mb-1">Ensemble 3 (MD)</label>
-                <select
-                  value={pasMdSampleId}
-                  onChange={(e) => setPasMdSampleId(e.target.value)}
-                  className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-                >
-                  {mdSamples.map((s) => (
-                    <option key={s.sample_id} value={s.sample_id}>
-                      {s.name || s.sample_id}
                     </option>
                   ))}
                 </select>
@@ -876,41 +707,6 @@ export default function DeltaCommitment3DPage() {
                   />
                   Keep invalid
                 </label>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">Band fraction</label>
-                <input
-                  type="number"
-                  step="0.01"
-                  min="0.01"
-                  max="0.99"
-                  value={bandFraction}
-                  onChange={(e) => setBandFraction(e.target.value)}
-                  className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">Top residues</label>
-                <input
-                  type="number"
-                  min="1"
-                  value={topKResidues}
-                  onChange={(e) => setTopKResidues(e.target.value)}
-                  className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">Top edges</label>
-                <input
-                  type="number"
-                  min="1"
-                  value={topKEdges}
-                  onChange={(e) => setTopKEdges(e.target.value)}
-                  className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-                />
               </div>
             </div>
 
@@ -978,25 +774,13 @@ export default function DeltaCommitment3DPage() {
 
             {clusterInfoError && <ErrorMessage message={clusterInfoError} />}
             {analysesError && <ErrorMessage message={analysesError} />}
-            {jobError && <ErrorMessage message={jobError} />}
 
             {missing && (
               <div className="rounded-md border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200 space-y-2">
-                <div>No matching TS analysis found for this selection.</div>
-                <button
-                  type="button"
-                  onClick={handleRun}
-                  className="inline-flex items-center gap-2 text-xs px-3 py-2 rounded-md border border-yellow-700 text-yellow-200 hover:border-yellow-500"
-                >
-                  <Play className="h-4 w-4" />
-                  Run TS analysis
-                </button>
-              </div>
-            )}
-
-            {jobStatus?.status && (
-              <div className="rounded-md border border-gray-800 bg-gray-950/40 p-2 text-xs text-gray-300">
-                Job: <span className="font-mono">{jobStatus.status}</span>
+                <div>No matching commitment analysis found for this (A,B,params) selection.</div>
+                <div className="text-[11px] text-yellow-200">
+                  Go back to <span className="font-mono">Delta Potts Evaluation</span> and run commitment on at least one sample.
+                </div>
               </div>
             )}
           </div>
@@ -1038,14 +822,14 @@ export default function DeltaCommitment3DPage() {
                   <Loader message="Loading structure..." />
                 </div>
               )}
-              <div ref={containerRef} className="w-full h-full relative" />
-            </div>
-            {analysisDataLoading && <p className="mt-2 text-sm text-gray-400">Loading analysis…</p>}
-            {!analysisDataLoading && selectedTransitionMeta && !analysisData && (
-              <p className="mt-2 text-sm text-gray-400">Select an analysis (or run it) to color residues.</p>
-            )}
+            <div ref={containerRef} className="w-full h-full relative" />
           </div>
-        </main>
+          {analysisDataLoading && <p className="mt-2 text-sm text-gray-400">Loading analysis…</p>}
+          {!analysisDataLoading && selectedCommitmentMeta && !analysisData && (
+            <p className="mt-2 text-sm text-gray-400">Select an analysis to color residues.</p>
+          )}
+        </div>
+      </main>
       </div>
     </div>
   );

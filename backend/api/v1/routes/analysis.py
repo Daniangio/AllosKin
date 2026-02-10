@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from backend.api.v1.common import ensure_system_ready, get_cluster_entry, get_queue, project_store
 from backend.api.v1.schemas import (
     DeltaEvalJobRequest,
+    DeltaCommitmentJobRequest,
     DeltaTransitionJobRequest,
     LambdaSweepJobRequest,
     MdSamplesRefreshJobRequest,
@@ -17,6 +18,7 @@ from backend.api.v1.schemas import (
 from backend.tasks import (
     run_analysis_job,
     run_delta_eval_job,
+    run_delta_commitment_job,
     run_delta_transition_job,
     run_lambda_sweep_job,
     run_md_samples_refresh_job,
@@ -481,6 +483,59 @@ async def submit_delta_transition_job(
             job_timeout="2h",
             result_ttl=86400,
             job_id=f"delta-transition-{job_uuid}",
+        )
+        return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"Job submission failed: {exc}") from exc
+
+
+@router.post(
+    "/submit/delta_commitment",
+    summary="Submit an incremental delta-commitment analysis for a fixed (model A, model B) pair.",
+)
+async def submit_delta_commitment_job(
+    payload: DeltaCommitmentJobRequest,
+    task_queue: Any = Depends(get_queue),
+):
+    try:
+        system_meta = project_store.get_system(payload.project_id, payload.system_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"System '{payload.system_id}' not found in project '{payload.project_id}'.",
+        )
+
+    get_cluster_entry(system_meta, payload.cluster_id)
+
+    md_label_mode = (payload.md_label_mode or "assigned").lower()
+    if md_label_mode not in {"assigned", "halo"}:
+        raise HTTPException(status_code=400, detail="md_label_mode must be 'assigned' or 'halo'.")
+
+    if not payload.sample_ids or not isinstance(payload.sample_ids, list):
+        raise HTTPException(status_code=400, detail="sample_ids must be a non-empty list.")
+
+    if payload.top_k_residues is not None and int(payload.top_k_residues) < 1:
+        raise HTTPException(status_code=400, detail="top_k_residues must be >= 1.")
+    if payload.top_k_edges is not None and int(payload.top_k_edges) < 1:
+        raise HTTPException(status_code=400, detail="top_k_edges must be >= 1.")
+    if payload.energy_bins is not None and int(payload.energy_bins) < 5:
+        raise HTTPException(status_code=400, detail="energy_bins must be >= 5.")
+
+    params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
+    dataset_ref = {
+        "project_id": payload.project_id,
+        "system_id": payload.system_id,
+        "cluster_id": payload.cluster_id,
+    }
+
+    try:
+        job_uuid = str(uuid.uuid4())
+        job = task_queue.enqueue(
+            run_delta_commitment_job,
+            args=(job_uuid, dataset_ref, params),
+            job_timeout="2h",
+            result_ttl=86400,
+            job_id=f"delta-commitment-{job_uuid}",
         )
         return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
     except Exception as exc:  # pragma: no cover

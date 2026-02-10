@@ -22,6 +22,5 @@ The 3D overlay uses a diverging palette:
 
 ## Notes
 
-- Currently, only the **top-K residues** (by `|D_i|`) are overlaid, to keep the visualization focused.
+- Currently, only the **top-K residues** (by parameter magnitude of `Δh_i`) are overlaid, to keep the visualization focused.
 - Residue selection prefers PDB numbering (`auth_seq_id`) when labels include an integer (e.g. `res_279`); otherwise it falls back to sequential indices (`label_seq_id`).
-

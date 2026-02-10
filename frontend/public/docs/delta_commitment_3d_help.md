@@ -22,7 +22,7 @@ The residue overlay uses a diverging palette:
 
 ## Scope / Current Limitation
 
-The overlay is applied to the **top-K residues** selected by the TS-like analysis (by `|D_i|`).
+The overlay is applied to the **top-K residues** selected by the commitment analysis ranking (parameter magnitude of `Δh_i`).
 Residues outside the top-K are left as the gray base cartoon.
 
 ## Practical Notes
@@ -30,4 +30,3 @@ Residues outside the top-K are left as the gray base cartoon.
 - The selection tries to match residues by PDB residue numbering (`auth_seq_id`) when residue labels contain integers (e.g. `res_279`).
   If not available, it falls back to sequential residue indices (`label_seq_id`).
 - If you don’t see colored residues, verify you loaded a structure compatible with the cluster residue indexing.
-
