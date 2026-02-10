@@ -4,10 +4,14 @@ import { CircleHelp, RefreshCw } from 'lucide-react';
 import { createPluginUI } from 'molstar/lib/mol-plugin-ui/index';
 import { renderReact18 } from 'molstar/lib/mol-plugin-ui/react18';
 import { Asset } from 'molstar/lib/mol-util/assets';
+import { PluginCommands } from 'molstar/lib/mol-plugin/commands';
 import { MolScriptBuilder as MS } from 'molstar/lib/mol-script/language/builder';
 import { Script } from 'molstar/lib/mol-script/script';
-import { StructureSelection } from 'molstar/lib/mol-model/structure';
+import { StructureElement, StructureSelection } from 'molstar/lib/mol-model/structure';
 import { clearStructureOverpaint, setStructureOverpaint } from 'molstar/lib/mol-plugin-state/helpers/structure-overpaint';
+import { StateSelection } from 'molstar/lib/mol-state';
+import { PluginStateObject } from 'molstar/lib/mol-plugin-state/objects';
+import { StateTransforms } from 'molstar/lib/mol-plugin-state/transforms';
 import 'molstar/build/viewer/molstar.css';
 
 import Loader from '../components/common/Loader';
@@ -58,6 +62,24 @@ function commitmentColor(q) {
   return rgbToHex(lerp(255, 239, u), lerp(255, 68, u), lerp(255, 68, u));
 }
 
+function sigmoid(x) {
+  if (!Number.isFinite(x)) return 0.5;
+  // numerically stable sigmoid
+  if (x >= 0) {
+    const z = Math.exp(-x);
+    return 1 / (1 + z);
+  }
+  const z = Math.exp(x);
+  return z / (1 + z);
+}
+
+function clamp(x, lo, hi) {
+  if (!Number.isFinite(x)) return lo;
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
 function parseResidueId(label) {
   if (label == null) return null;
   const m = String(label).match(/-?\d+/);
@@ -65,6 +87,8 @@ function parseResidueId(label) {
   const v = Number(m[0]);
   return Number.isFinite(v) ? v : null;
 }
+
+const EDGE_LINK_TAG = 'phase-delta-commitment-edge-link';
 
 export default function DeltaCommitment3DPage() {
   const { projectId, systemId } = useParams();
@@ -107,10 +131,20 @@ export default function DeltaCommitment3DPage() {
   const [structureLoading, setStructureLoading] = useState(false);
 
   const [commitmentRowIndex, setCommitmentRowIndex] = useState(0);
+  const [commitmentMode, setCommitmentMode] = useState('prob'); // prob | centered | mu_sigmoid
+  const [referenceSampleIds, setReferenceSampleIds] = useState([]); // used for centered mode
+  const [edgeSmoothEnabled, setEdgeSmoothEnabled] = useState(false);
+  const [edgeSmoothStrength, setEdgeSmoothStrength] = useState(0.75); // 0..1
+
   // Residue-id mapping between cluster residues and the loaded PDB.
   // In practice, "label" (sequential) is the most robust across PDBs; "auth" depends on PDB numbering.
   const [residueIdMode, setResidueIdMode] = useState('auth'); // label | auth
   const [coloringDebug, setColoringDebug] = useState(null);
+
+  const [showEdgeLinks, setShowEdgeLinks] = useState(false);
+  const [maxEdgeLinks, setMaxEdgeLinks] = useState(60);
+
+  const edgeRunIdRef = useRef(0);
 
   useEffect(() => {
     const load = async () => {
@@ -412,11 +446,35 @@ export default function DeltaCommitment3DPage() {
     if (Array.isArray(ids) && ids.length) return ids.map(String);
     return [];
   }, [analysisData]);
+  const commitmentSampleIds = useMemo(() => {
+    const ids = analysisData?.data?.sample_ids;
+    return Array.isArray(ids) ? ids.map(String) : [];
+  }, [analysisData]);
+  const commitmentTypes = useMemo(() => {
+    const raw = analysisData?.data?.sample_types;
+    return Array.isArray(raw) ? raw.map(String) : [];
+  }, [analysisData]);
 
   const commitmentMatrix = useMemo(
     () => (Array.isArray(analysisData?.data?.q_residue_all) ? analysisData.data.q_residue_all : []),
     [analysisData]
   );
+  const dhTable = useMemo(() => (Array.isArray(analysisData?.data?.dh) ? analysisData.data.dh : null), [analysisData]);
+  const pNode = useMemo(() => (Array.isArray(analysisData?.data?.p_node) ? analysisData.data.p_node : null), [analysisData]);
+  const kList = useMemo(() => (Array.isArray(analysisData?.data?.K_list) ? analysisData.data.K_list.map((v) => Number(v)) : null), [analysisData]);
+  const qEdgeMatrix = useMemo(() => (Array.isArray(analysisData?.data?.q_edge) ? analysisData.data.q_edge : null), [analysisData]);
+  const edgesAll = useMemo(() => (Array.isArray(analysisData?.data?.edges) ? analysisData.data.edges : []), [analysisData]);
+  const topEdgeIndices = useMemo(
+    () => (Array.isArray(analysisData?.data?.top_edge_indices) ? analysisData.data.top_edge_indices : []),
+    [analysisData]
+  );
+  const dEdge = useMemo(() => (Array.isArray(analysisData?.data?.D_edge) ? analysisData.data.D_edge : null), [analysisData]);
+
+  const hasAltCommitmentData = useMemo(() => {
+    const okDh = Boolean(dhTable && Array.isArray(dhTable[0]) && dhTable.length > 0);
+    const okP = Boolean(pNode && Array.isArray(pNode[0]) && pNode.length > 0);
+    return okDh && okP;
+  }, [dhTable, pNode]);
 
   useEffect(() => {
     if (!commitmentLabels.length) return;
@@ -427,26 +485,240 @@ export default function DeltaCommitment3DPage() {
     });
   }, [commitmentLabels]);
 
-  const coloringPayload = useMemo(() => {
+  // Default reference set for centered mode: use MD samples if present, else the first available sample.
+  useEffect(() => {
+    if (commitmentMode !== 'centered') return;
+    if (referenceSampleIds.length) return;
+    if (!commitmentSampleIds.length) return;
+    const md = commitmentSampleIds.filter((sid, idx) => {
+      const t = (commitmentTypes[idx] || '').toLowerCase();
+      return t.includes('md');
+    });
+    if (md.length) setReferenceSampleIds(md);
+    else setReferenceSampleIds([commitmentSampleIds[0]]);
+  }, [commitmentMode, referenceSampleIds.length, commitmentSampleIds, commitmentTypes]);
+
+  const centeredCalib = useMemo(() => {
+    if (commitmentMode !== 'centered') return null;
+    if (!dhTable || !pNode) return null;
+    if (!referenceSampleIds.length) return null;
+    if (!commitmentSampleIds.length) return null;
+
+    const refIdxs = referenceSampleIds
+      .map((sid) => commitmentSampleIds.indexOf(String(sid)))
+      .filter((i) => i != null && i >= 0);
+    if (!refIdxs.length) return null;
+
+    const N = dhTable.length;
+    const Kmax = Array.isArray(dhTable[0]) ? dhTable[0].length : 0;
+    if (N <= 0 || Kmax <= 0) return null;
+
+    const eps = 1e-9;
+    const thresholds = new Array(N);
+    const alphas = new Array(N);
+    for (let i = 0; i < N; i += 1) {
+      const dhRow = (Array.isArray(dhTable[i]) ? dhTable[i] : []).map((v) => Number(v));
+      const Ki = kList && Number.isFinite(kList[i]) ? Math.max(0, Math.min(Kmax, Math.floor(kList[i]))) : dhRow.length;
+      if (dhRow.length < Ki || Ki <= 0) {
+        thresholds[i] = 0;
+        alphas[i] = 0.5;
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+      const pRef = new Array(Ki).fill(0);
+      for (const ridx of refIdxs) {
+        const prow = pNode?.[ridx]?.[i];
+        if (!Array.isArray(prow) || prow.length < Ki) continue;
+        for (let a = 0; a < Ki; a += 1) pRef[a] += Number(prow[a]) || 0;
+      }
+      const inv = 1 / refIdxs.length;
+      for (let a = 0; a < Ki; a += 1) pRef[a] *= inv;
+
+      const order = Array.from({ length: Ki }, (_, a) => a);
+      order.sort((a, b) => dhRow[a] - dhRow[b]);
+      let cum = 0;
+      let t = dhRow[order[order.length - 1]];
+      for (const a of order) {
+        cum += pRef[a];
+        if (cum >= 0.5) {
+          t = dhRow[a];
+          break;
+        }
+      }
+      thresholds[i] = t;
+
+      // Calibrate tie-handling such that the reference ensemble maps exactly to 0.5.
+      let cBefore = 0;
+      let cAt = 0;
+      for (let a = 0; a < Ki; a += 1) {
+        const dv = dhRow[a];
+        const pv = pRef[a] || 0;
+        if (dv < t - eps) cBefore += pv;
+        else if (Math.abs(dv - t) <= eps) cAt += pv;
+      }
+      if (cAt > 0) {
+        const alpha = (0.5 - cBefore) / cAt;
+        alphas[i] = Math.max(0, Math.min(1, alpha));
+      } else {
+        alphas[i] = 0.5;
+      }
+    }
+    return { thresholds, alphas, eps };
+  }, [commitmentMode, dhTable, pNode, referenceSampleIds, commitmentSampleIds, kList]);
+
+  const qRowValues = useMemo(() => {
     if (!Array.isArray(commitmentMatrix) || !commitmentMatrix.length) return null;
     const row = commitmentMatrix[commitmentRowIndex];
     if (!Array.isArray(row) || !row.length) return null;
 
+    const N = residueLabels.length;
+    const baseQ = () => {
+      const q = new Array(N);
+      for (let i = 0; i < N; i += 1) q[i] = Number(row[i]);
+      return q;
+    };
+    if (commitmentMode === 'prob') return baseQ();
+
+    // If the analysis was created before we started storing dh/p_node, fall back to the base q.
+    if (!dhTable || !pNode) {
+      return baseQ();
+    }
+    const Kmax = Array.isArray(dhTable[0]) ? dhTable[0].length : 0;
+    if (Kmax <= 0) return null;
+
+    if (commitmentMode === 'centered') {
+      if (!centeredCalib) return null;
+      const { thresholds, alphas, eps } = centeredCalib;
+      const q = new Array(N);
+      for (let i = 0; i < N; i += 1) {
+        const dhRow = dhTable?.[i];
+        const prow = pNode?.[commitmentRowIndex]?.[i];
+        const Ki = kList && Number.isFinite(kList[i]) ? Math.max(0, Math.min(Kmax, Math.floor(kList[i]))) : Kmax;
+        if (!Array.isArray(dhRow) || !Array.isArray(prow) || dhRow.length < Ki || prow.length < Ki || Ki <= 0) {
+          q[i] = NaN;
+          // eslint-disable-next-line no-continue
+          continue;
+        }
+        const t = Number(thresholds[i]);
+        const alpha = Number(alphas[i]);
+        let accBefore = 0;
+        let accAt = 0;
+        for (let a = 0; a < Ki; a += 1) {
+          const dhv = Number(dhRow[a]);
+          const pv = Number(prow[a]) || 0;
+          if (dhv < t - eps) accBefore += pv;
+          else if (Math.abs(dhv - t) <= eps) accAt += pv;
+        }
+        q[i] = accBefore + alpha * accAt;
+      }
+      return q;
+    }
+
+    if (commitmentMode === 'mu_sigmoid') {
+      const mu = new Array(N);
+      for (let i = 0; i < N; i += 1) {
+        const dhRow = dhTable?.[i];
+        const prow = pNode?.[commitmentRowIndex]?.[i];
+        const Ki = kList && Number.isFinite(kList[i]) ? Math.max(0, Math.min(Kmax, Math.floor(kList[i]))) : Kmax;
+        if (!Array.isArray(dhRow) || !Array.isArray(prow) || dhRow.length < Ki || prow.length < Ki || Ki <= 0) {
+          mu[i] = NaN;
+          // eslint-disable-next-line no-continue
+          continue;
+        }
+        let m = 0;
+        for (let a = 0; a < Ki; a += 1) m += (Number(prow[a]) || 0) * (Number(dhRow[a]) || 0);
+        mu[i] = m;
+      }
+      const finite = mu.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+      if (!finite.length) return mu.map(() => 0.5);
+      const med = finite[Math.floor(finite.length / 2)];
+      const absDev = finite.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
+      const mad = absDev[Math.floor(absDev.length / 2)];
+      const scale = mad > 1e-9 ? mad : 1.0;
+      return mu.map((m) => sigmoid(-(Number(m) || 0) / scale));
+    }
+
+    return null;
+  }, [commitmentMatrix, commitmentRowIndex, commitmentMode, dhTable, pNode, centeredCalib, residueLabels, kList]);
+
+  const qRowValuesEdgeSmoothed = useMemo(() => {
+    // Optional visualization: smooth residue colors using edge commitment on top edges.
+    if (!edgeSmoothEnabled) return qRowValues;
+    if (!Array.isArray(qRowValues) || !qRowValues.length) return qRowValues;
+    if (!qEdgeMatrix || !Array.isArray(qEdgeMatrix[commitmentRowIndex])) return qRowValues;
+    if (!Array.isArray(topEdgeIndices) || !topEdgeIndices.length) return qRowValues;
+    if (!Array.isArray(edgesAll) || !edgesAll.length) return qRowValues;
+
+    const N = residueLabels.length;
+    const strength = clamp(Number(edgeSmoothStrength), 0, 1);
+    if (strength <= 0) return qRowValues;
+
+    const rowQe = qEdgeMatrix[commitmentRowIndex].map((v) => Number(v));
+    const sumW = new Array(N).fill(0);
+    const sumWD = new Array(N).fill(0);
+
+    for (let col = 0; col < topEdgeIndices.length && col < rowQe.length; col += 1) {
+      const eidx = Number(topEdgeIndices[col]);
+      const e = edgesAll[eidx];
+      if (!Array.isArray(e) || e.length < 2) continue;
+      const r = Number(e[0]);
+      const s = Number(e[1]);
+      if (!Number.isInteger(r) || !Number.isInteger(s) || r < 0 || s < 0 || r >= N || s >= N) continue;
+      const q = rowQe[col];
+      if (!Number.isFinite(q)) continue;
+
+      const wRaw = dEdge && Number.isFinite(Number(dEdge[eidx])) ? Math.abs(Number(dEdge[eidx])) : 1.0;
+      const w = wRaw > 1e-12 ? wRaw : 1.0;
+      const d = clamp01(q) - 0.5;
+      sumW[r] += w;
+      sumWD[r] += w * d;
+      sumW[s] += w;
+      sumWD[s] += w * d;
+    }
+
+    const out = new Array(N);
+    for (let i = 0; i < N; i += 1) {
+      const qi = clamp01(Number(qRowValues[i]));
+      const di = qi - 0.5;
+      const de = sumW[i] > 0 ? sumWD[i] / sumW[i] : 0;
+      const dMix = (1 - strength) * di + strength * de;
+      out[i] = 0.5 + dMix;
+    }
+    return out;
+  }, [
+    edgeSmoothEnabled,
+    edgeSmoothStrength,
+    qRowValues,
+    qEdgeMatrix,
+    commitmentRowIndex,
+    topEdgeIndices,
+    edgesAll,
+    dEdge,
+    residueLabels.length,
+  ]);
+
+  const coloringPayload = useMemo(() => {
+    if (!Array.isArray(qRowValuesEdgeSmoothed) || !qRowValuesEdgeSmoothed.length) return null;
+
     const residueIdsAuth = [];
     const residueIdsLabel = [];
-    const qValues = [];
+    const qValuesAuth = [];
+    const qValuesLabel = [];
 
     // Color all residues; filtering is a visualization concern.
     for (let ridx = 0; ridx < residueLabels.length; ridx += 1) {
-      const q = Number(row[ridx]);
+      const q = Number(qRowValuesEdgeSmoothed[ridx]);
       const label = residueLabels[ridx];
       const auth = parseResidueId(label);
-      if (auth !== null) residueIdsAuth.push(auth);
+      if (auth !== null) {
+        residueIdsAuth.push(auth);
+        qValuesAuth.push(Number.isFinite(q) ? q : NaN);
+      }
       residueIdsLabel.push(ridx + 1); // Mol* label_seq_id is 1-based
-      qValues.push(Number.isFinite(q) ? q : NaN);
+      qValuesLabel.push(Number.isFinite(q) ? q : NaN);
     }
-    return { residueIdsAuth, residueIdsLabel, qValues };
-  }, [commitmentMatrix, commitmentRowIndex, residueLabels]);
+    return { residueIdsAuth, qValuesAuth, residueIdsLabel, qValuesLabel };
+  }, [qRowValuesEdgeSmoothed, residueLabels]);
 
   const applyColoring = useCallback(async () => {
     if (viewerStatus !== 'ready') {
@@ -474,16 +746,22 @@ export default function DeltaCommitment3DPage() {
 
     await clearOverpaint();
 
-    const { residueIdsAuth, residueIdsLabel, qValues } = coloringPayload;
+    const { residueIdsAuth, qValuesAuth, residueIdsLabel, qValuesLabel } = coloringPayload;
     const useAuth = residueIdMode === 'auth';
     const residueIds = useAuth ? residueIdsAuth : residueIdsLabel;
+    const qValues = useAuth ? qValuesAuth : qValuesLabel;
     const prop = useAuth ? 'auth' : 'label';
     if (!residueIds.length) {
       setColoringDebug({ status: 'skip', reason: 'no-residue-ids-for-mode', mode: residueIdMode });
       return;
     }
 
-    const bins = 11;
+    const finiteQ = qValues.filter((v) => Number.isFinite(v));
+    const qMin = finiteQ.length ? Math.min(...finiteQ) : NaN;
+    const qMax = finiteQ.length ? Math.max(...finiteQ) : NaN;
+    const qMean = finiteQ.length ? finiteQ.reduce((a, b) => a + b, 0) / finiteQ.length : NaN;
+
+    const bins = 21;
     const bucket = Array.from({ length: bins }, () => []);
     for (let i = 0; i < residueIds.length; i += 1) {
       const q = qValues[i];
@@ -527,13 +805,163 @@ export default function DeltaCommitment3DPage() {
       status: 'run',
       prop,
       mode: residueIdMode,
+      commitmentMode,
+      refCount: commitmentMode === 'centered' ? referenceSampleIds.length : 0,
       residues: residueIds.length,
+      qMin,
+      qMax,
+      qMean,
       bins: bucket.map((x) => x.length),
       created: layers,
       note: 'overpaint layers applied',
       selectedElementsByBin,
     });
-  }, [viewerStatus, structureLoading, analysisData, coloringPayload, residueIdMode, clearOverpaint, getBaseComponentWrapper]);
+  }, [
+    viewerStatus,
+    structureLoading,
+    analysisData,
+    coloringPayload,
+    residueIdMode,
+    commitmentMode,
+    referenceSampleIds.length,
+    clearOverpaint,
+    getBaseComponentWrapper,
+  ]);
+
+  const clearEdgeLinks = useCallback(async () => {
+    const plugin = pluginRef.current;
+    if (!plugin) return;
+    const state = plugin.state.data;
+    const update = state.build();
+
+    // Delete the selection roots; their children (representations) will be removed as well.
+    const sel = state.select(StateSelection.Generators.ofType(PluginStateObject.Molecule.Structure.Selections).withTag(EDGE_LINK_TAG));
+    for (const obj of sel) update.delete(obj);
+
+    if (update.editInfo.count === 0) return;
+    await PluginCommands.State.Update(plugin, { state, tree: update, options: { doNotLogTiming: true } });
+  }, []);
+
+  const applyEdgeLinks = useCallback(async () => {
+    if (viewerStatus !== 'ready') return;
+    if (structureLoading) return;
+    if (!analysisData) return;
+    const plugin = pluginRef.current;
+    if (!plugin) return;
+
+    const runId = (edgeRunIdRef.current += 1);
+
+    // Always clear first so toggles/row changes are deterministic.
+    await clearEdgeLinks();
+    if (runId !== edgeRunIdRef.current) return;
+
+    if (!showEdgeLinks) return;
+    if (Number(maxEdgeLinks) <= 0) return;
+    if (!qEdgeMatrix || !Array.isArray(qEdgeMatrix[commitmentRowIndex])) return;
+    if (!Array.isArray(topEdgeIndices) || !topEdgeIndices.length) return;
+    if (!Array.isArray(edgesAll) || !edgesAll.length) return;
+
+    const rootStructure = plugin.managers.structure.hierarchy.current.structures[0]?.cell?.obj?.data;
+    if (!rootStructure) return;
+
+    const useAuth = residueIdMode === 'auth';
+    const seqProp =
+      useAuth ? MS.struct.atomProperty.macromolecular.auth_seq_id() : MS.struct.atomProperty.macromolecular.label_seq_id();
+    const atomProp =
+      useAuth ? MS.struct.atomProperty.macromolecular.auth_atom_id() : MS.struct.atomProperty.macromolecular.label_atom_id();
+
+    const getResidueSeqId = (resIdx) => {
+      if (useAuth) return parseResidueId(residueLabels[resIdx]);
+      return resIdx + 1; // label_seq_id is 1-based
+    };
+
+    const rowQ = qEdgeMatrix[commitmentRowIndex].map((v) => Number(v));
+    const limit = Math.min(Number(maxEdgeLinks) || 0, topEdgeIndices.length);
+
+    const group = plugin.managers.structure.measurement.getGroup();
+    const serialize = (l) => ({ bundle: StructureElement.Bundle.fromLoci(l) });
+
+    for (let col = 0; col < limit; col += 1) {
+      if (runId !== edgeRunIdRef.current) return;
+      const eidx = Number(topEdgeIndices[col]);
+      const edge = edgesAll[eidx];
+      if (!Array.isArray(edge) || edge.length < 2) continue;
+      const r = Number(edge[0]);
+      const s = Number(edge[1]);
+      if (!Number.isInteger(r) || !Number.isInteger(s)) continue;
+
+      const rid = getResidueSeqId(r);
+      const sid = getResidueSeqId(s);
+      if (rid == null || sid == null) continue;
+
+      const q = Number.isFinite(rowQ[col]) ? rowQ[col] : 0.5;
+      const colorValue = hexToInt(commitmentColor(q));
+
+      const exprA = MS.struct.generator.atomGroups({
+        'residue-test': MS.core.rel.eq([seqProp, rid]),
+        'atom-test': MS.core.rel.eq([atomProp, MS.core.type.str('CA')]),
+      });
+      const exprB = MS.struct.generator.atomGroups({
+        'residue-test': MS.core.rel.eq([seqProp, sid]),
+        'atom-test': MS.core.rel.eq([atomProp, MS.core.type.str('CA')]),
+      });
+
+      const selA = Script.getStructureSelection(exprA, rootStructure);
+      const selB = Script.getStructureSelection(exprB, rootStructure);
+      const lociA = StructureSelection.toLociWithSourceUnits(selA);
+      const lociB = StructureSelection.toLociWithSourceUnits(selB);
+      if (StructureElement.Loci.isEmpty(lociA) || StructureElement.Loci.isEmpty(lociB)) continue;
+
+      const cellA = plugin.helpers.substructureParent.get(lociA.structure);
+      const cellB = plugin.helpers.substructureParent.get(lociB.structure);
+      if (!cellA || !cellB) continue;
+
+      const dependsOn = [cellA.transform.ref];
+      if (cellB.transform.ref !== cellA.transform.ref) dependsOn.push(cellB.transform.ref);
+      const selection = group.apply(
+        StateTransforms.Model.MultiStructureSelectionFromBundle,
+        {
+          selections: [
+            { key: `a${col}`, groupId: `a${col}`, ref: cellA.transform.ref, ...serialize(lociA) },
+            { key: `b${col}`, groupId: `b${col}`, ref: cellB.transform.ref, ...serialize(lociB) },
+          ],
+          isTransitive: true,
+          label: 'Distance',
+        },
+        { dependsOn, tags: [EDGE_LINK_TAG] }
+      );
+      selection.apply(
+        StateTransforms.Representation.StructureSelectionsDistance3D,
+        {
+          visuals: ['lines'],
+          // Keep defaults for label settings; we omit text by not including the "text" visual.
+          linesColor: colorValue,
+          linesSize: 0.12,
+          dashLength: 0,
+          customText: '',
+        },
+        { tags: [EDGE_LINK_TAG] }
+      );
+    }
+
+    if (runId !== edgeRunIdRef.current) return;
+    const state = plugin.state.data;
+    if (group.editInfo.count === 0) return;
+    await PluginCommands.State.Update(plugin, { state, tree: group, options: { doNotLogTiming: true } });
+  }, [
+    viewerStatus,
+    structureLoading,
+    analysisData,
+    clearEdgeLinks,
+    showEdgeLinks,
+    maxEdgeLinks,
+    qEdgeMatrix,
+    commitmentRowIndex,
+    topEdgeIndices,
+    edgesAll,
+    residueIdMode,
+    residueLabels,
+  ]);
 
   useEffect(() => {
     applyColoring();
@@ -543,6 +971,17 @@ export default function DeltaCommitment3DPage() {
     // Ensure recoloring happens when the selected row changes even if memoization keeps callback identity stable.
     applyColoring();
   }, [commitmentRowIndex, residueIdMode, analysisData, viewerStatus, structureLoading, applyColoring]);
+
+  useEffect(() => {
+    applyEdgeLinks();
+  }, [applyEdgeLinks]);
+
+  useEffect(() => {
+    return () => {
+      // best-effort cleanup
+      clearEdgeLinks();
+    };
+  }, [clearEdgeLinks]);
 
   if (loadingSystem) return <Loader message="Loading 3D commitment viewer..." />;
   if (systemError) return <ErrorMessage message={systemError} />;
@@ -575,7 +1014,7 @@ export default function DeltaCommitment3DPage() {
           <h1 className="text-2xl font-semibold text-white">Delta Commitment (3D)</h1>
           <p className="text-sm text-gray-400">
             Load a structure and color residues by commitment <code>q_i</code> for a selected ensemble under a fixed model pair (A,B).
-            Residues not in the top-K set are left uncolored (base cartoon is gray).
+            The base cartoon is gray; colored residues are overpainted on top.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -719,12 +1158,12 @@ export default function DeltaCommitment3DPage() {
               >
                 {commitmentLabels.map((name, idx) => (
                   <option key={`${idx}:${name}`} value={String(idx)}>
-                    {name}
+                    {commitmentTypes[idx] ? `${name} (${commitmentTypes[idx]})` : name}
                   </option>
                 ))}
               </select>
               <p className="text-[11px] text-gray-500 mt-1">
-                Colors approximate <code>q_i = Pr(δ_i &lt; 0)</code> for top-K residues.
+                Colors are derived from the selected commitment mode (see below).
               </p>
               <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2">
                 <div>
@@ -742,7 +1181,111 @@ export default function DeltaCommitment3DPage() {
                     matching residue numbers in cluster labels (e.g. <span className="font-mono">res_279</span>).
                   </p>
                 </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">Commitment mode</label>
+                  <select
+                    value={commitmentMode}
+                    onChange={(e) => setCommitmentMode(e.target.value)}
+                    className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                  >
+                    <option value="prob">Base: Pr(Δh &lt; 0)</option>
+                    <option value="centered" disabled={!hasAltCommitmentData}>
+                      Centered: Pr(Δh ≤ median(ref))
+                    </option>
+                    <option value="mu_sigmoid" disabled={!hasAltCommitmentData}>
+                      Mean field (smooth)
+                    </option>
+                  </select>
+                  <p className="text-[11px] text-gray-500 mt-1">
+                    Centered mode calibrates each residue by a reference ensemble so "neutral" residues appear closer to white (0.5).
+                  </p>
+                  {!hasAltCommitmentData && (
+                    <p className="text-[11px] text-yellow-300 mt-1">
+                      Centered/Mean require analysis artifacts generated with the latest backend. Re-run commitment analysis for this (A,B) pair.
+                    </p>
+                  )}
+                </div>
               </div>
+
+              {commitmentMode === 'centered' && (
+                <div className="mt-3">
+                  <label className="block text-xs text-gray-400 mb-1">Reference ensemble(s)</label>
+                  <select
+                    multiple
+                    value={referenceSampleIds}
+                    onChange={(e) => {
+                      const opts = Array.from(e.target.selectedOptions).map((o) => String(o.value));
+                      setReferenceSampleIds(opts);
+                    }}
+                    className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100 h-24"
+                  >
+                    {commitmentSampleIds.map((sid, idx) => (
+                      <option key={`ref:${sid}`} value={sid}>
+                        {commitmentTypes[idx] ? `${commitmentLabels[idx] || sid} (${commitmentTypes[idx]})` : commitmentLabels[idx] || sid}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-[11px] text-gray-500 mt-1">
+                    Tip: select all MD ensembles (or any set you treat as a "baseline") to reduce artifacts from mixed-state marginals.
+                  </p>
+                </div>
+              )}
+
+              <div className="mt-3 rounded-md border border-gray-800 bg-gray-950/30 p-2 space-y-2">
+                <label className="flex items-center gap-2 text-sm text-gray-200">
+                  <input
+                    type="checkbox"
+                    checked={edgeSmoothEnabled}
+                    onChange={(e) => setEdgeSmoothEnabled(e.target.checked)}
+                    className="h-4 w-4 text-cyan-500 rounded border-gray-700 bg-gray-950"
+                  />
+                  Edge-weighted residue coloring (uses top edges)
+                </label>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2 items-end">
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Smoothing strength (0..1)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={edgeSmoothStrength}
+                      onChange={(e) => setEdgeSmoothStrength(Number(e.target.value))}
+                      className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                      disabled={!edgeSmoothEnabled}
+                    />
+                  </div>
+                  <p className="text-[11px] text-gray-500">
+                    Each residue color is blended with the average commitment of its incident top edges (weighted by |ΔJ|).
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2">
+                <div className="flex items-end">
+                  <label className="flex items-center gap-2 text-sm text-gray-200">
+                    <input
+                      type="checkbox"
+                      checked={showEdgeLinks}
+                      onChange={(e) => setShowEdgeLinks(e.target.checked)}
+                      className="h-4 w-4 text-cyan-500 rounded border-gray-700 bg-gray-950"
+                    />
+                    Show coupling links (top edges)
+                  </label>
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">Max links</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={500}
+                    value={maxEdgeLinks}
+                    onChange={(e) => setMaxEdgeLinks(Number(e.target.value))}
+                    className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                  />
+                </div>
+              </div>
+
               {coloringDebug && (
                 <div className="mt-2 rounded-md border border-gray-800 bg-gray-950/40 p-2 text-[11px] text-gray-300">
                   <div>
@@ -756,10 +1299,28 @@ export default function DeltaCommitment3DPage() {
                         <span className="font-mono">{coloringDebug.mode}</span> · residues:{' '}
                         <span className="font-mono">{coloringDebug.residues}</span>
                       </div>
+                      {coloringDebug.commitmentMode && (
+                        <div>
+                          q: <span className="font-mono">{coloringDebug.commitmentMode}</span>
+                          {coloringDebug.refCount ? (
+                            <>
+                              {' '}
+                              · ref: <span className="font-mono">{coloringDebug.refCount}</span>
+                            </>
+                          ) : null}
+                        </div>
+                      )}
                       {coloringDebug.created !== undefined && (
                         <div>
                           created: <span className="font-mono">{coloringDebug.created}</span>{' '}
                           {coloringDebug.note ? <span className="text-gray-500">({coloringDebug.note})</span> : null}
+                        </div>
+                      )}
+                      {(coloringDebug.qMin !== undefined || coloringDebug.qMax !== undefined) && (
+                        <div>
+                          q: min <span className="font-mono">{String(coloringDebug.qMin)}</span> · max{' '}
+                          <span className="font-mono">{String(coloringDebug.qMax)}</span> · mean{' '}
+                          <span className="font-mono">{String(coloringDebug.qMean)}</span>
                         </div>
                       )}
                       <div className="font-mono">bins: {JSON.stringify(coloringDebug.bins)}</div>

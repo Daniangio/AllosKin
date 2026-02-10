@@ -4,7 +4,7 @@ This page visualizes **per-residue commitment** for a fixed pair of Potts models
 
 ## What Is Being Colored
 
-For each residue `i`, commitment is:
+For each residue `i`, commitment is a value `q_i` derived from the Potts field difference:
 
 `q_i = Pr(δ_i < 0)` where `δ_i(t) = h^A_i(s_{t,i}) - h^B_i(s_{t,i})`.
 
@@ -13,6 +13,26 @@ Interpretation:
 - `q_i ~ 1`: that residue tends to favor model **A** (δ_i mostly negative).
 - `q_i ~ 0.5`: ambiguous / mixed signs (partial commitment).
 
+## Commitment Modes
+
+The UI lets you switch between multiple visualization modes:
+
+- **Base: `Pr(Δh < 0)`**
+- **Centered: `Pr(Δh ≤ median(ref))`**
+  - Uses a per-residue threshold computed from a selected *reference ensemble* so neutral residues appear closer to white.
+- **Mean: `sigmoid(-E[Δh]/scale)`**
+  - Smooth view based on the mean field difference per residue.
+
+### Reading Centered Mode
+
+Centered mode is best interpreted as a **reference-normalized** view:
+
+- Pick a reference ensemble (often an MD ensemble).
+- In centered mode, the reference is calibrated to look ~white per residue.
+- When you switch to another ensemble while keeping the same reference:
+  - residues turning **red** indicate that ensemble is more **A-like** than the reference at those residues
+  - residues turning **blue** indicate it is more **B-like** than the reference at those residues
+
 ## Colors
 
 The residue overlay uses a diverging palette:
@@ -20,10 +40,14 @@ The residue overlay uses a diverging palette:
 - **white**: `q ≈ 0.5`
 - **red**: `q → 1`
 
-## Scope / Current Limitation
+## Coupling Links (Optional)
 
-The overlay is applied to the **top-K residues** selected by the commitment analysis ranking (parameter magnitude of `Δh_i`).
-Residues outside the top-K are left as the gray base cartoon.
+If enabled, the page draws line links for the **top Potts edges** (by parameter magnitude). Link colors follow the same palette.
+
+## Edge-Weighted Residue Coloring (Optional)
+
+If enabled, residue colors are blended with the average edge commitment of incident top edges (weighted by `|ΔJ|`).
+This can make coupling-supported patches easier to see on the structure.
 
 ## Practical Notes
 

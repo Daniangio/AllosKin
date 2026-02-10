@@ -1032,6 +1032,9 @@ def compute_delta_transition_analysis(
     dh_list: list[np.ndarray] = [
         np.asarray(model_a.h[i], dtype=float) - np.asarray(model_b.h[i], dtype=float) for i in range(N)
     ]
+    dh = np.stack([np.asarray(x, dtype=float).ravel() for x in dh_list], axis=0)
+    if dh.shape != (N, K):
+        raise ValueError(f"Unexpected dh shape: {dh.shape}, expected {(N, K)}")
     dJ: dict[tuple[int, int], np.ndarray] = {}
     for (r, s) in edges:
         dJ[(r, s)] = np.asarray(model_a.coupling(r, s), dtype=float) - np.asarray(model_b.coupling(r, s), dtype=float)
@@ -1245,17 +1248,36 @@ def upsert_delta_commitment_analysis(
     model_b = zero_sum_gauge_model(model_b)
 
     N = int(len(model_a.h))
-    K = int(len(np.asarray(model_a.h[0]).ravel())) if N > 0 else 0
-    if N <= 0 or K <= 0:
+    if N <= 0:
         raise ValueError("Invalid Potts model size.")
+
+    # Variable alphabet sizes per residue are supported (K_i can differ).
+    K_list = [int(k) for k in model_a.K_list()]
+    if len(K_list) != N:
+        raise ValueError("Invalid K_list length.")
+    K_max = int(max(K_list)) if K_list else 0
+    if K_max <= 0:
+        raise ValueError("Invalid Potts model alphabet size.")
 
     edges_a = {(min(int(r), int(s)), max(int(r), int(s))) for r, s in (model_a.edges or []) if int(r) != int(s)}
     edges_b = {(min(int(r), int(s)), max(int(r), int(s))) for r, s in (model_b.edges or []) if int(r) != int(s)}
     edges = sorted(edges_a & edges_b)
 
-    dh_list: list[np.ndarray] = [
-        np.asarray(model_a.h[i], dtype=float) - np.asarray(model_b.h[i], dtype=float) for i in range(N)
-    ]
+    dh_list: list[np.ndarray] = []
+    for i in range(N):
+        a = np.asarray(model_a.h[i], dtype=float).ravel()
+        b = np.asarray(model_b.h[i], dtype=float).ravel()
+        if a.shape != b.shape:
+            raise ValueError(f"Model alphabets do not match at residue {i}: {a.shape} vs {b.shape}")
+        dh_list.append(a - b)
+
+    # Padded Δh table for visualization/calibration (variable K_i supported).
+    # dh[i, :K_i] is defined; dh[i, K_i:] is zero-padding (use K_list to know valid range).
+    dh = np.zeros((N, K_max), dtype=np.float32)
+    for i in range(N):
+        Ki = int(dh_list[i].shape[0])
+        if Ki > 0:
+            dh[i, :Ki] = np.asarray(dh_list[i], dtype=np.float32)
     dJ: dict[tuple[int, int], np.ndarray] = {}
     for (r, s) in edges:
         dJ[(r, s)] = np.asarray(model_a.coupling(r, s), dtype=float) - np.asarray(model_b.coupling(r, s), dtype=float)
@@ -1352,6 +1374,9 @@ def upsert_delta_commitment_analysis(
     sample_types: list[str] = []
     # Store commitment for ALL residues (filtering is a visualization concern).
     q_residue_all = np.zeros((len(merged), N), dtype=float)
+    # Per-sample per-residue marginals (for alternative visualizations/calibrations).
+    # Shape: (S, N, K_max), with zero-padding for missing states (variable K_i supported).
+    p_node = np.zeros((len(merged), N, K_max), dtype=np.float32)
     q_edge = np.zeros((len(merged), top_k_e), dtype=float)
     delta_energy_all: list[np.ndarray] = []
     energy_mean = np.zeros((len(merged),), dtype=float)
@@ -1368,11 +1393,37 @@ def upsert_delta_commitment_analysis(
             raise ValueError(f"Sample labels are empty: {sid}")
         if int(X.shape[1]) != N:
             raise ValueError(f"Sample labels do not match model size for {sid}: got N={X.shape[1]}, expected {N}")
-
-        # Commitment on all residues: q_i = Pr(dh_i(X_i) < 0)
+        # Validate label range per residue (variable K_i supported).
+        # Note: this analysis assumes assigned labels are in [0, K_i-1].
+        if np.min(X) < 0:
+            raise ValueError(
+                f"Sample contains negative labels for {sid}. "
+                "Use md_label_mode='assigned' or remap unassigned labels before analysis."
+            )
         for i in range(N):
-            vals = dh_list[i][X[:, i]]
-            q_residue_all[row, i] = float(np.mean(vals < 0)) if vals.size else np.nan
+            Ki = int(K_list[i])
+            if Ki <= 0:
+                continue
+            col = X[:, i]
+            mx = int(np.max(col)) if col.size else -1
+            if mx >= Ki:
+                raise ValueError(
+                    f"Sample labels out of range for {sid} at residue {i}: max={mx}, expected in [0,{Ki-1}]"
+                )
+
+        n_frames = int(X.shape[0])
+        # Node marginals + commitment on all residues: q_i = Pr(dh_i(X_i) < 0)
+        # We compute from marginals so that downstream visualizations can reuse p_i(a).
+        for i in range(N):
+            Ki = int(K_list[i])
+            counts = np.bincount(np.asarray(X[:, i], dtype=int), minlength=Ki).astype(np.float32, copy=False)
+            if n_frames > 0:
+                p = counts / float(n_frames)
+            else:
+                p = np.zeros((Ki,), dtype=np.float32)
+            p_node[row, i, :Ki] = p
+            mask = (np.asarray(dh_list[i], dtype=float) < 0).astype(np.float32, copy=False)
+            q_residue_all[row, i] = float(np.sum(p * mask)) if p.size else np.nan
 
         # Commitment on top edges: Pr(dJ_ij(X_i,X_j) < 0)
         if top_k_e > 0 and edges:
@@ -1416,6 +1467,9 @@ def upsert_delta_commitment_analysis(
         sample_ids=np.asarray(merged, dtype=str),
         sample_labels=np.asarray(sample_labels, dtype=str),
         sample_types=np.asarray(sample_types, dtype=str),
+        K_list=np.asarray(K_list, dtype=int),
+        dh=np.asarray(dh, dtype=np.float32),
+        p_node=np.asarray(p_node, dtype=np.float32),
         q_residue_all=np.asarray(q_residue_all, dtype=float),
         q_edge=np.asarray(q_edge, dtype=float),
         energy_bins=np.asarray(bins, dtype=float),

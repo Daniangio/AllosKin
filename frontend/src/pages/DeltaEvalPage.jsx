@@ -19,6 +19,23 @@ function clamp01(x) {
   return Math.max(0, Math.min(1, x));
 }
 
+function sigmoid(x) {
+  if (!Number.isFinite(x)) return 0.5;
+  if (x >= 0) {
+    const z = Math.exp(-x);
+    return 1 / (1 + z);
+  }
+  const z = Math.exp(x);
+  return z / (1 + z);
+}
+
+function clamp(x, lo, hi) {
+  if (!Number.isFinite(x)) return lo;
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
 function edgeLabel(edge, residueLabels) {
   if (!Array.isArray(edge) || edge.length < 2) return '';
   const r = Number(edge[0]);
@@ -46,7 +63,13 @@ export default function DeltaEvalPage() {
   const [modelAId, setModelAId] = useState('');
   const [modelBId, setModelBId] = useState('');
 
-  const [topKResidues, setTopKResidues] = useState(20);
+  const [commitmentMode, setCommitmentMode] = useState('prob'); // prob | centered | mu_sigmoid
+  const [referenceSampleIds, setReferenceSampleIds] = useState([]); // used for centered mode
+  const [edgeSmoothEnabled, setEdgeSmoothEnabled] = useState(false);
+  const [edgeSmoothStrength, setEdgeSmoothStrength] = useState(0.75);
+
+  // Visualization-only filter: 0 means "show all residues". The analysis always stores q for all residues.
+  const [topKResidues, setTopKResidues] = useState(0);
   const [topKEdges, setTopKEdges] = useState(30);
   const [energyBins, setEnergyBins] = useState(80);
 
@@ -269,7 +292,8 @@ export default function DeltaEvalPage() {
         sample_ids: selectedSampleIds,
         md_label_mode: mdLabelMode,
         keep_invalid: keepInvalid,
-        top_k_residues: Number(topKResidues),
+        // Backend requires >=1; this parameter only affects the stored top_residue_indices convenience field.
+        top_k_residues: Math.max(1, Number(topKResidues)),
         top_k_edges: Number(topKEdges),
         ranking_method: 'param_l2',
         energy_bins: Number(energyBins),
@@ -329,12 +353,35 @@ export default function DeltaEvalPage() {
     if (Array.isArray(labels)) return labels.map(String);
     return analysisSampleIds;
   }, [data, analysisSampleIds]);
+  const analysisSampleTypes = useMemo(() => {
+    const types = data?.data?.sample_types;
+    return Array.isArray(types) ? types.map(String) : [];
+  }, [data]);
+
+  const dhTable = useMemo(() => (Array.isArray(data?.data?.dh) ? data.data.dh : null), [data]);
+  const pNode = useMemo(() => (Array.isArray(data?.data?.p_node) ? data.data.p_node : null), [data]);
+  const kList = useMemo(() => (Array.isArray(data?.data?.K_list) ? data.data.K_list.map((v) => Number(v)) : null), [data]);
+  const hasAltCommitmentData = useMemo(() => {
+    const okDh = Boolean(dhTable && Array.isArray(dhTable[0]) && dhTable.length > 0);
+    const okP = Boolean(pNode && Array.isArray(pNode[0]) && pNode.length > 0);
+    return okDh && okP;
+  }, [dhTable, pNode]);
 
   const analysisSampleIndexById = useMemo(() => {
     const m = new Map();
     analysisSampleIds.forEach((sid, i) => m.set(String(sid), i));
     return m;
   }, [analysisSampleIds]);
+
+  // Default reference set for centered mode: all MD samples if present, else the first available sample.
+  useEffect(() => {
+    if (commitmentMode !== 'centered') return;
+    if (referenceSampleIds.length) return;
+    if (!analysisSampleIds.length) return;
+    const md = analysisSampleIds.filter((sid, idx) => (analysisSampleTypes[idx] || '').toLowerCase().includes('md'));
+    if (md.length) setReferenceSampleIds(md);
+    else setReferenceSampleIds([analysisSampleIds[0]]);
+  }, [commitmentMode, referenceSampleIds.length, analysisSampleIds, analysisSampleTypes]);
 
   // Default plotting selection: whatever is available in the analysis (or the selected set).
   useEffect(() => {
@@ -367,8 +414,76 @@ export default function DeltaEvalPage() {
   );
   const topEdgeIndices = useMemo(() => (Array.isArray(data?.data?.top_edge_indices) ? data.data.top_edge_indices : []), [data]);
   const edges = useMemo(() => (Array.isArray(data?.data?.edges) ? data.data.edges : []), [data]);
+  const dEdge = useMemo(() => (Array.isArray(data?.data?.D_edge) ? data.data.D_edge : null), [data]);
 
   const qResidueAll = useMemo(() => (Array.isArray(data?.data?.q_residue_all) ? data.data.q_residue_all : []), [data]);
+
+  const centeredCalib = useMemo(() => {
+    if (commitmentMode !== 'centered') return null;
+    if (!dhTable || !pNode) return null;
+    if (!referenceSampleIds.length || !analysisSampleIds.length) return null;
+
+    const refIdxs = referenceSampleIds
+      .map((sid) => analysisSampleIds.indexOf(String(sid)))
+      .filter((i) => i != null && i >= 0);
+    if (!refIdxs.length) return null;
+
+    const N = dhTable.length;
+    const Kmax = Array.isArray(dhTable[0]) ? dhTable[0].length : 0;
+    if (N <= 0 || Kmax <= 0) return null;
+
+    const eps = 1e-9;
+    const thresholds = new Array(N);
+    const alphas = new Array(N);
+    for (let i = 0; i < N; i += 1) {
+      const dhRow = (Array.isArray(dhTable[i]) ? dhTable[i] : []).map((v) => Number(v));
+      const Ki = kList && Number.isFinite(kList[i]) ? Math.max(0, Math.min(Kmax, Math.floor(kList[i]))) : dhRow.length;
+      if (dhRow.length < Ki || Ki <= 0) {
+        thresholds[i] = 0;
+        alphas[i] = 0.5;
+        // eslint-disable-next-line no-continue
+        continue;
+      }
+      const pRef = new Array(Ki).fill(0);
+      for (const ridx of refIdxs) {
+        const prow = pNode?.[ridx]?.[i];
+        if (!Array.isArray(prow) || prow.length < Ki) continue;
+        for (let a = 0; a < Ki; a += 1) pRef[a] += Number(prow[a]) || 0;
+      }
+      const inv = 1 / refIdxs.length;
+      for (let a = 0; a < Ki; a += 1) pRef[a] *= inv;
+
+      const order = Array.from({ length: Ki }, (_, a) => a);
+      order.sort((a, b) => dhRow[a] - dhRow[b]);
+      let cum = 0;
+      let t = dhRow[order[order.length - 1]];
+      for (const a of order) {
+        cum += pRef[a];
+        if (cum >= 0.5) {
+          t = dhRow[a];
+          break;
+        }
+      }
+      thresholds[i] = t;
+
+      let cBefore = 0;
+      let cAt = 0;
+      for (let a = 0; a < Ki; a += 1) {
+        const dv = dhRow[a];
+        const pv = pRef[a] || 0;
+        if (dv < t - eps) cBefore += pv;
+        else if (Math.abs(dv - t) <= eps) cAt += pv;
+      }
+      if (cAt > 0) {
+        const alpha = (0.5 - cBefore) / cAt;
+        alphas[i] = Math.max(0, Math.min(1, alpha));
+      } else {
+        alphas[i] = 0.5;
+      }
+    }
+    return { thresholds, alphas, eps };
+  }, [commitmentMode, dhTable, pNode, referenceSampleIds, analysisSampleIds, kList]);
+
   const showTopResiduesOnly = useMemo(
     () => Number(topKResidues) > 0 && Number(topKResidues) < residueLabels.length,
     [topKResidues, residueLabels.length]
@@ -396,10 +511,200 @@ export default function DeltaEvalPage() {
 
   const qResidueHeatmap = useMemo(() => {
     if (!plotRows.length || !Array.isArray(qResidueAll) || !qResidueAll.length) return null;
-    const z = plotRows.map((row) => residueAxis.indices.map((i) => clamp01(Number(qResidueAll[row][i]))));
+    const N = residueLabels.length;
+    const base = (row, i) => clamp01(Number(qResidueAll?.[row]?.[i]));
+
+    // If dh/p_node aren't available (older analyses), fall back to the base q.
+    const canAlt = Boolean(dhTable && pNode && Array.isArray(dhTable?.[0]) && Array.isArray(pNode?.[0]?.[0]));
+    if (commitmentMode !== 'prob' && !canAlt) {
+      const z = plotRows.map((row) => residueAxis.indices.map((i) => base(row, i)));
+      const y = plotRows.map((row) => analysisSampleLabels[row] ?? String(analysisSampleIds[row] ?? row));
+      return { z, y, x: residueAxisLabels };
+    }
+
+    const Kmax = dhTable && Array.isArray(dhTable[0]) ? dhTable[0].length : 0;
+    const z = plotRows.map((row) => {
+      if (commitmentMode === 'prob') return residueAxis.indices.map((i) => base(row, i));
+
+      if (commitmentMode === 'centered') {
+        if (!centeredCalib || !Kmax) return residueAxis.indices.map((i) => base(row, i));
+        const { thresholds, alphas, eps } = centeredCalib;
+        const outFull = new Array(N);
+        for (let i = 0; i < N; i += 1) outFull[i] = base(row, i);
+        for (let idx = 0; idx < residueAxis.indices.length; idx += 1) {
+          const i = residueAxis.indices[idx];
+          const dhRow = dhTable?.[i];
+          const prow = pNode?.[row]?.[i];
+          const Ki = kList && Number.isFinite(kList[i]) ? Math.max(0, Math.min(Kmax, Math.floor(kList[i]))) : Kmax;
+          if (!Array.isArray(dhRow) || !Array.isArray(prow) || dhRow.length < Ki || prow.length < Ki || Ki <= 0) {
+            outFull[i] = base(row, i);
+            // eslint-disable-next-line no-continue
+            continue;
+          }
+          const t = Number(thresholds[i]);
+          const alpha = Number(alphas[i]);
+          let accBefore = 0;
+          let accAt = 0;
+          for (let a = 0; a < Ki; a += 1) {
+            const dhv = Number(dhRow[a]);
+            const pv = Number(prow[a]) || 0;
+            if (dhv < t - eps) accBefore += pv;
+            else if (Math.abs(dhv - t) <= eps) accAt += pv;
+          }
+          outFull[i] = clamp01(accBefore + alpha * accAt);
+        }
+        if (!edgeSmoothEnabled) return residueAxis.indices.map((i) => outFull[i]);
+        const strength = clamp(Number(edgeSmoothStrength), 0, 1);
+        if (strength <= 0) return residueAxis.indices.map((i) => outFull[i]);
+        if (!Array.isArray(qEdge) || !Array.isArray(qEdge[row]) || !Array.isArray(topEdgeIndices) || !topEdgeIndices.length) {
+          return residueAxis.indices.map((i) => outFull[i]);
+        }
+        const rowQe = qEdge[row].map((v) => Number(v));
+        const sumW = new Array(N).fill(0);
+        const sumWD = new Array(N).fill(0);
+        for (let col = 0; col < topEdgeIndices.length && col < rowQe.length; col += 1) {
+          const eidx = Number(topEdgeIndices[col]);
+          const e = edges[eidx];
+          if (!Array.isArray(e) || e.length < 2) continue;
+          const r = Number(e[0]);
+          const s = Number(e[1]);
+          if (!Number.isInteger(r) || !Number.isInteger(s) || r < 0 || s < 0 || r >= N || s >= N) continue;
+          const qv = rowQe[col];
+          if (!Number.isFinite(qv)) continue;
+          const wRaw = dEdge && Number.isFinite(Number(dEdge[eidx])) ? Math.abs(Number(dEdge[eidx])) : 1.0;
+          const w = wRaw > 1e-12 ? wRaw : 1.0;
+          const d = clamp01(qv) - 0.5;
+          sumW[r] += w;
+          sumWD[r] += w * d;
+          sumW[s] += w;
+          sumWD[s] += w * d;
+        }
+        const sm = new Array(N);
+        for (let i = 0; i < N; i += 1) {
+          const di = outFull[i] - 0.5;
+          const de = sumW[i] > 0 ? sumWD[i] / sumW[i] : 0;
+          sm[i] = clamp01(0.5 + (1 - strength) * di + strength * de);
+        }
+        return residueAxis.indices.map((i) => sm[i]);
+      }
+
+      if (commitmentMode === 'mu_sigmoid') {
+        if (!Kmax) return residueAxis.indices.map((i) => base(row, i));
+        const mu = new Array(N);
+        for (let i = 0; i < N; i += 1) {
+          const dhRow = dhTable?.[i];
+          const prow = pNode?.[row]?.[i];
+          const Ki = kList && Number.isFinite(kList[i]) ? Math.max(0, Math.min(Kmax, Math.floor(kList[i]))) : Kmax;
+          if (!Array.isArray(dhRow) || !Array.isArray(prow) || dhRow.length < Ki || prow.length < Ki || Ki <= 0) {
+            mu[i] = NaN;
+            // eslint-disable-next-line no-continue
+            continue;
+          }
+          let m = 0;
+          for (let a = 0; a < Ki; a += 1) m += (Number(prow[a]) || 0) * (Number(dhRow[a]) || 0);
+          mu[i] = m;
+        }
+        const finite = mu.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+        const med = finite.length ? finite[Math.floor(finite.length / 2)] : 0;
+        const absDev = finite.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
+        const mad = absDev.length ? absDev[Math.floor(absDev.length / 2)] : 0;
+        const scale = mad > 1e-9 ? mad : 1.0;
+        const outFull = new Array(N);
+        for (let i = 0; i < N; i += 1) outFull[i] = clamp01(sigmoid(-(Number(mu[i]) || 0) / scale));
+        if (!edgeSmoothEnabled) return residueAxis.indices.map((i) => outFull[i]);
+        const strength = clamp(Number(edgeSmoothStrength), 0, 1);
+        if (strength <= 0) return residueAxis.indices.map((i) => outFull[i]);
+        if (!Array.isArray(qEdge) || !Array.isArray(qEdge[row]) || !Array.isArray(topEdgeIndices) || !topEdgeIndices.length) {
+          return residueAxis.indices.map((i) => outFull[i]);
+        }
+        const rowQe = qEdge[row].map((v) => Number(v));
+        const sumW = new Array(N).fill(0);
+        const sumWD = new Array(N).fill(0);
+        for (let col = 0; col < topEdgeIndices.length && col < rowQe.length; col += 1) {
+          const eidx = Number(topEdgeIndices[col]);
+          const e = edges[eidx];
+          if (!Array.isArray(e) || e.length < 2) continue;
+          const r = Number(e[0]);
+          const s = Number(e[1]);
+          if (!Number.isInteger(r) || !Number.isInteger(s) || r < 0 || s < 0 || r >= N || s >= N) continue;
+          const qv = rowQe[col];
+          if (!Number.isFinite(qv)) continue;
+          const wRaw = dEdge && Number.isFinite(Number(dEdge[eidx])) ? Math.abs(Number(dEdge[eidx])) : 1.0;
+          const w = wRaw > 1e-12 ? wRaw : 1.0;
+          const d = clamp01(qv) - 0.5;
+          sumW[r] += w;
+          sumWD[r] += w * d;
+          sumW[s] += w;
+          sumWD[s] += w * d;
+        }
+        const sm = new Array(N);
+        for (let i = 0; i < N; i += 1) {
+          const di = outFull[i] - 0.5;
+          const de = sumW[i] > 0 ? sumWD[i] / sumW[i] : 0;
+          sm[i] = clamp01(0.5 + (1 - strength) * di + strength * de);
+        }
+        return residueAxis.indices.map((i) => sm[i]);
+      }
+
+      // prob case
+      const outFull = new Array(N);
+      for (let i = 0; i < N; i += 1) outFull[i] = base(row, i);
+      if (!edgeSmoothEnabled) return residueAxis.indices.map((i) => outFull[i]);
+      const strength = clamp(Number(edgeSmoothStrength), 0, 1);
+      if (strength <= 0) return residueAxis.indices.map((i) => outFull[i]);
+      if (!Array.isArray(qEdge) || !Array.isArray(qEdge[row]) || !Array.isArray(topEdgeIndices) || !topEdgeIndices.length) {
+        return residueAxis.indices.map((i) => outFull[i]);
+      }
+      const rowQe = qEdge[row].map((v) => Number(v));
+      const sumW = new Array(N).fill(0);
+      const sumWD = new Array(N).fill(0);
+      for (let col = 0; col < topEdgeIndices.length && col < rowQe.length; col += 1) {
+        const eidx = Number(topEdgeIndices[col]);
+        const e = edges[eidx];
+        if (!Array.isArray(e) || e.length < 2) continue;
+        const r = Number(e[0]);
+        const s = Number(e[1]);
+        if (!Number.isInteger(r) || !Number.isInteger(s) || r < 0 || s < 0 || r >= N || s >= N) continue;
+        const qv = rowQe[col];
+        if (!Number.isFinite(qv)) continue;
+        const wRaw = dEdge && Number.isFinite(Number(dEdge[eidx])) ? Math.abs(Number(dEdge[eidx])) : 1.0;
+        const w = wRaw > 1e-12 ? wRaw : 1.0;
+        const d = clamp01(qv) - 0.5;
+        sumW[r] += w;
+        sumWD[r] += w * d;
+        sumW[s] += w;
+        sumWD[s] += w * d;
+      }
+      const sm = new Array(N);
+      for (let i = 0; i < N; i += 1) {
+        const di = outFull[i] - 0.5;
+        const de = sumW[i] > 0 ? sumWD[i] / sumW[i] : 0;
+        sm[i] = clamp01(0.5 + (1 - strength) * di + strength * de);
+      }
+      return residueAxis.indices.map((i) => sm[i]);
+    });
     const y = plotRows.map((row) => analysisSampleLabels[row] ?? String(analysisSampleIds[row] ?? row));
     return { z, y, x: residueAxisLabels };
-  }, [plotRows, qResidueAll, residueAxis, analysisSampleLabels, analysisSampleIds, residueAxisLabels]);
+  }, [
+    plotRows,
+    qResidueAll,
+    residueAxis,
+    analysisSampleLabels,
+    analysisSampleIds,
+    residueAxisLabels,
+    commitmentMode,
+    dhTable,
+    pNode,
+    centeredCalib,
+    residueLabels.length,
+    kList,
+    edgeSmoothEnabled,
+    edgeSmoothStrength,
+    qEdge,
+    topEdgeIndices,
+    edges,
+    dEdge,
+  ]);
 
   const qEdgeHeatmap = useMemo(() => {
     if (!plotRows.length || !Array.isArray(qEdge) || !qEdge.length) return null;
@@ -580,10 +885,10 @@ export default function DeltaEvalPage() {
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
               <div className="space-y-1">
-                <label className="block text-xs text-gray-400">Top residues</label>
+                <label className="block text-xs text-gray-400">Residues to show (0 = all)</label>
                 <input
                   type="number"
-                  min="1"
+                  min="0"
                   value={topKResidues}
                   onChange={(e) => setTopKResidues(e.target.value)}
                   className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
@@ -608,6 +913,85 @@ export default function DeltaEvalPage() {
                   onChange={(e) => setEnergyBins(e.target.value)}
                   className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
                 />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+              <div className="space-y-1">
+                <label className="block text-xs text-gray-400">Commitment mode</label>
+                <select
+                  value={commitmentMode}
+                  onChange={(e) => setCommitmentMode(e.target.value)}
+                  className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                >
+                  <option value="prob">Base: Pr(Δh &lt; 0)</option>
+                  <option value="centered" disabled={!hasAltCommitmentData}>
+                    Centered: Pr(Δh ≤ median(ref))
+                  </option>
+                  <option value="mu_sigmoid" disabled={!hasAltCommitmentData}>
+                    Mean field (smooth)
+                  </option>
+                </select>
+                <p className="text-[11px] text-gray-500">
+                  Centered mode helps when ensembles share discrete marginals (mixtures), so "neutral" residues appear closer to white.
+                </p>
+                {!hasAltCommitmentData && (
+                  <p className="text-[11px] text-yellow-300">
+                    Centered/Mean require analysis artifacts generated with the latest backend. Re-run commitment analysis for this (A,B) pair.
+                  </p>
+                )}
+              </div>
+              <div className="space-y-1">
+                <label className="block text-xs text-gray-400">Reference ensemble(s)</label>
+                <select
+                  multiple
+                  disabled={commitmentMode !== 'centered' || !hasAltCommitmentData}
+                  value={referenceSampleIds}
+                  onChange={(e) => {
+                    const opts = Array.from(e.target.selectedOptions).map((o) => String(o.value));
+                    setReferenceSampleIds(opts);
+                  }}
+                  className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100 h-24 disabled:opacity-60"
+                >
+                  {analysisSampleIds.map((sid, idx) => (
+                    <option key={`ref:${sid}`} value={sid}>
+                      {analysisSampleTypes[idx] ? `${analysisSampleLabels[idx] || sid} (${analysisSampleTypes[idx]})` : analysisSampleLabels[idx] || sid}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-[11px] text-gray-500">
+                  Uses stored node marginals <code>p_i(a)</code>. If you just ran analysis, reload data to enable centered/mean modes.
+                </p>
+              </div>
+            </div>
+
+            <div className="rounded-md border border-gray-800 bg-gray-950/30 p-2 space-y-2">
+              <label className="flex items-center gap-2 text-sm text-gray-200">
+                <input
+                  type="checkbox"
+                  checked={edgeSmoothEnabled}
+                  onChange={(e) => setEdgeSmoothEnabled(e.target.checked)}
+                  className="h-4 w-4 text-cyan-500 rounded border-gray-700 bg-gray-950"
+                />
+                Edge-weighted residue coloring (uses top edges)
+              </label>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2 items-end">
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">Smoothing strength (0..1)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={edgeSmoothStrength}
+                    onChange={(e) => setEdgeSmoothStrength(Number(e.target.value))}
+                    className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                    disabled={!edgeSmoothEnabled}
+                  />
+                </div>
+                <p className="text-[11px] text-gray-500">
+                  Each residue value is blended with the average commitment of its incident top edges (weighted by |ΔJ|).
+                </p>
               </div>
             </div>
 
