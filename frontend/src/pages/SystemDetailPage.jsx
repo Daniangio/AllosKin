@@ -1435,11 +1435,26 @@ export default function SystemDetailPage() {
               >
                 <div className="flex items-center gap-2">
                   <h3 className="text-md font-semibold text-white">Potts Modeling</h3>
-                  <InfoTooltip
-                    ariaLabel="Potts analysis documentation"
-                    text="Open documentation for the Potts model, sampling, and diagnostics."
-                    onClick={() => openDoc('potts_overview')}
-                  />
+                  <span
+                    role="button"
+                    tabIndex={0}
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      openDoc('potts_overview');
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        openDoc('potts_overview');
+                      }
+                    }}
+                    className="inline-flex"
+                    aria-label="Potts analysis documentation"
+                  >
+                    <InfoTooltip text="Open documentation for the Potts model, sampling, and diagnostics." ariaLabel="Potts analysis documentation" />
+                  </span>
                 </div>
                 <p className="text-xs text-gray-500 mt-1">Fit a model or reuse an uploaded one.</p>
                 <p className="text-xs text-gray-400 mt-3">

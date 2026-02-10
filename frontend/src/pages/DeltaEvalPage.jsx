@@ -770,6 +770,13 @@ export default function DeltaEvalPage() {
           </button>
           <button
             type="button"
+            onClick={() => navigate(`/projects/${projectId}/systems/${systemId}/sampling/delta_commitment_3d`)}
+            className="text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:border-gray-500"
+          >
+            3D commitment
+          </button>
+          <button
+            type="button"
             onClick={() => navigate(`/projects/${projectId}/systems/${systemId}`)}
             className="text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:border-gray-500"
           >

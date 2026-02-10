@@ -7,15 +7,23 @@ import IconButton from '../common/IconButton';
 export function InfoTooltip({ text, ariaLabel, onClick }) {
   return (
     <span className="relative inline-flex group">
-      <button
-        type="button"
+      <span
+        role="button"
+        tabIndex={0}
         className="inline-flex items-center justify-center text-gray-500 hover:text-gray-300 focus:outline-none"
         aria-label={ariaLabel}
         aria-haspopup={onClick ? 'dialog' : undefined}
         onClick={onClick}
+        onKeyDown={(e) => {
+          if (!onClick) return;
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onClick(e);
+          }
+        }}
       >
         <Info className="h-4 w-4" />
-      </button>
+      </span>
       <span className="pointer-events-none absolute left-1/2 top-full z-20 mt-2 w-72 -translate-x-1/2 rounded-md border border-gray-700 bg-gray-900 px-3 py-2 text-xs text-gray-200 opacity-0 shadow-lg transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
         {text}
       </span>

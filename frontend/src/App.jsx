@@ -11,6 +11,7 @@ import DescriptorVizPage from './pages/DescriptorVizPage';
 import MetastableVizPage from './pages/MetastableVizPage';
 import SamplingVizPage from './pages/SamplingVizPage';
 import DeltaEvalPage from './pages/DeltaEvalPage';
+import DeltaCommitment3DPage from './pages/DeltaCommitment3DPage';
 import LambdaSweepPage from './pages/LambdaSweepPage';
 import MolstarDebugPage from './pages/MolstarDebugPage';
 import HealthPage from './pages/HealthPage';
@@ -18,7 +19,7 @@ import JobStatusPage from './pages/JobStatusPage';
 
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
       <AppLayout>
         <Routes>
           <Route path="/" element={<Navigate to="/projects" replace />} />
@@ -39,6 +40,10 @@ export default function App() {
           <Route
             path="/projects/:projectId/systems/:systemId/sampling/delta_eval"
             element={<DeltaEvalPage />}
+          />
+          <Route
+            path="/projects/:projectId/systems/:systemId/sampling/delta_commitment_3d"
+            element={<DeltaCommitment3DPage />}
           />
           <Route
             path="/projects/:projectId/systems/:systemId/sampling/lambda_sweep"
