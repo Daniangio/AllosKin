@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.spatial import KDTree
+from scipy.cluster.hierarchy import fcluster, linkage
 import MDAnalysis as mda
 from dadapy import Data
 
@@ -204,6 +205,282 @@ def _angles_to_periodic(samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return centered, period
 
 
+def _angles_to_circular_features(samples: np.ndarray) -> np.ndarray:
+    """Map angle triplets to a wrap-safe embedding using sin/cos per angle."""
+    centered, _ = _angles_to_periodic(samples)
+    sin_part = np.sin(centered)
+    cos_part = np.cos(centered)
+    return np.concatenate([sin_part, cos_part], axis=1).astype(np.float64, copy=False)
+
+
+def _gaussian_logpdf_matrix(
+    X: np.ndarray,
+    means: np.ndarray,
+    covariances: np.ndarray,
+    *,
+    covariance_type: str,
+    reg_covar: float,
+) -> np.ndarray:
+    """Return component log densities log N(x | mean_k, cov_k) for all rows/components."""
+    X = np.asarray(X, dtype=np.float64)
+    means = np.asarray(means, dtype=np.float64)
+    covariances = np.asarray(covariances, dtype=np.float64)
+    n, d = X.shape
+    k = means.shape[0]
+    out = np.full((n, k), -np.inf, dtype=np.float64)
+    log2pi = d * np.log(2.0 * np.pi)
+    reg = float(max(reg_covar, 1e-12))
+
+    cov_kind = str(covariance_type or "full").lower()
+    if cov_kind == "diag":
+        for j in range(k):
+            var = np.asarray(covariances[j], dtype=np.float64).reshape(-1)
+            if var.size != d:
+                var = np.resize(var, d)
+            var = np.maximum(var, reg)
+            diff = X - means[j]
+            quad = np.sum((diff * diff) / var[None, :], axis=1)
+            logdet = float(np.sum(np.log(var)))
+            out[:, j] = -0.5 * (log2pi + logdet + quad)
+        return out
+
+    for j in range(k):
+        cov = np.asarray(covariances[j], dtype=np.float64)
+        if cov.shape != (d, d):
+            eye = np.eye(d, dtype=np.float64)
+            cov = eye * reg
+        cov = cov + (np.eye(d, dtype=np.float64) * reg)
+        try:
+            sign, logdet = np.linalg.slogdet(cov)
+            if sign <= 0:
+                raise np.linalg.LinAlgError("non-positive definite covariance")
+            inv = np.linalg.inv(cov)
+        except np.linalg.LinAlgError:
+            cov = cov + (np.eye(d, dtype=np.float64) * (reg * 10.0))
+            sign, logdet = np.linalg.slogdet(cov)
+            if sign <= 0:
+                continue
+            inv = np.linalg.inv(cov)
+
+        diff = X - means[j]
+        quad = np.einsum("ni,ij,nj->n", diff, inv, diff)
+        out[:, j] = -0.5 * (log2pi + float(logdet) + quad)
+    return out
+
+
+def _predict_cluster_frozen_gmm(
+    model: Dict[str, Any],
+    samples: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Predict assigned/halo labels using a frozen Gaussian approximation."""
+    features = _angles_to_circular_features(samples)
+    means = np.asarray(model.get("means", []), dtype=np.float64)
+    covariances = np.asarray(model.get("covariances", []), dtype=np.float64)
+    weights = np.asarray(model.get("weights", []), dtype=np.float64).reshape(-1)
+    thresholds = np.asarray(model.get("thresholds_logpdf", []), dtype=np.float64).reshape(-1)
+    covariance_type = str(model.get("covariance_type") or "full").lower()
+    reg_covar = float(model.get("reg_covar", 1e-5))
+
+    n = features.shape[0]
+    if means.ndim != 2 or means.shape[0] == 0:
+        empty = np.full((n,), -1, dtype=np.int32)
+        return empty, empty
+    k = means.shape[0]
+    if weights.size != k:
+        weights = np.full((k,), 1.0 / float(k), dtype=np.float64)
+    weights = np.maximum(weights, 1e-12)
+    weights = weights / np.sum(weights)
+    if thresholds.size != k:
+        thresholds = np.full((k,), -np.inf, dtype=np.float64)
+
+    logpdf = _gaussian_logpdf_matrix(
+        features,
+        means,
+        covariances,
+        covariance_type=covariance_type,
+        reg_covar=reg_covar,
+    )
+    logpost = logpdf + np.log(weights[None, :])
+    assigned = np.argmax(logpost, axis=1).astype(np.int32, copy=False)
+    halo = assigned.copy()
+    chosen = logpdf[np.arange(n), assigned]
+    halo[chosen < thresholds[assigned]] = -1
+    return assigned, halo
+
+
+def _fit_hierarchical_frozen_gmm(
+    samples: np.ndarray,
+    *,
+    n_clusters: Optional[int],
+    cluster_selection_mode: str,
+    inconsistent_threshold: Optional[float],
+    inconsistent_depth: int,
+    linkage_method: str,
+    covariance_type: str,
+    reg_covar: float,
+    halo_percentile: float,
+    max_cluster_frames: Optional[int],
+    subsample_indices: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, np.ndarray, int, Dict[str, Any], int, Dict[str, Any]]:
+    """Cluster a residue with scipy hierarchical and build a frozen Gaussian predictor."""
+    if samples.ndim != 2 or samples.shape[0] == 0:
+        empty = np.array([], dtype=np.int32)
+        model = {"kind": "frozen_gmm", "means": [], "covariances": [], "weights": []}
+        return empty, empty, 0, {"algorithm": "hierarchical_gmm"}, 0, model
+
+    features = _angles_to_circular_features(samples)
+    n_frames = features.shape[0]
+    if max_cluster_frames and max_cluster_frames > 0 and n_frames > int(max_cluster_frames):
+        sub_idx = (
+            _uniform_subsample_indices(n_frames, int(max_cluster_frames))
+            if subsample_indices is None
+            else np.asarray(subsample_indices, dtype=int)
+        )
+    else:
+        sub_idx = np.arange(n_frames, dtype=int)
+
+    X_train = features[sub_idx]
+    n_train = X_train.shape[0]
+    d = X_train.shape[1]
+    selection_mode = str(cluster_selection_mode or "maxclust").strip().lower()
+    if selection_mode not in {"maxclust", "inconsistent"}:
+        raise ValueError("cluster_selection_mode must be one of: maxclust, inconsistent.")
+    k_target = max(1, min(int(n_clusters), n_train)) if n_clusters is not None else max(1, min(2, n_train))
+    if n_train <= 1:
+        labels_train = np.zeros((n_train,), dtype=np.int32)
+    else:
+        Z = linkage(X_train, method=str(linkage_method or "ward").lower(), metric="euclidean")
+        if selection_mode == "maxclust":
+            labels_train = (fcluster(Z, t=k_target, criterion="maxclust") - 1).astype(np.int32, copy=False)
+        else:
+            threshold = float(inconsistent_threshold if inconsistent_threshold is not None else 1.0)
+            depth = max(1, int(inconsistent_depth))
+            labels_train = (
+                fcluster(Z, t=threshold, criterion="inconsistent", depth=depth) - 1
+            ).astype(np.int32, copy=False)
+
+    uniq = np.array(sorted(int(v) for v in np.unique(labels_train)), dtype=np.int32)
+    if uniq.size == 0:
+        uniq = np.array([0], dtype=np.int32)
+        labels_train = np.zeros((n_train,), dtype=np.int32)
+    remap = {int(old): int(new) for new, old in enumerate(uniq.tolist())}
+    labels_train = np.asarray([remap[int(v)] for v in labels_train], dtype=np.int32)
+    k = int(len(uniq))
+
+    means = np.zeros((k, d), dtype=np.float64)
+    if str(covariance_type or "full").lower() == "diag":
+        covs = np.zeros((k, d), dtype=np.float64)
+    else:
+        covs = np.zeros((k, d, d), dtype=np.float64)
+    weights = np.zeros((k,), dtype=np.float64)
+    thresholds = np.full((k,), -np.inf, dtype=np.float64)
+    reg = float(max(reg_covar, 1e-8))
+    halo_q = float(np.clip(halo_percentile, 0.0, 100.0))
+
+    cov_kind = str(covariance_type or "full").lower()
+    for j in range(k):
+        mask = labels_train == j
+        Xj = X_train[mask]
+        if Xj.shape[0] == 0:
+            continue
+        means[j] = np.mean(Xj, axis=0)
+        weights[j] = float(Xj.shape[0]) / float(n_train)
+        if cov_kind == "diag":
+            if Xj.shape[0] <= 1:
+                var = np.full((d,), reg, dtype=np.float64)
+            else:
+                var = np.var(Xj, axis=0, ddof=1)
+                var = np.maximum(var, reg)
+            covs[j] = var
+        else:
+            if Xj.shape[0] <= 1:
+                cov = np.eye(d, dtype=np.float64) * reg
+            else:
+                cov = np.cov(Xj, rowvar=False, ddof=1)
+                if cov.shape != (d, d):
+                    cov = np.eye(d, dtype=np.float64) * reg
+                cov = cov + (np.eye(d, dtype=np.float64) * reg)
+            covs[j] = cov
+
+    model = {
+        "kind": "frozen_gmm",
+        "feature_space": "sin_cos_3angles_v1",
+        "covariance_type": cov_kind,
+        "cluster_selection_mode": selection_mode,
+        "inconsistent_threshold": float(inconsistent_threshold) if inconsistent_threshold is not None else None,
+        "inconsistent_depth": int(max(1, int(inconsistent_depth))),
+        "means": means.tolist(),
+        "covariances": covs.tolist(),
+        "weights": weights.tolist(),
+        "thresholds_logpdf": thresholds.tolist(),
+        "reg_covar": reg,
+        "halo_percentile": halo_q,
+        "linkage_method": str(linkage_method or "ward").lower(),
+        "n_clusters": int(k),
+    }
+
+    train_assigned, _ = _predict_cluster_frozen_gmm(model, samples[sub_idx])
+    train_features = _angles_to_circular_features(samples[sub_idx])
+    train_logpdf = _gaussian_logpdf_matrix(
+        train_features,
+        np.asarray(model["means"], dtype=np.float64),
+        np.asarray(model["covariances"], dtype=np.float64),
+        covariance_type=cov_kind,
+        reg_covar=reg,
+    )
+    thresholds_arr = np.full((k,), -np.inf, dtype=np.float64)
+    for j in range(k):
+        mask = train_assigned == j
+        if not np.any(mask):
+            continue
+        vals = train_logpdf[mask, j]
+        thresholds_arr[j] = float(np.percentile(vals, halo_q))
+    model["thresholds_logpdf"] = thresholds_arr.tolist()
+
+    labels_assigned, labels_halo = _predict_cluster_frozen_gmm(model, samples)
+    diag = {
+        "algorithm": "hierarchical_gmm",
+        "n_clusters": int(k),
+        "cluster_selection_mode": selection_mode,
+        "inconsistent_threshold": float(inconsistent_threshold) if inconsistent_threshold is not None else None,
+        "inconsistent_depth": int(max(1, int(inconsistent_depth))),
+        "linkage_method": str(linkage_method or "ward").lower(),
+        "covariance_type": cov_kind,
+        "reg_covar": reg,
+        "halo_percentile": halo_q,
+        "subsampled": bool(sub_idx.size != n_frames),
+        "subsample_size": int(sub_idx.size),
+        "total_frames": int(n_frames),
+    }
+    return labels_halo, labels_assigned, int(k), diag, int(sub_idx.size), model
+
+
+def _predict_labels_with_model(
+    model: Any,
+    samples: np.ndarray,
+    *,
+    density_maxk: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Predict labels for one residue with ADP, frozen GMM, or legacy ADP pair models."""
+    if model is None:
+        n = int(samples.shape[0]) if samples.ndim > 0 else 0
+        empty = np.full((n,), -1, dtype=np.int32)
+        return empty, empty
+    if isinstance(model, Data):
+        return _predict_cluster_adp(model, samples, density_maxk=density_maxk)
+    if isinstance(model, dict):
+        kind = str(model.get("kind") or "").lower()
+        if kind == "frozen_gmm":
+            return _predict_cluster_frozen_gmm(model, samples)
+        if kind == "adp_legacy_models":
+            model_assigned = model.get("model_assigned")
+            model_halo = model.get("model_halo")
+            assigned, _ = _predict_cluster_adp(model_assigned, samples, density_maxk=density_maxk)
+            _, halo = _predict_cluster_adp(model_halo, samples, density_maxk=density_maxk)
+            return assigned, halo
+    raise ValueError(f"Unsupported residue model type: {type(model)}")
+
+
 def _cluster_residue_samples(
     samples: np.ndarray,
     *,
@@ -334,11 +611,11 @@ def _cluster_residue_worker_with_models(
 def _predict_residue_worker(
     res_idx: int,
     samples: np.ndarray,
-    dp_data: Data,
+    model: Any,
     density_maxk: int,
 ) -> Tuple[int, np.ndarray, np.ndarray]:
-    labels_assigned, labels_halo = _predict_cluster_adp(
-        dp_data,
+    labels_assigned, labels_halo = _predict_labels_with_model(
+        model,
         samples,
         density_maxk=density_maxk,
     )
@@ -728,22 +1005,17 @@ def evaluate_state_with_models(
     residue_keys = [str(k) for k in meta.get("residue_keys", [])]
     cluster_params = meta.get("cluster_params") or {}
     density_maxk = int(cluster_params.get("density_maxk", 100))
-    model_paths = meta.get("model_paths") or []
-    model_paths_halo = meta.get("model_paths_halo") or []
-    model_paths_assigned = meta.get("model_paths_assigned") or []
-    use_legacy = (
-        len(model_paths_halo) == len(residue_keys)
-        and len(model_paths_assigned) == len(residue_keys)
-        and not model_paths
+    if not residue_keys:
+        raise ValueError("Cluster NPZ metadata is missing residue keys for evaluation.")
+    residue_models = _load_residue_models_from_metadata(
+        store=store,
+        project_id=project_id,
+        system_id=system_id,
+        residue_keys=residue_keys,
+        metadata=meta,
     )
-    if model_paths and len(model_paths) != len(residue_keys):
-        use_legacy = (
-            len(model_paths_halo) == len(residue_keys)
-            and len(model_paths_assigned) == len(residue_keys)
-        )
-        model_paths = []
-    if not residue_keys or (not model_paths and not use_legacy):
-        raise ValueError("Cluster NPZ is missing model_paths for evaluation.")
+    if not any(m is not None for m in residue_models):
+        raise ValueError("Cluster NPZ is missing predictor models for evaluation.")
 
     descriptor_path = store.resolve_path(project_id, system_id, state.descriptor_file)
     feature_dict = load_descriptor_npz(descriptor_path)
@@ -764,39 +1036,14 @@ def evaluate_state_with_models(
             n_frames = samples.shape[0]
         if samples.shape[0] != n_frames:
             raise ValueError("Descriptor frame counts are inconsistent across residues.")
-        if use_legacy:
-            model_rel_halo = model_paths_halo[idx]
-            model_rel_assigned = model_paths_assigned[idx]
-            if not model_rel_halo or not model_rel_assigned:
-                continue
-            model_path_halo = store.resolve_path(project_id, system_id, model_rel_halo)
-            model_path_assigned = store.resolve_path(project_id, system_id, model_rel_assigned)
-            with open(model_path_halo, "rb") as inp:
-                dp_data_halo = pickle.load(inp)
-            with open(model_path_assigned, "rb") as inp:
-                dp_data_assigned = pickle.load(inp)
-            _, labels_halo[:, idx] = _predict_cluster_adp(
-                dp_data_halo,
-                samples,
-                density_maxk=density_maxk,
-            )
-            labels_assigned[:, idx], _ = _predict_cluster_adp(
-                dp_data_assigned,
-                samples,
-                density_maxk=density_maxk,
-            )
-        else:
-            model_rel = model_paths[idx]
-            if not model_rel:
-                continue
-            model_path = store.resolve_path(project_id, system_id, model_rel)
-            with open(model_path, "rb") as inp:
-                dp_data = pickle.load(inp)
-            labels_assigned[:, idx], labels_halo[:, idx] = _predict_cluster_adp(
-                dp_data,
-                samples,
-                density_maxk=density_maxk,
-            )
+        model = residue_models[idx] if idx < len(residue_models) else None
+        if model is None:
+            continue
+        labels_assigned[:, idx], labels_halo[:, idx] = _predict_labels_with_model(
+            model,
+            samples,
+            density_maxk=density_maxk,
+        )
         if np.any(labels_assigned[:, idx] >= 0):
             cluster_counts[idx] = int(labels_assigned[:, idx].max()) + 1
 
@@ -857,6 +1104,583 @@ def update_cluster_metadata_with_assignments(
     meta.update(assignments or {})
     payload["metadata_json"] = np.array(json.dumps(meta))
     np.savez_compressed(cluster_path, **payload)
+
+
+def _load_cluster_payload(cluster_path: Path) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    data = np.load(cluster_path, allow_pickle=True)
+    payload: Dict[str, Any] = {key: data[key] for key in data.files}
+    meta: Dict[str, Any] = {}
+    meta_raw = payload.get("metadata_json")
+    if meta_raw is not None:
+        try:
+            meta_val = meta_raw.item() if hasattr(meta_raw, "item") else meta_raw
+            meta = json.loads(str(meta_val))
+        except Exception:
+            meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    return payload, meta
+
+
+def _save_cluster_payload(cluster_path: Path, payload: Dict[str, Any], meta: Dict[str, Any]) -> None:
+    payload = dict(payload)
+    payload["metadata_json"] = np.array(json.dumps(meta))
+    np.savez_compressed(cluster_path, **payload)
+
+
+def _resolve_patch_residue_indices(
+    residue_keys: List[str],
+    *,
+    residue_indices: Optional[List[int]] = None,
+    residue_key_subset: Optional[List[str]] = None,
+) -> List[int]:
+    idxs: List[int] = []
+    if residue_indices:
+        for ridx in residue_indices:
+            ir = int(ridx)
+            if ir < 0 or ir >= len(residue_keys):
+                raise ValueError(f"Residue index out of range: {ir}")
+            idxs.append(ir)
+    if residue_key_subset:
+        key_to_idx = {str(k): i for i, k in enumerate(residue_keys)}
+        for key in residue_key_subset:
+            s = str(key).strip()
+            if not s:
+                continue
+            if s not in key_to_idx:
+                raise ValueError(f"Residue key not found in cluster: {s}")
+            idxs.append(key_to_idx[s])
+    out = sorted(set(int(i) for i in idxs))
+    if not out:
+        raise ValueError("Select at least one residue to patch.")
+    return out
+
+
+def _build_source_to_target_row_map(
+    *,
+    source_state_ids: Sequence[Any],
+    source_frame_indices: Sequence[Any],
+    target_state_ids: Sequence[Any],
+    target_frame_indices: Sequence[Any],
+) -> np.ndarray:
+    source_lookup: Dict[tuple[str, int], List[int]] = {}
+    for i, (sid, fidx) in enumerate(zip(source_state_ids, source_frame_indices)):
+        key = (str(sid), int(fidx))
+        source_lookup.setdefault(key, []).append(i)
+    source_ptr: Dict[tuple[str, int], int] = {k: 0 for k in source_lookup.keys()}
+    mapped = np.full((len(target_state_ids),), -1, dtype=np.int64)
+    for i, (sid, fidx) in enumerate(zip(target_state_ids, target_frame_indices)):
+        key = (str(sid), int(fidx))
+        bucket = source_lookup.get(key)
+        if not bucket:
+            continue
+        ptr = source_ptr[key]
+        if ptr >= len(bucket):
+            continue
+        mapped[i] = int(bucket[ptr])
+        source_ptr[key] = ptr + 1
+    return mapped
+
+
+def _prefix_condition_payload(
+    condition_payload: Dict[str, Any],
+    predictions_meta: Dict[str, Any],
+    extra_meta: Dict[str, Any],
+    *,
+    prefix: str,
+) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], Dict[str, str]]:
+    key_map: Dict[str, str] = {}
+    prefixed_payload: Dict[str, Any] = {}
+    for key, value in (condition_payload or {}).items():
+        new_key = f"{prefix}{key}"
+        key_map[key] = new_key
+        prefixed_payload[new_key] = value
+
+    prefixed_predictions: Dict[str, Any] = {}
+    for pred_key, entry in (predictions_meta or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        new_entry: Dict[str, Any] = {}
+        for k, v in entry.items():
+            if isinstance(v, str) and v in key_map:
+                new_entry[k] = key_map[v]
+            else:
+                new_entry[k] = v
+        prefixed_predictions[str(pred_key)] = new_entry
+
+    prefixed_extra = dict(extra_meta or {})
+    halo_summary = prefixed_extra.get("halo_summary")
+    if isinstance(halo_summary, dict):
+        npz_keys = halo_summary.get("npz_keys")
+        if isinstance(npz_keys, dict):
+            halo_summary["npz_keys"] = {
+                str(k): key_map.get(str(v), str(v))
+                for k, v in npz_keys.items()
+            }
+        prefixed_extra["halo_summary"] = halo_summary
+
+    return prefixed_payload, prefixed_predictions, prefixed_extra, key_map
+
+
+def _load_residue_models_from_metadata(
+    *,
+    store: ProjectStore,
+    project_id: str,
+    system_id: str,
+    residue_keys: List[str],
+    metadata: Dict[str, Any],
+) -> List[Any]:
+    n_res = len(residue_keys)
+    models: List[Any] = [None] * n_res
+    model_paths = metadata.get("model_paths") or []
+    model_paths_halo = metadata.get("model_paths_halo") or []
+    model_paths_assigned = metadata.get("model_paths_assigned") or []
+
+    if isinstance(model_paths, list) and len(model_paths) == n_res:
+        for i in range(n_res):
+            rel = model_paths[i]
+            if not rel:
+                continue
+            p = store.resolve_path(project_id, system_id, str(rel))
+            if not p.exists():
+                continue
+            with open(p, "rb") as inp:
+                models[i] = pickle.load(inp)
+    elif (
+        isinstance(model_paths_halo, list)
+        and isinstance(model_paths_assigned, list)
+        and len(model_paths_halo) == n_res
+        and len(model_paths_assigned) == n_res
+    ):
+        for i in range(n_res):
+            rel_h = model_paths_halo[i]
+            rel_a = model_paths_assigned[i]
+            if not rel_h or not rel_a:
+                continue
+            ph = store.resolve_path(project_id, system_id, str(rel_h))
+            pa = store.resolve_path(project_id, system_id, str(rel_a))
+            if not ph.exists() or not pa.exists():
+                continue
+            with open(ph, "rb") as inp:
+                mh = pickle.load(inp)
+            with open(pa, "rb") as inp:
+                ma = pickle.load(inp)
+            models[i] = {"kind": "adp_legacy_models", "model_halo": mh, "model_assigned": ma}
+
+    overrides = metadata.get("residue_model_overrides") or {}
+    if isinstance(overrides, dict):
+        for k, spec in overrides.items():
+            try:
+                idx = int(k)
+            except Exception:
+                continue
+            if idx < 0 or idx >= n_res:
+                continue
+            if isinstance(spec, dict) and str(spec.get("kind") or "").lower() == "frozen_gmm":
+                models[idx] = spec
+    return models
+
+
+def list_cluster_patches(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    *,
+    store: ProjectStore | None = None,
+) -> Dict[str, Any]:
+    store = store or ProjectStore()
+    cluster_path = store.ensure_cluster_directories(project_id, system_id, cluster_id)["cluster_dir"] / "cluster.npz"
+    if not cluster_path.exists():
+        raise FileNotFoundError(f"Cluster NPZ not found for cluster_id='{cluster_id}'.")
+    _, meta = _load_cluster_payload(cluster_path)
+    patches = meta.get("cluster_patches") or []
+    out = []
+    for item in patches:
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            {
+                "patch_id": str(item.get("patch_id") or ""),
+                "name": item.get("name"),
+                "status": item.get("status") or "preview",
+                "created_at": item.get("created_at"),
+                "residue_keys": (item.get("residues") or {}).get("keys") or [],
+                "algorithm": item.get("algorithm") or "hierarchical_gmm",
+            }
+        )
+    return {"cluster_id": cluster_id, "patches": out}
+
+
+def create_cluster_residue_patch(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    *,
+    residue_indices: Optional[List[int]] = None,
+    residue_keys: Optional[List[str]] = None,
+    n_clusters: Optional[int] = None,
+    cluster_selection_mode: str = "maxclust",
+    inconsistent_threshold: Optional[float] = None,
+    inconsistent_depth: int = 2,
+    linkage_method: str = "ward",
+    covariance_type: str = "full",
+    reg_covar: float = 1e-5,
+    halo_percentile: float = 5.0,
+    max_cluster_frames: Optional[int] = None,
+    patch_name: Optional[str] = None,
+    predict_jobs: Optional[int] = None,
+    store: ProjectStore | None = None,
+) -> Dict[str, Any]:
+    store = store or ProjectStore()
+    cluster_dirs = store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    cluster_path = cluster_dirs["cluster_dir"] / "cluster.npz"
+    if not cluster_path.exists():
+        raise FileNotFoundError(f"Cluster NPZ not found for cluster_id='{cluster_id}'.")
+
+    payload, meta = _load_cluster_payload(cluster_path)
+    if "merged__labels" not in payload or "merged__labels_assigned" not in payload:
+        raise ValueError("Cluster NPZ missing merged label arrays.")
+
+    residue_key_list = [str(v) for v in (meta.get("residue_keys") or payload.get("residue_keys", []))]
+    if not residue_key_list:
+        raise ValueError("Cluster metadata missing residue_keys.")
+    patch_indices = _resolve_patch_residue_indices(
+        residue_key_list,
+        residue_indices=residue_indices,
+        residue_key_subset=residue_keys,
+    )
+
+    selected_ids = [str(v) for v in (meta.get("selected_state_ids") or meta.get("selected_metastable_ids") or [])]
+    if not selected_ids:
+        raise ValueError("Cluster metadata missing selected_state_ids.")
+    collected = _collect_cluster_inputs(project_id, system_id, selected_ids)
+    source_state_ids = np.asarray(collected["merged_frame_state_ids"], dtype=str)
+    source_frame_idx = np.asarray(collected["merged_frame_indices"], dtype=np.int64)
+    target_state_ids = np.asarray(payload.get("merged__frame_state_ids"), dtype=str)
+    target_frame_idx = np.asarray(payload.get("merged__frame_indices"), dtype=np.int64)
+    row_map = _build_source_to_target_row_map(
+        source_state_ids=source_state_ids,
+        source_frame_indices=source_frame_idx,
+        target_state_ids=target_state_ids,
+        target_frame_indices=target_frame_idx,
+    )
+    if np.any(row_map < 0):
+        missing = int(np.count_nonzero(row_map < 0))
+        raise ValueError(f"Could not align {missing} merged frames between source descriptors and cluster NPZ.")
+
+    merged_halo = np.asarray(payload["merged__labels"], dtype=np.int32)
+    merged_assigned = np.asarray(payload["merged__labels_assigned"], dtype=np.int32)
+    merged_counts = np.asarray(payload.get("merged__cluster_counts"), dtype=np.int32).copy()
+    if merged_halo.shape != merged_assigned.shape:
+        raise ValueError("Merged halo/assigned arrays have incompatible shapes.")
+    n_frames, n_residues = merged_halo.shape
+    if n_residues != len(residue_key_list):
+        raise ValueError("Residue key count does not match merged label shape.")
+
+    out_halo = merged_halo.copy()
+    out_assigned = merged_assigned.copy()
+    cluster_params = meta.get("cluster_params") or {}
+    if max_cluster_frames is None:
+        max_cluster_frames = cluster_params.get("max_cluster_frames")
+    linkage_method = str(linkage_method or "ward").lower()
+    covariance_type = str(covariance_type or "full").lower()
+    cluster_selection_mode = str(cluster_selection_mode or "maxclust").lower()
+    if linkage_method not in {"ward", "complete", "average", "single"}:
+        raise ValueError("linkage_method must be one of: ward, complete, average, single.")
+    if covariance_type not in {"full", "diag"}:
+        raise ValueError("covariance_type must be one of: full, diag.")
+    if cluster_selection_mode not in {"maxclust", "inconsistent"}:
+        raise ValueError("cluster_selection_mode must be one of: maxclust, inconsistent.")
+    if cluster_selection_mode == "inconsistent":
+        if inconsistent_threshold is None:
+            raise ValueError("inconsistent_threshold is required when cluster_selection_mode='inconsistent'.")
+        try:
+            inconsistent_threshold = float(inconsistent_threshold)
+        except Exception as exc:
+            raise ValueError("inconsistent_threshold must be numeric.") from exc
+        if not np.isfinite(float(inconsistent_threshold)):
+            raise ValueError("inconsistent_threshold must be finite.")
+    inconsistent_depth = max(1, int(inconsistent_depth))
+
+    overrides_update: Dict[str, Any] = {}
+    diagnostics: Dict[str, Any] = {}
+    for ridx in patch_indices:
+        source_samples = np.asarray(collected["merged_angles_per_residue"][ridx], dtype=float)
+        if source_samples.shape[0] != int(source_state_ids.shape[0]):
+            raise ValueError("Merged source sample length mismatch for residue patching.")
+        samples = source_samples[row_map]
+        if samples.shape[0] != n_frames:
+            raise ValueError("Aligned sample length mismatch for residue patching.")
+        k_default = int(merged_counts[ridx]) if ridx < merged_counts.shape[0] and int(merged_counts[ridx]) > 0 else 2
+        k_target: Optional[int]
+        if cluster_selection_mode == "maxclust":
+            k_target = int(n_clusters) if n_clusters is not None else k_default
+            k_target = max(1, k_target)
+        else:
+            k_target = None
+        labels_halo_r, labels_assigned_r, k_final, diag, _, model_spec = _fit_hierarchical_frozen_gmm(
+            samples,
+            n_clusters=k_target,
+            cluster_selection_mode=cluster_selection_mode,
+            inconsistent_threshold=float(inconsistent_threshold) if inconsistent_threshold is not None else None,
+            inconsistent_depth=inconsistent_depth,
+            linkage_method=linkage_method,
+            covariance_type=covariance_type,
+            reg_covar=float(reg_covar),
+            halo_percentile=float(halo_percentile),
+            max_cluster_frames=int(max_cluster_frames) if max_cluster_frames else None,
+        )
+        if labels_halo_r.shape[0] != n_frames or labels_assigned_r.shape[0] != n_frames:
+            raise ValueError("Patched labels have unexpected frame count.")
+        out_halo[:, ridx] = labels_halo_r
+        out_assigned[:, ridx] = labels_assigned_r
+        if ridx < merged_counts.shape[0]:
+            merged_counts[ridx] = int(k_final)
+        overrides_update[str(int(ridx))] = model_spec
+        diagnostics[residue_key_list[ridx]] = diag
+
+    system_meta = store.get_system(project_id, system_id)
+    state_labels, _ = _build_state_name_maps(system_meta)
+
+    # Build preview predictions from merged patched labels directly.
+    # This avoids re-predicting all residues for all states and keeps patch preview responsive.
+    unique_state_ids = sorted({str(v) for v in target_state_ids.tolist()})
+    state_frame_counts: Dict[str, int] = {}
+    for sid in unique_state_ids:
+        count = 0
+        state_obj = (system_meta.states or {}).get(sid) if hasattr(system_meta, "states") else None
+        desc_rel = getattr(state_obj, "descriptor_file", None)
+        if isinstance(desc_rel, str) and desc_rel:
+            try:
+                desc_path = store.resolve_path(project_id, system_id, desc_rel)
+                if desc_path.exists():
+                    features = load_descriptor_npz(desc_path)
+                    count = int(_infer_frame_count(features))
+            except Exception:
+                count = 0
+        if count <= 0:
+            mask = target_state_ids == sid
+            if np.any(mask):
+                count = int(np.max(target_frame_idx[mask]) + 1)
+        state_frame_counts[sid] = max(0, int(count))
+
+    condition_payload, predictions_meta, extra_meta = _build_state_predictions_from_merged(
+        merged_labels_halo=out_halo,
+        merged_labels_assigned=out_assigned,
+        merged_frame_state_ids=[str(v) for v in target_state_ids.tolist()],
+        merged_frame_indices=[int(v) for v in target_frame_idx.tolist()],
+        state_frame_counts=state_frame_counts,
+        state_labels=state_labels,
+    )
+
+    patch_id = str(uuid.uuid4())
+    prefix = f"patch__{_slug(patch_id)}__"
+    pref_payload, pref_predictions, pref_extra, _ = _prefix_condition_payload(
+        condition_payload,
+        predictions_meta,
+        extra_meta,
+        prefix=prefix,
+    )
+    payload.update(pref_payload)
+    payload[f"{prefix}merged__labels"] = out_halo
+    payload[f"{prefix}merged__labels_assigned"] = out_assigned
+    payload[f"{prefix}merged__cluster_counts"] = merged_counts
+
+    merged_keys = ((meta.get("merged") or {}).get("npz_keys") or {})
+    patch_entry = {
+        "patch_id": patch_id,
+        "name": patch_name or f"patch_{patch_id[:8]}",
+        "status": "preview",
+        "created_at": datetime.utcnow().isoformat(),
+        "algorithm": "hierarchical_gmm",
+        "params": {
+            "n_clusters": int(n_clusters) if n_clusters is not None else None,
+            "cluster_selection_mode": cluster_selection_mode,
+            "inconsistent_threshold": float(inconsistent_threshold) if inconsistent_threshold is not None else None,
+            "inconsistent_depth": int(inconsistent_depth),
+            "linkage_method": linkage_method,
+            "covariance_type": covariance_type,
+            "reg_covar": float(reg_covar),
+            "halo_percentile": float(halo_percentile),
+            "max_cluster_frames": int(max_cluster_frames) if max_cluster_frames else None,
+        },
+        "residues": {
+            "indices": [int(i) for i in patch_indices],
+            "keys": [residue_key_list[int(i)] for i in patch_indices],
+        },
+        "merged": {
+            "npz_keys": {
+                "labels": f"{prefix}merged__labels",
+                "labels_halo": f"{prefix}merged__labels",
+                "labels_assigned": f"{prefix}merged__labels_assigned",
+                "cluster_counts": f"{prefix}merged__cluster_counts",
+                "frame_state_ids": merged_keys.get("frame_state_ids", "merged__frame_state_ids"),
+                "frame_indices": merged_keys.get("frame_indices", "merged__frame_indices"),
+            }
+        },
+        "predictions": pref_predictions,
+        "halo_summary": (pref_extra or {}).get("halo_summary") or {},
+        "residue_model_overrides": overrides_update,
+        "diagnostics": diagnostics,
+    }
+
+    patches = [p for p in (meta.get("cluster_patches") or []) if isinstance(p, dict)]
+    patches.append(patch_entry)
+    meta["cluster_patches"] = patches
+    _save_cluster_payload(cluster_path, payload, meta)
+
+    return {
+        "cluster_id": cluster_id,
+        "patch_id": patch_id,
+        "patch": patch_entry,
+    }
+
+
+def discard_cluster_residue_patch(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    *,
+    patch_id: str,
+    store: ProjectStore | None = None,
+) -> Dict[str, Any]:
+    store = store or ProjectStore()
+    cluster_path = store.ensure_cluster_directories(project_id, system_id, cluster_id)["cluster_dir"] / "cluster.npz"
+    if not cluster_path.exists():
+        raise FileNotFoundError(f"Cluster NPZ not found for cluster_id='{cluster_id}'.")
+    payload, meta = _load_cluster_payload(cluster_path)
+    patches = [p for p in (meta.get("cluster_patches") or []) if isinstance(p, dict)]
+    keep: List[Dict[str, Any]] = []
+    removed = None
+    prefix = f"patch__{_slug(str(patch_id))}__"
+    for p in patches:
+        if str(p.get("patch_id")) == str(patch_id):
+            removed = p
+            continue
+        keep.append(p)
+    if removed is None:
+        raise ValueError(f"Patch not found: {patch_id}")
+    for key in [k for k in payload.keys() if str(k).startswith(prefix)]:
+        payload.pop(key, None)
+    meta["cluster_patches"] = keep
+    _save_cluster_payload(cluster_path, payload, meta)
+    return {"cluster_id": cluster_id, "patch_id": str(patch_id), "status": "discarded"}
+
+
+def confirm_cluster_residue_patch(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    *,
+    patch_id: str,
+    recompute_assignments: bool = True,
+    store: ProjectStore | None = None,
+) -> Dict[str, Any]:
+    store = store or ProjectStore()
+    cluster_path = store.ensure_cluster_directories(project_id, system_id, cluster_id)["cluster_dir"] / "cluster.npz"
+    if not cluster_path.exists():
+        raise FileNotFoundError(f"Cluster NPZ not found for cluster_id='{cluster_id}'.")
+    payload, meta = _load_cluster_payload(cluster_path)
+
+    patches = [p for p in (meta.get("cluster_patches") or []) if isinstance(p, dict)]
+    patch = next((p for p in patches if str(p.get("patch_id")) == str(patch_id)), None)
+    if patch is None:
+        raise ValueError(f"Patch not found: {patch_id}")
+    merged_keys = ((patch.get("merged") or {}).get("npz_keys") or {})
+    key_halo = merged_keys.get("labels_halo") or merged_keys.get("labels")
+    key_assigned = merged_keys.get("labels_assigned")
+    key_counts = merged_keys.get("cluster_counts")
+    if not key_halo or key_halo not in payload:
+        raise ValueError("Patch is missing merged halo labels.")
+    if not key_assigned or key_assigned not in payload:
+        raise ValueError("Patch is missing merged assigned labels.")
+    if not key_counts or key_counts not in payload:
+        raise ValueError("Patch is missing merged cluster counts.")
+
+    payload["merged__labels"] = np.asarray(payload[key_halo], dtype=np.int32)
+    payload["merged__labels_assigned"] = np.asarray(payload[key_assigned], dtype=np.int32)
+    payload["merged__cluster_counts"] = np.asarray(payload[key_counts], dtype=np.int32)
+
+    predictions_patch = patch.get("predictions") or {}
+    prefix = f"patch__{_slug(str(patch_id))}__"
+    predictions_new: Dict[str, Any] = {}
+    keys_to_copy: Dict[str, str] = {}
+    for pred_key, entry in predictions_patch.items():
+        if not isinstance(entry, dict):
+            continue
+        new_entry: Dict[str, Any] = {}
+        for k, v in entry.items():
+            if isinstance(v, str) and v.startswith(prefix):
+                target_key = v[len(prefix) :]
+                keys_to_copy[v] = target_key
+                new_entry[k] = target_key
+            else:
+                new_entry[k] = v
+        predictions_new[str(pred_key)] = new_entry
+
+    halo_summary_patch = patch.get("halo_summary") or {}
+    halo_summary_new = {}
+    if isinstance(halo_summary_patch, dict):
+        halo_summary_new = dict(halo_summary_patch)
+        npz_keys = halo_summary_new.get("npz_keys")
+        if isinstance(npz_keys, dict):
+            remapped = {}
+            for k, v in npz_keys.items():
+                if isinstance(v, str) and v.startswith(prefix):
+                    target_key = v[len(prefix) :]
+                    keys_to_copy[v] = target_key
+                    remapped[str(k)] = target_key
+                else:
+                    remapped[str(k)] = v
+            halo_summary_new["npz_keys"] = remapped
+
+    for src_key, dst_key in keys_to_copy.items():
+        if src_key in payload:
+            payload[dst_key] = payload[src_key]
+
+    meta["predictions"] = predictions_new
+    if halo_summary_new:
+        meta["halo_summary"] = halo_summary_new
+
+    overrides = meta.get("residue_model_overrides") or {}
+    if not isinstance(overrides, dict):
+        overrides = {}
+    patch_overrides = patch.get("residue_model_overrides") or {}
+    if isinstance(patch_overrides, dict):
+        for k, v in patch_overrides.items():
+            overrides[str(k)] = v
+    meta["residue_model_overrides"] = overrides
+
+    now = datetime.utcnow().isoformat()
+    history = [h for h in (meta.get("patch_history") or []) if isinstance(h, dict)]
+    history.append(
+        {
+            "patch_id": str(patch_id),
+            "name": patch.get("name"),
+            "confirmed_at": now,
+            "algorithm": patch.get("algorithm"),
+            "residue_keys": (patch.get("residues") or {}).get("keys") or [],
+        }
+    )
+    meta["patch_history"] = history
+    meta["cluster_patches"] = [p for p in patches if str(p.get("patch_id")) != str(patch_id)]
+
+    for key in [k for k in payload.keys() if str(k).startswith(prefix)]:
+        payload.pop(key, None)
+
+    _save_cluster_payload(cluster_path, payload, meta)
+
+    assignments: Dict[str, Any] = {}
+    if recompute_assignments:
+        assignments = assign_cluster_labels_to_states(cluster_path, project_id, system_id)
+        update_cluster_metadata_with_assignments(cluster_path, assignments)
+
+    return {
+        "cluster_id": cluster_id,
+        "patch_id": str(patch_id),
+        "status": "confirmed",
+        "assignments": assignments,
+    }
 
 
 def _collect_cluster_inputs(
@@ -1013,7 +1837,7 @@ def _build_condition_predictions(
     project_id: str,
     system_id: str,
     residue_keys: List[str],
-    dp_models: List[Data | None],
+    residue_models: List[Any],
     density_maxk: int,
     state_labels: Dict[str, str],
     metastable_labels: Dict[str, str],
@@ -1050,6 +1874,12 @@ def _build_condition_predictions(
         progress_callback("Predicting labels...", 0, total_pred_jobs)
 
     use_processes = predict_jobs is not None and int(predict_jobs) > 1
+    if use_processes:
+        # Legacy dual-ADP models embed live Data objects; keep prediction in-process for stability.
+        for mdl in residue_models:
+            if isinstance(mdl, dict) and str(mdl.get("kind") or "").lower() == "adp_legacy_models":
+                use_processes = False
+                break
 
     for state_id, state, desc_path in states_to_process:
         features = load_descriptor_npz(desc_path)
@@ -1063,7 +1893,7 @@ def _build_condition_predictions(
                 futures: Dict[Any, int] = {}
                 for res_idx, key in enumerate(residue_keys):
                     angles = _extract_angles_array(features, key)
-                    if angles is None or angles.shape[0] != frame_count or dp_models[res_idx] is None:
+                    if angles is None or angles.shape[0] != frame_count or residue_models[res_idx] is None:
                         completed_pred_jobs += 1
                         if progress_callback and total_pred_jobs:
                             progress_callback(
@@ -1076,7 +1906,7 @@ def _build_condition_predictions(
                         _predict_residue_worker,
                         res_idx,
                         angles,
-                        dp_models[res_idx],
+                        residue_models[res_idx],
                         density_maxk,
                     )] = res_idx
                 for fut in as_completed(futures):
@@ -1093,7 +1923,7 @@ def _build_condition_predictions(
         else:
             for res_idx, key in enumerate(residue_keys):
                 angles = _extract_angles_array(features, key)
-                if angles is None or angles.shape[0] != frame_count or dp_models[res_idx] is None:
+                if angles is None or angles.shape[0] != frame_count or residue_models[res_idx] is None:
                     if progress_callback and total_pred_jobs:
                         completed_pred_jobs += 1
                         progress_callback(
@@ -1102,8 +1932,8 @@ def _build_condition_predictions(
                             total_pred_jobs,
                         )
                     continue
-                labels_assigned_res, labels_halo_res = _predict_cluster_adp(
-                    dp_models[res_idx],
+                labels_assigned_res, labels_halo_res = _predict_labels_with_model(
+                    residue_models[res_idx],
                     angles,
                     density_maxk=density_maxk,
                 )
@@ -1439,7 +2269,7 @@ def generate_metastable_cluster_npz(
         project_id=project_id,
         system_id=system_id,
         residue_keys=residue_keys,
-        dp_models=dp_models,
+        residue_models=dp_models,
         density_maxk=density_maxk_val,
         state_labels=state_labels,
         metastable_labels=metastable_labels,
@@ -2009,7 +2839,7 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
         project_id=project_id,
         system_id=system_id,
         residue_keys=residue_keys,
-        dp_models=dp_models,
+        residue_models=dp_models,
         density_maxk=density_maxk_val,
         state_labels=state_labels,
         metastable_labels=metastable_labels,

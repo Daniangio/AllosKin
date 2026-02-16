@@ -1,9 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
 import Plot from 'react-plotly.js';
+import { CircleHelp } from 'lucide-react';
 import Loader from '../components/common/Loader';
 import ErrorMessage from '../components/common/ErrorMessage';
-import { fetchSystem, fetchStateDescriptors } from '../api/projects';
+import HelpDrawer from '../components/common/HelpDrawer';
+import {
+  fetchSystem,
+  fetchStateDescriptors,
+  createClusterPatch,
+  confirmClusterPatch,
+  discardClusterPatch,
+} from '../api/projects';
 
 const colors = [
   '#22d3ee',
@@ -26,6 +34,7 @@ export default function DescriptorVizPage() {
   const [system, setSystem] = useState(null);
   const [loadingSystem, setLoadingSystem] = useState(true);
   const [error, setError] = useState(null);
+  const [helpOpen, setHelpOpen] = useState(false);
 
   const [selectedStates, setSelectedStates] = useState([]);
   const [selectedMetastableIds, setSelectedMetastableIds] = useState([]);
@@ -49,15 +58,29 @@ export default function DescriptorVizPage() {
   const [appliedStateQuery, setAppliedStateQuery] = useState('');
   const [appliedMetaQuery, setAppliedMetaQuery] = useState('');
   const [selectedClusterId, setSelectedClusterId] = useState('');
+  const [selectedClusterVariantId, setSelectedClusterVariantId] = useState('original');
+  const [clusterVariants, setClusterVariants] = useState([]);
   const [clusterLegend, setClusterLegend] = useState([]);
   const [clusterLabelMode, setClusterLabelMode] = useState('halo');
   const [haloSummary, setHaloSummary] = useState(null);
   const [selectedHaloCondition, setSelectedHaloCondition] = useState('');
+  const [patchResiduesInput, setPatchResiduesInput] = useState('');
+  const [patchClusterSelectionMode, setPatchClusterSelectionMode] = useState('maxclust');
+  const [patchNClusters, setPatchNClusters] = useState('');
+  const [patchInconsistentThreshold, setPatchInconsistentThreshold] = useState('1.0');
+  const [patchInconsistentDepth, setPatchInconsistentDepth] = useState('2');
+  const [patchMaxClusterFrames, setPatchMaxClusterFrames] = useState('');
+  const [patchLinkage, setPatchLinkage] = useState('ward');
+  const [patchCovariance, setPatchCovariance] = useState('full');
+  const [patchHaloPercentile, setPatchHaloPercentile] = useState(5);
+  const [patchBusy, setPatchBusy] = useState(false);
+  const [patchError, setPatchError] = useState(null);
 
   const [anglesByState, setAnglesByState] = useState({});
   const [metaByState, setMetaByState] = useState({});
   const [loadingAngles, setLoadingAngles] = useState(false);
   const [anglesError, setAnglesError] = useState(null);
+  const didHydrateQueryRef = useRef(false);
 
   useEffect(() => {
     const loadSystem = async () => {
@@ -89,12 +112,18 @@ export default function DescriptorVizPage() {
     [system]
   );
 
-  // Hydrate from query params (cluster selection) whenever search changes.
+  // Hydrate from query params once on first mount.
   useEffect(() => {
+    if (didHydrateQueryRef.current) return;
+    didHydrateQueryRef.current = true;
     const params = new URLSearchParams(location.search || '');
     const clusterId = params.get('cluster_id');
     if (clusterId) {
       setSelectedClusterId(clusterId);
+    }
+    const variantId = params.get('cluster_variant_id');
+    if (variantId) {
+      setSelectedClusterVariantId(variantId);
     }
   }, [location.search]);
 
@@ -236,6 +265,12 @@ export default function DescriptorVizPage() {
     return mapping;
   }, [clusterLegend]);
 
+  const selectedClusterVariant = useMemo(
+    () =>
+      (clusterVariants || []).find((v) => String(v.id) === String(selectedClusterVariantId)) || null,
+    [clusterVariants, selectedClusterVariantId]
+  );
+
   const residueSymbols = useMemo(() => {
     const symbols = [
       'circle',
@@ -364,7 +399,7 @@ export default function DescriptorVizPage() {
       if (!selectedStates.length) return;
       try {
         const stateId = selectedStates[0];
-        const data = await fetchStateDescriptors(projectId, systemId, stateId, { max_points: 1 });
+        const data = await fetchStateDescriptors(projectId, systemId, stateId, { max_points: 10 });
         const labels = data.residue_labels || {};
         const mapping = data.residue_mapping || {};
         const combined = { ...labels };
@@ -399,6 +434,8 @@ export default function DescriptorVizPage() {
       setAnglesByState({});
       setMetaByState({});
       setClusterLegend([]);
+      setClusterVariants([]);
+      setSelectedClusterVariantId('original');
       setHaloSummary(null);
       setSelectedHaloCondition('');
       setSelectedResidue('');
@@ -412,6 +449,7 @@ export default function DescriptorVizPage() {
       if (selectedClusterId) {
         qs.cluster_id = selectedClusterId;
         qs.cluster_label_mode = clusterLabelMode;
+        qs.cluster_variant_id = selectedClusterVariantId;
       }
       if (selectedMetastableIds.length) {
         qs.metastable_ids = selectedMetastableIds;
@@ -431,6 +469,8 @@ export default function DescriptorVizPage() {
       const newMeta = {};
       const unionResidues = new Set();
       let nextHaloSummary = null;
+      let nextClusterVariants = [];
+      let nextVariantId = selectedClusterVariantId;
 
       responses.forEach(({ stateId, data }) => {
         newAngles[stateId] = data.angles || {};
@@ -452,6 +492,12 @@ export default function DescriptorVizPage() {
             conditionTypes: data.halo_rate_condition_types || [],
             residueKeys: data.halo_rate_residue_keys || data.residue_keys || [],
           };
+        }
+        if (!nextClusterVariants.length && Array.isArray(data.cluster_variants)) {
+          nextClusterVariants = data.cluster_variants;
+          if (data.cluster_variant_id) {
+            nextVariantId = String(data.cluster_variant_id);
+          }
         }
         (data.residue_keys || []).forEach((key) => unionResidues.add(key));
         // Cache labels from this response to keep names informative in the list
@@ -475,6 +521,20 @@ export default function DescriptorVizPage() {
       // Cluster legend: use from first response if present
       const firstLegend = responses.find((r) => (r.data.cluster_legend || []).length);
       setClusterLegend(firstLegend ? firstLegend.data.cluster_legend || [] : []);
+      setClusterVariants(nextClusterVariants);
+      if (nextClusterVariants.length) {
+        const allowed = new Set(nextClusterVariants.map((v) => String(v.id)));
+        const suggested = String(nextVariantId || 'original');
+        const current = String(selectedClusterVariantId || 'original');
+        const resolved = allowed.has(current)
+          ? current
+          : allowed.has(suggested)
+          ? suggested
+          : 'original';
+        if (resolved !== current) {
+          setSelectedClusterVariantId(resolved);
+        }
+      }
       setMetaByState(newMeta);
       setHaloSummary(nextHaloSummary);
       if (nextHaloSummary?.conditionIds?.length) {
@@ -512,11 +572,13 @@ export default function DescriptorVizPage() {
   }, [
     maxPoints,
     clusterLabelMode,
+    selectedClusterVariantId,
     projectId,
     selectedMetastableIds,
     selectedClusterId,
     selectedResidue,
     selectedStates,
+    sortResidues,
     systemId,
   ]);
 
@@ -529,7 +591,115 @@ export default function DescriptorVizPage() {
       setSelectedResidue('');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedStates, selectedClusterId, selectedResidue, clusterLabelMode, selectedMetastableIds]);
+  }, [selectedStates, selectedClusterId, selectedResidue, clusterLabelMode, selectedClusterVariantId, selectedMetastableIds]);
+
+  useEffect(() => {
+    if (!patchResiduesInput && selectedResidue) {
+      setPatchResiduesInput(selectedResidue);
+    }
+  }, [selectedResidue, patchResiduesInput]);
+
+  const parsePatchResidues = useCallback(() => {
+    const raw = (patchResiduesInput || '').trim();
+    if (!raw) return selectedResidue ? [selectedResidue] : [];
+    const toks = raw
+      .split(/[,\s]+/)
+      .map((v) => v.trim())
+      .filter(Boolean);
+    return Array.from(new Set(toks));
+  }, [patchResiduesInput, selectedResidue]);
+
+  const handleCreatePatch = useCallback(async () => {
+    if (!selectedClusterId) return;
+    const residueKeys = parsePatchResidues();
+    if (!residueKeys.length) {
+      setPatchError('Select at least one residue key for patching.');
+      return;
+    }
+    setPatchBusy(true);
+    setPatchError(null);
+    try {
+      const haloPct = Number(patchHaloPercentile);
+      const payload = {
+        residue_keys: residueKeys,
+        cluster_selection_mode: patchClusterSelectionMode,
+        linkage_method: patchLinkage,
+        covariance_type: patchCovariance,
+        halo_percentile: Number.isFinite(haloPct) ? haloPct : 5,
+      };
+      if (patchClusterSelectionMode === 'inconsistent') {
+        const thr = Number(patchInconsistentThreshold);
+        if (!Number.isFinite(thr)) {
+          setPatchError('Inconsistent threshold must be numeric.');
+          setPatchBusy(false);
+          return;
+        }
+        payload.inconsistent_threshold = thr;
+        const depth = Number(patchInconsistentDepth);
+        payload.inconsistent_depth = Number.isFinite(depth) && depth > 0 ? Math.floor(depth) : 2;
+      } else {
+        const ncl = Number(patchNClusters);
+        if (Number.isFinite(ncl) && ncl > 0) {
+          payload.n_clusters = Math.floor(ncl);
+        }
+      }
+      const maxFrames = Number(patchMaxClusterFrames);
+      if (Number.isFinite(maxFrames) && maxFrames > 0) {
+        payload.max_cluster_frames = Math.floor(maxFrames);
+      }
+      const out = await createClusterPatch(projectId, systemId, selectedClusterId, payload);
+      if (out?.patch_id) setSelectedClusterVariantId(String(out.patch_id));
+      await loadAngles();
+    } catch (err) {
+      setPatchError(err.message || 'Failed to create patch.');
+    } finally {
+      setPatchBusy(false);
+    }
+  }, [
+    selectedClusterId,
+    parsePatchResidues,
+    patchClusterSelectionMode,
+    patchLinkage,
+    patchCovariance,
+    patchHaloPercentile,
+    patchNClusters,
+    patchInconsistentThreshold,
+    patchInconsistentDepth,
+    patchMaxClusterFrames,
+    projectId,
+    systemId,
+    loadAngles,
+  ]);
+
+  const handleConfirmPatch = useCallback(async () => {
+    if (!selectedClusterId || !selectedClusterVariantId || selectedClusterVariantId === 'original') return;
+    setPatchBusy(true);
+    setPatchError(null);
+    try {
+      await confirmClusterPatch(projectId, systemId, selectedClusterId, selectedClusterVariantId);
+      setSelectedClusterVariantId('original');
+      await loadAngles();
+    } catch (err) {
+      setPatchError(err.message || 'Failed to confirm patch.');
+    } finally {
+      setPatchBusy(false);
+    }
+  }, [projectId, systemId, selectedClusterId, selectedClusterVariantId, loadAngles]);
+
+  const handleDiscardPatch = useCallback(async () => {
+    if (!selectedClusterId || !selectedClusterVariantId || selectedClusterVariantId === 'original') return;
+    setPatchBusy(true);
+    setPatchError(null);
+    try {
+      await discardClusterPatch(projectId, systemId, selectedClusterId, selectedClusterVariantId);
+      setSelectedClusterVariantId('original');
+      await loadAngles();
+    } catch (err) {
+      setPatchError(err.message || 'Failed to discard patch.');
+    } finally {
+      setPatchBusy(false);
+    }
+  }, [projectId, systemId, selectedClusterId, selectedClusterVariantId, loadAngles]);
 
   const traces3d = useMemo(() => {
     const traces = [];
@@ -662,6 +832,12 @@ export default function DescriptorVizPage() {
 
   return (
     <div className="space-y-4">
+      <HelpDrawer
+        open={helpOpen}
+        title="Residue Patch Clustering: Help"
+        docPath="/docs/cluster_patching_help.md"
+        onClose={() => setHelpOpen(false)}
+      />
       <button
         onClick={() => navigate(`/projects/${projectId}/systems/${systemId}`)}
         className="text-cyan-400 hover:text-cyan-300 text-sm"
@@ -675,24 +851,34 @@ export default function DescriptorVizPage() {
             Visualize per-residue phi/psi/chi1 angles. Data are down-sampled for plotting.
           </p>
         </div>
-        <div className="text-xs text-gray-400 text-right space-y-0.5">
-          <div>
-            States: {selectedStates.length ? stateSummaries.map((s) => s.name).join(', ') : '—'}
-          </div>
-          <div>
-            Metastable: {selectedMetastableIds.length ? selectedMetastableIds.length : 'All'}
-          </div>
-          <div>
-            Frames:{' '}
-            {stateSummaries.length
-              ? stateSummaries.map((s) => `${s.name}: ${s.frames ?? '—'}`).join(' • ')
-              : '—'}
-          </div>
-          <div>
-            Sample stride:{' '}
-            {stateSummaries.length
-              ? stateSummaries.map((s) => `${s.name}: ${s.stride ?? '—'}`).join(' • ')
-              : '—'}
+        <div className="flex items-start gap-3">
+          <button
+            type="button"
+            onClick={() => setHelpOpen(true)}
+            className="text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:border-gray-500 inline-flex items-center gap-2"
+          >
+            <CircleHelp className="h-4 w-4" />
+            Help
+          </button>
+          <div className="text-xs text-gray-400 text-right space-y-0.5">
+            <div>
+              States: {selectedStates.length ? stateSummaries.map((s) => s.name).join(', ') : '—'}
+            </div>
+            <div>
+              Metastable: {selectedMetastableIds.length ? selectedMetastableIds.length : 'All'}
+            </div>
+            <div>
+              Frames:{' '}
+              {stateSummaries.length
+                ? stateSummaries.map((s) => `${s.name}: ${s.frames ?? '—'}`).join(' • ')
+                : '—'}
+            </div>
+            <div>
+              Sample stride:{' '}
+              {stateSummaries.length
+                ? stateSummaries.map((s) => `${s.name}: ${s.stride ?? '—'}`).join(' • ')
+                : '—'}
+            </div>
           </div>
         </div>
       </div>
@@ -818,7 +1004,10 @@ export default function DescriptorVizPage() {
               <label className="block text-xs text-gray-400 mb-1">Cluster NPZ (optional coloring)</label>
               <select
                 value={selectedClusterId}
-                onChange={(e) => setSelectedClusterId(e.target.value)}
+                onChange={(e) => {
+                  setSelectedClusterId(e.target.value);
+                  setSelectedClusterVariantId('original');
+                }}
                 className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
               >
                 <option value="">None</option>
@@ -855,6 +1044,167 @@ export default function DescriptorVizPage() {
                       Assigned
                     </label>
                   </div>
+                </div>
+              )}
+              {selectedClusterId && (
+                <div className="mt-3 space-y-2 border border-gray-700 rounded-md p-3 bg-gray-900">
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Cluster variant</label>
+                    <select
+                      value={selectedClusterVariantId}
+                      onChange={(e) => setSelectedClusterVariantId(e.target.value || 'original')}
+                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                    >
+                      {(clusterVariants.length ? clusterVariants : [{ id: 'original', label: 'Original cluster' }]).map(
+                        (v) => (
+                          <option key={String(v.id)} value={String(v.id)}>
+                            {v.label || v.id}
+                          </option>
+                        )
+                      )}
+                    </select>
+                    {selectedClusterVariant && selectedClusterVariantId !== 'original' && (
+                      <p className="text-[11px] text-gray-500 mt-1">
+                        Variant status: {selectedClusterVariant.status || 'preview'}
+                      </p>
+                    )}
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block text-xs text-gray-400">Patch residues</label>
+                    <input
+                      type="text"
+                      value={patchResiduesInput}
+                      onChange={(e) => setPatchResiduesInput(e.target.value)}
+                      placeholder="res_10,res_11"
+                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                    />
+                    <p className="text-[10px] text-gray-500">
+                      Comma-separated residue keys. Selected residue is used if empty.
+                    </p>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Cluster selection mode</label>
+                    <select
+                      value={patchClusterSelectionMode}
+                      onChange={(e) => setPatchClusterSelectionMode(e.target.value)}
+                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                    >
+                      <option value="maxclust">Fixed K (maxclust)</option>
+                      <option value="inconsistent">Auto by threshold (inconsistent)</option>
+                    </select>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    {patchClusterSelectionMode === 'maxclust' ? (
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">n_clusters (optional)</label>
+                        <input
+                          type="number"
+                          min={1}
+                          value={patchNClusters}
+                          onChange={(e) => setPatchNClusters(e.target.value)}
+                          className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                        />
+                      </div>
+                    ) : (
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">Inconsistent threshold</label>
+                        <input
+                          type="number"
+                          step={0.1}
+                          value={patchInconsistentThreshold}
+                          onChange={(e) => setPatchInconsistentThreshold(e.target.value)}
+                          className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                        />
+                      </div>
+                    )}
+                    {patchClusterSelectionMode === 'inconsistent' && (
+                      <div>
+                        <label className="block text-xs text-gray-400 mb-1">Inconsistent depth</label>
+                        <input
+                          type="number"
+                          min={1}
+                          value={patchInconsistentDepth}
+                          onChange={(e) => setPatchInconsistentDepth(e.target.value)}
+                          className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                        />
+                      </div>
+                    )}
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">Max frames (optional)</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={patchMaxClusterFrames}
+                        onChange={(e) => setPatchMaxClusterFrames(e.target.value)}
+                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">Halo percentile</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={50}
+                        step={0.5}
+                        value={patchHaloPercentile}
+                        onChange={(e) => setPatchHaloPercentile(e.target.value)}
+                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">Linkage</label>
+                      <select
+                        value={patchLinkage}
+                        onChange={(e) => setPatchLinkage(e.target.value)}
+                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                      >
+                        <option value="ward">ward</option>
+                        <option value="complete">complete</option>
+                        <option value="average">average</option>
+                        <option value="single">single</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">Covariance</label>
+                      <select
+                        value={patchCovariance}
+                        onChange={(e) => setPatchCovariance(e.target.value)}
+                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                      >
+                        <option value="full">full</option>
+                        <option value="diag">diag</option>
+                      </select>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleCreatePatch}
+                    disabled={patchBusy}
+                    className="w-full bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-semibold py-1.5 rounded-md disabled:opacity-60"
+                  >
+                    {patchBusy ? 'Working…' : 'Create preview patch'}
+                  </button>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={handleConfirmPatch}
+                      disabled={patchBusy || selectedClusterVariantId === 'original'}
+                      className="bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold py-1.5 rounded-md disabled:opacity-60"
+                    >
+                      Confirm swap
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDiscardPatch}
+                      disabled={patchBusy || selectedClusterVariantId === 'original'}
+                      className="bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold py-1.5 rounded-md disabled:opacity-60"
+                    >
+                      Discard patch
+                    </button>
+                  </div>
+                  {patchError && <p className="text-[11px] text-rose-400">{patchError}</p>}
                 </div>
               )}
               {clusterLegend.length > 0 && (

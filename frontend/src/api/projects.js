@@ -138,6 +138,35 @@ export function fetchClusterAnalyses(projectId, systemId, clusterId, options = {
   return requestJSON(`/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/analyses${query}`);
 }
 
+export function fetchClusterPatches(projectId, systemId, clusterId) {
+  return requestJSON(`/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/patches`);
+}
+
+export function createClusterPatch(projectId, systemId, clusterId, payload) {
+  return requestJSON(`/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/patches`, {
+    method: 'POST',
+    body: payload,
+  });
+}
+
+export function confirmClusterPatch(projectId, systemId, clusterId, patchId) {
+  return requestJSON(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/patches/${encodeURIComponent(
+      patchId
+    )}/confirm`,
+    { method: 'POST' }
+  );
+}
+
+export function discardClusterPatch(projectId, systemId, clusterId, patchId) {
+  return requestJSON(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/patches/${encodeURIComponent(
+      patchId
+    )}`,
+    { method: 'DELETE' }
+  );
+}
+
 export function fetchClusterAnalysisData(projectId, systemId, clusterId, analysisType, analysisId) {
   return requestJSON(
     `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/analyses/${analysisType}/${analysisId}/data`
@@ -291,6 +320,7 @@ export function fetchStateDescriptors(projectId, systemId, stateId, params = {})
   }
   if (params.cluster_id) qs.set('cluster_id', params.cluster_id);
   if (params.cluster_label_mode) qs.set('cluster_label_mode', params.cluster_label_mode);
+  if (params.cluster_variant_id) qs.set('cluster_variant_id', params.cluster_variant_id);
   const suffix = qs.toString() ? `?${qs.toString()}` : '';
   return requestJSON(`/projects/${projectId}/systems/${systemId}/states/${stateId}/descriptors${suffix}`);
 }

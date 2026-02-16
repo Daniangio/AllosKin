@@ -21,6 +21,10 @@ from phase.workflows.clustering import (
     update_cluster_metadata_with_assignments,
     build_cluster_entry,
     build_cluster_output_path,
+    list_cluster_patches,
+    create_cluster_residue_patch,
+    discard_cluster_residue_patch,
+    confirm_cluster_residue_patch,
     _slug,
     evaluate_state_with_models,
 )
@@ -157,6 +161,19 @@ def _parse_state_ids(raw: str) -> List[str]:
     if not raw:
         return []
     return [val.strip() for val in raw.split(",") if val.strip()]
+
+
+def _replace_md_samples(existing_samples: Any, new_md_samples: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    kept: List[Dict[str, Any]] = []
+    if isinstance(existing_samples, list):
+        for entry in existing_samples:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("type") or "") == "md_eval":
+                continue
+            kept.append(entry)
+    kept.extend(new_md_samples or [])
+    return kept
 
 
 def _decode_metadata_json(meta_raw: Any) -> Dict[str, Any]:
@@ -380,6 +397,234 @@ async def get_potts_cluster_info(
         "model_id": model_id,
         "model_name": model_name,
     }
+
+
+@router.get(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/patches",
+    summary="List preview clustering patches stored for a cluster.",
+)
+async def get_cluster_patches(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+):
+    try:
+        project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="System not found.")
+    try:
+        result = await run_in_threadpool(
+            list_cluster_patches,
+            project_id,
+            system_id,
+            cluster_id,
+            store=project_store,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to list cluster patches: {exc}") from exc
+    return _convert_nan_to_none(result)
+
+
+@router.post(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/patches",
+    summary="Create a preview cluster patch on selected residues (hierarchical + frozen GMM).",
+)
+async def create_cluster_patch(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    payload: Dict[str, Any],
+):
+    logger = logging.getLogger("cluster_patch")
+    try:
+        project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="System not found.")
+
+    residue_keys = payload.get("residue_keys")
+    if isinstance(residue_keys, str):
+        residue_keys = [v.strip() for v in residue_keys.split(",") if v.strip()]
+    residue_indices = payload.get("residue_indices")
+    if isinstance(residue_indices, str):
+        residue_indices = [int(v.strip()) for v in residue_indices.split(",") if v.strip()]
+    if not isinstance(residue_keys, list):
+        residue_keys = None
+    if not isinstance(residue_indices, list):
+        residue_indices = None
+
+    n_clusters = payload.get("n_clusters")
+    if n_clusters is not None:
+        try:
+            n_clusters = int(n_clusters)
+        except Exception:
+            raise HTTPException(status_code=400, detail="n_clusters must be an integer.")
+    cluster_selection_mode = str(payload.get("cluster_selection_mode") or "maxclust").strip().lower()
+    if cluster_selection_mode not in {"maxclust", "inconsistent"}:
+        raise HTTPException(status_code=400, detail="cluster_selection_mode must be one of: maxclust, inconsistent.")
+    inconsistent_threshold = payload.get("inconsistent_threshold")
+    if inconsistent_threshold is not None:
+        try:
+            inconsistent_threshold = float(inconsistent_threshold)
+        except Exception:
+            raise HTTPException(status_code=400, detail="inconsistent_threshold must be numeric.")
+    inconsistent_depth = payload.get("inconsistent_depth", 2)
+    try:
+        inconsistent_depth = int(inconsistent_depth)
+    except Exception:
+        raise HTTPException(status_code=400, detail="inconsistent_depth must be an integer.")
+    if inconsistent_depth < 1:
+        raise HTTPException(status_code=400, detail="inconsistent_depth must be >= 1.")
+    if cluster_selection_mode == "inconsistent" and inconsistent_threshold is None:
+        raise HTTPException(
+            status_code=400,
+            detail="inconsistent_threshold is required when cluster_selection_mode='inconsistent'.",
+        )
+    linkage_method = str(payload.get("linkage_method") or "ward")
+    covariance_type = str(payload.get("covariance_type") or "full")
+    reg_covar = float(payload.get("reg_covar", 1e-5))
+    halo_percentile = float(payload.get("halo_percentile", 5.0))
+    max_cluster_frames = payload.get("max_cluster_frames")
+    if max_cluster_frames is not None:
+        try:
+            max_cluster_frames = int(max_cluster_frames)
+        except Exception:
+            raise HTTPException(status_code=400, detail="max_cluster_frames must be an integer.")
+    patch_name = payload.get("name")
+    if patch_name is not None and not isinstance(patch_name, str):
+        patch_name = str(patch_name)
+
+    logger.info(
+        "[cluster_patch] create start project=%s system=%s cluster=%s residues=%s mode=%s n_clusters=%s inconsistent_threshold=%s max_cluster_frames=%s",
+        project_id,
+        system_id,
+        cluster_id,
+        len(residue_keys or residue_indices or []),
+        cluster_selection_mode,
+        n_clusters,
+        inconsistent_threshold,
+        max_cluster_frames,
+    )
+    try:
+        result = await run_in_threadpool(
+            create_cluster_residue_patch,
+            project_id,
+            system_id,
+            cluster_id,
+            residue_indices=residue_indices,
+            residue_keys=residue_keys,
+            n_clusters=n_clusters,
+            cluster_selection_mode=cluster_selection_mode,
+            inconsistent_threshold=inconsistent_threshold,
+            inconsistent_depth=inconsistent_depth,
+            linkage_method=linkage_method,
+            covariance_type=covariance_type,
+            reg_covar=reg_covar,
+            halo_percentile=halo_percentile,
+            max_cluster_frames=max_cluster_frames,
+            patch_name=patch_name,
+            store=project_store,
+        )
+        logger.info(
+            "[cluster_patch] create done project=%s system=%s cluster=%s patch_id=%s",
+            project_id,
+            system_id,
+            cluster_id,
+            result.get("patch_id"),
+        )
+    except FileNotFoundError as exc:
+        logger.error("[cluster_patch] create file not found: %s", exc)
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        logger.error("[cluster_patch] create validation error: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("[cluster_patch] create failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to create cluster patch: {exc}") from exc
+    return _convert_nan_to_none(result)
+
+
+@router.post(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/patches/{patch_id}/confirm",
+    summary="Confirm a preview patch, swap labels, and recompute MD cluster memberships.",
+)
+async def confirm_cluster_patch(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    patch_id: str,
+):
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="System not found.")
+
+    entry = get_cluster_entry(system_meta, cluster_id)
+    if not isinstance(entry, dict):
+        raise HTTPException(status_code=404, detail="Cluster not found.")
+
+    try:
+        result = await run_in_threadpool(
+            confirm_cluster_residue_patch,
+            project_id,
+            system_id,
+            cluster_id,
+            patch_id=patch_id,
+            recompute_assignments=True,
+            store=project_store,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to confirm cluster patch: {exc}") from exc
+
+    assignments = result.get("assignments") or {}
+    if isinstance(assignments, dict):
+        entry["assigned_state_paths"] = assignments.get("assigned_state_paths", {})
+        entry["assigned_metastable_paths"] = assignments.get("assigned_metastable_paths", {})
+        new_md_samples = [s for s in (assignments.get("samples") or []) if isinstance(s, dict)]
+        entry["samples"] = _replace_md_samples(entry.get("samples"), new_md_samples)
+        entry["updated_at"] = datetime.utcnow().isoformat()
+        project_store.save_system(system_meta)
+
+    return _convert_nan_to_none(result)
+
+
+@router.delete(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/patches/{patch_id}",
+    summary="Discard a preview cluster patch.",
+)
+async def discard_cluster_patch(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    patch_id: str,
+):
+    try:
+        project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="System not found.")
+    try:
+        result = await run_in_threadpool(
+            discard_cluster_residue_patch,
+            project_id,
+            system_id,
+            cluster_id,
+            patch_id=patch_id,
+            store=project_store,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to discard cluster patch: {exc}") from exc
+    return _convert_nan_to_none(result)
 
 
 @router.get(

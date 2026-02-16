@@ -36,6 +36,10 @@ async def get_state_descriptors(
         "halo",
         description="Cluster label mode for coloring: 'halo' (default) or 'assigned'.",
     ),
+    cluster_variant_id: Optional[str] = Query(
+        None,
+        description="Cluster variant to use: 'original' (default) or a preview patch id.",
+    ),
     max_points: int = Query(
         2000,
         ge=10,
@@ -113,6 +117,8 @@ async def get_state_descriptors(
     cluster_residue_indices: Dict[str, int] = {}
     merged_labels_arr: Optional[np.ndarray] = None
     cluster_legend: List[Dict[str, Any]] = []
+    cluster_variants: List[Dict[str, Any]] = []
+    selected_cluster_variant = "original"
     state_labels_arr: Optional[np.ndarray] = None
     state_labels_arr_halo: Optional[np.ndarray] = None
     state_labels_arr_assigned: Optional[np.ndarray] = None
@@ -193,7 +199,38 @@ async def get_state_descriptors(
         if not cluster_residue_indices:
             cluster_res_keys = list(cluster_meta.get("residue_keys", []))
             cluster_residue_indices = {k: i for i, k in enumerate(cluster_res_keys)}
-        predictions = cluster_meta.get("predictions") or {}
+        patch_entries = [
+            p for p in (cluster_meta.get("cluster_patches") or [])
+            if isinstance(p, dict) and p.get("patch_id")
+        ]
+        cluster_variants = [{"id": "original", "label": "Original cluster", "status": "confirmed"}]
+        for p in patch_entries:
+            rid_keys = ((p.get("residues") or {}).get("keys") or [])
+            cluster_variants.append(
+                {
+                    "id": str(p.get("patch_id")),
+                    "label": str(p.get("name") or f"Patch {str(p.get('patch_id'))[:8]}"),
+                    "status": str(p.get("status") or "preview"),
+                    "residue_keys": [str(v) for v in rid_keys],
+                    "created_at": p.get("created_at"),
+                }
+            )
+
+        variant_entry = None
+        requested_variant = str(cluster_variant_id).strip() if cluster_variant_id else "original"
+        if requested_variant and requested_variant != "original":
+            variant_entry = next((p for p in patch_entries if str(p.get("patch_id")) == requested_variant), None)
+        selected_cluster_variant = requested_variant if (requested_variant == "original" or variant_entry) else "original"
+
+        if variant_entry:
+            predictions = variant_entry.get("predictions") or {}
+            halo_summary = variant_entry.get("halo_summary") if isinstance(variant_entry, dict) else None
+            merged_keys = (variant_entry.get("merged") or {}).get("npz_keys") or {}
+        else:
+            predictions = cluster_meta.get("predictions") or {}
+            halo_summary = cluster_meta.get("halo_summary") if isinstance(cluster_meta, dict) else None
+            merged_keys = cluster_meta.get("merged", {}).get("npz_keys", {})
+
         state_pred = predictions.get(f"state:{state_meta.state_id}")
         if state_labels_arr is None and isinstance(state_pred, dict):
             labels_key = state_pred.get("labels_halo")
@@ -214,7 +251,6 @@ async def get_state_descriptors(
                     state_frame_lookup = {int(fidx): idx for idx, fidx in enumerate(frame_indices)}
                 except Exception:
                     state_frame_lookup = None
-        merged_keys = cluster_meta.get("merged", {}).get("npz_keys", {})
         if (
             not merged_keys
             or "labels" not in merged_keys
@@ -223,14 +259,15 @@ async def get_state_descriptors(
         ):
             raise HTTPException(status_code=400, detail="Cluster NPZ missing merged frame metadata. Regenerate clusters.")
         merged_lookup = _build_lookup("merged", cluster_npz, merged_keys)
-        merged_label_key = merged_keys.get("labels")
+        merged_label_key = merged_keys.get("labels_halo") or merged_keys.get("labels")
         if label_mode == "assigned":
             merged_label_key = merged_keys.get("labels_assigned") or merged_label_key
+        if not isinstance(merged_label_key, str) or merged_label_key not in cluster_npz:
+            raise HTTPException(status_code=400, detail="Selected cluster variant is missing merged labels.")
         merged_labels_arr = cluster_npz[merged_label_key]
         if not cluster_legend:
             unique_clusters = sorted({int(v) for v in np.unique(merged_labels_arr) if int(v) >= 0})
             cluster_legend = [{"id": c, "label": f"Merged c{c}"} for c in unique_clusters]
-        halo_summary = cluster_meta.get("halo_summary") if isinstance(cluster_meta, dict) else None
 
     # Shared frame selection (metastable filter + sampling) computed once
     labels_meta = None
@@ -345,6 +382,8 @@ async def get_state_descriptors(
         "sample_stride": sample_stride,
         "angles": angles_payload,
         "cluster_legend": cluster_legend,
+        "cluster_variants": cluster_variants,
+        "cluster_variant_id": selected_cluster_variant,
         "metastable_labels": labels_meta[sample_indices].astype(int).tolist() if labels_meta is not None else [],
         "metastable_legend": [
             {
