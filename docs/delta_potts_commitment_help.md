@@ -68,6 +68,24 @@ What the colors mean (centered mode):
 - `q ≈ 0`: sample tends to occupy states where **B** is favored vs **A**.
 - `q ≈ 0.5`: weak / mixed preference.
 
+## What “red even more Inactive-like than Inactive” means concretely (in your current definition)
+
+In your delta-commitment page, per-residue commitment is built from field differences only:
+
+Δℎ𝑖(𝑎) = ℎ𝑖𝐴(𝑎) − ℎ𝑖𝐵(𝑎)
+
+base mode: 𝑞𝑖 = Pr(Δℎ𝑖(𝑋𝑖)<0)
+centered mode: you choose a reference ensemble, compute a weighted median threshold 𝑡𝑖 from that reference, and then report how much probability mass is on the “A side” vs the “B side” of that threshold; ties are handled so the reference maps to ~0.5 (white) by construction
+
+So if you set:
+
+model 𝐴 = Inactive, model 𝐵 = Active,
+reference = Inactive,
+
+and you look at some other trajectory, then a residue being red in centered mode means:
+
+Relative to the Inactive reference median at that residue, this trajectory puts more probability mass on microstates with “more A-favored” Δℎ𝑖 values.
+
 ## Ranking (“Top Residues/Edges”)
 
 We rank residues/edges by **parameter magnitude** (currently L2 norm of `Δh_i` and `ΔJ_ij`).

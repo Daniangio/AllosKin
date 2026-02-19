@@ -193,7 +193,10 @@ def build_backmapping_npz(
     with np.load(cluster_path, allow_pickle=True) as cluster_npz:
         residue_keys = [str(v) for v in cluster_npz["residue_keys"].tolist()]
         labels = np.asarray(cluster_npz["merged__labels_assigned"], dtype=np.int32)
-        cluster_counts = np.asarray(cluster_npz["merged__cluster_counts"], dtype=np.int32)
+        if "cluster_counts" in cluster_npz:
+            cluster_counts = np.asarray(cluster_npz["cluster_counts"], dtype=np.int32)
+        else:
+            cluster_counts = np.asarray(cluster_npz["merged__cluster_counts"], dtype=np.int32)
         frame_state_ids = np.asarray(cluster_npz["merged__frame_state_ids"]).astype(str)
         frame_indices = np.asarray(cluster_npz["merged__frame_indices"], dtype=np.int64)
 

@@ -67,6 +67,7 @@ export default function DeltaEvalPage() {
   const [referenceSampleIds, setReferenceSampleIds] = useState([]); // used for centered mode
   const [edgeSmoothEnabled, setEdgeSmoothEnabled] = useState(false);
   const [edgeSmoothStrength, setEdgeSmoothStrength] = useState(0.75);
+  const [hideSingleClusterResidues, setHideSingleClusterResidues] = useState(false);
 
   // Visualization-only filter: 0 means "show all residues". The analysis always stores q for all residues.
   const [topKResidues, setTopKResidues] = useState(0);
@@ -221,18 +222,28 @@ export default function DeltaEvalPage() {
   const selectedMeta = useMemo(() => {
     if (!modelAId || !modelBId) return null;
     const dropInvalid = !keepInvalid;
-    return (
-      analyses.find((a) => {
-        const mode = (a.md_label_mode || 'assigned').toLowerCase();
-        return (
-          a.model_a_id === modelAId &&
-          a.model_b_id === modelBId &&
-          mode === mdLabelMode &&
-          Boolean(a.drop_invalid) === Boolean(dropInvalid) &&
-          String(a.ranking_method || 'param_l2').toLowerCase() === 'param_l2'
-        );
-      }) || null
-    );
+    const baseMatch = (a) =>
+      a.model_a_id === modelAId &&
+      a.model_b_id === modelBId &&
+      (a.md_label_mode || 'assigned').toLowerCase() === mdLabelMode &&
+      String(a.ranking_method || 'param_l2').toLowerCase() === 'param_l2';
+    const exact = analyses.filter((a) => baseMatch(a) && Boolean(a.drop_invalid) === Boolean(dropInvalid));
+    const fallback = exact.length ? exact : analyses.filter((a) => baseMatch(a));
+    if (!fallback.length) return null;
+    const score = (a) => {
+      const nSamples = Number(a?.summary?.n_samples);
+      const n = Number.isFinite(nSamples) ? nSamples : 0;
+      const t = Date.parse(String(a?.updated_at || a?.created_at || ''));
+      const ts = Number.isFinite(t) ? t : 0;
+      return [n, ts];
+    };
+    const sorted = [...fallback].sort((x, y) => {
+      const [nx, tx] = score(x);
+      const [ny, ty] = score(y);
+      if (ny !== nx) return ny - nx;
+      return ty - tx;
+    });
+    return sorted[0] || null;
   }, [analyses, modelAId, modelBId, mdLabelMode, keepInvalid]);
 
   const loadAnalysisData = useCallback(
@@ -417,6 +428,23 @@ export default function DeltaEvalPage() {
   const topEdgeIndices = useMemo(() => (Array.isArray(data?.data?.top_edge_indices) ? data.data.top_edge_indices : []), [data]);
   const edges = useMemo(() => (Array.isArray(data?.data?.edges) ? data.data.edges : []), [data]);
   const dEdge = useMemo(() => (Array.isArray(data?.data?.D_edge) ? data.data.D_edge : null), [data]);
+  const singleClusterByResidue = useMemo(() => {
+    const n = residueLabels.length;
+    const out = new Array(n).fill(false);
+    const source =
+      Array.isArray(kList) && kList.length
+        ? kList
+        : Array.isArray(clusterInfo?.cluster_counts)
+        ? clusterInfo.cluster_counts
+        : [];
+    if (!Array.isArray(source) || !source.length) return out;
+    const m = Math.min(n, source.length);
+    for (let i = 0; i < m; i += 1) {
+      const ki = Number(source[i]);
+      if (Number.isFinite(ki) && ki <= 1) out[i] = true;
+    }
+    return out;
+  }, [kList, clusterInfo, residueLabels.length]);
 
   const qResidueAll = useMemo(() => (Array.isArray(data?.data?.q_residue_all) ? data.data.q_residue_all : []), [data]);
 
@@ -510,11 +538,41 @@ export default function DeltaEvalPage() {
   }, [topEdgeIndices, edges, residueLabels]);
 
   const qEdge = useMemo(() => (Array.isArray(data?.data?.q_edge) ? data.data.q_edge : []), [data]);
+  const centeredEdgeRefIdxs = useMemo(() => {
+    if (commitmentMode !== 'centered') return [];
+    if (!referenceSampleIds.length || !analysisSampleIds.length) return [];
+    return referenceSampleIds
+      .map((sid) => analysisSampleIds.indexOf(String(sid)))
+      .filter((i) => Number.isInteger(i) && i >= 0);
+  }, [commitmentMode, referenceSampleIds, analysisSampleIds]);
 
   const qResidueHeatmap = useMemo(() => {
     if (!plotRows.length || !Array.isArray(qResidueAll) || !qResidueAll.length) return null;
     const N = residueLabels.length;
     const base = (row, i) => clamp01(Number(qResidueAll?.[row]?.[i]));
+    const edgeRowForSmoothing = (rowIdx) => {
+      if (!Array.isArray(qEdge) || !Array.isArray(qEdge[rowIdx])) return [];
+      const raw = qEdge[rowIdx].map((v) => Number(v));
+      if (commitmentMode !== 'centered' || !centeredEdgeRefIdxs.length) return raw;
+      const eps = 1e-9;
+      const out = new Array(raw.length).fill(NaN);
+      for (let col = 0; col < raw.length; col += 1) {
+        const v = raw[col];
+        if (!Number.isFinite(v)) continue;
+        let before = 0;
+        let at = 0;
+        let n = 0;
+        for (const ridx of centeredEdgeRefIdxs) {
+          const rv = Number(qEdge?.[ridx]?.[col]);
+          if (!Number.isFinite(rv)) continue;
+          n += 1;
+          if (rv < v - eps) before += 1;
+          else if (Math.abs(rv - v) <= eps) at += 1;
+        }
+        out[col] = n > 0 ? (before + 0.5 * at) / n : v;
+      }
+      return out;
+    };
 
     // If dh/p_node aren't available (older analyses), fall back to the base q.
     const canAlt = Boolean(dhTable && pNode && Array.isArray(dhTable?.[0]) && Array.isArray(pNode?.[0]?.[0]));
@@ -561,7 +619,7 @@ export default function DeltaEvalPage() {
         if (!Array.isArray(qEdge) || !Array.isArray(qEdge[row]) || !Array.isArray(topEdgeIndices) || !topEdgeIndices.length) {
           return residueAxis.indices.map((i) => outFull[i]);
         }
-        const rowQe = qEdge[row].map((v) => Number(v));
+        const rowQe = edgeRowForSmoothing(row);
         const sumW = new Array(N).fill(0);
         const sumWD = new Array(N).fill(0);
         for (let col = 0; col < topEdgeIndices.length && col < rowQe.length; col += 1) {
@@ -619,7 +677,7 @@ export default function DeltaEvalPage() {
         if (!Array.isArray(qEdge) || !Array.isArray(qEdge[row]) || !Array.isArray(topEdgeIndices) || !topEdgeIndices.length) {
           return residueAxis.indices.map((i) => outFull[i]);
         }
-        const rowQe = qEdge[row].map((v) => Number(v));
+        const rowQe = edgeRowForSmoothing(row);
         const sumW = new Array(N).fill(0);
         const sumWD = new Array(N).fill(0);
         for (let col = 0; col < topEdgeIndices.length && col < rowQe.length; col += 1) {
@@ -657,7 +715,7 @@ export default function DeltaEvalPage() {
       if (!Array.isArray(qEdge) || !Array.isArray(qEdge[row]) || !Array.isArray(topEdgeIndices) || !topEdgeIndices.length) {
         return residueAxis.indices.map((i) => outFull[i]);
       }
-      const rowQe = qEdge[row].map((v) => Number(v));
+      const rowQe = edgeRowForSmoothing(row);
       const sumW = new Array(N).fill(0);
       const sumWD = new Array(N).fill(0);
       for (let col = 0; col < topEdgeIndices.length && col < rowQe.length; col += 1) {
@@ -685,8 +743,22 @@ export default function DeltaEvalPage() {
       }
       return residueAxis.indices.map((i) => sm[i]);
     });
+    const singleMaskCols = residueAxis.indices.map((i) => Boolean(singleClusterByResidue[i]));
+    const colKeepMask = singleMaskCols.map((isSingle) => (hideSingleClusterResidues ? !isSingle : true));
+    const keptCols = colKeepMask.reduce((acc, keep) => acc + (keep ? 1 : 0), 0);
+    if (keptCols <= 0) return null;
+
+    const filteredX = residueAxisLabels.filter((_, col) => colKeepMask[col]);
+    const zFiltered = z.map((row) => row.filter((_, col) => colKeepMask[col]));
+    const singleFiltered = singleMaskCols.filter((_, col) => colKeepMask[col]);
+    const zBase = singleFiltered.some(Boolean)
+      ? zFiltered.map((row) => row.map((v, col) => (singleFiltered[col] ? null : v)))
+      : zFiltered;
+    const zSingle = singleFiltered.some(Boolean)
+      ? zFiltered.map((row) => row.map((_, col) => (singleFiltered[col] ? 1 : null)))
+      : null;
     const y = plotRows.map((row) => analysisSampleLabels[row] ?? String(analysisSampleIds[row] ?? row));
-    return { z, y, x: residueAxisLabels };
+    return { z: zBase, zSingle, y, x: filteredX, hasSingle: singleFiltered.some(Boolean) };
   }, [
     plotRows,
     qResidueAll,
@@ -694,6 +766,8 @@ export default function DeltaEvalPage() {
     analysisSampleLabels,
     analysisSampleIds,
     residueAxisLabels,
+    singleClusterByResidue,
+    hideSingleClusterResidues,
     commitmentMode,
     dhTable,
     pNode,
@@ -703,6 +777,7 @@ export default function DeltaEvalPage() {
     edgeSmoothEnabled,
     edgeSmoothStrength,
     qEdge,
+    centeredEdgeRefIdxs,
     topEdgeIndices,
     edges,
     dEdge,
@@ -995,6 +1070,15 @@ export default function DeltaEvalPage() {
                   Each residue value is blended with the average commitment of its incident top edges (weighted by |ΔJ|).
                 </p>
               </div>
+              <label className="flex items-center gap-2 text-sm text-gray-200">
+                <input
+                  type="checkbox"
+                  checked={hideSingleClusterResidues}
+                  onChange={(e) => setHideSingleClusterResidues(e.target.checked)}
+                  className="h-4 w-4 text-cyan-500 rounded border-gray-700 bg-gray-950"
+                />
+                Hide single-cluster residues from heatmaps
+              </label>
             </div>
 
             <div className="space-y-2">
@@ -1137,6 +1221,24 @@ export default function DeltaEvalPage() {
                     ],
                     hovertemplate: 'sample=%{y}<br>res=%{x}<br>q=%{z:.3f}<extra></extra>',
                   },
+                  ...(qResidueHeatmap.hasSingle && qResidueHeatmap.zSingle
+                    ? [
+                        {
+                          type: 'heatmap',
+                          z: qResidueHeatmap.zSingle,
+                          x: qResidueHeatmap.x,
+                          y: qResidueHeatmap.y,
+                          zmin: 0,
+                          zmax: 1,
+                          colorscale: [
+                            [0, '#9ca3af'],
+                            [1, '#9ca3af'],
+                          ],
+                          showscale: false,
+                          hovertemplate: 'sample=%{y}<br>res=%{x}<br>single-cluster residue<extra></extra>',
+                        },
+                      ]
+                    : []),
                 ]}
                 layout={{
                   paper_bgcolor: 'rgba(0,0,0,0)',
@@ -1149,6 +1251,11 @@ export default function DeltaEvalPage() {
                 config={{ responsive: true, displaylogo: false }}
                 style={{ width: '100%' }}
               />
+            </div>
+          )}
+          {!qResidueHeatmap && hideSingleClusterResidues && data && (
+            <div className="rounded-lg border border-gray-800 bg-gray-900/40 p-4 text-sm text-gray-300">
+              Per-residue heatmap hidden: all currently selected residues are single-cluster and filtered out.
             </div>
           )}
 

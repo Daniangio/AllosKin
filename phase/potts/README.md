@@ -37,7 +37,7 @@ SA/QUBO samples often behave like draws from a Boltzmann distribution at an **un
 `main.py` expects (names must match):
 
 - `merged__labels`: shape `(T, N)` integer labels per frame & residue  
-- `merged__cluster_counts`: shape `(N,)` number of clusters per residue  
+- `cluster_counts`: shape `(N,)` number of clusters per residue  
 - `contact_edge_index`: shape `(2, E)` residue indices for edges (contact graph)  
 - `residue_keys`: shape `(N,)` (optional, used for plot labels)
 

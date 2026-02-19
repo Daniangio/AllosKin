@@ -101,11 +101,27 @@ function pieColor(idx) {
   return `hsl(${hue} 70% 55%)`;
 }
 
+function clusterColorFromKey(key, fallbackIdx = 0) {
+  if (key == null) return pieColor(fallbackIdx);
+  const nums = String(key).match(/-?\d+/g);
+  if (!nums || !nums.length) return pieColor(fallbackIdx);
+  let hash = 17;
+  nums.forEach((tok) => {
+    const n = Number(tok);
+    if (Number.isFinite(n)) hash = hash * 31 + Math.abs(Math.trunc(n));
+  });
+  const hue = Math.abs(hash) % 360;
+  return `hsl(${hue} 70% 55%)`;
+}
+
 function compressPieSlices(rawSlices, maxSlices = 8) {
   const clean = (rawSlices || [])
     .map((s) => ({
       label: String(s?.label ?? ''),
       value: Number(s?.value ?? 0),
+      tooltip: String(s?.tooltip || ''),
+      colorKey: s?.colorKey,
+      color: s?.color,
     }))
     .filter((s) => Number.isFinite(s.value) && s.value > 0);
   if (!clean.length) return [];
@@ -115,7 +131,7 @@ function compressPieSlices(rawSlices, maxSlices = 8) {
   const other = rest.reduce((acc, s) => acc + s.value, 0);
   const out = keep.map((s, i) => ({
     ...s,
-    color: pieColor(i),
+    color: s.color || clusterColorFromKey(s.colorKey || s.label, i),
   }));
   if (other > 0) out.push({ label: 'other', value: other, color: '#6b7280' });
   const total = out.reduce((acc, s) => acc + s.value, 0);
@@ -123,19 +139,41 @@ function compressPieSlices(rawSlices, maxSlices = 8) {
   return out.map((s) => ({ ...s, value: s.value / total }));
 }
 
-function vecToSlices(values, labelPrefix = 'c') {
+function vecToSlices(values, labelPrefix = 'c', clusterIds = null) {
   if (!Array.isArray(values)) return [];
-  return values.map((v, idx) => ({ label: `${labelPrefix}${idx}`, value: Number(v) || 0 }));
+  return values.map((v, idx) => {
+    const cid = Array.isArray(clusterIds) && idx < clusterIds.length ? Number(clusterIds[idx]) : idx;
+    const clusterId = Number.isFinite(cid) ? cid : idx;
+    return {
+      label: `${labelPrefix}${clusterId}`,
+      value: Number(v) || 0,
+      colorKey: `c${clusterId}`,
+      tooltip: `cluster ${labelPrefix}${clusterId}`,
+    };
+  });
 }
 
-function jointToSlices(joint) {
+function jointToSlices(joint, clusterIdsR = null, clusterIdsS = null, rLabel = 'res_source', sLabel = 'res_target') {
   if (!Array.isArray(joint)) return [];
   const out = [];
   for (let a = 0; a < joint.length; a += 1) {
     const row = joint[a];
     if (!Array.isArray(row)) continue;
     for (let b = 0; b < row.length; b += 1) {
-      out.push({ label: `c${a}-c${b}`, value: Number(row[b]) || 0 });
+      const cidA =
+        Array.isArray(clusterIdsR) && a < clusterIdsR.length && Number.isFinite(Number(clusterIdsR[a]))
+          ? Number(clusterIdsR[a])
+          : a;
+      const cidB =
+        Array.isArray(clusterIdsS) && b < clusterIdsS.length && Number.isFinite(Number(clusterIdsS[b]))
+          ? Number(clusterIdsS[b])
+          : b;
+      out.push({
+        label: `c${cidA}-c${cidB}`,
+        value: Number(row[b]) || 0,
+        colorKey: `c${cidA}-c${cidB}`,
+        tooltip: `${rLabel}: c${cidA} · ${sLabel}: c${cidB}`,
+      });
     }
   }
   return out;
@@ -150,7 +188,7 @@ function piePath(cx, cy, r, start, end) {
   return `M ${cx} ${cy} L ${x0} ${y0} A ${r} ${r} 0 ${large} 1 ${x1} ${y1} Z`;
 }
 
-function PieChart({ slices, size = 120 }) {
+function PieChart({ slices, size = 120, onSliceClick = null }) {
   const radius = size * 0.45;
   const center = size / 2;
   let acc = -Math.PI / 2;
@@ -162,7 +200,19 @@ function PieChart({ slices, size = 120 }) {
         const next = acc + v * Math.PI * 2;
         const d = piePath(center, center, radius, acc, next);
         acc = next;
-        return <path key={`${slice.label}:${idx}`} d={d} fill={slice.color || pieColor(idx)} />;
+        const pct = Number.isFinite(v) ? `${(100 * v).toFixed(2)}%` : 'n/a';
+        const title = `${slice.tooltip || slice.label}: ${pct}`;
+        return (
+          <path
+            key={`${slice.label}:${idx}`}
+            d={d}
+            fill={slice.color || pieColor(idx)}
+            onClick={onSliceClick ? () => onSliceClick(slice, idx) : undefined}
+            className={onSliceClick ? 'cursor-pointer' : undefined}
+          >
+            <title>{title}</title>
+          </path>
+        );
       })}
       <circle cx={center} cy={center} r={radius * 0.35} fill="#0b1220" />
     </svg>
@@ -299,6 +349,7 @@ export default function DeltaCommitment3DPage() {
   const [residueProfile, setResidueProfile] = useState(null);
   const [residueProfileLoading, setResidueProfileLoading] = useState(false);
   const [residueProfileError, setResidueProfileError] = useState(null);
+  const [pieModal, setPieModal] = useState(null);
 
   const edgeRunIdRef = useRef(0);
   const lociLabelProviderRef = useRef(null);
@@ -362,18 +413,30 @@ export default function DeltaCommitment3DPage() {
 
   const selectedCommitmentMeta = useMemo(() => {
     if (!modelAId || !modelBId) return null;
-    return (
-      analyses.find((a) => {
-        const mode = (a.md_label_mode || 'assigned').toLowerCase();
-        return (
-          a.model_a_id === modelAId &&
-          a.model_b_id === modelBId &&
-          mode === mdLabelMode &&
-          Boolean(a.drop_invalid) === Boolean(dropInvalid) &&
-          String(a.ranking_method || 'param_l2').toLowerCase() === 'param_l2'
-        );
-      }) || null
-    );
+    const baseMatch = (a) =>
+      a.model_a_id === modelAId &&
+      a.model_b_id === modelBId &&
+      (a.md_label_mode || 'assigned').toLowerCase() === mdLabelMode &&
+      String(a.ranking_method || 'param_l2').toLowerCase() === 'param_l2';
+
+    const exact = analyses.filter((a) => baseMatch(a) && Boolean(a.drop_invalid) === Boolean(dropInvalid));
+    const fallback = exact.length ? exact : analyses.filter((a) => baseMatch(a));
+    if (!fallback.length) return null;
+
+    const score = (a) => {
+      const nSamples = Number(a?.summary?.n_samples);
+      const n = Number.isFinite(nSamples) ? nSamples : 0;
+      const t = Date.parse(String(a?.updated_at || a?.created_at || ''));
+      const ts = Number.isFinite(t) ? t : 0;
+      return [n, ts];
+    };
+    const sorted = [...fallback].sort((x, y) => {
+      const [nx, tx] = score(x);
+      const [ny, ty] = score(y);
+      if (ny !== nx) return ny - nx;
+      return ty - tx;
+    });
+    return sorted[0] || null;
   }, [analyses, modelAId, modelBId, mdLabelMode, dropInvalid]);
 
   const loadAnalyses = useCallback(async () => {
@@ -603,21 +666,57 @@ export default function DeltaCommitment3DPage() {
     run();
   }, [projectId, systemId, selectedClusterId, selectedCommitmentMeta, clearOverpaint]);
 
-  const commitmentLabels = useMemo(() => {
-    const raw = analysisData?.data?.sample_labels;
-    if (Array.isArray(raw) && raw.length) return raw.map(String);
-    const ids = analysisData?.data?.sample_ids;
-    if (Array.isArray(ids) && ids.length) return ids.map(String);
-    return [];
-  }, [analysisData]);
   const commitmentSampleIds = useMemo(() => {
     const ids = analysisData?.data?.sample_ids;
     return Array.isArray(ids) ? ids.map(String) : [];
   }, [analysisData]);
+  const sampleCatalogById = useMemo(() => {
+    const out = new Map();
+    const samples = Array.isArray(selectedCluster?.samples) ? selectedCluster.samples : [];
+    for (const s of samples) {
+      const sid = s?.sample_id ? String(s.sample_id) : '';
+      if (!sid) continue;
+      out.set(sid, {
+        name: String(s?.name || sid),
+        type: String(s?.type || ''),
+      });
+    }
+    return out;
+  }, [selectedCluster]);
+  const commitmentLabels = useMemo(() => {
+    if (!commitmentSampleIds.length) return [];
+    const raw = Array.isArray(analysisData?.data?.sample_labels) ? analysisData.data.sample_labels.map(String) : [];
+    return commitmentSampleIds.map((sid, idx) => {
+      const item = sampleCatalogById.get(String(sid));
+      if (item?.name) return item.name;
+      if (idx < raw.length && raw[idx]) return raw[idx];
+      return String(sid);
+    });
+  }, [analysisData, commitmentSampleIds, sampleCatalogById]);
   const commitmentTypes = useMemo(() => {
-    const raw = analysisData?.data?.sample_types;
-    return Array.isArray(raw) ? raw.map(String) : [];
-  }, [analysisData]);
+    if (!commitmentSampleIds.length) return [];
+    const raw = Array.isArray(analysisData?.data?.sample_types) ? analysisData.data.sample_types.map(String) : [];
+    return commitmentSampleIds.map((sid, idx) => {
+      const item = sampleCatalogById.get(String(sid));
+      if (item?.type) return item.type;
+      return idx < raw.length ? String(raw[idx] || '') : '';
+    });
+  }, [analysisData, commitmentSampleIds, sampleCatalogById]);
+  const missingMdCommitmentSamples = useMemo(() => {
+    const samples = Array.isArray(selectedCluster?.samples) ? selectedCluster.samples : [];
+    const analyzed = new Set(commitmentSampleIds.map((sid) => String(sid)));
+    return samples
+      .filter((s) => String(s?.type || '').toLowerCase() === 'md_eval')
+      .filter((s) => {
+        const sid = s?.sample_id ? String(s.sample_id) : '';
+        return sid && !analyzed.has(sid);
+      })
+      .map((s) => ({
+        sample_id: String(s.sample_id),
+        name: String(s.name || s.sample_id),
+        state_id: s.state_id ? String(s.state_id) : '',
+      }));
+  }, [selectedCluster, commitmentSampleIds]);
 
   const commitmentMatrix = useMemo(
     () => (Array.isArray(analysisData?.data?.q_residue_all) ? analysisData.data.q_residue_all : []),
@@ -1522,7 +1621,8 @@ export default function DeltaCommitment3DPage() {
 
   const nodeSlices = useMemo(() => {
     const probs = residueProfile?.node_probs;
-    return compressPieSlices(vecToSlices(probs, 'c'), 8);
+    const ids = Array.isArray(residueProfile?.node_cluster_ids) ? residueProfile.node_cluster_ids : null;
+    return compressPieSlices(vecToSlices(probs, 'c', ids), 8);
   }, [residueProfile]);
 
   const edgeProfileByKey = useMemo(() => {
@@ -1720,6 +1820,18 @@ export default function DeltaCommitment3DPage() {
               <p className="text-[11px] text-gray-500 mt-1">
                 Colors are derived from the selected commitment mode (see below).
               </p>
+              {selectedCommitmentMeta && commitmentSampleIds.length > 0 && missingMdCommitmentSamples.length > 0 && (
+                <div className="mt-2 rounded-md border border-yellow-900 bg-yellow-950/20 p-2 text-[11px] text-yellow-200">
+                  Commitment rows missing for {missingMdCommitmentSamples.length} MD samples:
+                  {' '}
+                  {missingMdCommitmentSamples
+                    .slice(0, 6)
+                    .map((s) => (s.state_id ? `${s.name} (${s.state_id})` : s.name))
+                    .join(', ')}
+                  {missingMdCommitmentSamples.length > 6 ? ' ...' : ''}.
+                  {' '}Run Delta Commitment analysis again and include these samples to append them.
+                </div>
+              )}
               <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2">
                 <div>
                   <label className="block text-xs text-gray-400 mb-1">Residue mapping</label>
@@ -2005,7 +2117,17 @@ export default function DeltaCommitment3DPage() {
                 <div className="rounded-md border border-gray-800 bg-gray-950/40 p-3 space-y-2">
                   <p className="text-xs text-gray-400">Node distribution</p>
                   <div className="flex items-start gap-3">
-                    <PieChart slices={nodeSlices} size={132} />
+                    <PieChart
+                      slices={nodeSlices}
+                      size={132}
+                      onSliceClick={() =>
+                        setPieModal({
+                          title: `Node distribution · ${selectedResidueLabel}`,
+                          subtitle: selectedSampleLabel || selectedSampleId,
+                          slices: nodeSlices,
+                        })
+                      }
+                    />
                     <div className="space-y-2 text-xs text-gray-200 min-w-0">
                       <p>
                         <span className="text-gray-400">Residue:</span> {selectedResidueLabel}
@@ -2034,6 +2156,21 @@ export default function DeltaCommitment3DPage() {
                             : ''}
                         </span>
                       </div>
+                      {nodeSlices.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setPieModal({
+                              title: `Node distribution · ${selectedResidueLabel}`,
+                              subtitle: selectedSampleLabel || selectedSampleId,
+                              slices: nodeSlices,
+                            })
+                          }
+                          className="text-[11px] px-2 py-1 rounded border border-gray-700 text-gray-200 hover:border-gray-500"
+                        >
+                          Enlarge pie
+                        </button>
+                      )}
                     </div>
                   </div>
                   {nodeSlices.length > 0 && (
@@ -2061,9 +2198,18 @@ export default function DeltaCommitment3DPage() {
                       {selectedEdgeEntries.map((edge) => {
                         const key = `${Math.min(edge.r, edge.s)}-${Math.max(edge.r, edge.s)}`;
                         const profile = edgeProfileByKey.get(key);
-                        const slices = compressPieSlices(jointToSlices(profile?.joint_probs), 10);
                         const rLabel = residueLabels[edge.r] || `res_${edge.r}`;
                         const sLabel = residueLabels[edge.s] || `res_${edge.s}`;
+                        const slices = compressPieSlices(
+                          jointToSlices(
+                            profile?.joint_probs,
+                            profile?.cluster_ids_r,
+                            profile?.cluster_ids_s,
+                            rLabel,
+                            sLabel
+                          ),
+                          10
+                        );
                         const q = Number(edge.q);
                         return (
                           <div key={`edge-card:${key}:${edge.eidx}`} className="rounded border border-gray-800 bg-gray-900/50 p-2 space-y-2">
@@ -2079,7 +2225,17 @@ export default function DeltaCommitment3DPage() {
                               </span>
                             </div>
                             <div className="flex items-start gap-3">
-                              <PieChart slices={slices} size={96} />
+                              <PieChart
+                                slices={slices}
+                                size={96}
+                                onSliceClick={() =>
+                                  setPieModal({
+                                    title: `Edge distribution · ${rLabel} - ${sLabel}`,
+                                    subtitle: selectedSampleLabel || selectedSampleId,
+                                    slices,
+                                  })
+                                }
+                              />
                               <div className="text-[11px] text-gray-400 space-y-1">
                                 <div>edge idx: {edge.eidx}</div>
                                 <div>|ΔJ|: {Number.isFinite(edge.d) ? Math.abs(edge.d).toFixed(3) : 'n/a'}</div>
@@ -2095,6 +2251,21 @@ export default function DeltaCommitment3DPage() {
                                       : 'neutral'
                                     : ''}
                                 </div>
+                                {slices.length > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setPieModal({
+                                        title: `Edge distribution · ${rLabel} - ${sLabel}`,
+                                        subtitle: selectedSampleLabel || selectedSampleId,
+                                        slices,
+                                      })
+                                    }
+                                    className="text-[11px] px-2 py-1 rounded border border-gray-700 text-gray-200 hover:border-gray-500"
+                                  >
+                                    Enlarge pie
+                                  </button>
+                                )}
                               </div>
                             </div>
                           </div>
@@ -2109,6 +2280,37 @@ export default function DeltaCommitment3DPage() {
         </div>
       </main>
       </div>
+      {pieModal && (
+        <div className="fixed inset-0 z-40 bg-black/70 flex items-center justify-center p-4">
+          <div className="w-full max-w-xl rounded-lg border border-gray-700 bg-gray-900 p-4 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-white">{pieModal.title}</h3>
+                {pieModal.subtitle && <p className="text-xs text-gray-400">{pieModal.subtitle}</p>}
+              </div>
+              <button
+                type="button"
+                onClick={() => setPieModal(null)}
+                className="text-xs px-2 py-1 rounded border border-gray-700 text-gray-200 hover:border-gray-500"
+              >
+                Close
+              </button>
+            </div>
+            <div className="flex flex-col md:flex-row items-start gap-4">
+              <PieChart slices={pieModal.slices || []} size={280} />
+              <div className="flex-1 max-h-72 overflow-auto pr-1 space-y-1 text-xs">
+                {(pieModal.slices || []).map((s) => (
+                  <div key={`modal-slice:${s.label}`} className="flex items-center gap-2 text-gray-200">
+                    <span className="inline-block h-3 w-3 rounded-sm" style={{ backgroundColor: s.color }} />
+                    <span className="truncate">{s.tooltip || s.label}</span>
+                    <span className="ml-auto text-gray-400">{(100 * (Number(s.value) || 0)).toFixed(2)}%</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

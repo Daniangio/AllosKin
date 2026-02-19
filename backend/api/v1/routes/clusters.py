@@ -354,7 +354,12 @@ async def get_potts_cluster_info(
     try:
         with np.load(cluster_path, allow_pickle=True) as data:
             residue_keys = data["residue_keys"].tolist() if "residue_keys" in data else []
-            cluster_counts = data["merged__cluster_counts"].tolist() if "merged__cluster_counts" in data else []
+            if "cluster_counts" in data:
+                cluster_counts = data["cluster_counts"].tolist()
+            elif "merged__cluster_counts" in data:
+                cluster_counts = data["merged__cluster_counts"].tolist()
+            else:
+                cluster_counts = []
             if "contact_edge_index" in data:
                 edge_index = np.asarray(data["contact_edge_index"], dtype=int)
                 if edge_index.ndim == 2 and edge_index.shape[0] == 2:
@@ -725,13 +730,12 @@ async def get_sample_stats(
     sample_id: str,
 ):
     try:
-        system_meta = project_store.get_system(project_id, system_id)
+        project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="System not found.")
 
-    entry = get_cluster_entry(system_meta, cluster_id)
-    samples = entry.get("samples") if isinstance(entry, dict) else None
-    if not isinstance(samples, list):
+    samples = project_store.list_samples(project_id, system_id, cluster_id)
+    if not isinstance(samples, list) or not samples:
         raise HTTPException(status_code=404, detail="No samples recorded for this cluster.")
     sample_entry = next((s for s in samples if isinstance(s, dict) and s.get("sample_id") == sample_id), None)
     if not sample_entry:
@@ -840,17 +844,16 @@ async def get_sample_residue_profile(
         edge_pairs.append((r, s))
 
     try:
-        system_meta = project_store.get_system(project_id, system_id)
+        project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="System not found.")
 
-    entry = get_cluster_entry(system_meta, cluster_id)
-    samples = entry.get("samples") if isinstance(entry, dict) else None
-    if not isinstance(samples, list):
+    samples = project_store.list_samples(project_id, system_id, cluster_id)
+    if not isinstance(samples, list) or not samples:
         raise HTTPException(status_code=404, detail="No samples recorded for this cluster.")
     sample_entry = next((s for s in samples if isinstance(s, dict) and s.get("sample_id") == sample_id), None)
     if not sample_entry:
-        raise HTTPException(status_code=404, detail="Sample not found in cluster metadata.")
+        raise HTTPException(status_code=404, detail="Sample not found in sample directory.")
     paths = sample_entry.get("paths") if isinstance(sample_entry, dict) else None
     sample_rel = paths.get("summary_npz") if isinstance(paths, dict) else None
     sample_rel = sample_rel or sample_entry.get("path")
@@ -865,27 +868,6 @@ async def get_sample_residue_profile(
             sample_path = alt
     if not sample_path.exists():
         raise HTTPException(status_code=404, detail="Sample NPZ not found on disk.")
-
-    cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
-    cluster_path = cluster_dirs["cluster_dir"] / "cluster.npz"
-    if not cluster_path.exists() and entry.get("path"):
-        cluster_path = project_store.resolve_path(project_id, system_id, str(entry.get("path")))
-    if not cluster_path.exists():
-        raise HTTPException(status_code=404, detail="Cluster NPZ not found.")
-
-    try:
-        with np.load(cluster_path, allow_pickle=True) as cluster_npz:
-            if "merged__cluster_counts" not in cluster_npz:
-                raise HTTPException(status_code=400, detail="Cluster NPZ is missing merged__cluster_counts.")
-            K = np.asarray(cluster_npz["merged__cluster_counts"], dtype=int)
-            residue_keys = [str(v) for v in cluster_npz["residue_keys"].tolist()] if "residue_keys" in cluster_npz else []
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to load cluster NPZ: {exc}") from exc
-
-    if residue_index < 0 or residue_index >= int(K.shape[0]):
-        raise HTTPException(status_code=400, detail=f"residue_index out of range [0,{int(K.shape[0]) - 1}].")
 
     try:
         with np.load(sample_path, allow_pickle=True) as sample_npz:
@@ -911,15 +893,16 @@ async def get_sample_residue_profile(
 
     if labels.ndim != 2:
         raise HTTPException(status_code=400, detail="Sample labels array must be 2D.")
-    if int(labels.shape[1]) != int(K.shape[0]):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Sample labels width mismatch: got {labels.shape[1]}, expected {int(K.shape[0])}.",
-        )
+
+    n_res = int(labels.shape[1])
+    if residue_index < 0 or residue_index >= n_res:
+        raise HTTPException(status_code=400, detail=f"residue_index out of range [0,{n_res - 1}].")
+
+    valid_pos = np.where(labels >= 0, labels, -1)
+    K = np.max(valid_pos, axis=0).astype(int, copy=False) + 1 if valid_pos.size else np.zeros((n_res,), dtype=int)
+    K = np.maximum(K, 1)
 
     Ki = int(K[residue_index])
-    if Ki <= 0:
-        raise HTTPException(status_code=400, detail=f"Invalid cluster count K[{residue_index}]={Ki}.")
     col = np.asarray(labels[:, residue_index], dtype=int)
     valid = (col >= 0) & (col < Ki)
     valid_count = int(np.count_nonzero(valid))
@@ -929,7 +912,7 @@ async def get_sample_residue_profile(
     edge_profiles: List[Dict[str, Any]] = []
     seen_pairs: set[tuple[int, int]] = set()
     for r, s in edge_pairs:
-        if r < 0 or s < 0 or r >= int(K.shape[0]) or s >= int(K.shape[0]):
+        if r < 0 or s < 0 or r >= n_res or s >= n_res:
             continue
         rr, ss = (r, s) if r < s else (s, r)
         if (rr, ss) in seen_pairs:
@@ -955,13 +938,15 @@ async def get_sample_residue_profile(
                 "s": int(ss),
                 "k_r": int(Kr),
                 "k_s": int(Ks),
+                "cluster_ids_r": list(range(int(Kr))),
+                "cluster_ids_s": list(range(int(Ks))),
                 "valid_count": int(edge_valid_count),
                 "invalid_count": int(labels.shape[0] - edge_valid_count),
                 "joint_probs": joint_probs.tolist(),
             }
         )
 
-    residue_label = residue_keys[residue_index] if residue_keys and residue_index < len(residue_keys) else f"res_{residue_index}"
+    residue_label = f"res_{residue_index}"
     return {
         "sample_id": sample_id,
         "sample_name": sample_entry.get("name"),
@@ -970,6 +955,7 @@ async def get_sample_residue_profile(
         "residue_index": int(residue_index),
         "residue_label": str(residue_label),
         "k": int(Ki),
+        "node_cluster_ids": list(range(int(Ki))),
         "node_probs": probs.tolist(),
         "node_valid_count": int(valid_count),
         "node_invalid_count": int(labels.shape[0] - valid_count),

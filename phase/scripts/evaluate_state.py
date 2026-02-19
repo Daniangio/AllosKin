@@ -14,6 +14,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--system-id", required=True)
     ap.add_argument("--cluster-id", required=True)
     ap.add_argument("--state-id", required=True)
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Residue prediction workers (1=sequential, 0=auto/all CPUs).",
+    )
     args = ap.parse_args(argv)
 
     root = Path(args.root).expanduser().resolve() / "projects"
@@ -51,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         args.state_id,
         store=store,
         sample_id=reuse_id,
+        workers=int(args.workers),
     )
 
     out_id = sample_entry.get("sample_id")

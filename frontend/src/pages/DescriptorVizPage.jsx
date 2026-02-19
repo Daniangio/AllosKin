@@ -26,6 +26,50 @@ const colors = [
   '#f59e0b',
 ];
 
+function pieColor(idx) {
+  const hue = (idx * 137.507764) % 360;
+  return `hsl(${hue} 70% 55%)`;
+}
+
+function piePath(cx, cy, r, start, end) {
+  const x0 = cx + r * Math.cos(start);
+  const y0 = cy + r * Math.sin(start);
+  const x1 = cx + r * Math.cos(end);
+  const y1 = cy + r * Math.sin(end);
+  const large = end - start > Math.PI ? 1 : 0;
+  return `M ${cx} ${cy} L ${x0} ${y0} A ${r} ${r} 0 ${large} 1 ${x1} ${y1} Z`;
+}
+
+function PieChart({ slices, size = 120, onClick = null }) {
+  const radius = size * 0.45;
+  const center = size / 2;
+  let acc = -Math.PI / 2;
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="shrink-0">
+      <circle cx={center} cy={center} r={radius} fill="#111827" />
+      {(slices || []).map((slice, idx) => {
+        const v = Number(slice.value) || 0;
+        const next = acc + v * Math.PI * 2;
+        const d = piePath(center, center, radius, acc, next);
+        acc = next;
+        const pct = `${(100 * v).toFixed(2)}%`;
+        return (
+          <path
+            key={`${slice.label}:${idx}`}
+            d={d}
+            fill={slice.color || pieColor(idx)}
+            onClick={onClick ? () => onClick(slice) : undefined}
+            className={onClick ? 'cursor-pointer' : undefined}
+          >
+            <title>{`${slice.tooltip || slice.label}: ${pct}`}</title>
+          </path>
+        );
+      })}
+      <circle cx={center} cy={center} r={radius * 0.35} fill="#0b1220" />
+    </svg>
+  );
+}
+
 export default function DescriptorVizPage() {
   const { projectId, systemId } = useParams();
   const location = useLocation();
@@ -75,12 +119,33 @@ export default function DescriptorVizPage() {
   const [patchHaloPercentile, setPatchHaloPercentile] = useState(5);
   const [patchBusy, setPatchBusy] = useState(false);
   const [patchError, setPatchError] = useState(null);
+  const [clusterVariantPanelOpen, setClusterVariantPanelOpen] = useState(false);
+  const [pieModal, setPieModal] = useState(null);
 
   const [anglesByState, setAnglesByState] = useState({});
   const [metaByState, setMetaByState] = useState({});
   const [loadingAngles, setLoadingAngles] = useState(false);
   const [anglesError, setAnglesError] = useState(null);
   const didHydrateQueryRef = useRef(false);
+
+  const axisLabel = useCallback((key) => {
+    if (key === 'phi') return 'Phi';
+    if (key === 'psi') return 'Psi';
+    if (key === 'chi1') return 'Chi1';
+    return String(key || '');
+  }, []);
+
+  const normalizeClusterId = useCallback((raw) => {
+    if (raw === null || raw === undefined) return -1;
+    if (typeof raw === 'number' && Number.isFinite(raw)) return Math.trunc(raw);
+    const text = String(raw).trim();
+    if (!text) return -1;
+    const prefixed = text.match(/^c(-?\d+)$/i);
+    if (prefixed) return Number(prefixed[1]);
+    const parsed = Number(text);
+    if (Number.isFinite(parsed)) return Math.trunc(parsed);
+    return -1;
+  }, []);
 
   useEffect(() => {
     const loadSystem = async () => {
@@ -308,10 +373,15 @@ export default function DescriptorVizPage() {
         metaLabels.length === xVals.length &&
         metaLabels.some((v) => Number.isFinite(v) && v >= 0);
 
-      const clusterLabels = data.cluster_labels;
+      const clusterLabels = Array.isArray(data.cluster_labels)
+        ? data.cluster_labels.map((v) => normalizeClusterId(v))
+        : null;
       const clusterColors =
         clusterLabels && clusterLegend.length
-          ? clusterLabels.map((c) => clusterColorMap[c] || '#9ca3af')
+          ? clusterLabels.map((c) => {
+              if (c < 0) return '#9ca3af';
+              return clusterColorMap[c] || colors[Math.abs(c) % colors.length];
+            })
           : null;
       const clusterHover =
         clusterLabels && clusterLegend.length
@@ -369,7 +439,7 @@ export default function DescriptorVizPage() {
             metaHover +
             (axes.zKey
               ? '<br>Phi: %{x:.2f}°<br>Psi: %{y:.2f}°<br>Chi1: %{z:.2f}°'
-              : `<br>${axes.xKey.toUpperCase()}: %{x:.2f}°<br>${axes.yKey.toUpperCase()}: %{y:.2f}°`) +
+              : `<br>${axisLabel(axes.xKey)}: %{x:.2f}°<br>${axisLabel(axes.yKey)}: %{y:.2f}°`) +
             (clusterHover ? '<br>Cluster: %{customdata}' : '') +
             '<extra></extra>',
         };
@@ -385,6 +455,8 @@ export default function DescriptorVizPage() {
       residueSymbols,
       stateColors,
       stateName,
+      axisLabel,
+      normalizeClusterId,
     ]
   );
 
@@ -518,9 +590,40 @@ export default function DescriptorVizPage() {
         }
       });
 
-      // Cluster legend: use from first response if present
-      const firstLegend = responses.find((r) => (r.data.cluster_legend || []).length);
-      setClusterLegend(firstLegend ? firstLegend.data.cluster_legend || [] : []);
+      const legendFromMetadata = new Map();
+      responses.forEach(({ data }) => {
+        (data.cluster_legend || []).forEach((entry) => {
+          const id = normalizeClusterId(entry?.id);
+          if (id < 0) return;
+          const key = String(id);
+          if (!legendFromMetadata.has(key)) {
+            legendFromMetadata.set(key, entry?.label || `c${id}`);
+          }
+        });
+      });
+
+      // Build legend from the labels actually present in the fetched points. This guarantees
+      // every visible non-halo cluster has a color and avoids rendering valid clusters as gray.
+      const observed = new Set();
+      responses.forEach(({ data }) => {
+        Object.values(data.angles || {}).forEach((anglePayload) => {
+          (anglePayload?.cluster_labels || []).forEach((raw) => {
+            const id = normalizeClusterId(raw);
+            if (id >= 0) observed.add(id);
+          });
+        });
+      });
+      const ids = observed.size
+        ? Array.from(observed).sort((a, b) => a - b)
+        : Array.from(legendFromMetadata.keys())
+            .map((k) => Number(k))
+            .filter((v) => Number.isFinite(v))
+            .sort((a, b) => a - b);
+      const mergedLegend = ids.map((id) => ({
+        id,
+        label: legendFromMetadata.get(String(id)) || `c${id}`,
+      }));
+      setClusterLegend(mergedLegend);
       setClusterVariants(nextClusterVariants);
       if (nextClusterVariants.length) {
         const allowed = new Set(nextClusterVariants.map((v) => String(v.id)));
@@ -573,6 +676,7 @@ export default function DescriptorVizPage() {
     maxPoints,
     clusterLabelMode,
     selectedClusterVariantId,
+    normalizeClusterId,
     projectId,
     selectedMetastableIds,
     selectedClusterId,
@@ -598,6 +702,12 @@ export default function DescriptorVizPage() {
       setPatchResiduesInput(selectedResidue);
     }
   }, [selectedResidue, patchResiduesInput]);
+
+  useEffect(() => {
+    if (!selectedClusterId) {
+      setClusterVariantPanelOpen(false);
+    }
+  }, [selectedClusterId]);
 
   const parsePatchResidues = useCallback(() => {
     const raw = (patchResiduesInput || '').trim();
@@ -756,6 +866,66 @@ export default function DescriptorVizPage() {
       Object.values(anglesByState).some((residues) => Boolean((residues || {})[selectedResidue])),
     [anglesByState, selectedResidue]
   );
+
+  const residuePieByState = useMemo(() => {
+    if (!selectedResidue) return [];
+    const rows = [];
+    selectedStates.forEach((stateId) => {
+      const payload = anglesByState?.[stateId]?.[selectedResidue];
+      const labelsRaw = Array.isArray(payload?.cluster_labels) ? payload.cluster_labels : null;
+      if (!labelsRaw || !labelsRaw.length) {
+        rows.push({
+          stateId,
+          stateName: stateName(stateId),
+          total: 0,
+          valid: 0,
+          slices: [],
+        });
+        return;
+      }
+      const labels = labelsRaw.map((v) => normalizeClusterId(v));
+      const counts = new Map();
+      labels.forEach((cid) => {
+        if (cid < 0) return;
+        counts.set(cid, (counts.get(cid) || 0) + 1);
+      });
+      const valid = Array.from(counts.values()).reduce((acc, v) => acc + v, 0);
+      const slicesRaw = Array.from(counts.entries())
+        .sort((a, b) => b[1] - a[1])
+        .map(([cid, count], idx) => {
+          const label = clusterLabelLookup[cid] || `c${cid}`;
+          const color = clusterColorMap[cid] || colors[Math.abs(cid) % colors.length] || pieColor(idx);
+          const frac = valid > 0 ? count / valid : 0;
+          return {
+            label,
+            value: frac,
+            color,
+            tooltip: `cluster ${label}`,
+          };
+        });
+      const maxSlices = 10;
+      const keep = slicesRaw.slice(0, maxSlices);
+      const rest = slicesRaw.slice(maxSlices);
+      const restValue = rest.reduce((acc, s) => acc + (Number(s.value) || 0), 0);
+      const slices = restValue > 0 ? [...keep, { label: 'other', value: restValue, color: '#6b7280', tooltip: 'other clusters' }] : keep;
+      rows.push({
+        stateId,
+        stateName: stateName(stateId),
+        total: labels.length,
+        valid,
+        slices,
+      });
+    });
+    return rows;
+  }, [
+    anglesByState,
+    selectedResidue,
+    selectedStates,
+    stateName,
+    normalizeClusterId,
+    clusterColorMap,
+    clusterLabelLookup,
+  ]);
 
   const hasHaloSummary = useMemo(() => {
     const matrix = haloSummary?.matrix;
@@ -1001,7 +1171,7 @@ export default function DescriptorVizPage() {
               </div>
             )}
             <div>
-              <label className="block text-xs text-gray-400 mb-1">Cluster NPZ (optional coloring)</label>
+              <label className="block text-xs text-gray-400 mb-1">Cluster (optional coloring)</label>
               <select
                 value={selectedClusterId}
                 onChange={(e) => {
@@ -1047,164 +1217,14 @@ export default function DescriptorVizPage() {
                 </div>
               )}
               {selectedClusterId && (
-                <div className="mt-3 space-y-2 border border-gray-700 rounded-md p-3 bg-gray-900">
-                  <div>
-                    <label className="block text-xs text-gray-400 mb-1">Cluster variant</label>
-                    <select
-                      value={selectedClusterVariantId}
-                      onChange={(e) => setSelectedClusterVariantId(e.target.value || 'original')}
-                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
-                    >
-                      {(clusterVariants.length ? clusterVariants : [{ id: 'original', label: 'Original cluster' }]).map(
-                        (v) => (
-                          <option key={String(v.id)} value={String(v.id)}>
-                            {v.label || v.id}
-                          </option>
-                        )
-                      )}
-                    </select>
-                    {selectedClusterVariant && selectedClusterVariantId !== 'original' && (
-                      <p className="text-[11px] text-gray-500 mt-1">
-                        Variant status: {selectedClusterVariant.status || 'preview'}
-                      </p>
-                    )}
-                  </div>
-                  <div className="space-y-1">
-                    <label className="block text-xs text-gray-400">Patch residues</label>
-                    <input
-                      type="text"
-                      value={patchResiduesInput}
-                      onChange={(e) => setPatchResiduesInput(e.target.value)}
-                      placeholder="res_10,res_11"
-                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
-                    />
-                    <p className="text-[10px] text-gray-500">
-                      Comma-separated residue keys. Selected residue is used if empty.
-                    </p>
-                  </div>
-                  <div>
-                    <label className="block text-xs text-gray-400 mb-1">Cluster selection mode</label>
-                    <select
-                      value={patchClusterSelectionMode}
-                      onChange={(e) => setPatchClusterSelectionMode(e.target.value)}
-                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
-                    >
-                      <option value="maxclust">Fixed K (maxclust)</option>
-                      <option value="inconsistent">Auto by threshold (inconsistent)</option>
-                    </select>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2">
-                    {patchClusterSelectionMode === 'maxclust' ? (
-                      <div>
-                        <label className="block text-xs text-gray-400 mb-1">n_clusters (optional)</label>
-                        <input
-                          type="number"
-                          min={1}
-                          value={patchNClusters}
-                          onChange={(e) => setPatchNClusters(e.target.value)}
-                          className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
-                        />
-                      </div>
-                    ) : (
-                      <div>
-                        <label className="block text-xs text-gray-400 mb-1">Inconsistent threshold</label>
-                        <input
-                          type="number"
-                          step={0.1}
-                          value={patchInconsistentThreshold}
-                          onChange={(e) => setPatchInconsistentThreshold(e.target.value)}
-                          className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
-                        />
-                      </div>
-                    )}
-                    {patchClusterSelectionMode === 'inconsistent' && (
-                      <div>
-                        <label className="block text-xs text-gray-400 mb-1">Inconsistent depth</label>
-                        <input
-                          type="number"
-                          min={1}
-                          value={patchInconsistentDepth}
-                          onChange={(e) => setPatchInconsistentDepth(e.target.value)}
-                          className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
-                        />
-                      </div>
-                    )}
-                    <div>
-                      <label className="block text-xs text-gray-400 mb-1">Max frames (optional)</label>
-                      <input
-                        type="number"
-                        min={1}
-                        value={patchMaxClusterFrames}
-                        onChange={(e) => setPatchMaxClusterFrames(e.target.value)}
-                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-xs text-gray-400 mb-1">Halo percentile</label>
-                      <input
-                        type="number"
-                        min={0}
-                        max={50}
-                        step={0.5}
-                        value={patchHaloPercentile}
-                        onChange={(e) => setPatchHaloPercentile(e.target.value)}
-                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
-                      />
-                    </div>
-                  </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <div>
-                      <label className="block text-xs text-gray-400 mb-1">Linkage</label>
-                      <select
-                        value={patchLinkage}
-                        onChange={(e) => setPatchLinkage(e.target.value)}
-                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
-                      >
-                        <option value="ward">ward</option>
-                        <option value="complete">complete</option>
-                        <option value="average">average</option>
-                        <option value="single">single</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-xs text-gray-400 mb-1">Covariance</label>
-                      <select
-                        value={patchCovariance}
-                        onChange={(e) => setPatchCovariance(e.target.value)}
-                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
-                      >
-                        <option value="full">full</option>
-                        <option value="diag">diag</option>
-                      </select>
-                    </div>
-                  </div>
+                <div className="mt-3">
                   <button
                     type="button"
-                    onClick={handleCreatePatch}
-                    disabled={patchBusy}
-                    className="w-full bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-semibold py-1.5 rounded-md disabled:opacity-60"
+                    onClick={() => setClusterVariantPanelOpen(true)}
+                    className="w-full border border-gray-700 rounded-md px-3 py-2 text-xs text-gray-200 hover:border-cyan-500"
                   >
-                    {patchBusy ? 'Working…' : 'Create preview patch'}
+                    Open Cluster Variant & Patch Panel
                   </button>
-                  <div className="grid grid-cols-2 gap-2">
-                    <button
-                      type="button"
-                      onClick={handleConfirmPatch}
-                      disabled={patchBusy || selectedClusterVariantId === 'original'}
-                      className="bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold py-1.5 rounded-md disabled:opacity-60"
-                    >
-                      Confirm swap
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleDiscardPatch}
-                      disabled={patchBusy || selectedClusterVariantId === 'original'}
-                      className="bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold py-1.5 rounded-md disabled:opacity-60"
-                    >
-                      Discard patch
-                    </button>
-                  </div>
-                  {patchError && <p className="text-[11px] text-rose-400">{patchError}</p>}
                 </div>
               )}
               {clusterLegend.length > 0 && (
@@ -1306,14 +1326,80 @@ export default function DescriptorVizPage() {
                           plot_bgcolor: '#111827',
                           font: { color: '#e5e7eb' },
                           margin: { l: 40, r: 10, t: 30, b: 40 },
-                          xaxis: { title: `${axes.x.toUpperCase()} (°)`, range: [-180, 180] },
-                          yaxis: { title: `${axes.y.toUpperCase()} (°)`, range: [-180, 180] },
+                          xaxis: { title: `${axisLabel(axes.x)} (°)`, range: [-180, 180] },
+                          yaxis: { title: `${axisLabel(axes.y)} (°)`, range: [-180, 180] },
                           legend: { bgcolor: 'rgba(0,0,0,0)', groupclick: 'toggleitem', itemdoubleclick: 'toggleothers' },
                         }}
                         useResizeHandler
                         style={{ width: '100%', height: '100%' }}
                         config={{ displaylogo: false, responsive: true }}
                       />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {hasAngles && selectedClusterId && (
+              <div className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <h3 className="text-sm font-semibold text-white">Selected Residue Cluster Pies</h3>
+                    <p className="text-[11px] text-gray-400">
+                      Distribution of cluster assignments for <span className="font-mono">{residueLabel(selectedResidue)}</span> in each selected macro-state.
+                    </p>
+                  </div>
+                </div>
+                <div className="grid xl:grid-cols-2 gap-3">
+                  {residuePieByState.map((row) => (
+                    <div key={`pie:${row.stateId}`} className="rounded-md border border-gray-700 bg-gray-900/50 p-3 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-xs text-gray-200 truncate">{row.stateName}</p>
+                        <p className="text-[11px] text-gray-500">
+                          valid {row.valid} / {row.total}
+                        </p>
+                      </div>
+                      {row.slices.length === 0 ? (
+                        <p className="text-xs text-gray-500">
+                          No non-halo cluster labels in the loaded sample points for this state.
+                        </p>
+                      ) : (
+                        <div className="flex items-start gap-3">
+                          <PieChart
+                            slices={row.slices}
+                            size={124}
+                            onClick={() =>
+                              setPieModal({
+                                title: `Cluster distribution · ${residueLabel(selectedResidue)}`,
+                                subtitle: row.stateName,
+                                slices: row.slices,
+                              })
+                            }
+                          />
+                          <div className="min-w-0 flex-1 space-y-1 text-[11px]">
+                            {row.slices.map((s) => (
+                              <div key={`pie-slice:${row.stateId}:${s.label}`} className="flex items-center gap-2 text-gray-300">
+                                <span className="inline-block h-2.5 w-2.5 rounded-sm" style={{ backgroundColor: s.color }} />
+                                <span className="truncate">{s.label}</span>
+                                <span className="ml-auto text-gray-400">{(100 * s.value).toFixed(1)}%</span>
+                              </div>
+                            ))}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setPieModal({
+                                  title: `Cluster distribution · ${residueLabel(selectedResidue)}`,
+                                  subtitle: row.stateName,
+                                  slices: row.slices,
+                                })
+                              }
+                              className="mt-1 text-[11px] px-2 py-1 rounded border border-gray-700 text-gray-200 hover:border-gray-500"
+                            >
+                              Enlarge pie
+                            </button>
+                          </div>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -1411,6 +1497,217 @@ export default function DescriptorVizPage() {
               </div>
             )}
           </section>
+
+          {selectedClusterId && clusterVariantPanelOpen && (
+            <div className="fixed inset-0 z-40 bg-black/60 flex items-center justify-center p-4">
+              <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-lg border border-gray-700 bg-gray-900 p-4 space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <h3 className="text-sm font-semibold text-white">Cluster Variant & Patch Panel</h3>
+                  <button
+                    type="button"
+                    onClick={() => setClusterVariantPanelOpen(false)}
+                    className="border border-gray-700 rounded-md px-2 py-1 text-xs text-gray-200 hover:border-gray-500"
+                  >
+                    Close
+                  </button>
+                </div>
+
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">Cluster variant</label>
+                  <select
+                    value={selectedClusterVariantId}
+                    onChange={(e) => setSelectedClusterVariantId(e.target.value || 'original')}
+                    className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                  >
+                    {(clusterVariants.length ? clusterVariants : [{ id: 'original', label: 'Original cluster' }]).map(
+                      (v) => (
+                        <option key={String(v.id)} value={String(v.id)}>
+                          {v.label || v.id}
+                        </option>
+                      )
+                    )}
+                  </select>
+                  {selectedClusterVariant && selectedClusterVariantId !== 'original' && (
+                    <p className="text-[11px] text-gray-500 mt-1">
+                      Variant status: {selectedClusterVariant.status || 'preview'}
+                    </p>
+                  )}
+                </div>
+
+                <div className="space-y-1">
+                  <label className="block text-xs text-gray-400">Patch residues</label>
+                  <input
+                    type="text"
+                    value={patchResiduesInput}
+                    onChange={(e) => setPatchResiduesInput(e.target.value)}
+                    placeholder="res_10,res_11"
+                    className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                  />
+                  <p className="text-[10px] text-gray-500">
+                    Comma-separated residue keys. Selected residue is used if empty.
+                  </p>
+                </div>
+
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">Cluster selection mode</label>
+                  <select
+                    value={patchClusterSelectionMode}
+                    onChange={(e) => setPatchClusterSelectionMode(e.target.value)}
+                    className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                  >
+                    <option value="maxclust">Fixed K (maxclust)</option>
+                    <option value="inconsistent">Auto by threshold (inconsistent)</option>
+                  </select>
+                </div>
+
+                <div className="grid grid-cols-3 gap-2">
+                  {patchClusterSelectionMode === 'maxclust' ? (
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">n_clusters (optional)</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={patchNClusters}
+                        onChange={(e) => setPatchNClusters(e.target.value)}
+                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                      />
+                    </div>
+                  ) : (
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">Inconsistent threshold</label>
+                      <input
+                        type="number"
+                        step={0.1}
+                        value={patchInconsistentThreshold}
+                        onChange={(e) => setPatchInconsistentThreshold(e.target.value)}
+                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                      />
+                    </div>
+                  )}
+                  {patchClusterSelectionMode === 'inconsistent' && (
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">Inconsistent depth</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={patchInconsistentDepth}
+                        onChange={(e) => setPatchInconsistentDepth(e.target.value)}
+                        className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                      />
+                    </div>
+                  )}
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Max frames (optional)</label>
+                    <input
+                      type="number"
+                      min={1}
+                      value={patchMaxClusterFrames}
+                      onChange={(e) => setPatchMaxClusterFrames(e.target.value)}
+                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Halo percentile</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={50}
+                      step={0.5}
+                      value={patchHaloPercentile}
+                      onChange={(e) => setPatchHaloPercentile(e.target.value)}
+                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Linkage</label>
+                    <select
+                      value={patchLinkage}
+                      onChange={(e) => setPatchLinkage(e.target.value)}
+                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                    >
+                      <option value="ward">ward</option>
+                      <option value="complete">complete</option>
+                      <option value="average">average</option>
+                      <option value="single">single</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Covariance</label>
+                    <select
+                      value={patchCovariance}
+                      onChange={(e) => setPatchCovariance(e.target.value)}
+                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-1.5 text-white text-xs"
+                    >
+                      <option value="full">full</option>
+                      <option value="diag">diag</option>
+                    </select>
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleCreatePatch}
+                  disabled={patchBusy}
+                  className="w-full bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-semibold py-1.5 rounded-md disabled:opacity-60"
+                >
+                  {patchBusy ? 'Working…' : 'Create preview patch'}
+                </button>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={handleConfirmPatch}
+                    disabled={patchBusy || selectedClusterVariantId === 'original'}
+                    className="bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-semibold py-1.5 rounded-md disabled:opacity-60"
+                  >
+                    Confirm swap
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDiscardPatch}
+                    disabled={patchBusy || selectedClusterVariantId === 'original'}
+                    className="bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold py-1.5 rounded-md disabled:opacity-60"
+                  >
+                    Discard patch
+                  </button>
+                </div>
+                {patchError && <p className="text-[11px] text-rose-400">{patchError}</p>}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {pieModal && (
+        <div className="fixed inset-0 z-40 bg-black/70 flex items-center justify-center p-4">
+          <div className="w-full max-w-xl rounded-lg border border-gray-700 bg-gray-900 p-4 space-y-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-white">{pieModal.title}</h3>
+                {pieModal.subtitle && <p className="text-xs text-gray-400">{pieModal.subtitle}</p>}
+              </div>
+              <button
+                type="button"
+                onClick={() => setPieModal(null)}
+                className="text-xs px-2 py-1 rounded border border-gray-700 text-gray-200 hover:border-gray-500"
+              >
+                Close
+              </button>
+            </div>
+            <div className="flex flex-col md:flex-row items-start gap-4">
+              <PieChart slices={pieModal.slices || []} size={280} />
+              <div className="flex-1 max-h-72 overflow-auto pr-1 space-y-1 text-xs">
+                {(pieModal.slices || []).map((s) => (
+                  <div key={`pie-modal-slice:${s.label}`} className="flex items-center gap-2 text-gray-200">
+                    <span className="inline-block h-3 w-3 rounded-sm" style={{ backgroundColor: s.color }} />
+                    <span className="truncate">{s.tooltip || s.label}</span>
+                    <span className="ml-auto text-gray-400">{(100 * (Number(s.value) || 0)).toFixed(2)}%</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>

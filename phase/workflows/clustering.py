@@ -6,6 +6,7 @@ import json
 import re
 import uuid
 import pickle
+import os
 from datetime import datetime
 from pathlib import Path
 import inspect
@@ -796,9 +797,6 @@ def assign_cluster_labels_to_states(
     system = store.get_system(project_id, system_id)
     data = np.load(cluster_path, allow_pickle=True)
 
-    residue_keys = [str(k) for k in data["residue_keys"]]
-    merged_counts = np.asarray(data["merged__cluster_counts"], dtype=np.int32)
-
     meta = {}
     if "metadata_json" in data:
         try:
@@ -807,8 +805,39 @@ def assign_cluster_labels_to_states(
             meta = json.loads(str(meta_val))
         except Exception:
             meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
 
-    predictions = meta.get("predictions") or {}
+    residue_keys = [str(k) for k in data["residue_keys"]] if "residue_keys" in data else [str(k) for k in (meta.get("residue_keys") or [])]
+    if not residue_keys:
+        raise ValueError("Cluster NPZ missing residue_keys.")
+
+    merged_keys = ((meta.get("merged") or {}).get("npz_keys") or {})
+    key_halo = str(merged_keys.get("labels_halo") or merged_keys.get("labels") or "merged__labels")
+    key_assigned = str(merged_keys.get("labels_assigned") or "merged__labels_assigned")
+    key_state_ids = str(merged_keys.get("frame_state_ids") or "merged__frame_state_ids")
+    key_meta_ids = str(merged_keys.get("frame_metastable_ids") or "merged__frame_metastable_ids")
+    key_frame_indices = str(merged_keys.get("frame_indices") or "merged__frame_indices")
+
+    if key_halo not in data:
+        raise ValueError(f"Cluster NPZ missing merged labels array: '{key_halo}'")
+    if key_state_ids not in data:
+        raise ValueError(f"Cluster NPZ missing merged frame state ids array: '{key_state_ids}'")
+    if key_frame_indices not in data:
+        raise ValueError(f"Cluster NPZ missing merged frame indices array: '{key_frame_indices}'")
+
+    merged_halo = np.asarray(data[key_halo], dtype=np.int32)
+    merged_assigned = np.asarray(data[key_assigned], dtype=np.int32) if key_assigned in data else merged_halo
+    merged_frame_state_ids = np.asarray(data[key_state_ids]).astype(str)
+    merged_frame_indices = np.asarray(data[key_frame_indices], dtype=np.int64)
+    merged_frame_meta_ids = np.asarray(data[key_meta_ids]).astype(str) if key_meta_ids in data else np.array([], dtype=str)
+
+    if merged_halo.ndim != 2 or merged_assigned.ndim != 2:
+        raise ValueError("Merged label arrays must be 2D.")
+    if merged_halo.shape != merged_assigned.shape:
+        raise ValueError("Merged halo/assigned label arrays must have the same shape.")
+    if merged_frame_state_ids.shape[0] != merged_halo.shape[0] or merged_frame_indices.shape[0] != merged_halo.shape[0]:
+        raise ValueError("Merged frame id/index arrays are misaligned with merged labels.")
 
     assign_root = output_dir or (cluster_path.parent / "samples")
     assign_root.mkdir(parents=True, exist_ok=True)
@@ -832,35 +861,49 @@ def assign_cluster_labels_to_states(
             seen_state_ids.add(sid)
             target_state_ids.append(sid)
 
+    def _infer_state_frame_count(state_obj: DescriptorState | None, state_sid: str, local_frame_idx: np.ndarray) -> int:
+        count = 0
+        desc_rel = getattr(state_obj, "descriptor_file", None) if state_obj is not None else None
+        if isinstance(desc_rel, str) and desc_rel:
+            try:
+                desc_path = store.resolve_path(project_id, system_id, desc_rel)
+                if desc_path.exists():
+                    features = load_descriptor_npz(desc_path)
+                    count = int(_infer_frame_count(features))
+            except Exception:
+                count = 0
+        if count <= 0 and local_frame_idx.size:
+            count = int(np.max(local_frame_idx)) + 1
+        return max(0, int(count))
+
     for state_id in target_state_ids:
         state = (system.states or {}).get(str(state_id))
         if not state:
             continue
-        key = f"state:{state_id}"
-        entry = predictions.get(key)
-        if not isinstance(entry, dict):
+        rows = np.where(merged_frame_state_ids == str(state_id))[0]
+        if rows.size == 0:
             continue
-        labels_key = entry.get("labels_halo")
-        if not labels_key or labels_key not in data:
+
+        local_halo = merged_halo[rows]
+        local_assigned = merged_assigned[rows]
+        local_frame_idx = merged_frame_indices[rows]
+        frame_count = _infer_state_frame_count(state, str(state_id), local_frame_idx)
+        if frame_count <= 0:
             continue
-        labels_halo = np.asarray(data[labels_key], dtype=np.int32)
-        assigned_key = entry.get("labels_assigned")
-        labels_assigned = (
-            np.asarray(data[assigned_key], dtype=np.int32)
-            if isinstance(assigned_key, str) and assigned_key in data
-            else None
-        )
-        frame_indices_key = entry.get("frame_indices")
-        if isinstance(frame_indices_key, str) and frame_indices_key in data:
-            frame_indices = np.asarray(data[frame_indices_key], dtype=np.int64)
-        else:
-            frame_indices = np.arange(labels_halo.shape[0], dtype=np.int64)
+        n_res = local_halo.shape[1]
+        labels_halo = np.full((frame_count, n_res), -1, dtype=np.int32)
+        labels_assigned = np.full((frame_count, n_res), -1, dtype=np.int32)
+        valid = (local_frame_idx >= 0) & (local_frame_idx < frame_count)
+        if np.any(valid):
+            labels_halo[local_frame_idx[valid]] = local_halo[valid]
+            labels_assigned[local_frame_idx[valid]] = local_assigned[valid]
+        frame_indices = np.arange(frame_count, dtype=np.int64)
 
         sample_id = str(uuid.uuid4())
         sample_dir = assign_root / sample_id
         sample_dir.mkdir(parents=True, exist_ok=True)
         out_path = sample_dir / SAMPLE_NPZ_FILENAME
-        labels_primary = labels_assigned if labels_assigned is not None else labels_halo
+        labels_primary = labels_assigned
         keep = np.all(labels_primary >= 0, axis=1)
         if keep.size and not np.all(keep):
             labels_primary = labels_primary[keep]
@@ -906,62 +949,40 @@ def assign_cluster_labels_to_states(
         assigned_state_ids.append(str(state_id))
 
     assigned_meta_ids: List[str] = []
-    meta_lookup = {m.get("metastable_id") or m.get("id"): m for m in system.metastable_states or []}
-    if include_metastable:
+    if include_metastable and merged_frame_meta_ids.shape[0] == merged_halo.shape[0]:
+        meta_lookup = {str(m.get("metastable_id") or m.get("id")): m for m in system.metastable_states or []}
         if metastable_ids is None:
-            target_meta_ids = [str(mid) for mid in meta_lookup.keys() if mid is not None]
+            target_meta_ids = sorted({str(v) for v in merged_frame_meta_ids.tolist() if str(v)})
         else:
-            target_meta_ids = []
             seen_meta_ids: set[str] = set()
+            target_meta_ids = []
             for raw in metastable_ids:
                 mid = str(raw)
-                if mid in seen_meta_ids:
+                if not mid or mid in seen_meta_ids:
                     continue
                 seen_meta_ids.add(mid)
                 target_meta_ids.append(mid)
 
         for meta_id in target_meta_ids:
-            key = f"meta:{meta_id}"
-            entry = predictions.get(key)
-            if not isinstance(entry, dict):
+            rows = np.where(merged_frame_meta_ids == str(meta_id))[0]
+            if rows.size == 0:
                 continue
-            labels_key = entry.get("labels_halo")
-            if not labels_key or labels_key not in data:
-                continue
-            labels_halo = np.asarray(data[labels_key], dtype=np.int32)
-            assigned_key = entry.get("labels_assigned")
-            labels_assigned = (
-                np.asarray(data[assigned_key], dtype=np.int32)
-                if isinstance(assigned_key, str) and assigned_key in data
-                else None
-            )
-            frame_state_ids_key = entry.get("frame_state_ids")
-            frame_indices_key = entry.get("frame_indices")
-            frame_state_ids = (
-                np.asarray(data[frame_state_ids_key], dtype=str)
-                if isinstance(frame_state_ids_key, str) and frame_state_ids_key in data
-                else np.array([], dtype=str)
-            )
-            frame_indices = (
-                np.asarray(data[frame_indices_key], dtype=np.int64)
-                if isinstance(frame_indices_key, str) and frame_indices_key in data
-                else np.arange(labels_halo.shape[0], dtype=np.int64)
-            )
+            labels_halo = merged_halo[rows]
+            labels_assigned = merged_assigned[rows]
+            frame_indices = merged_frame_indices[rows]
+            frame_state_ids_arr = merged_frame_state_ids[rows]
 
             sample_id = str(uuid.uuid4())
             sample_dir = assign_root / sample_id
             sample_dir.mkdir(parents=True, exist_ok=True)
             out_path = sample_dir / SAMPLE_NPZ_FILENAME
-            labels_primary = labels_assigned if labels_assigned is not None else labels_halo
-            frame_state_ids_arr = frame_state_ids
-            if frame_state_ids_arr.size != frame_indices.shape[0]:
-                frame_state_ids_arr = np.full(frame_indices.shape[0], "", dtype=str)
+            labels_primary = labels_assigned
             keep = np.all(labels_primary >= 0, axis=1)
             if keep.size and not np.all(keep):
                 labels_primary = labels_primary[keep]
                 labels_halo = labels_halo[keep]
                 frame_indices = frame_indices[keep]
-                frame_state_ids_arr = frame_state_ids_arr[keep] if frame_state_ids_arr.size == keep.shape[0] else frame_state_ids_arr
+                frame_state_ids_arr = frame_state_ids_arr[keep]
             save_sample_npz(
                 out_path,
                 labels=labels_primary,
@@ -974,9 +995,15 @@ def assign_cluster_labels_to_states(
                 rel_system = str(out_path.relative_to(system_dir))
             except Exception:
                 rel_system = str(out_path)
+            meta_obj = meta_lookup.get(str(meta_id)) if isinstance(meta_lookup, dict) else None
+            meta_label = (
+                (meta_obj.get("name") or meta_obj.get("default_name") or meta_obj.get("metastable_id"))
+                if isinstance(meta_obj, dict)
+                else str(meta_id)
+            )
             sample_meta = {
                 "sample_id": sample_id,
-                "name": f"MD {meta_lookup.get(meta_id, {}).get('label') or meta_id}",
+                "name": f"MD {meta_label}",
                 "type": "md_eval",
                 "method": "md_eval",
                 "source": "clustering",
@@ -987,11 +1014,10 @@ def assign_cluster_labels_to_states(
                 "params": {},
             }
             (sample_dir / "sample_metadata.json").write_text(json.dumps(sample_meta, indent=2), encoding="utf-8")
-            meta_label = meta_lookup.get(meta_id, {}).get("label") if isinstance(meta_id, str) else None
             samples.append(
                 {
                     "sample_id": sample_id,
-                    "name": f"MD {meta_label or meta_id}",
+                    "name": f"MD {meta_label}",
                     "type": "md_eval",
                     "method": "md_eval",
                     "metastable_id": str(meta_id),
@@ -1017,6 +1043,7 @@ def evaluate_state_with_models(
     *,
     store: ProjectStore | None = None,
     sample_id: str | None = None,
+    workers: int = 1,
 ) -> Dict[str, Any]:
     store = store or ProjectStore()
     system = store.get_system(project_id, system_id)
@@ -1052,6 +1079,19 @@ def evaluate_state_with_models(
     )
     if not any(m is not None for m in residue_models):
         raise ValueError("Cluster NPZ is missing predictor models for evaluation.")
+    try:
+        workers_i = int(workers)
+    except Exception:
+        workers_i = 1
+    if workers_i <= 0:
+        workers_i = max(1, int(os.cpu_count() or 1))
+    use_processes = workers_i > 1
+    if use_processes:
+        # Legacy dual-ADP models embed live Data objects; keep prediction in-process for stability.
+        for mdl in residue_models:
+            if isinstance(mdl, dict) and str(mdl.get("kind") or "").lower() == "adp_legacy_models":
+                use_processes = False
+                break
 
     descriptor_path = store.resolve_path(project_id, system_id, state.descriptor_file)
     feature_dict = load_descriptor_npz(descriptor_path)
@@ -1060,6 +1100,7 @@ def evaluate_state_with_models(
     labels_halo = np.full((feature_dict[residue_keys[0]].shape[0], len(residue_keys)), -1, dtype=np.int32)
     labels_assigned = np.full_like(labels_halo, -1)
     cluster_counts = np.zeros(len(residue_keys), dtype=np.int32)
+    samples_by_residue: List[np.ndarray] = [np.zeros((0, 0), dtype=float)] * len(residue_keys)
 
     for idx, key in enumerate(residue_keys):
         if key not in feature_dict:
@@ -1072,31 +1113,49 @@ def evaluate_state_with_models(
             n_frames = samples.shape[0]
         if samples.shape[0] != n_frames:
             raise ValueError("Descriptor frame counts are inconsistent across residues.")
-        model = residue_models[idx] if idx < len(residue_models) else None
-        if model is None:
-            continue
-        labels_assigned[:, idx], labels_halo[:, idx] = _predict_labels_with_model(
-            model,
-            samples,
-            density_maxk=density_maxk,
-        )
-        if np.any(labels_assigned[:, idx] >= 0):
-            cluster_counts[idx] = int(labels_assigned[:, idx].max()) + 1
+        samples_by_residue[idx] = samples
 
-    # Keep full-frame predictions for cluster-level metadata/halo summary updates.
+    valid_residue_indices = [idx for idx, model in enumerate(residue_models) if model is not None]
+    if use_processes and valid_residue_indices:
+        with ProcessPoolExecutor(max_workers=min(workers_i, len(valid_residue_indices))) as executor:
+            futures: Dict[Any, int] = {}
+            for idx in valid_residue_indices:
+                futures[
+                    executor.submit(
+                        _predict_residue_worker,
+                        idx,
+                        samples_by_residue[idx],
+                        residue_models[idx],
+                        density_maxk,
+                    )
+                ] = idx
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    _, labels_assigned_res, labels_halo_res = fut.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed prediction for residue '{residue_keys[idx]}' (index={idx})"
+                    ) from exc
+                labels_assigned[:, idx] = labels_assigned_res
+                labels_halo[:, idx] = labels_halo_res
+                if np.any(labels_assigned_res >= 0):
+                    cluster_counts[idx] = int(labels_assigned_res.max()) + 1
+    else:
+        for idx in valid_residue_indices:
+            labels_assigned_res, labels_halo_res = _predict_labels_with_model(
+                residue_models[idx],
+                samples_by_residue[idx],
+                density_maxk=density_maxk,
+            )
+            labels_assigned[:, idx] = labels_assigned_res
+            labels_halo[:, idx] = labels_halo_res
+            if np.any(labels_assigned_res >= 0):
+                cluster_counts[idx] = int(labels_assigned_res.max()) + 1
+
     labels_halo_full = labels_halo.copy()
     labels_assigned_full = labels_assigned.copy()
     frame_indices_full = np.arange(labels_halo.shape[0], dtype=np.int64)
-
-    state_label = state.name or state_id
-    _upsert_state_prediction_and_halo_summary(
-        cluster_path=cluster_path,
-        state_id=state_id,
-        state_label=state_label,
-        labels_halo=labels_halo_full,
-        labels_assigned=labels_assigned_full,
-        frame_indices=frame_indices_full,
-    )
 
     sample_id = str(sample_id) if sample_id else str(uuid.uuid4())
     sample_dir = cluster_dirs["samples_dir"] / sample_id
@@ -1121,7 +1180,7 @@ def evaluate_state_with_models(
         rel = str(out_path)
     sample_entry = {
         "sample_id": sample_id,
-        "name": f"MD {state_label}",
+        "name": f"MD {state.name or state_id}",
         "type": "md_eval",
         "method": "md_eval",
         "source": "clustering",
@@ -1616,7 +1675,10 @@ def create_cluster_residue_patch(
 
     merged_halo = np.asarray(payload["merged__labels"], dtype=np.int32)
     merged_assigned = np.asarray(payload["merged__labels_assigned"], dtype=np.int32)
-    merged_counts = np.asarray(payload.get("merged__cluster_counts"), dtype=np.int32).copy()
+    if "cluster_counts" in payload:
+        merged_counts = np.asarray(payload.get("cluster_counts"), dtype=np.int32).copy()
+    else:
+        merged_counts = np.asarray(payload.get("merged__cluster_counts"), dtype=np.int32).copy()
     if merged_halo.shape != merged_assigned.shape:
         raise ValueError("Merged halo/assigned arrays have incompatible shapes.")
     n_frames, n_residues = merged_halo.shape
@@ -1845,6 +1907,7 @@ def confirm_cluster_residue_patch(
 
     payload["merged__labels"] = np.asarray(payload[key_halo], dtype=np.int32)
     payload["merged__labels_assigned"] = np.asarray(payload[key_assigned], dtype=np.int32)
+    payload["cluster_counts"] = np.asarray(payload[key_counts], dtype=np.int32)
     payload["merged__cluster_counts"] = np.asarray(payload[key_counts], dtype=np.int32)
 
     predictions_patch = patch.get("predictions") or {}
@@ -2521,19 +2584,6 @@ def generate_metastable_cluster_npz(
                     total_residue_jobs,
                 )
 
-    condition_payload, predictions_meta, extra_meta = _build_condition_predictions(
-        project_id=project_id,
-        system_id=system_id,
-        residue_keys=residue_keys,
-        residue_models=dp_models,
-        density_maxk=density_maxk_val,
-        state_labels=state_labels,
-        metastable_labels=metastable_labels,
-        analysis_mode=getattr(system_meta, "analysis_mode", None),
-        predict_jobs=n_jobs,
-        progress_callback=progress_callback,
-    )
-
     # Persist NPZ
     dirs = store.ensure_directories(project_id, system_id)
     cluster_dir = dirs["clusters_dir"]
@@ -2563,7 +2613,6 @@ def generate_metastable_cluster_npz(
             "max_cluster_frames": max_cluster_frames_val,
             "random_state": random_state,
         },
-        "predictions": predictions_meta,
         "residue_keys": residue_keys,
         "residue_mapping": residue_mapping,
         "random_state": random_state,
@@ -2575,25 +2624,24 @@ def generate_metastable_cluster_npz(
                 "labels": "merged__labels",
                 "labels_halo": "merged__labels",
                 "labels_assigned": "merged__labels_assigned",
-                "cluster_counts": "merged__cluster_counts",
+                "cluster_counts": "cluster_counts",
                 "frame_state_ids": "merged__frame_state_ids",
                 "frame_metastable_ids": "merged__frame_metastable_ids",
                 "frame_indices": "merged__frame_indices",
             },
         },
     }
-    metadata.update(extra_meta)
 
     payload: Dict[str, Any] = {
         "residue_keys": np.array(residue_keys),
         "merged__labels": merged_labels_halo,
         "merged__labels_assigned": merged_labels_assigned,
+        "cluster_counts": merged_counts,
         "merged__cluster_counts": merged_counts,
         "merged__frame_state_ids": np.array(merged_frame_state_ids),
         "merged__frame_metastable_ids": np.array(merged_frame_meta_ids),
         "merged__frame_indices": np.array(merged_frame_indices, dtype=np.int64),
     }
-    payload.update(condition_payload)
     if persist_models:
         model_dir = out_path.parent / "models"
         model_dir.mkdir(parents=True, exist_ok=True)
@@ -2846,16 +2894,6 @@ def generate_cluster_npz_from_descriptors(
                     total_residue_jobs,
                 )
 
-    state_frame_counts = {state_id: _infer_frame_count(features) for state_id, features in features_by_state.items()}
-    condition_payload, predictions_meta, extra_meta = _build_state_predictions_from_merged(
-        merged_labels_halo=merged_labels_halo,
-        merged_labels_assigned=merged_labels_assigned,
-        merged_frame_state_ids=merged_frame_state_ids,
-        merged_frame_indices=merged_frame_indices,
-        state_frame_counts=state_frame_counts,
-        state_labels=state_labels,
-    )
-
     if output_path is None:
         output_path = Path.cwd() / f"cluster_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.npz"
     output_path = Path(output_path)
@@ -2874,7 +2912,6 @@ def generate_cluster_npz_from_descriptors(
             "max_cluster_frames": max_cluster_frames_val,
             "random_state": random_state,
         },
-        "predictions": predictions_meta,
         "residue_keys": residue_keys,
         "residue_mapping": {},
         "random_state": random_state,
@@ -2886,26 +2923,25 @@ def generate_cluster_npz_from_descriptors(
                 "labels": "merged__labels",
                 "labels_halo": "merged__labels",
                 "labels_assigned": "merged__labels_assigned",
-                "cluster_counts": "merged__cluster_counts",
+                "cluster_counts": "cluster_counts",
                 "frame_state_ids": "merged__frame_state_ids",
                 "frame_metastable_ids": "merged__frame_metastable_ids",
                 "frame_indices": "merged__frame_indices",
             },
         },
     }
-    metadata.update(extra_meta)
 
     payload: Dict[str, Any] = {
         "residue_keys": np.array(residue_keys),
         "metadata_json": np.array(json.dumps(metadata)),
         "merged__labels": merged_labels_halo,
         "merged__labels_assigned": merged_labels_assigned,
+        "cluster_counts": merged_counts,
         "merged__cluster_counts": merged_counts,
         "merged__frame_state_ids": np.array(merged_frame_state_ids),
         "merged__frame_metastable_ids": np.array(merged_frame_meta_ids),
         "merged__frame_indices": np.array(merged_frame_indices, dtype=np.int64),
     }
-    payload.update(condition_payload)
 
     np.savez_compressed(output_path, **payload)
     return output_path, metadata
@@ -3093,17 +3129,6 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
     frame_indices = np.load(work_dir / manifest["frame_indices_path"], allow_pickle=True)
     contact_sources = manifest.get("contact_sources") or []
 
-    condition_payload, predictions_meta, extra_meta = _build_condition_predictions(
-        project_id=project_id,
-        system_id=system_id,
-        residue_keys=residue_keys,
-        residue_models=dp_models,
-        density_maxk=density_maxk_val,
-        state_labels=state_labels,
-        metastable_labels=metastable_labels,
-        analysis_mode=getattr(system_meta, "analysis_mode", None),
-    )
-
     metadata = {
         "project_id": project_id,
         "system_id": system_id,
@@ -3115,7 +3140,6 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
         "metastable_kinds": metastable_kinds,
         "cluster_algorithm": "density_peaks",
         "cluster_params": cluster_params,
-        "predictions": predictions_meta,
         "residue_keys": residue_keys,
         "residue_mapping": residue_mapping,
         "random_state": cluster_params.get("random_state"),
@@ -3127,25 +3151,24 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
                 "labels": "merged__labels",
                 "labels_halo": "merged__labels",
                 "labels_assigned": "merged__labels_assigned",
-                "cluster_counts": "merged__cluster_counts",
+                "cluster_counts": "cluster_counts",
                 "frame_state_ids": "merged__frame_state_ids",
                 "frame_metastable_ids": "merged__frame_metastable_ids",
                 "frame_indices": "merged__frame_indices",
             },
         },
     }
-    metadata.update(extra_meta)
 
     payload = {
         "residue_keys": np.array(residue_keys),
         "merged__labels": merged_labels_halo,
         "merged__labels_assigned": merged_labels_assigned,
+        "cluster_counts": merged_counts,
         "merged__cluster_counts": merged_counts,
         "merged__frame_state_ids": frame_state_ids,
         "merged__frame_metastable_ids": frame_meta_ids,
         "merged__frame_indices": frame_indices,
     }
-    payload.update(condition_payload)
     model_dir = out_path.parent / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     model_paths: List[str | None] = []

@@ -11,7 +11,7 @@ This page summarizes the reduced-state Potts pipeline used by the Potts analysis
 
 ## Inputs (cluster NPZ)
 - `merged__labels`: shape (T, N) integer labels per frame and residue.
-- `merged__cluster_counts`: shape (N,) number of microstates per residue.
+- `cluster_counts`: shape (N,) number of microstates per residue.
 - `contact_edge_index`: shape (2, E) edges for pairwise couplings.
 - `residue_keys`: optional labels for plotting.
 

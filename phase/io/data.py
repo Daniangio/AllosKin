@@ -48,7 +48,7 @@ def load_npz(
     Expects keys similar to your clustering output:
       - residue_keys: (N,)
       - merged__labels: (T,N) (may contain -1)
-      - merged__cluster_counts: (N,)
+      - cluster_counts: (N,)
       - contact_edge_index: (2,E)
     """
     data = np.load(path, allow_pickle=True)
@@ -58,7 +58,10 @@ def load_npz(
         labels = np.asarray(data["merged__labels_assigned"], dtype=int)
     else:
         labels = np.asarray(data["merged__labels"], dtype=int)
-    cluster_counts = np.asarray(data["merged__cluster_counts"], dtype=int)
+    if "cluster_counts" in data:
+        cluster_counts = np.asarray(data["cluster_counts"], dtype=int)
+    else:
+        cluster_counts = np.asarray(data["merged__cluster_counts"], dtype=int)
 
     edges: List[Tuple[int, int]] = []
     if "contact_edge_index" not in data:

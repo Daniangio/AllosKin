@@ -1,4 +1,3 @@
-import json
 from typing import Any, Dict, List, Optional
 
 import MDAnalysis as mda
@@ -30,7 +29,7 @@ async def get_state_descriptors(
     ),
     cluster_id: Optional[str] = Query(
         None,
-        description="ID of a saved cluster NPZ to use for coloring (optional).",
+        description="ID of a saved cluster to use for sample-based cluster coloring (optional).",
     ),
     cluster_label_mode: str = Query(
         "halo",
@@ -69,7 +68,22 @@ async def get_state_descriptors(
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=500, detail=f"Failed to load descriptor file: {exc}") from exc
 
-    keys_to_use = list(feature_dict.keys())
+    def _residue_sort_key(key: str) -> int:
+        tok = str(key).split("_")[-1]
+        try:
+            return int(tok)
+        except Exception:
+            return 0
+
+    residue_key_order = sorted(
+        [k for k in feature_dict.keys() if str(k).startswith("res_")],
+        key=_residue_sort_key,
+    )
+    if not residue_key_order:
+        raise HTTPException(status_code=500, detail="Descriptor file contained no residue keys.")
+
+    key_to_col = {k: i for i, k in enumerate(residue_key_order)}
+    keys_to_use = list(residue_key_order)
     if residue_keys:
         requested = [key.strip() for key in residue_keys.split(",") if key.strip()]
         keys_to_use = [k for k in keys_to_use if k in requested]
@@ -110,164 +124,71 @@ async def get_state_descriptors(
             if m.get("metastable_index") is not None:
                 index_to_meta_id[m.get("metastable_index")] = mid
 
-    # --- Cluster NPZ / Samples ---
-    cluster_npz = None
-    cluster_meta = None
-    merged_lookup = {}
-    cluster_residue_indices: Dict[str, int] = {}
-    merged_labels_arr: Optional[np.ndarray] = None
+    # --- Cluster / Sample labels (directory-driven; no cluster.npz reads) ---
     cluster_legend: List[Dict[str, Any]] = []
     cluster_variants: List[Dict[str, Any]] = []
     selected_cluster_variant = "original"
     state_labels_arr: Optional[np.ndarray] = None
-    state_labels_arr_halo: Optional[np.ndarray] = None
-    state_labels_arr_assigned: Optional[np.ndarray] = None
     state_frame_lookup: Optional[Dict[int, int]] = None
-    halo_summary = None
+    cluster_entry: Optional[Dict[str, Any]] = None
     label_mode = str(cluster_label_mode or "halo").lower()
     if label_mode not in {"halo", "assigned"}:
         raise HTTPException(status_code=400, detail="cluster_label_mode must be 'halo' or 'assigned'.")
 
-    def _build_lookup(entry_key: str, npz_dict, keys_dict):
-        """
-        Build a mapping (state_id, frame_idx) -> row index.
-        Falls back to sequential frame indices for backward-compatible NPZs that
-        lack the explicit frame_indices array.
-        """
-        if not keys_dict or "frame_state_ids" not in keys_dict:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cluster NPZ is missing frame index metadata for '{entry_key}'. Regenerate clusters.",
-            )
-        if keys_dict["frame_state_ids"] not in npz_dict:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cluster NPZ is missing array '{keys_dict['frame_state_ids']}'. Regenerate clusters.",
-            )
-
-        frame_states = np.asarray(npz_dict[keys_dict["frame_state_ids"]])
-        if "frame_indices" in keys_dict and keys_dict.get("frame_indices") in npz_dict:
-            frame_indices = np.asarray(npz_dict[keys_dict["frame_indices"]])
-        else:
-            frame_indices = np.arange(len(frame_states), dtype=int)
-
-        lookup = {}
-        for i, (sid, fidx) in enumerate(zip(frame_states, frame_indices)):
-            lookup[(str(sid), int(fidx))] = i
-        return lookup
-
     if cluster_id:
-        entry = next((c for c in system.metastable_clusters or [] if c.get("cluster_id") == cluster_id), None)
-        if not entry:
-            raise HTTPException(status_code=404, detail="Cluster NPZ not found.")
-        sample_entry = next(
-            (
-                s
-                for s in entry.get("samples") or []
-                if s.get("type") == "md_eval" and s.get("state_id") == state_meta.state_id
-            ),
-            None,
-        )
-        if sample_entry and sample_entry.get("path"):
-            sample_path = project_store.resolve_path(project_id, system_id, sample_entry["path"])
-            if sample_path.exists():
-                sample_npz = np.load(sample_path, allow_pickle=True)
-                labels_key = "labels_halo" if label_mode == "halo" else "labels"
-                if labels_key in sample_npz:
-                    state_labels_arr = sample_npz[labels_key]
-                elif "labels" in sample_npz:
-                    state_labels_arr = sample_npz["labels"]
-                if "frame_indices" in sample_npz:
-                    frame_indices = np.asarray(sample_npz["frame_indices"], dtype=int)
-                    state_frame_lookup = {int(fidx): idx for idx, fidx in enumerate(frame_indices)}
-                elif "assigned__frame_indices" in sample_npz:
-                    frame_indices = np.asarray(sample_npz["assigned__frame_indices"], dtype=int)
-                    state_frame_lookup = {int(fidx): idx for idx, fidx in enumerate(frame_indices)}
-        rel_path = entry.get("path")
-        if not rel_path:
-            raise HTTPException(status_code=404, detail="Cluster NPZ path missing.")
-        cluster_path = project_store.resolve_path(project_id, system_id, rel_path)
-        if not cluster_path.exists():
-            raise HTTPException(status_code=404, detail="Cluster NPZ file missing.")
-        cluster_npz = np.load(cluster_path, allow_pickle=True)
         try:
-            cluster_meta = json.loads(cluster_npz["metadata_json"].item())
-        except Exception:
-            cluster_meta = None
-        if not isinstance(cluster_meta, dict) or not cluster_meta:
-            raise HTTPException(status_code=400, detail="Cluster NPZ missing metadata_json. Regenerate clusters.")
-        if not cluster_residue_indices:
-            cluster_res_keys = list(cluster_meta.get("residue_keys", []))
-            cluster_residue_indices = {k: i for i, k in enumerate(cluster_res_keys)}
-        patch_entries = [
-            p for p in (cluster_meta.get("cluster_patches") or [])
-            if isinstance(p, dict) and p.get("patch_id")
-        ]
+            cluster_entry = project_store.get_cluster_entry(project_id, system_id, cluster_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Cluster not found.")
+
         cluster_variants = [{"id": "original", "label": "Original cluster", "status": "confirmed"}]
-        for p in patch_entries:
-            rid_keys = ((p.get("residues") or {}).get("keys") or [])
-            cluster_variants.append(
-                {
-                    "id": str(p.get("patch_id")),
-                    "label": str(p.get("name") or f"Patch {str(p.get('patch_id'))[:8]}"),
-                    "status": str(p.get("status") or "preview"),
-                    "residue_keys": [str(v) for v in rid_keys],
-                    "created_at": p.get("created_at"),
-                }
-            )
+        selected_cluster_variant = "original"
 
-        variant_entry = None
-        requested_variant = str(cluster_variant_id).strip() if cluster_variant_id else "original"
-        if requested_variant and requested_variant != "original":
-            variant_entry = next((p for p in patch_entries if str(p.get("patch_id")) == requested_variant), None)
-        selected_cluster_variant = requested_variant if (requested_variant == "original" or variant_entry) else "original"
-
-        if variant_entry:
-            predictions = variant_entry.get("predictions") or {}
-            halo_summary = variant_entry.get("halo_summary") if isinstance(variant_entry, dict) else None
-            merged_keys = (variant_entry.get("merged") or {}).get("npz_keys") or {}
-        else:
-            predictions = cluster_meta.get("predictions") or {}
-            halo_summary = cluster_meta.get("halo_summary") if isinstance(cluster_meta, dict) else None
-            merged_keys = cluster_meta.get("merged", {}).get("npz_keys", {})
-
-        state_pred = predictions.get(f"state:{state_meta.state_id}")
-        if state_labels_arr is None and isinstance(state_pred, dict):
-            labels_key = state_pred.get("labels_halo")
-            if label_mode == "assigned":
-                labels_key = state_pred.get("labels_assigned") or labels_key
-            if isinstance(labels_key, str) and labels_key in cluster_npz:
-                state_labels_arr = cluster_npz[labels_key]
-            halo_key = state_pred.get("labels_halo")
-            assigned_key = state_pred.get("labels_assigned")
-            if isinstance(halo_key, str) and halo_key in cluster_npz:
-                state_labels_arr_halo = cluster_npz[halo_key]
-            if isinstance(assigned_key, str) and assigned_key in cluster_npz:
-                state_labels_arr_assigned = cluster_npz[assigned_key]
-            frame_key = state_pred.get("frame_indices")
-            if isinstance(frame_key, str) and frame_key in cluster_npz:
-                try:
-                    frame_indices = np.asarray(cluster_npz[frame_key], dtype=int)
-                    state_frame_lookup = {int(fidx): idx for idx, fidx in enumerate(frame_indices)}
-                except Exception:
-                    state_frame_lookup = None
-        if (
-            not merged_keys
-            or "labels" not in merged_keys
-            or "frame_state_ids" not in merged_keys
-            or "frame_indices" not in merged_keys
-        ):
-            raise HTTPException(status_code=400, detail="Cluster NPZ missing merged frame metadata. Regenerate clusters.")
-        merged_lookup = _build_lookup("merged", cluster_npz, merged_keys)
-        merged_label_key = merged_keys.get("labels_halo") or merged_keys.get("labels")
-        if label_mode == "assigned":
-            merged_label_key = merged_keys.get("labels_assigned") or merged_label_key
-        if not isinstance(merged_label_key, str) or merged_label_key not in cluster_npz:
-            raise HTTPException(status_code=400, detail="Selected cluster variant is missing merged labels.")
-        merged_labels_arr = cluster_npz[merged_label_key]
-        if not cluster_legend:
-            unique_clusters = sorted({int(v) for v in np.unique(merged_labels_arr) if int(v) >= 0})
-            cluster_legend = [{"id": c, "label": f"Merged c{c}"} for c in unique_clusters]
+        samples = project_store.list_samples(project_id, system_id, cluster_id)
+        md_samples = [
+            s
+            for s in samples
+            if isinstance(s, dict)
+            and str(s.get("type") or "") == "md_eval"
+            and str(s.get("state_id") or "") == str(state_meta.state_id)
+        ]
+        if md_samples:
+            md_samples.sort(key=lambda s: str(s.get("created_at") or ""))
+            sample_entry = md_samples[-1]
+            paths = sample_entry.get("paths") if isinstance(sample_entry, dict) else None
+            sample_rel = paths.get("summary_npz") if isinstance(paths, dict) else None
+            sample_rel = sample_rel or sample_entry.get("path")
+            if sample_rel:
+                sample_path = project_store.resolve_path(project_id, system_id, str(sample_rel))
+                if not sample_path.exists():
+                    try:
+                        cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+                        alt = cluster_dirs["cluster_dir"] / str(sample_rel)
+                        if alt.exists():
+                            sample_path = alt
+                    except Exception:
+                        pass
+                if sample_path.exists():
+                    with np.load(sample_path, allow_pickle=True) as sample_npz:
+                        if label_mode == "halo":
+                            if "labels_halo" in sample_npz:
+                                state_labels_arr = np.asarray(sample_npz["labels_halo"], dtype=int)
+                            elif "assigned__labels" in sample_npz:
+                                state_labels_arr = np.asarray(sample_npz["assigned__labels"], dtype=int)
+                        else:
+                            if "labels" in sample_npz:
+                                state_labels_arr = np.asarray(sample_npz["labels"], dtype=int)
+                            elif "assigned__labels_assigned" in sample_npz:
+                                state_labels_arr = np.asarray(sample_npz["assigned__labels_assigned"], dtype=int)
+                            elif "assigned__labels" in sample_npz:
+                                state_labels_arr = np.asarray(sample_npz["assigned__labels"], dtype=int)
+                        frame_indices = None
+                        if "frame_indices" in sample_npz:
+                            frame_indices = np.asarray(sample_npz["frame_indices"], dtype=int)
+                        elif "assigned__frame_indices" in sample_npz:
+                            frame_indices = np.asarray(sample_npz["assigned__frame_indices"], dtype=int)
+                        if frame_indices is not None:
+                            state_frame_lookup = {int(fidx): idx for idx, fidx in enumerate(frame_indices)}
 
     # Shared frame selection (metastable filter + sampling) computed once
     labels_meta = None
@@ -298,12 +219,6 @@ async def get_state_descriptors(
     sample_indices = indices[::sample_stride]
     n_frames_out = n_frames_filtered
 
-    merged_rows_for_samples = None
-    if cluster_npz is not None and merged_lookup:
-        merged_rows_for_samples = np.array(
-            [merged_lookup.get((state_meta.state_id, int(f)), -1) for f in sample_indices], dtype=int
-        )
-
     for key in keys_to_use:
         arr = feature_dict[key]
         if arr.ndim != 3 or arr.shape[2] < 3:
@@ -315,31 +230,22 @@ async def get_state_descriptors(
         chi1 = (sampled[:, 2] * 180.0 / 3.141592653589793).tolist()
         angles_payload[key] = {"phi": phi, "psi": psi, "chi1": chi1}
 
-        if cluster_npz is not None:
-            res_idx = cluster_residue_indices.get(key, None)
-            if res_idx is not None:
-                if state_labels_arr is not None:
-                    if state_frame_lookup is not None:
-                        rows = np.array(
-                            [state_frame_lookup.get(int(fidx), -1) for fidx in sample_indices],
-                            dtype=int,
-                        )
-                        labels_for_res = np.full(sample_indices.shape[0], -1, dtype=int)
-                        valid = rows >= 0
-                        if np.any(valid):
-                            labels_for_res[valid] = state_labels_arr[rows[valid], res_idx].astype(int)
+        if state_labels_arr is not None:
+            res_idx = key_to_col.get(key)
+            if res_idx is not None and res_idx < int(state_labels_arr.shape[1]):
+                if state_frame_lookup is not None:
+                    rows = np.array([state_frame_lookup.get(int(fidx), -1) for fidx in sample_indices], dtype=int)
+                    labels_for_res = np.full(sample_indices.shape[0], -1, dtype=int)
+                    valid = rows >= 0
+                    if np.any(valid):
+                        labels_for_res[valid] = state_labels_arr[rows[valid], int(res_idx)].astype(int)
+                else:
+                    if sample_indices.size == 0 or sample_indices.max() < state_labels_arr.shape[0]:
+                        labels_for_res = state_labels_arr[sample_indices, int(res_idx)].astype(int)
                     else:
-                        if sample_indices.size == 0 or sample_indices.max() < state_labels_arr.shape[0]:
-                            labels_for_res = state_labels_arr[sample_indices, res_idx].astype(int)
-                        else:
-                            safe_rows = np.clip(sample_indices, 0, state_labels_arr.shape[0] - 1)
-                            labels_for_res = state_labels_arr[safe_rows, res_idx].astype(int)
-                    angles_payload[key]["cluster_labels"] = labels_for_res.tolist()
-                elif merged_rows_for_samples is not None and merged_labels_arr is not None:
-                    safe_rows = np.clip(merged_rows_for_samples, 0, merged_labels_arr.shape[0] - 1)
-                    labels_for_res = merged_labels_arr[safe_rows, res_idx].astype(int)
-                    labels_for_res[merged_rows_for_samples < 0] = -1
-                    angles_payload[key]["cluster_labels"] = labels_for_res.tolist()
+                        safe_rows = np.clip(sample_indices, 0, state_labels_arr.shape[0] - 1)
+                        labels_for_res = state_labels_arr[safe_rows, int(res_idx)].astype(int)
+                angles_payload[key]["cluster_labels"] = labels_for_res.tolist()
 
         label = key
         selection = (state_meta.residue_mapping or {}).get(key) or ""
@@ -351,18 +257,23 @@ async def get_state_descriptors(
             label = f"{key}_{resname_map[resid_val]}"
         residue_labels[key] = label
 
+    if cluster_id:
+        residue_cluster_ids = sorted(
+            {
+                int(v)
+                for payload in angles_payload.values()
+                for v in (payload.get("cluster_labels") or [])
+                if int(v) >= 0
+            }
+        )
+        cluster_legend = [{"id": cid, "label": f"c{cid}"} for cid in residue_cluster_ids]
+
     if not angles_payload:
         raise HTTPException(status_code=500, detail="Descriptor file contained no usable angle data.")
 
     halo_payload = {}
-    if cluster_id and isinstance(entry, dict) and str(selected_cluster_variant or "original") == "original":
-        cluster_residue_keys = (
-            [str(v) for v in (cluster_meta or {}).get("residue_keys", [])]
-            if isinstance(cluster_meta, dict)
-            else []
-        )
-        if not cluster_residue_keys and cluster_residue_indices:
-            cluster_residue_keys = [k for k, _ in sorted(cluster_residue_indices.items(), key=lambda item: item[1])]
+    if cluster_id and isinstance(cluster_entry, dict) and str(selected_cluster_variant or "original") == "original":
+        cluster_residue_keys = list(residue_key_order)
         n_residues = len(cluster_residue_keys)
         state_label_map = {str(sid): str(state.name or sid) for sid, state in (system.states or {}).items()}
         meta_label_map = {
@@ -370,11 +281,7 @@ async def get_state_descriptors(
             for m in (system.metastable_states or [])
             if m.get("metastable_id")
         }
-        md_samples = [
-            s
-            for s in (entry.get("samples") or [])
-            if isinstance(s, dict) and str(s.get("type") or "") == "md_eval" and isinstance(s.get("path"), str)
-        ]
+        md_samples = [s for s in project_store.list_samples(project_id, system_id, cluster_id) if isinstance(s, dict) and str(s.get("type") or "") == "md_eval"]
         by_condition: Dict[str, Dict[str, Any]] = {}
         for sample in sorted(md_samples, key=lambda s: str(s.get("created_at") or "")):
             sid = sample.get("state_id")
@@ -394,11 +301,16 @@ async def get_state_descriptors(
                 cond_id = f"sample:{sample_id}"
                 cond_label = str(sample.get("name") or sample_id)
                 cond_type = "md_eval"
-            sample_path = project_store.resolve_path(project_id, system_id, sample["path"])
+            paths = sample.get("paths") if isinstance(sample, dict) else None
+            sample_rel = paths.get("summary_npz") if isinstance(paths, dict) else None
+            sample_rel = sample_rel or sample.get("path")
+            if not sample_rel:
+                continue
+            sample_path = project_store.resolve_path(project_id, system_id, str(sample_rel))
             if not sample_path.exists():
                 try:
                     cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
-                    alt = cluster_dirs["cluster_dir"] / sample["path"]
+                    alt = cluster_dirs["cluster_dir"] / str(sample_rel)
                     if alt.exists():
                         sample_path = alt
                 except Exception:
@@ -441,26 +353,6 @@ async def get_state_descriptors(
             halo_payload["halo_rate_condition_ids"] = [row["id"] for row in rows]
             halo_payload["halo_rate_condition_labels"] = [row["label"] for row in rows]
             halo_payload["halo_rate_condition_types"] = [row["type"] for row in rows]
-
-    # Backward-compatible fallback for clusters that do not yet have md_eval sample files.
-    if not halo_payload and halo_summary and cluster_npz is not None:
-        keys = (halo_summary or {}).get("npz_keys", {})
-        matrix_key = keys.get("matrix") if isinstance(keys, dict) else None
-        ids_key = keys.get("condition_ids") if isinstance(keys, dict) else None
-        labels_key = keys.get("condition_labels") if isinstance(keys, dict) else None
-        types_key = keys.get("condition_types") if isinstance(keys, dict) else None
-        if isinstance(cluster_meta, dict):
-            residue_keys = cluster_meta.get("residue_keys")
-            if residue_keys:
-                halo_payload["halo_rate_residue_keys"] = [str(v) for v in residue_keys]
-        if matrix_key in cluster_npz:
-            halo_payload["halo_rate_matrix"] = cluster_npz[matrix_key].tolist()
-        if ids_key in cluster_npz:
-            halo_payload["halo_rate_condition_ids"] = [str(v) for v in cluster_npz[ids_key].tolist()]
-        if labels_key in cluster_npz:
-            halo_payload["halo_rate_condition_labels"] = [str(v) for v in cluster_npz[labels_key].tolist()]
-        if types_key in cluster_npz:
-            halo_payload["halo_rate_condition_types"] = [str(v) for v in cluster_npz[types_key].tolist()]
 
     response = {
         "residue_keys": keys_to_use,
