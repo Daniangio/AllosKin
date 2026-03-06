@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router-dom';
-import { ChevronDown, ChevronRight, CircleHelp, Play, RefreshCw } from 'lucide-react';
+import { CircleHelp, Play, Plus, RefreshCw, X } from 'lucide-react';
 import Plot from 'react-plotly.js';
 
 import Loader from '../components/common/Loader';
@@ -136,6 +136,7 @@ export default function DeltaJsEvalPage() {
   const [selectedFilterSetupId, setSelectedFilterSetupId] = useState('');
   const [newFilterSetupName, setNewFilterSetupName] = useState('');
   const [runPanelOpen, setRunPanelOpen] = useState(false);
+  const [selectedAnalysisId, setSelectedAnalysisId] = useState('');
 
   useEffect(() => {
     const loadSystem = async () => {
@@ -325,7 +326,7 @@ export default function DeltaJsEvalPage() {
     loadClusterInfo();
   }, [selectedClusterId, modelAId, loadClusterInfo]);
 
-  const selectedMeta = useMemo(() => {
+  const matchingAnalyses = useMemo(() => {
     const dropInvalid = !keepInvalid;
     const expectedEdgeSource = useModelPair ? 'potts_intersection' : edgeMode;
     const base = analyses.filter((a) => {
@@ -335,7 +336,7 @@ export default function DeltaJsEvalPage() {
       if (a.model_a_id || a.model_b_id) return false;
       return String(a.edge_source || a.edge_mode || 'cluster') === expectedEdgeSource;
     });
-    if (!base.length) return null;
+    if (!base.length) return [];
     const scored = [...base].sort((x, y) => {
       const nx = Number(x?.summary?.n_samples || 0);
       const ny = Number(y?.summary?.n_samples || 0);
@@ -344,8 +345,23 @@ export default function DeltaJsEvalPage() {
       const ty = Date.parse(String(y?.updated_at || y?.created_at || ''));
       return (Number.isFinite(ty) ? ty : 0) - (Number.isFinite(tx) ? tx : 0);
     });
-    return scored[0] || null;
+    return scored;
   }, [analyses, modelAId, modelBId, mdLabelMode, keepInvalid, useModelPair, edgeMode]);
+
+  useEffect(() => {
+    if (!matchingAnalyses.length) {
+      setSelectedAnalysisId('');
+      return;
+    }
+    const has = matchingAnalyses.some((a) => String(a.analysis_id) === String(selectedAnalysisId));
+    if (!has) setSelectedAnalysisId(String(matchingAnalyses[0].analysis_id));
+  }, [matchingAnalyses, selectedAnalysisId]);
+
+  const selectedMeta = useMemo(() => {
+    if (!matchingAnalyses.length) return null;
+    const picked = matchingAnalyses.find((a) => String(a.analysis_id) === String(selectedAnalysisId));
+    return picked || matchingAnalyses[0] || null;
+  }, [matchingAnalyses, selectedAnalysisId]);
 
   const loadAnalysisData = useCallback(
     async (analysisId) => {
@@ -822,6 +838,14 @@ export default function DeltaJsEvalPage() {
         <div className="flex items-center gap-2">
           <button
             type="button"
+            onClick={() => setRunPanelOpen(true)}
+            className="text-xs px-3 py-2 rounded-md border border-cyan-700 text-cyan-200 hover:border-cyan-500 inline-flex items-center gap-2"
+          >
+            <Plus className="h-4 w-4" />
+            New analysis
+          </button>
+          <button
+            type="button"
             onClick={() => setHelpOpen(true)}
             className="text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:border-gray-500 inline-flex items-center gap-2"
           >
@@ -838,21 +862,23 @@ export default function DeltaJsEvalPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-[380px_1fr] gap-4">
-        <aside className="space-y-3">
-          <div className="rounded-lg border border-gray-800 bg-gray-900/40 p-3 space-y-3">
+      {runPanelOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/70 p-4 sm:p-8 overflow-y-auto"
+          onClick={() => setRunPanelOpen(false)}
+        >
+          <div
+            className="mx-auto max-w-2xl rounded-lg border border-gray-700 bg-gray-900 p-4 space-y-3"
+            onClick={(e) => e.stopPropagation()}
+          >
             <div className="flex items-center justify-between">
-              <h2 className="text-sm font-semibold text-gray-200">Selection</h2>
+              <h2 className="text-sm font-semibold text-white">Run New Delta JS Analysis</h2>
               <button
                 type="button"
-                onClick={async () => {
-                  await loadClusterInfo();
-                  await loadAnalyses();
-                }}
-                className="text-xs px-2 py-1 rounded-md border border-gray-700 text-gray-200 hover:border-gray-500 inline-flex items-center gap-2"
+                onClick={() => setRunPanelOpen(false)}
+                className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-gray-700 text-gray-300 hover:border-gray-500"
               >
-                <RefreshCw className="h-3 w-3" />
-                Refresh
+                <X className="h-4 w-4" />
               </button>
             </div>
             <div>
@@ -1070,6 +1096,96 @@ export default function DeltaJsEvalPage() {
                 ))}
               </select>
             </div>
+            <div>
+              <label className="block text-xs text-gray-400">Samples to compute</label>
+              <div className="max-h-[360px] overflow-auto rounded-md border border-gray-800 bg-gray-950/30">
+                {sampleEntries.map((s) => {
+                  const sid = String(s.sample_id);
+                  const checked = selectedSampleIds.includes(sid);
+                  return (
+                    <label
+                      key={`sel:${sid}`}
+                      className="flex items-center justify-between gap-3 px-3 py-2 border-b border-gray-900 text-sm text-gray-200"
+                    >
+                      <span className="min-w-0 truncate">
+                        {s.name || sid}{' '}
+                        <span className="text-[11px] text-gray-500">({s.type || 'sample'})</span>
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={(e) => {
+                          const on = e.target.checked;
+                          setSelectedSampleIds((prev) =>
+                            on ? (prev.includes(sid) ? prev : [...prev, sid]) : prev.filter((x) => x !== sid)
+                          );
+                        }}
+                        className="h-4 w-4 text-cyan-500 rounded border-gray-700 bg-gray-950"
+                      />
+                    </label>
+                  );
+                })}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleRun}
+              disabled={
+                !selectedClusterId ||
+                !selectedSampleIds.length ||
+                !refSampleIdsA.length ||
+                !refSampleIdsB.length ||
+                !edgeConfigValid ||
+                (useModelPair && (!modelAId || !modelBId || modelAId === modelBId))
+              }
+              className="inline-flex items-center justify-center gap-2 px-3 py-2 rounded-md bg-cyan-600 hover:bg-cyan-500 text-white text-sm disabled:opacity-60"
+            >
+              <Play className="h-4 w-4" />
+              Run JS analysis
+            </button>
+            {job?.job_id && (
+              <div className="text-[11px] text-gray-300">
+                Job: <span className="text-gray-200">{job.job_id}</span>
+                {jobStatus?.meta?.status ? ` · ${jobStatus.meta.status}` : ''}
+                {typeof jobStatus?.meta?.progress === 'number' ? ` · ${jobStatus.meta.progress}%` : ''}
+              </div>
+            )}
+            {jobError && <ErrorMessage message={jobError} />}
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 xl:grid-cols-[380px_1fr] gap-4">
+        <aside className="space-y-3">
+          <div className="rounded-lg border border-gray-800 bg-gray-900/40 p-3 space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-gray-200">Selection</h2>
+              <button
+                type="button"
+                onClick={async () => {
+                  await loadClusterInfo();
+                  await loadAnalyses();
+                }}
+                className="text-xs px-2 py-1 rounded-md border border-gray-700 text-gray-200 hover:border-gray-500 inline-flex items-center gap-2"
+              >
+                <RefreshCw className="h-3 w-3" />
+                Refresh
+              </button>
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400">Cluster</label>
+              <select
+                value={selectedClusterId}
+                onChange={(e) => setSelectedClusterId(e.target.value)}
+                className="w-full bg-gray-950 border border-gray-800 rounded-md px-3 py-2 text-sm text-gray-100"
+              >
+                {clusterOptions.map((c) => (
+                  <option key={c.cluster_id} value={c.cluster_id}>
+                    {c.name || c.cluster_id}
+                  </option>
+                ))}
+              </select>
+            </div>
             <label className="flex items-center gap-2 text-sm text-gray-200">
               <input
                 type="checkbox"
@@ -1079,6 +1195,22 @@ export default function DeltaJsEvalPage() {
               />
               Hide single-cluster residues from node heatmap
             </label>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Analysis run</label>
+              <select
+                value={selectedAnalysisId}
+                onChange={(e) => setSelectedAnalysisId(e.target.value)}
+                className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+              >
+                {!matchingAnalyses.length && <option value="">No matching analyses</option>}
+                {matchingAnalyses.map((a) => (
+                  <option key={a.analysis_id} value={a.analysis_id}>
+                    {String(a.updated_at || a.created_at || '').slice(0, 19)} · n={Number(a?.summary?.n_samples || 0)} ·{' '}
+                    {String(a.analysis_id).slice(0, 8)}
+                  </option>
+                ))}
+              </select>
+            </div>
             <JsRangeFilterBuilder rules={jsFilters} onChange={setJsFilters} />
             <FilterSetupManager
               setups={filterSetups}
@@ -1091,67 +1223,6 @@ export default function DeltaJsEvalPage() {
               onDelete={handleDeleteFilterSetup}
               error={filterSetupsError}
             />
-            <div className="rounded-md border border-gray-800 bg-gray-950/30 p-2 space-y-2">
-              <button
-                type="button"
-                onClick={() => setRunPanelOpen((v) => !v)}
-                className="w-full inline-flex items-center justify-between text-sm text-gray-200"
-              >
-                <span>Run analysis</span>
-                {runPanelOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-              </button>
-              {runPanelOpen && (
-                <div className="space-y-2">
-                  <label className="block text-xs text-gray-400">Samples to compute</label>
-                  <div className="max-h-[220px] overflow-auto rounded-md border border-gray-800 bg-gray-950/30">
-                    {sampleEntries.map((s) => {
-                      const sid = String(s.sample_id);
-                      const checked = selectedSampleIds.includes(sid);
-                      return (
-                        <label key={`sel:${sid}`} className="flex items-center justify-between gap-3 px-3 py-2 border-b border-gray-900 text-sm text-gray-200">
-                          <span className="min-w-0 truncate">
-                            {s.name || sid} <span className="text-[11px] text-gray-500">({s.type || 'sample'})</span>
-                          </span>
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={(e) => {
-                              const on = e.target.checked;
-                              setSelectedSampleIds((prev) => (on ? (prev.includes(sid) ? prev : [...prev, sid]) : prev.filter((x) => x !== sid)));
-                            }}
-                            className="h-4 w-4 text-cyan-500 rounded border-gray-700 bg-gray-950"
-                          />
-                        </label>
-                      );
-                    })}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={handleRun}
-                    disabled={
-                      !selectedClusterId ||
-                      !selectedSampleIds.length ||
-                      !refSampleIdsA.length ||
-                      !refSampleIdsB.length ||
-                      !edgeConfigValid ||
-                      (useModelPair && (!modelAId || !modelBId || modelAId === modelBId))
-                    }
-                    className="inline-flex items-center justify-center gap-2 px-3 py-2 rounded-md bg-cyan-600 hover:bg-cyan-500 text-white text-sm disabled:opacity-60"
-                  >
-                    <Play className="h-4 w-4" />
-                    Run JS analysis
-                  </button>
-                  {job?.job_id && (
-                    <div className="text-[11px] text-gray-300">
-                      Job: <span className="text-gray-200">{job.job_id}</span>
-                      {jobStatus?.meta?.status ? ` · ${jobStatus.meta.status}` : ''}
-                      {typeof jobStatus?.meta?.progress === 'number' ? ` · ${jobStatus.meta.progress}%` : ''}
-                    </div>
-                  )}
-                  {jobError && <ErrorMessage message={jobError} />}
-                </div>
-              )}
-            </div>
             {clusterInfoError && <ErrorMessage message={clusterInfoError} />}
             {analysesError && <ErrorMessage message={analysesError} />}
           </div>

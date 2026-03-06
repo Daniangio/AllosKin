@@ -29,6 +29,7 @@ from phase.potts.analysis_run import (
     compute_lambda_sweep_analysis,
     compute_md_delta_preference,
     run_gibbs_relaxation_analysis,
+    run_ligand_completion_analysis,
 )
 from phase.potts.potts_model import interpolate_potts_models, load_potts_model, zero_sum_gauge_model
 from phase.potts.sample_io import save_sample_npz
@@ -2447,6 +2448,198 @@ def run_gibbs_relaxation_job(
         write_result_to_disk(sanitized_payload)
 
     save_progress("Gibbs relaxation analysis completed", 100)
+    return sanitized_payload
+
+
+def run_ligand_completion_job(
+    job_uuid: str,
+    dataset_ref: Dict[str, str],
+    params: Dict[str, Any],
+):
+    """
+    Ligand-guided conditional completion analysis with endpoint models A/B.
+    """
+    job = get_current_job()
+    start_time = datetime.utcnow()
+    rq_job_id = job.id if job else f"ligand-completion-{job_uuid}"
+
+    project_id = dataset_ref.get("project_id")
+    system_id = dataset_ref.get("system_id")
+    cluster_id = dataset_ref.get("cluster_id")
+    if not project_id or not system_id or not cluster_id:
+        raise ValueError("ligand_completion requires project_id/system_id/cluster_id.")
+
+    results_dirs = project_store.ensure_results_directories(project_id, system_id)
+    result_filepath = results_dirs["jobs_dir"] / f"{job_uuid}.json"
+
+    result_payload: Dict[str, Any] = {
+        "job_id": job_uuid,
+        "rq_job_id": rq_job_id,
+        "analysis_type": "ligand_completion",
+        "status": "started",
+        "created_at": start_time.isoformat(),
+        "params": params,
+        "results": None,
+        "system_reference": {
+            "project_id": project_id,
+            "system_id": system_id,
+            "cluster_id": cluster_id,
+        },
+        "error": None,
+        "completed_at": None,
+    }
+
+    def save_progress(status_msg: str, progress: int):
+        if job:
+            job.meta["status"] = status_msg
+            job.meta["progress"] = progress
+            job.save_meta()
+        print(f"[LigandCompletion {job_uuid}] {status_msg}")
+
+    def write_result_to_disk(payload: Dict[str, Any]):
+        try:
+            with open(result_filepath, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            print(f"CRITICAL: Failed to save result file {result_filepath}: {e}")
+            payload["status"] = "failed"
+            payload["error"] = f"Failed to save result file: {e}"
+
+    def progress_cb(message: str, current: int, total: int):
+        if total <= 0:
+            return
+        ratio = max(0.0, min(1.0, float(current) / float(total)))
+        pct = 10 + int(80 * ratio)
+        save_progress(message, pct)
+
+    try:
+        save_progress("Initializing...", 0)
+        write_result_to_disk(result_payload)
+
+        model_a_ref = str(params.get("model_a_id") or params.get("model_a_path") or "").strip()
+        model_b_ref = str(params.get("model_b_id") or params.get("model_b_path") or "").strip()
+        if not model_a_ref or not model_b_ref:
+            raise ValueError("ligand_completion requires model_a_id/model_b_id (or paths).")
+        if model_a_ref == model_b_ref:
+            raise ValueError("model_a and model_b must be different.")
+
+        constrained_residues = params.get("constrained_residues")
+        if isinstance(constrained_residues, str):
+            constrained_residues = [s.strip() for s in constrained_residues.split(",") if s.strip()]
+        constraint_mode = str(params.get("constraint_source_mode") or "manual").strip().lower()
+        if constraint_mode not in {"manual", "delta_js_auto"}:
+            raise ValueError("constraint_source_mode must be one of: manual, delta_js_auto.")
+        if constraint_mode == "manual":
+            if not isinstance(constrained_residues, list) or not constrained_residues:
+                raise ValueError("constrained_residues must be a non-empty list for manual constraint mode.")
+        elif not isinstance(constrained_residues, list):
+            constrained_residues = []
+
+        save_progress("Running ligand completion analysis...", 10)
+        out = run_ligand_completion_analysis(
+            project_id=project_id,
+            system_id=system_id,
+            cluster_id=cluster_id,
+            model_a_ref=model_a_ref,
+            model_b_ref=model_b_ref,
+            md_sample_id=str(params.get("md_sample_id") or "").strip(),
+            constrained_residues=constrained_residues,
+            reference_sample_id_a=str(params.get("reference_sample_id_a") or "").strip() or None,
+            reference_sample_id_b=str(params.get("reference_sample_id_b") or "").strip() or None,
+            sampler=str(params.get("sampler") or "sa"),
+            lambda_values=params.get("lambda_values") or [0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0],
+            n_start_frames=int(params.get("n_start_frames", 100)),
+            n_samples_per_frame=int(params.get("n_samples_per_frame", 100)),
+            n_steps=int(params.get("n_steps", 1000)),
+            tail_steps=int(params.get("tail_steps", 200)),
+            target_window_size=int(params.get("target_window_size", 11)),
+            target_pseudocount=float(params.get("target_pseudocount", 1e-3)),
+            epsilon_logpenalty=float(params.get("epsilon_logpenalty", 1e-8)),
+            constraint_weight_mode=str(params.get("constraint_weight_mode") or "uniform"),
+            constraint_weights=params.get("constraint_weights"),
+            constraint_weight_min=float(params.get("constraint_weight_min", 0.0)),
+            constraint_weight_max=float(params.get("constraint_weight_max", 1.0)),
+            constraint_source_mode=str(params.get("constraint_source_mode") or "manual"),
+            constraint_delta_js_analysis_id=(
+                str(params.get("constraint_delta_js_analysis_id") or "").strip() or None
+            ),
+            constraint_delta_js_sample_id=(
+                str(params.get("constraint_delta_js_sample_id") or "").strip() or None
+            ),
+            constraint_auto_top_k=int(params.get("constraint_auto_top_k", 12)),
+            constraint_auto_edge_alpha=float(params.get("constraint_auto_edge_alpha", 0.3)),
+            constraint_auto_exclude_success=bool(params.get("constraint_auto_exclude_success", True)),
+            gibbs_beta=float(params.get("gibbs_beta", 1.0)),
+            sa_beta_hot=float(params.get("sa_beta_hot", 0.8)),
+            sa_beta_cold=float(params.get("sa_beta_cold", 50.0)),
+            sa_schedule=str(params.get("sa_schedule") or "geom"),
+            md_label_mode=str(params.get("md_label_mode") or "assigned"),
+            drop_invalid=not bool(params.get("keep_invalid", False)),
+            success_metric_mode=str(params.get("success_metric_mode") or "deltae"),
+            delta_js_experiment_id=(str(params.get("delta_js_experiment_id") or "").strip() or None),
+            delta_js_analysis_id=(str(params.get("delta_js_analysis_id") or "").strip() or None),
+            delta_js_filter_setup_id=(str(params.get("delta_js_filter_setup_id") or "").strip() or None),
+            delta_js_filter_edge_alpha=float(params.get("delta_js_filter_edge_alpha", 0.75)),
+            delta_js_d_residue_min=float(params.get("delta_js_d_residue_min", 0.0)),
+            delta_js_d_residue_max=(
+                float(params.get("delta_js_d_residue_max"))
+                if params.get("delta_js_d_residue_max") is not None
+                else None
+            ),
+            delta_js_d_edge_min=float(params.get("delta_js_d_edge_min", 0.0)),
+            delta_js_d_edge_max=(
+                float(params.get("delta_js_d_edge_max"))
+                if params.get("delta_js_d_edge_max") is not None
+                else None
+            ),
+            delta_js_node_edge_alpha=(
+                float(params.get("delta_js_node_edge_alpha"))
+                if params.get("delta_js_node_edge_alpha") is not None
+                else None
+            ),
+            js_success_threshold=float(params.get("js_success_threshold", 0.10)),
+            js_success_margin=float(params.get("js_success_margin", 0.0)),
+            deltae_margin=float(params.get("deltae_margin", 0.0)),
+            completion_target_success=float(params.get("completion_target_success", 0.7)),
+            completion_cost_if_unreached=(
+                float(params.get("completion_cost_if_unreached"))
+                if params.get("completion_cost_if_unreached") is not None
+                else None
+            ),
+            n_workers=int(params.get("workers", 1)),
+            seed=int(params.get("seed", 0)),
+            progress_callback=progress_cb,
+        )
+
+        meta = out.get("metadata") or {}
+        analysis_id = str(meta.get("analysis_id") or "")
+        analysis_dir = Path(str(out.get("analysis_dir") or "")).resolve()
+        npz_path = Path(str(out.get("analysis_npz") or "")).resolve()
+        if not analysis_id or not analysis_dir.exists() or not npz_path.exists():
+            raise RuntimeError("ligand_completion did not write analysis artifacts as expected.")
+
+        result_payload["status"] = "finished"
+        result_payload["results"] = {
+            "analysis_type": "ligand_completion",
+            "analysis_id": analysis_id,
+            "analysis_dir": _relativize_path(analysis_dir),
+            "analysis_npz": _relativize_path(npz_path),
+        }
+
+    except Exception as e:
+        print(f"[LigandCompletion {job_uuid}] FAILED: {e}")
+        traceback.print_exc()
+        result_payload["status"] = "failed"
+        result_payload["error"] = str(e)
+        raise e
+
+    finally:
+        save_progress("Saving final result", 95)
+        result_payload["completed_at"] = datetime.utcnow().isoformat()
+        sanitized_payload = _convert_nan_to_none(result_payload)
+        write_result_to_disk(sanitized_payload)
+
+    save_progress("Ligand completion analysis completed", 100)
     return sanitized_payload
 
 

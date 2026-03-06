@@ -17,6 +17,7 @@ import DeltaJs3DPage from './pages/DeltaJs3DPage';
 import LambdaSweepPage from './pages/LambdaSweepPage';
 import GibbsRelaxationPage from './pages/GibbsRelaxationPage';
 import GibbsRelaxation3DPage from './pages/GibbsRelaxation3DPage';
+import LigandCompletionPage from './pages/LigandCompletionPage';
 import MolstarDebugPage from './pages/MolstarDebugPage';
 import HealthPage from './pages/HealthPage';
 import JobStatusPage from './pages/JobStatusPage';
@@ -68,6 +69,10 @@ export default function App() {
           <Route
             path="/projects/:projectId/systems/:systemId/sampling/gibbs_relaxation_3d"
             element={<GibbsRelaxation3DPage />}
+          />
+          <Route
+            path="/projects/:projectId/systems/:systemId/sampling/ligand_completion"
+            element={<LigandCompletionPage />}
           />
           <Route path="/results" element={<ResultsPage />} />
           <Route path="/results/:jobId" element={<ResultDetailPage />} />

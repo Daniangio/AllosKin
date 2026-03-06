@@ -151,6 +151,7 @@ export default function DeltaJs3DPage() {
   const [filterSetupsError, setFilterSetupsError] = useState(null);
   const [selectedFilterSetupId, setSelectedFilterSetupId] = useState('');
   const [newFilterSetupName, setNewFilterSetupName] = useState('');
+  const [selectedAnalysisId, setSelectedAnalysisId] = useState('');
 
   const [rowIndex, setRowIndex] = useState(0);
   const [selectedResidueIndex, setSelectedResidueIndex] = useState(-1);
@@ -234,7 +235,7 @@ export default function DeltaJs3DPage() {
     return out;
   }, [analysisData, clusterInfo, residueLabels.length]);
 
-  const selectedMeta = useMemo(() => {
+  const matchingAnalyses = useMemo(() => {
     const expectedEdgeSource = useModelPair ? 'potts_intersection' : edgeMode;
     const base = analyses.filter(
       (a) =>
@@ -244,7 +245,7 @@ export default function DeltaJs3DPage() {
           ? a.model_a_id === modelAId && a.model_b_id === modelBId
           : !a.model_a_id && !a.model_b_id && String(a.edge_source || a.edge_mode || 'cluster') === expectedEdgeSource)
     );
-    if (!base.length) return null;
+    if (!base.length) return [];
     const sorted = [...base].sort((x, y) => {
       const nx = Number(x?.summary?.n_samples || 0);
       const ny = Number(y?.summary?.n_samples || 0);
@@ -253,8 +254,23 @@ export default function DeltaJs3DPage() {
       const ty = Date.parse(String(y?.updated_at || y?.created_at || ''));
       return (Number.isFinite(ty) ? ty : 0) - (Number.isFinite(tx) ? tx : 0);
     });
-    return sorted[0] || null;
+    return sorted;
   }, [analyses, modelAId, modelBId, mdLabelMode, dropInvalid, useModelPair, edgeMode]);
+
+  useEffect(() => {
+    if (!matchingAnalyses.length) {
+      setSelectedAnalysisId('');
+      return;
+    }
+    const has = matchingAnalyses.some((a) => String(a.analysis_id) === String(selectedAnalysisId));
+    if (!has) setSelectedAnalysisId(String(matchingAnalyses[0].analysis_id));
+  }, [matchingAnalyses, selectedAnalysisId]);
+
+  const selectedMeta = useMemo(() => {
+    if (!matchingAnalyses.length) return null;
+    const picked = matchingAnalyses.find((a) => String(a.analysis_id) === String(selectedAnalysisId));
+    return picked || matchingAnalyses[0] || null;
+  }, [matchingAnalyses, selectedAnalysisId]);
 
   const loadClusterInfo = useCallback(async () => {
     if (!selectedClusterId) return;
@@ -999,6 +1015,22 @@ export default function DeltaJs3DPage() {
                   Keep invalid
                 </label>
               </div>
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">Analysis run</label>
+              <select
+                value={selectedAnalysisId}
+                onChange={(e) => setSelectedAnalysisId(e.target.value)}
+                className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+              >
+                {!matchingAnalyses.length && <option value="">No matching analyses</option>}
+                {matchingAnalyses.map((a) => (
+                  <option key={a.analysis_id} value={a.analysis_id}>
+                    {String(a.updated_at || a.created_at || '').slice(0, 19)} · n={Number(a?.summary?.n_samples || 0)} ·{' '}
+                    {String(a.analysis_id).slice(0, 8)}
+                  </option>
+                ))}
+              </select>
             </div>
             <div>
               <label className="block text-xs text-gray-400 mb-1">Color by sample</label>

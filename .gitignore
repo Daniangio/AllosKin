@@ -1,6 +1,7 @@
 venv/
 data/
 results/
+progress_track/
 
 # Node.js
 frontend/node_modules

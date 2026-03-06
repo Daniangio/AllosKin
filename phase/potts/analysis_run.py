@@ -8,7 +8,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -187,6 +187,591 @@ def _gibbs_relax_worker(payload: dict[str, Any]) -> dict[str, np.ndarray]:
         "first_flip": first_flip.astype(np.int32, copy=False),
         "flip_counts": flip_counts,
         "energy_trace": energy_trace,
+    }
+
+
+_LIGAND_COMPLETION_MODEL_CACHE: dict[str, PottsModel] = {}
+
+
+def _load_gauged_model_from_path(path: str) -> PottsModel:
+    key = str(Path(path).resolve())
+    model = _LIGAND_COMPLETION_MODEL_CACHE.get(key)
+    if model is None:
+        model = zero_sum_gauge_model(load_potts_model(key))
+        _LIGAND_COMPLETION_MODEL_CACHE[key] = model
+    return model
+
+
+def _sa_metropolis_trajectory(
+    model: PottsModel,
+    *,
+    x0: np.ndarray,
+    n_steps: int,
+    beta_hot: float,
+    beta_cold: float,
+    seed: int,
+    schedule: str = "geom",
+) -> np.ndarray:
+    """
+    Lightweight SA trajectory on Potts labels with single-site Metropolis updates.
+    """
+    x = np.asarray(x0, dtype=np.int32).copy()
+    n_steps = max(1, int(n_steps))
+    beta_hot = float(beta_hot)
+    beta_cold = float(beta_cold)
+    if not np.isfinite(beta_hot) or not np.isfinite(beta_cold) or beta_hot <= 0 or beta_cold <= 0:
+        raise ValueError("SA betas must be finite and > 0.")
+    if beta_hot > beta_cold:
+        beta_hot, beta_cold = beta_cold, beta_hot
+
+    sched = str(schedule or "geom").strip().lower()
+    if n_steps == 1:
+        betas = np.asarray([beta_cold], dtype=float)
+    elif sched == "lin":
+        betas = np.linspace(beta_hot, beta_cold, num=n_steps, dtype=float)
+    else:
+        # Geometric spacing is the default (request: 0.8 -> 50).
+        betas = np.geomspace(beta_hot, beta_cold, num=n_steps).astype(float)
+
+    rng = np.random.default_rng(int(seed))
+    neigh = model.neighbors()
+    K_list = model.K_list()
+    N = len(K_list)
+    traj = np.zeros((n_steps, N), dtype=np.int32)
+
+    for t, beta in enumerate(betas.tolist()):
+        for r in range(N):
+            Kr = int(K_list[r])
+            if Kr <= 1:
+                continue
+            old = int(x[r])
+            new = int(rng.integers(0, Kr - 1))
+            if new >= old:
+                new += 1
+
+            dE = float(model.h[r][new] - model.h[r][old])
+            for s in neigh[r]:
+                xs = int(x[s])
+                Jrs = model.coupling(r, s)
+                dE += float(Jrs[new, xs] - Jrs[old, xs])
+
+            if dE <= 0.0 or float(rng.random()) < float(np.exp(-beta * dE)):
+                x[r] = np.int32(new)
+        traj[t] = x
+    return traj
+
+
+def _build_adjusted_model_with_penalty(
+    base_model: PottsModel,
+    *,
+    constrained_indices: Sequence[int],
+    constrained_weights: Sequence[float],
+    penalty_phi: Sequence[np.ndarray],
+    lam: float,
+) -> PottsModel:
+    """
+    Build E_cond(s) = E_base(s) + lam * sum_i w_i * phi_i(s_i) by adding to local fields.
+    """
+    h_adj = [np.asarray(hr, dtype=float).copy() for hr in base_model.h]
+    if float(lam) != 0.0:
+        for i, w, phi in zip(constrained_indices, constrained_weights, penalty_phi):
+            idx = int(i)
+            h_adj[idx] = h_adj[idx] + float(lam) * float(w) * np.asarray(phi, dtype=float)
+    return PottsModel(h=h_adj, J=base_model.J, edges=base_model.edges)
+
+
+def _subsample_tail_states(
+    traj: np.ndarray,
+    *,
+    tail_steps: int,
+    n_samples: int,
+) -> np.ndarray:
+    X = np.asarray(traj, dtype=np.int32)
+    if X.ndim != 2 or X.size == 0:
+        return np.zeros((0, 0), dtype=np.int32)
+    tail_n = max(1, min(int(tail_steps), int(X.shape[0])))
+    tail = X[-tail_n:]
+    n_out = int(n_samples)
+    if n_out <= 0:
+        return tail
+    if n_out == tail_n:
+        return tail
+    idx = np.linspace(0, tail_n - 1, num=n_out, dtype=np.int64)
+    return np.asarray(tail[idx], dtype=np.int32)
+
+
+def _normalized_auc(lambda_values: np.ndarray, success_values: np.ndarray) -> float:
+    x = np.asarray(lambda_values, dtype=float).ravel()
+    y = np.asarray(success_values, dtype=float).ravel()
+    if x.size == 0 or y.size == 0:
+        return float("nan")
+    if x.size == 1:
+        return float(y[0]) if np.isfinite(y[0]) else float("nan")
+    area = float(np.trapz(y, x))
+    span = float(x[-1] - x[0])
+    if not np.isfinite(span) or span <= 0:
+        return float(np.mean(y))
+    return area / span
+
+
+def _completion_cost_from_curve(
+    lambda_values: np.ndarray,
+    success_values: np.ndarray,
+    *,
+    target_success: float,
+    unreached_value: float,
+) -> float:
+    x = np.asarray(lambda_values, dtype=float).ravel()
+    y = np.asarray(success_values, dtype=float).ravel()
+    if x.size == 0 or y.size == 0:
+        return float("nan")
+    target = float(target_success)
+    idx = np.where(y >= target)[0]
+    if idx.size == 0:
+        return float(unreached_value)
+    k = int(idx[0])
+    if k <= 0:
+        return float(x[0])
+    x0, x1 = float(x[k - 1]), float(x[k])
+    y0, y1 = float(y[k - 1]), float(y[k])
+    if not np.isfinite(y0) or not np.isfinite(y1) or abs(y1 - y0) <= 1e-12:
+        return float(x1)
+    frac = (target - y0) / (y1 - y0)
+    frac = max(0.0, min(1.0, float(frac)))
+    return float(x0 + frac * (x1 - x0))
+
+
+def _mean_js_to_reference(
+    p_batch: Sequence[np.ndarray],
+    p_ref_padded: np.ndarray,
+    K_list: Sequence[int],
+) -> float:
+    vals: list[float] = []
+    for i, p_i in enumerate(p_batch):
+        Ki = int(K_list[i])
+        p_ref = np.asarray(p_ref_padded[i, :Ki], dtype=float)
+        p_cur = np.asarray(p_i, dtype=float)
+        vals.append(float(js_divergence(p_cur, p_ref)))
+    if not vals:
+        return float("nan")
+    return float(np.mean(np.asarray(vals, dtype=float)))
+
+
+def _weighted_mean_with_weights(values: np.ndarray, weights: np.ndarray) -> float:
+    v = np.asarray(values, dtype=float).ravel()
+    w = np.asarray(weights, dtype=float).ravel()
+    good = np.isfinite(v) & np.isfinite(w) & (w > 0)
+    if not np.any(good):
+        return float("nan")
+    ws = float(np.sum(w[good]))
+    if ws <= 0.0:
+        return float("nan")
+    return float(np.sum(v[good] * w[good]) / ws)
+
+
+def _normalize_js_filter_rules(rules_raw: Any) -> list[dict[str, float]]:
+    out: list[dict[str, float]] = []
+    if not isinstance(rules_raw, list):
+        return out
+    for item in rules_raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            a_min = float(item.get("aMin", 0.0))
+            a_max = float(item.get("aMax", 1.0))
+            b_min = float(item.get("bMin", 0.0))
+            b_max = float(item.get("bMax", 1.0))
+        except Exception:
+            continue
+        if not np.isfinite(a_min):
+            a_min = 0.0
+        if not np.isfinite(a_max):
+            a_max = 1.0
+        if not np.isfinite(b_min):
+            b_min = 0.0
+        if not np.isfinite(b_max):
+            b_max = 1.0
+        if a_max < a_min:
+            a_min, a_max = a_max, a_min
+        if b_max < b_min:
+            b_min, b_max = b_max, b_min
+        out.append({"aMin": a_min, "aMax": a_max, "bMin": b_min, "bMax": b_max})
+    return out
+
+
+def _passes_js_filter_rules(d_a: float, d_b: float, rules: Sequence[dict[str, float]]) -> bool:
+    if not np.isfinite(d_a) or not np.isfinite(d_b):
+        return False
+    if not rules:
+        return True
+    for rule in rules:
+        if (
+            d_a >= float(rule.get("aMin", 0.0))
+            and d_a <= float(rule.get("aMax", 1.0))
+            and d_b >= float(rule.get("bMin", 0.0))
+            and d_b <= float(rule.get("bMax", 1.0))
+        ):
+            return True
+    return False
+
+
+def _delta_js_row_node_edge_values(
+    *,
+    row: int,
+    N: int,
+    js_node_a: np.ndarray,
+    js_node_b: np.ndarray,
+    js_edge_a: np.ndarray,
+    js_edge_b: np.ndarray,
+    edges_all: np.ndarray,
+    top_edge_indices: np.ndarray,
+    D_edge: np.ndarray,
+    edge_alpha: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if row < 0 or row >= js_node_a.shape[0] or js_node_a.shape[1] != N or js_node_b.shape != js_node_a.shape:
+        raise ValueError("delta_js row or js_node dimensions are invalid.")
+    d_a = np.asarray(js_node_a[row], dtype=float).copy()
+    d_b = np.asarray(js_node_b[row], dtype=float).copy()
+    alpha = float(max(0.0, min(1.0, edge_alpha)))
+    if (
+        alpha <= 0.0
+        or edges_all.size == 0
+        or top_edge_indices.size == 0
+        or js_edge_a.ndim != 2
+        or js_edge_b.ndim != 2
+        or js_edge_a.shape != js_edge_b.shape
+        or row >= js_edge_a.shape[0]
+    ):
+        return d_a, d_b
+    sum_w = np.zeros((N,), dtype=float)
+    sum_a = np.zeros((N,), dtype=float)
+    sum_b = np.zeros((N,), dtype=float)
+    n_cols = min(int(top_edge_indices.size), int(js_edge_a.shape[1]))
+    for col in range(n_cols):
+        eidx = int(top_edge_indices[col])
+        if eidx < 0 or eidx >= edges_all.shape[0] or eidx >= D_edge.shape[0]:
+            continue
+        r, s = int(edges_all[eidx, 0]), int(edges_all[eidx, 1])
+        if r < 0 or s < 0 or r >= N or s >= N:
+            continue
+        v_a = float(js_edge_a[row, col])
+        v_b = float(js_edge_b[row, col])
+        if not np.isfinite(v_a) or not np.isfinite(v_b):
+            continue
+        wr = float(D_edge[eidx])
+        w = max(0.0, wr) if np.isfinite(wr) else 0.0
+        if w <= 0.0:
+            w = 1.0
+        sum_w[r] += w
+        sum_w[s] += w
+        sum_a[r] += w * v_a
+        sum_a[s] += w * v_a
+        sum_b[r] += w * v_b
+        sum_b[s] += w * v_b
+    edge_a = np.where(sum_w > 0.0, sum_a / np.maximum(sum_w, 1e-12), d_a)
+    edge_b = np.where(sum_w > 0.0, sum_b / np.maximum(sum_w, 1e-12), d_b)
+    d_a = (1.0 - alpha) * d_a + alpha * edge_a
+    d_b = (1.0 - alpha) * d_b + alpha * edge_b
+    return d_a, d_b
+
+
+def _compute_delta_js_edge_weighted_scores(
+    *,
+    tail: np.ndarray,
+    p_tail: Sequence[np.ndarray],
+    p_ref_a_padded: np.ndarray,
+    p_ref_b_padded: np.ndarray,
+    K_list: Sequence[int],
+    residue_indices: Sequence[int],
+    residue_weights: Sequence[float],
+    edges: Sequence[Tuple[int, int]],
+    edge_weights: Sequence[float],
+    ref_edge_a: Sequence[np.ndarray],
+    ref_edge_b: Sequence[np.ndarray],
+    node_edge_alpha: float,
+) -> tuple[float, float, float, float, float, float]:
+    """
+    Compute Delta-JS style weighted node/edge scores on a tail sample.
+
+    Returns:
+        (mixed_a, mixed_b, node_a, node_b, edge_a, edge_b)
+    """
+    residues = [int(i) for i in residue_indices]
+    if not residues:
+        return float("nan"), float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
+
+    r_weights = np.asarray(residue_weights, dtype=float).ravel()
+    if r_weights.shape[0] != len(residues):
+        raise ValueError("residue_weights size mismatch in delta-js success evaluation.")
+
+    node_js_a = np.zeros((len(residues),), dtype=float)
+    node_js_b = np.zeros((len(residues),), dtype=float)
+    for ridx, i in enumerate(residues):
+        Ki = int(K_list[i])
+        p_ref_a = np.asarray(p_ref_a_padded[i, :Ki], dtype=float)
+        p_ref_b = np.asarray(p_ref_b_padded[i, :Ki], dtype=float)
+        p_cur = np.asarray(p_tail[i], dtype=float)
+        node_js_a[ridx] = float(js_divergence(p_cur, p_ref_a))
+        node_js_b[ridx] = float(js_divergence(p_cur, p_ref_b))
+    node_score_a = _weighted_mean_with_weights(node_js_a, r_weights)
+    node_score_b = _weighted_mean_with_weights(node_js_b, r_weights)
+
+    edge_list = [(int(r), int(s)) for (r, s) in edges]
+    if (
+        not edge_list
+        or len(ref_edge_a) != len(edge_list)
+        or len(ref_edge_b) != len(edge_list)
+        or len(edge_weights) != len(edge_list)
+    ):
+        edge_score_a = node_score_a
+        edge_score_b = node_score_b
+        alpha_eff = 0.0
+    else:
+        e_weights = np.asarray(edge_weights, dtype=float).ravel()
+        p2_tail = pairwise_joints_on_edges(np.asarray(tail, dtype=np.int32), K_list, edge_list)
+        edge_js_a = np.zeros((len(edge_list),), dtype=float)
+        edge_js_b = np.zeros((len(edge_list),), dtype=float)
+        for eidx, e in enumerate(edge_list):
+            p_tail_e = np.asarray(p2_tail[e], dtype=float).ravel()
+            p_ref_e_a = np.asarray(ref_edge_a[eidx], dtype=float).ravel()
+            p_ref_e_b = np.asarray(ref_edge_b[eidx], dtype=float).ravel()
+            edge_js_a[eidx] = float(js_divergence(p_tail_e, p_ref_e_a))
+            edge_js_b[eidx] = float(js_divergence(p_tail_e, p_ref_e_b))
+        edge_score_a = _weighted_mean_with_weights(edge_js_a, e_weights)
+        edge_score_b = _weighted_mean_with_weights(edge_js_b, e_weights)
+        alpha_eff = float(max(0.0, min(1.0, node_edge_alpha)))
+
+    mixed_a = (1.0 - alpha_eff) * float(node_score_a) + alpha_eff * float(edge_score_a)
+    mixed_b = (1.0 - alpha_eff) * float(node_score_b) + alpha_eff * float(edge_score_b)
+    return (
+        float(mixed_a),
+        float(mixed_b),
+        float(node_score_a),
+        float(node_score_b),
+        float(edge_score_a),
+        float(edge_score_b),
+    )
+
+
+def _single_frame_ligand_completion_worker(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Worker for one starting frame in ligand-conditional completion analysis.
+    """
+    model_a = _load_gauged_model_from_path(str(payload["model_a_path"]))
+    model_b = _load_gauged_model_from_path(str(payload["model_b_path"]))
+    x0 = np.asarray(payload["x0"], dtype=np.int32).ravel()
+    K_list = [int(v) for v in payload["K_list"]]
+    lambdas = np.asarray(payload["lambda_values"], dtype=float).ravel()
+    constrained_indices = [int(i) for i in payload["constrained_indices"]]
+    constrained_weights = [float(w) for w in payload["constrained_weights"]]
+    penalty_phi = [np.asarray(v, dtype=float).ravel() for v in payload["penalty_phi"]]
+
+    sampler = str(payload.get("sampler") or "sa").strip().lower()
+    n_steps = int(payload["n_steps"])
+    tail_steps = int(payload["tail_steps"])
+    n_samples = int(payload["n_samples_per_frame"])
+    gibbs_beta = float(payload.get("gibbs_beta", 1.0))
+    sa_beta_hot = float(payload.get("sa_beta_hot", 0.8))
+    sa_beta_cold = float(payload.get("sa_beta_cold", 50.0))
+    sa_schedule = str(payload.get("sa_schedule") or "geom")
+    deltae_margin = float(payload.get("deltae_margin", 0.0))
+    success_metric_mode = str(payload.get("success_metric_mode") or "deltae").strip().lower()
+    js_success_threshold = float(payload.get("js_success_threshold", 0.10))
+    js_success_margin = float(payload.get("js_success_margin", 0.0))
+    p_ref_a = np.asarray(payload["p_ref_a"], dtype=float)
+    p_ref_b = np.asarray(payload["p_ref_b"], dtype=float)
+    delta_js_eval_spec = payload.get("delta_js_eval_spec") or {}
+    rng_seed = int(payload["seed"])
+
+    if sampler not in {"sa", "gibbs"}:
+        raise ValueError("sampler must be 'sa' or 'gibbs'.")
+    if success_metric_mode not in {"deltae", "delta_js_edge"}:
+        raise ValueError("success_metric_mode must be one of: deltae, delta_js_edge.")
+
+    djs_residue_indices = np.asarray(delta_js_eval_spec.get("residue_indices", []), dtype=np.int32).ravel()
+    djs_residue_weights = np.asarray(delta_js_eval_spec.get("residue_weights", []), dtype=float).ravel()
+    djs_edges_raw = np.asarray(delta_js_eval_spec.get("edges", []), dtype=np.int32)
+    djs_edge_weights = np.asarray(delta_js_eval_spec.get("edge_weights", []), dtype=float).ravel()
+    djs_ref_edge_a = [np.asarray(v, dtype=float) for v in (delta_js_eval_spec.get("ref_edge_a") or [])]
+    djs_ref_edge_b = [np.asarray(v, dtype=float) for v in (delta_js_eval_spec.get("ref_edge_b") or [])]
+    djs_alpha = float(delta_js_eval_spec.get("node_edge_alpha", 0.5))
+
+    if success_metric_mode == "delta_js_edge":
+        if djs_residue_indices.size == 0:
+            raise ValueError("delta_js_edge success mode requires at least one discriminative residue.")
+        if djs_residue_weights.size != djs_residue_indices.size:
+            raise ValueError("delta_js_edge residue weights mismatch.")
+        if djs_edges_raw.size == 0:
+            djs_edges: list[Tuple[int, int]] = []
+        else:
+            djs_edges_raw = np.asarray(djs_edges_raw, dtype=np.int32).reshape(-1, 2)
+            djs_edges = [(int(r), int(s)) for (r, s) in djs_edges_raw.tolist()]
+        if djs_edges and djs_edge_weights.size != len(djs_edges):
+            raise ValueError("delta_js_edge edge weights mismatch.")
+        if djs_edges and (len(djs_ref_edge_a) != len(djs_edges) or len(djs_ref_edge_b) != len(djs_edges)):
+            raise ValueError("delta_js_edge edge reference distributions mismatch.")
+    else:
+        djs_edges = []
+
+    L = int(lambdas.shape[0])
+    success_a = np.zeros((L,), dtype=np.float32)
+    success_b = np.zeros((L,), dtype=np.float32)
+    js_a_under_a = np.zeros((L,), dtype=np.float32)
+    js_b_under_a = np.zeros((L,), dtype=np.float32)
+    js_a_under_b = np.zeros((L,), dtype=np.float32)
+    js_b_under_b = np.zeros((L,), dtype=np.float32)
+    novelty_under_a = np.zeros((L,), dtype=np.float32)
+    novelty_under_b = np.zeros((L,), dtype=np.float32)
+    deltae_mean_under_a = np.zeros((L,), dtype=np.float32)
+    deltae_mean_under_b = np.zeros((L,), dtype=np.float32)
+    success_js_eval_under_a = np.zeros((L,), dtype=np.float32)
+    success_js_eval_under_b = np.zeros((L,), dtype=np.float32)
+    success_js_eval_node_under_a = np.zeros((L,), dtype=np.float32)
+    success_js_eval_node_under_b = np.zeros((L,), dtype=np.float32)
+    success_js_eval_edge_under_a = np.zeros((L,), dtype=np.float32)
+    success_js_eval_edge_under_b = np.zeros((L,), dtype=np.float32)
+
+    for li, lam in enumerate(lambdas.tolist()):
+        for endpoint in (0, 1):
+            base_model = model_a if endpoint == 0 else model_b
+            cond_model = _build_adjusted_model_with_penalty(
+                base_model,
+                constrained_indices=constrained_indices,
+                constrained_weights=constrained_weights,
+                penalty_phi=penalty_phi,
+                lam=float(lam),
+            )
+            local_seed = int(rng_seed + li * 17 + endpoint * 10007)
+            if sampler == "gibbs":
+                traj = gibbs_sample_potts(
+                    cond_model,
+                    beta=float(gibbs_beta),
+                    n_samples=int(n_steps),
+                    burn_in=0,
+                    thinning=1,
+                    seed=local_seed,
+                    x0=x0,
+                    progress=False,
+                )
+            else:
+                traj = _sa_metropolis_trajectory(
+                    cond_model,
+                    x0=x0,
+                    n_steps=int(n_steps),
+                    beta_hot=float(sa_beta_hot),
+                    beta_cold=float(sa_beta_cold),
+                    seed=local_seed,
+                    schedule=sa_schedule,
+                )
+
+            tail = _subsample_tail_states(traj, tail_steps=int(tail_steps), n_samples=int(n_samples))
+            if tail.ndim != 2 or tail.shape[0] == 0:
+                continue
+
+            dE = model_b.energy_batch(tail) - model_a.energy_batch(tail)
+            p_tail = marginals(tail, K_list)
+            js_a = _mean_js_to_reference(p_tail, p_ref_a, K_list)
+            js_b = _mean_js_to_reference(p_tail, p_ref_b, K_list)
+            novelty = float(min(js_a, js_b))
+            djs_mixed_a = float("nan")
+            djs_mixed_b = float("nan")
+            djs_node_a = float("nan")
+            djs_node_b = float("nan")
+            djs_edge_a = float("nan")
+            djs_edge_b = float("nan")
+            if success_metric_mode == "delta_js_edge":
+                (
+                    djs_mixed_a,
+                    djs_mixed_b,
+                    djs_node_a,
+                    djs_node_b,
+                    djs_edge_a,
+                    djs_edge_b,
+                ) = _compute_delta_js_edge_weighted_scores(
+                    tail=tail,
+                    p_tail=p_tail,
+                    p_ref_a_padded=p_ref_a,
+                    p_ref_b_padded=p_ref_b,
+                    K_list=K_list,
+                    residue_indices=djs_residue_indices.tolist(),
+                    residue_weights=djs_residue_weights.tolist(),
+                    edges=djs_edges,
+                    edge_weights=djs_edge_weights.tolist(),
+                    ref_edge_a=djs_ref_edge_a,
+                    ref_edge_b=djs_ref_edge_b,
+                    node_edge_alpha=djs_alpha,
+                )
+
+            if endpoint == 0:
+                if success_metric_mode == "deltae":
+                    success_a[li] = np.float32(np.mean(dE > float(deltae_margin)))
+                else:
+                    ok = (
+                        np.isfinite(djs_mixed_a)
+                        and np.isfinite(djs_mixed_b)
+                        and (float(djs_mixed_a) <= float(js_success_threshold))
+                        and (float(djs_mixed_a) + float(js_success_margin) <= float(djs_mixed_b))
+                    )
+                    success_a[li] = np.float32(1.0 if ok else 0.0)
+                js_a_under_a[li] = np.float32(js_a)
+                js_b_under_a[li] = np.float32(js_b)
+                novelty_under_a[li] = np.float32(novelty)
+                deltae_mean_under_a[li] = np.float32(np.mean(dE))
+                success_js_eval_under_a[li] = np.float32(djs_mixed_a)
+                success_js_eval_node_under_a[li] = np.float32(djs_node_a)
+                success_js_eval_edge_under_a[li] = np.float32(djs_edge_a)
+            else:
+                if success_metric_mode == "deltae":
+                    success_b[li] = np.float32(np.mean(dE < -float(deltae_margin)))
+                else:
+                    ok = (
+                        np.isfinite(djs_mixed_a)
+                        and np.isfinite(djs_mixed_b)
+                        and (float(djs_mixed_b) <= float(js_success_threshold))
+                        and (float(djs_mixed_b) + float(js_success_margin) <= float(djs_mixed_a))
+                    )
+                    success_b[li] = np.float32(1.0 if ok else 0.0)
+                js_a_under_b[li] = np.float32(js_a)
+                js_b_under_b[li] = np.float32(js_b)
+                novelty_under_b[li] = np.float32(novelty)
+                deltae_mean_under_b[li] = np.float32(np.mean(dE))
+                success_js_eval_under_b[li] = np.float32(djs_mixed_b)
+                success_js_eval_node_under_b[li] = np.float32(djs_node_b)
+                success_js_eval_edge_under_b[li] = np.float32(djs_edge_b)
+
+    raw_deltae = float(model_b.energy(x0) - model_a.energy(x0))
+    raw_js_a_vals: list[float] = []
+    raw_js_b_vals: list[float] = []
+    for i, state in enumerate(x0.tolist()):
+        Ki = int(K_list[i])
+        p0 = np.zeros((Ki,), dtype=float)
+        if 0 <= int(state) < Ki:
+            p0[int(state)] = 1.0
+        else:
+            p0[:] = 1.0 / max(1, Ki)
+        raw_js_a_vals.append(float(js_divergence(p0, np.asarray(p_ref_a[i, :Ki], dtype=float))))
+        raw_js_b_vals.append(float(js_divergence(p0, np.asarray(p_ref_b[i, :Ki], dtype=float))))
+
+    return {
+        "success_a": success_a,
+        "success_b": success_b,
+        "js_a_under_a": js_a_under_a,
+        "js_b_under_a": js_b_under_a,
+        "js_a_under_b": js_a_under_b,
+        "js_b_under_b": js_b_under_b,
+        "novelty_under_a": novelty_under_a,
+        "novelty_under_b": novelty_under_b,
+        "deltae_mean_under_a": deltae_mean_under_a,
+        "deltae_mean_under_b": deltae_mean_under_b,
+        "success_js_eval_under_a": success_js_eval_under_a,
+        "success_js_eval_under_b": success_js_eval_under_b,
+        "success_js_eval_node_under_a": success_js_eval_node_under_a,
+        "success_js_eval_node_under_b": success_js_eval_node_under_b,
+        "success_js_eval_edge_under_a": success_js_eval_edge_under_a,
+        "success_js_eval_edge_under_b": success_js_eval_edge_under_b,
+        "raw_deltae": np.float32(raw_deltae),
+        "raw_js_a": np.float32(np.mean(np.asarray(raw_js_a_vals, dtype=float))) if raw_js_a_vals else np.float32(np.nan),
+        "raw_js_b": np.float32(np.mean(np.asarray(raw_js_b_vals, dtype=float))) if raw_js_b_vals else np.float32(np.nan),
     }
 
 
@@ -1300,6 +1885,1161 @@ def run_gibbs_relaxation_analysis(
         "analysis_npz": str(npz_path),
         "analysis_dir": str(analysis_dir),
     }
+
+
+def run_ligand_completion_analysis(
+    *,
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    model_a_ref: str,
+    model_b_ref: str,
+    md_sample_id: str,
+    constrained_residues: Sequence[str | int],
+    reference_sample_id_a: str | None = None,
+    reference_sample_id_b: str | None = None,
+    sampler: str = "sa",
+    lambda_values: Sequence[float] = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0),
+    n_start_frames: int = 100,
+    n_samples_per_frame: int = 100,
+    n_steps: int = 1000,
+    tail_steps: int = 200,
+    target_window_size: int = 11,
+    target_pseudocount: float = 1e-3,
+    epsilon_logpenalty: float = 1e-8,
+    constraint_weight_mode: str = "uniform",
+    constraint_weights: Sequence[float] | None = None,
+    constraint_weight_min: float = 0.0,
+    constraint_weight_max: float = 1.0,
+    constraint_source_mode: str = "manual",
+    constraint_delta_js_analysis_id: str | None = None,
+    constraint_delta_js_sample_id: str | None = None,
+    constraint_auto_top_k: int = 12,
+    constraint_auto_edge_alpha: float = 0.3,
+    constraint_auto_exclude_success: bool = True,
+    gibbs_beta: float = 1.0,
+    sa_beta_hot: float = 0.8,
+    sa_beta_cold: float = 50.0,
+    sa_schedule: str = "geom",
+    md_label_mode: str = "assigned",
+    drop_invalid: bool = True,
+    success_metric_mode: str = "deltae",
+    delta_js_experiment_id: str | None = None,
+    delta_js_analysis_id: str | None = None,
+    delta_js_filter_setup_id: str | None = None,
+    delta_js_filter_edge_alpha: float = 0.75,
+    delta_js_d_residue_min: float = 0.0,
+    delta_js_d_residue_max: float | None = None,
+    delta_js_d_edge_min: float = 0.0,
+    delta_js_d_edge_max: float | None = None,
+    delta_js_node_edge_alpha: float | None = None,
+    js_success_threshold: float = 0.10,
+    js_success_margin: float = 0.0,
+    deltae_margin: float = 0.0,
+    completion_target_success: float = 0.7,
+    completion_cost_if_unreached: float | None = None,
+    n_workers: int = 1,
+    seed: int = 0,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+) -> dict[str, Any]:
+    """
+    Ligand-guided conditional completion analysis.
+
+    Core implementation choices:
+      - penalty mode: target distribution (recommended option 2 in dev_docs.md)
+      - success metric: selectable ('deltae' or Delta-JS weighted mode)
+      - stores partial components for LACS recombination at visualization time
+    """
+    sampler = str(sampler or "sa").strip().lower()
+    if sampler not in {"sa", "gibbs"}:
+        raise ValueError("sampler must be 'sa' or 'gibbs'.")
+    mode = str(md_label_mode or "assigned").strip().lower()
+    if mode not in {"assigned", "halo"}:
+        raise ValueError("md_label_mode must be 'assigned' or 'halo'.")
+    success_mode = str(success_metric_mode or "deltae").strip().lower()
+    if success_mode not in {"deltae", "delta_js_edge"}:
+        raise ValueError("success_metric_mode must be one of: deltae, delta_js_edge.")
+    shared_delta_js_id = str(delta_js_experiment_id or "").strip()
+    if success_mode == "delta_js_edge" and not (str(delta_js_analysis_id or "").strip() or shared_delta_js_id):
+        raise ValueError("delta_js_analysis_id (or delta_js_experiment_id) is required when success_metric_mode='delta_js_edge'.")
+    if float(js_success_threshold) < 0:
+        raise ValueError("js_success_threshold must be >= 0.")
+    constraint_mode = str(constraint_source_mode or "manual").strip().lower()
+    if constraint_mode not in {"manual", "delta_js_auto"}:
+        raise ValueError("constraint_source_mode must be one of: manual, delta_js_auto.")
+    if constraint_mode == "delta_js_auto" and not (
+        str(constraint_delta_js_analysis_id or "").strip() or shared_delta_js_id
+    ):
+        raise ValueError("constraint_delta_js_analysis_id (or delta_js_experiment_id) is required when constraint_source_mode='delta_js_auto'.")
+    if int(constraint_auto_top_k) < 1:
+        raise ValueError("constraint_auto_top_k must be >= 1.")
+    if not np.isfinite(float(delta_js_filter_edge_alpha)) or float(delta_js_filter_edge_alpha) < 0.0 or float(delta_js_filter_edge_alpha) > 1.0:
+        raise ValueError("delta_js_filter_edge_alpha must be in [0,1].")
+
+    n_start_frames = int(n_start_frames)
+    n_samples_per_frame = int(n_samples_per_frame)
+    n_steps = int(n_steps)
+    tail_steps = int(tail_steps)
+    target_window_size = int(target_window_size)
+    n_workers = int(n_workers)
+    seed = int(seed)
+
+    if n_start_frames < 1:
+        raise ValueError("n_start_frames must be >= 1.")
+    if n_samples_per_frame < 1:
+        raise ValueError("n_samples_per_frame must be >= 1.")
+    if n_steps < 1:
+        raise ValueError("n_steps must be >= 1.")
+    if tail_steps < 1:
+        raise ValueError("tail_steps must be >= 1.")
+    if target_window_size < 1:
+        raise ValueError("target_window_size must be >= 1.")
+
+    lambdas = np.asarray([float(v) for v in lambda_values], dtype=float).ravel()
+    if lambdas.size < 2:
+        raise ValueError("Provide at least 2 lambda values.")
+    if not np.all(np.isfinite(lambdas)):
+        raise ValueError("lambda_values must be finite.")
+    order = np.argsort(lambdas)
+    lambdas = lambdas[order]
+    if np.unique(lambdas).size != lambdas.size:
+        raise ValueError("lambda_values must be unique.")
+    if float(np.min(lambdas)) < 0.0:
+        raise ValueError("lambda_values must be >= 0.")
+
+    if float(target_pseudocount) < 0:
+        raise ValueError("target_pseudocount must be >= 0.")
+    if float(epsilon_logpenalty) <= 0:
+        raise ValueError("epsilon_logpenalty must be > 0.")
+
+    data_root = Path(os.getenv("PHASE_DATA_ROOT", "/app/data"))
+    store = ProjectStore(base_dir=data_root / "projects")
+    cluster_dirs = store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    system_dir = cluster_dirs["system_dir"]
+    cluster_dir = cluster_dirs["cluster_dir"]
+    shared_delta_js_id = str(delta_js_experiment_id or "").strip()
+    resolved_success_delta_js_id = str(delta_js_analysis_id or "").strip() or shared_delta_js_id
+    resolved_constraint_delta_js_id = str(constraint_delta_js_analysis_id or "").strip() or shared_delta_js_id
+
+    delta_js_filter_rules: list[dict[str, float]] = []
+    delta_js_filter_setup_id_resolved = str(delta_js_filter_setup_id or "").strip()
+    if delta_js_filter_setup_id_resolved:
+        setup_path = cluster_dir / "ui_setups" / f"{delta_js_filter_setup_id_resolved}.json"
+        if not setup_path.exists():
+            raise FileNotFoundError(f"Delta-JS filter setup not found: {delta_js_filter_setup_id_resolved}")
+        try:
+            setup_obj = json.loads(setup_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"Invalid Delta-JS filter setup JSON: {delta_js_filter_setup_id_resolved}") from exc
+        payload_obj = setup_obj.get("payload") if isinstance(setup_obj, dict) else None
+        rules_raw = payload_obj.get("rules") if isinstance(payload_obj, dict) else None
+        delta_js_filter_rules = _normalize_js_filter_rules(rules_raw)
+        if not delta_js_filter_rules:
+            raise ValueError(
+                f"Delta-JS filter setup '{delta_js_filter_setup_id_resolved}' has no valid rules payload."
+            )
+
+    def _resolve_model(ref: str) -> tuple[PottsModel, dict[str, Any], Path, str | None, str]:
+        model_id: str | None = None
+        model_path = Path(str(ref))
+        model_meta: dict[str, Any] | None = None
+        model_name = ""
+        if not model_path.suffix:
+            model_id = str(ref).strip()
+            models = store.list_potts_models(project_id, system_id, cluster_id)
+            model_meta = next((m for m in models if str(m.get("model_id")) == model_id), None)
+            if not model_meta or not model_meta.get("path"):
+                raise FileNotFoundError(f"Potts model_id not found on this cluster: {model_id}")
+            model_name = str(model_meta.get("name") or model_id)
+            model_path = store.resolve_path(project_id, system_id, str(model_meta.get("path")))
+        else:
+            if not model_path.is_absolute():
+                model_path = store.resolve_path(project_id, system_id, str(model_path))
+            model_name = model_path.stem
+            model_meta = {"model_id": None, "name": model_name, "path": str(model_path)}
+        if not model_path.exists():
+            raise FileNotFoundError(f"Potts model NPZ not found: {model_path}")
+        model = zero_sum_gauge_model(load_potts_model(str(model_path)))
+        return model, dict(model_meta or {}), model_path.resolve(), model_id, model_name
+
+    def _resolve_sample_path(entry: dict[str, Any]) -> Path:
+        paths = entry.get("paths") or {}
+        rel = None
+        if isinstance(paths, dict):
+            rel = paths.get("summary_npz") or paths.get("path")
+        rel = rel or entry.get("path")
+        if not rel:
+            raise FileNotFoundError("Sample entry missing path.")
+        p = Path(str(rel))
+        if not p.is_absolute():
+            resolved = store.resolve_path(project_id, system_id, str(rel))
+            if not resolved.exists():
+                alt = cluster_dir / str(rel)
+                p = alt if alt.exists() else resolved
+            else:
+                p = resolved
+        return p
+
+    def _load_labels(entry: dict[str, Any], *, md_mode: bool) -> tuple[np.ndarray, np.ndarray]:
+        p = _resolve_sample_path(entry)
+        s = load_sample_npz(p)
+        X = s.labels
+        if md_mode and mode in {"halo", "labels_halo"} and s.labels_halo is not None:
+            X = s.labels_halo
+        X = np.asarray(X, dtype=np.int32)
+        if X.ndim != 2 or X.size == 0:
+            raise ValueError(f"Sample has empty labels: {entry.get('sample_id')}")
+        frame_idx = (
+            np.asarray(s.frame_indices, dtype=np.int64)
+            if s.frame_indices is not None and s.frame_indices.shape[0] == X.shape[0]
+            else np.arange(X.shape[0], dtype=np.int64)
+        )
+        if drop_invalid and s.invalid_mask is not None:
+            keep = ~np.asarray(s.invalid_mask, dtype=bool).ravel()
+            if keep.shape[0] == X.shape[0]:
+                X = X[keep]
+                frame_idx = frame_idx[keep]
+        return X, frame_idx
+
+    model_a, model_a_meta, model_a_path, model_a_id, model_a_name = _resolve_model(model_a_ref)
+    model_b, model_b_meta, model_b_path, model_b_id, model_b_name = _resolve_model(model_b_ref)
+    if len(model_a.h) != len(model_b.h):
+        raise ValueError("Model sizes do not match.")
+    K_list = [int(k) for k in model_a.K_list()]
+    if K_list != [int(k) for k in model_b.K_list()]:
+        raise ValueError("Model state cardinalities (K) do not match.")
+    N = int(len(K_list))
+
+    samples = store.list_samples(project_id, system_id, cluster_id)
+    sample_by_id = {str(s.get("sample_id")): s for s in samples if isinstance(s, dict) and s.get("sample_id")}
+    start_entry = sample_by_id.get(str(md_sample_id))
+    if not start_entry:
+        raise FileNotFoundError(f"Start MD sample not found: {md_sample_id}")
+    if str(start_entry.get("type") or "") != "md_eval":
+        raise ValueError(f"Start sample must be an md_eval sample: {md_sample_id}")
+    X_start, frame_idx_start = _load_labels(start_entry, md_mode=True)
+
+    valid = np.all(X_start >= 0, axis=1)
+    for i, Ki in enumerate(K_list):
+        valid &= X_start[:, i] < int(Ki)
+    if not np.any(valid):
+        raise ValueError("No valid MD frames after filtering invalid/out-of-range labels.")
+    X_start = X_start[valid]
+    frame_idx_start = frame_idx_start[valid]
+
+    def _auto_ref_sample_id(model_meta: dict[str, Any], fallback_label: str) -> str:
+        params = model_meta.get("params") or {}
+        candidates: list[str] = []
+        raw_state_ids = params.get("state_ids")
+        if isinstance(raw_state_ids, list):
+            candidates.extend([str(v) for v in raw_state_ids if str(v).strip()])
+        for key in ("active_state_id", "inactive_state_id"):
+            val = params.get(key)
+            if val is not None and str(val).strip():
+                candidates.append(str(val))
+        md_entries = [s for s in samples if str(s.get("type") or "") == "md_eval"]
+        for sid in candidates:
+            hit = next((s for s in md_entries if str(s.get("state_id") or "") == sid), None)
+            if hit:
+                return str(hit.get("sample_id"))
+        raise ValueError(
+            f"Could not infer reference MD sample for model '{fallback_label}'. "
+            "Provide reference_sample_id_a/reference_sample_id_b explicitly."
+        )
+
+    ref_id_a = str(reference_sample_id_a or "").strip()
+    ref_id_b = str(reference_sample_id_b or "").strip()
+    if not ref_id_a:
+        ref_id_a = _auto_ref_sample_id(model_a_meta, str(model_a_name or model_a_id or "A"))
+    if not ref_id_b:
+        ref_id_b = _auto_ref_sample_id(model_b_meta, str(model_b_name or model_b_id or "B"))
+
+    ref_entry_a = sample_by_id.get(ref_id_a)
+    ref_entry_b = sample_by_id.get(ref_id_b)
+    if not ref_entry_a or not ref_entry_b:
+        raise FileNotFoundError("Reference sample ids not found on this cluster.")
+    if str(ref_entry_a.get("type") or "") != "md_eval":
+        raise ValueError(f"Reference sample A must be md_eval: {ref_id_a}")
+    if str(ref_entry_b.get("type") or "") != "md_eval":
+        raise ValueError(f"Reference sample B must be md_eval: {ref_id_b}")
+    X_ref_a, _ = _load_labels(ref_entry_a, md_mode=True)
+    X_ref_b, _ = _load_labels(ref_entry_b, md_mode=True)
+
+    for Xr, name in ((X_ref_a, "A"), (X_ref_b, "B")):
+        m = np.all(Xr >= 0, axis=1)
+        for i, Ki in enumerate(K_list):
+            m &= Xr[:, i] < int(Ki)
+        if not np.any(m):
+            raise ValueError(f"Reference sample {name} has no valid frames.")
+        if name == "A":
+            X_ref_a = Xr[m]
+        else:
+            X_ref_b = Xr[m]
+
+    p_ref_a = marginals(X_ref_a, K_list)
+    p_ref_b = marginals(X_ref_b, K_list)
+    max_k = int(max(K_list)) if K_list else 0
+    p_ref_a_pad = np.zeros((N, max_k), dtype=np.float32)
+    p_ref_b_pad = np.zeros((N, max_k), dtype=np.float32)
+    for i, Ki in enumerate(K_list):
+        p_ref_a_pad[i, :Ki] = np.asarray(p_ref_a[i], dtype=np.float32)
+        p_ref_b_pad[i, :Ki] = np.asarray(p_ref_b[i], dtype=np.float32)
+
+    residue_keys: list[str] = []
+    cluster_npz_path = cluster_dir / "cluster.npz"
+    if cluster_npz_path.exists():
+        try:
+            with np.load(cluster_npz_path, allow_pickle=True) as cnpz:
+                if "residue_keys" in cnpz:
+                    residue_keys = [str(v) for v in np.asarray(cnpz["residue_keys"]).tolist()]
+        except Exception:
+            residue_keys = []
+    if len(residue_keys) != N:
+        residue_keys = [f"res_{i}" for i in range(N)]
+
+    key_to_index = {str(k): i for i, k in enumerate(residue_keys)}
+    resid_to_index: dict[int, int] = {}
+    for i, key in enumerate(residue_keys):
+        m = re.search(r"(?:res[_-]?)(\d+)$", str(key), flags=re.IGNORECASE)
+        if m:
+            resid_to_index[int(m.group(1))] = i
+
+    delta_js_eval_spec: dict[str, Any] = {}
+    delta_js_selected_residue_indices = np.zeros((0,), dtype=np.int32)
+    delta_js_selected_edge_indices = np.zeros((0,), dtype=np.int32)
+    delta_js_selected_residue_weights = np.zeros((0,), dtype=np.float32)
+    delta_js_selected_edge_weights = np.zeros((0,), dtype=np.float32)
+    delta_js_selected_edges = np.zeros((0, 2), dtype=np.int32)
+    delta_js_effective_alpha = float(np.nan)
+    delta_js_filter_success_set_a = np.zeros((0,), dtype=np.int32)
+    delta_js_filter_success_set_b = np.zeros((0,), dtype=np.int32)
+    delta_js_filter_success_union = np.zeros((0,), dtype=np.int32)
+    delta_js_filter_target_candidates = np.zeros((0,), dtype=np.int32)
+    if success_mode == "delta_js_edge":
+        raw_ref = str(resolved_success_delta_js_id or "").strip()
+        analysis_npz_path: Path | None = None
+        sample_ids_djs: list[str] = []
+        js_node_a_all = np.zeros((0, 0), dtype=float)
+        js_node_b_all = np.zeros((0, 0), dtype=float)
+        js_edge_a_all = np.zeros((0, 0), dtype=float)
+        js_edge_b_all = np.zeros((0, 0), dtype=float)
+        ref_path = Path(raw_ref)
+        if ref_path.suffix:
+            if not ref_path.is_absolute():
+                ref_path = store.resolve_path(project_id, system_id, str(ref_path))
+            analysis_npz_path = ref_path
+        else:
+            candidate = cluster_dir / "analyses" / "delta_js" / raw_ref / "analysis.npz"
+            if candidate.exists():
+                analysis_npz_path = candidate
+        if analysis_npz_path is None or not analysis_npz_path.exists():
+            raise FileNotFoundError(f"Delta-JS analysis NPZ not found: {raw_ref}")
+
+        with np.load(analysis_npz_path, allow_pickle=False) as djs:
+            if "D_residue" not in djs:
+                raise ValueError("Invalid delta_js analysis: missing D_residue.")
+            D_residue = np.asarray(djs["D_residue"], dtype=float).ravel()
+            if D_residue.shape[0] != N:
+                raise ValueError(
+                    f"Delta-JS residue size mismatch: expected {N}, got {D_residue.shape[0]}."
+                )
+
+            edges_all = np.asarray(djs.get("edges", np.zeros((0, 2), dtype=int)), dtype=np.int32).reshape(-1, 2)
+            D_edge = np.asarray(djs.get("D_edge", np.zeros((edges_all.shape[0],), dtype=float)), dtype=float).ravel()
+            if D_edge.shape[0] != edges_all.shape[0]:
+                raise ValueError("Invalid delta_js analysis: D_edge size mismatch.")
+
+            top_res_idx = np.asarray(djs.get("top_residue_indices", np.arange(N, dtype=int)), dtype=np.int32).ravel()
+            if top_res_idx.size == 0:
+                top_res_idx = np.arange(N, dtype=np.int32)
+            top_res_idx = top_res_idx[(top_res_idx >= 0) & (top_res_idx < N)]
+            if top_res_idx.size == 0:
+                raise ValueError("Delta-JS top_residue_indices are invalid/empty.")
+
+            top_edge_idx = np.asarray(
+                djs.get("top_edge_indices", np.arange(edges_all.shape[0], dtype=int)),
+                dtype=np.int32,
+            ).ravel()
+            if edges_all.shape[0] == 0:
+                top_edge_idx = np.zeros((0,), dtype=np.int32)
+            elif top_edge_idx.size == 0:
+                top_edge_idx = np.arange(edges_all.shape[0], dtype=np.int32)
+            top_edge_idx = top_edge_idx[(top_edge_idx >= 0) & (top_edge_idx < edges_all.shape[0])]
+
+            alpha_from_analysis = float(np.asarray(djs.get("node_edge_alpha", np.asarray([0.5], dtype=float))).ravel()[0])
+            sample_ids_djs = [str(v) for v in np.asarray(djs.get("sample_ids", np.asarray([], dtype=str)), dtype=str).tolist()]
+            js_node_a_all = np.asarray(djs.get("js_node_a", np.zeros((0, 0), dtype=float)), dtype=float)
+            js_node_b_all = np.asarray(djs.get("js_node_b", np.zeros((0, 0), dtype=float)), dtype=float)
+            js_edge_a_all = np.asarray(djs.get("js_edge_a", np.zeros((0, 0), dtype=float)), dtype=float)
+            js_edge_b_all = np.asarray(djs.get("js_edge_b", np.zeros((0, 0), dtype=float)), dtype=float)
+
+        rmin = float(delta_js_d_residue_min)
+        rmax = float(delta_js_d_residue_max) if delta_js_d_residue_max is not None else float("inf")
+        if rmax < rmin:
+            rmin, rmax = rmax, rmin
+        emn = float(delta_js_d_edge_min)
+        emx = float(delta_js_d_edge_max) if delta_js_d_edge_max is not None else float("inf")
+        if emx < emn:
+            emn, emx = emx, emn
+
+        keep_res: list[int] = []
+        if delta_js_filter_rules:
+            sample_ids = sample_ids_djs
+            if not sample_ids:
+                raise ValueError("Delta-JS analysis has no sample_ids for filter-driven selection.")
+            try:
+                row_a = sample_ids.index(str(ref_id_a))
+                row_b = sample_ids.index(str(ref_id_b))
+            except Exception as exc:
+                raise ValueError(
+                    "Filter setup requires reference sample rows in selected Delta-JS analysis "
+                    f"('{ref_id_a}', '{ref_id_b}')."
+                ) from exc
+            js_node_a = js_node_a_all
+            js_node_b = js_node_b_all
+            js_edge_a = js_edge_a_all
+            js_edge_b = js_edge_b_all
+            filt_a, filt_b = _delta_js_row_node_edge_values(
+                row=row_a,
+                N=N,
+                js_node_a=js_node_a,
+                js_node_b=js_node_b,
+                js_edge_a=js_edge_a,
+                js_edge_b=js_edge_b,
+                edges_all=edges_all,
+                top_edge_indices=top_edge_idx,
+                D_edge=D_edge,
+                edge_alpha=float(delta_js_filter_edge_alpha),
+            )
+            filt_ba, filt_bb = _delta_js_row_node_edge_values(
+                row=row_b,
+                N=N,
+                js_node_a=js_node_a,
+                js_node_b=js_node_b,
+                js_edge_a=js_edge_a,
+                js_edge_b=js_edge_b,
+                edges_all=edges_all,
+                top_edge_indices=top_edge_idx,
+                D_edge=D_edge,
+                edge_alpha=float(delta_js_filter_edge_alpha),
+            )
+            set_a = [i for i in range(N) if _passes_js_filter_rules(float(filt_a[i]), float(filt_b[i]), delta_js_filter_rules)]
+            set_b = [i for i in range(N) if _passes_js_filter_rules(float(filt_ba[i]), float(filt_bb[i]), delta_js_filter_rules)]
+            keep_res = sorted(set([int(i) for i in set_a] + [int(i) for i in set_b]))
+            delta_js_filter_success_set_a = np.asarray(sorted(set(set_a)), dtype=np.int32)
+            delta_js_filter_success_set_b = np.asarray(sorted(set(set_b)), dtype=np.int32)
+            delta_js_filter_success_union = np.asarray(keep_res, dtype=np.int32)
+            if not keep_res:
+                raise ValueError(
+                    "Delta-JS filter setup selected zero residues on both reference MD samples."
+                )
+        else:
+            for idx in top_res_idx.tolist():
+                d = float(D_residue[int(idx)])
+                if np.isfinite(d) and d >= rmin and d <= rmax:
+                    keep_res.append(int(idx))
+            if not keep_res:
+                raise ValueError(
+                    "Delta-JS residue filter selected zero residues. "
+                    "Relax delta_js_d_residue_min/max or choose a different delta_js_analysis_id."
+                )
+        delta_js_selected_residue_indices = np.asarray(sorted(set(keep_res)), dtype=np.int32)
+        delta_js_selected_residue_weights = np.asarray(
+            [float(max(0.0, D_residue[int(i)])) for i in delta_js_selected_residue_indices.tolist()],
+            dtype=np.float32,
+        )
+        if not np.any(delta_js_selected_residue_weights > 0):
+            delta_js_selected_residue_weights = np.ones_like(delta_js_selected_residue_weights, dtype=np.float32)
+
+        selected_res_set = {int(i) for i in delta_js_selected_residue_indices.tolist()}
+        keep_edges: list[int] = []
+        for eidx in top_edge_idx.tolist():
+            r, s = int(edges_all[int(eidx), 0]), int(edges_all[int(eidx), 1])
+            if r not in selected_res_set or s not in selected_res_set:
+                continue
+            if delta_js_filter_rules:
+                keep_edges.append(int(eidx))
+            else:
+                d = float(D_edge[int(eidx)])
+                if np.isfinite(d) and d >= emn and d <= emx:
+                    keep_edges.append(int(eidx))
+
+        if keep_edges:
+            delta_js_selected_edge_indices = np.asarray(keep_edges, dtype=np.int32)
+            delta_js_selected_edges = np.asarray(edges_all[delta_js_selected_edge_indices], dtype=np.int32)
+            delta_js_selected_edge_weights = np.asarray(
+                [float(max(0.0, D_edge[int(i)])) for i in delta_js_selected_edge_indices.tolist()],
+                dtype=np.float32,
+            )
+            if not np.any(delta_js_selected_edge_weights > 0):
+                delta_js_selected_edge_weights = np.ones_like(delta_js_selected_edge_weights, dtype=np.float32)
+        else:
+            delta_js_selected_edge_indices = np.zeros((0,), dtype=np.int32)
+            delta_js_selected_edges = np.zeros((0, 2), dtype=np.int32)
+            delta_js_selected_edge_weights = np.zeros((0,), dtype=np.float32)
+
+        edge_list = [(int(r), int(s)) for (r, s) in delta_js_selected_edges.tolist()]
+        if edge_list:
+            p_ref_edge_a_dict = pairwise_joints_on_edges(X_ref_a, K_list, edge_list)
+            p_ref_edge_b_dict = pairwise_joints_on_edges(X_ref_b, K_list, edge_list)
+            ref_edge_a = [np.asarray(p_ref_edge_a_dict[e], dtype=np.float32) for e in edge_list]
+            ref_edge_b = [np.asarray(p_ref_edge_b_dict[e], dtype=np.float32) for e in edge_list]
+        else:
+            ref_edge_a = []
+            ref_edge_b = []
+
+        if delta_js_node_edge_alpha is not None:
+            alpha = float(delta_js_node_edge_alpha)
+        else:
+            alpha = float(alpha_from_analysis)
+        if not np.isfinite(alpha):
+            alpha = 0.5
+        alpha = max(0.0, min(1.0, alpha))
+        if not edge_list:
+            alpha = 0.0
+        delta_js_effective_alpha = float(alpha)
+
+        delta_js_eval_spec = {
+            "residue_indices": np.asarray(delta_js_selected_residue_indices, dtype=np.int32),
+            "residue_weights": np.asarray(delta_js_selected_residue_weights, dtype=np.float32),
+            "edges": np.asarray(delta_js_selected_edges, dtype=np.int32),
+            "edge_weights": np.asarray(delta_js_selected_edge_weights, dtype=np.float32),
+            "ref_edge_a": ref_edge_a,
+            "ref_edge_b": ref_edge_b,
+            "node_edge_alpha": float(delta_js_effective_alpha),
+        }
+
+    parsed_constraints: list[int] = []
+    constraint_auto_impact = np.zeros((N,), dtype=np.float32)
+    constraint_auto_ranked_indices: list[int] = []
+    constraint_auto_row_sample_id: str | None = None
+    if constraint_mode == "manual":
+        for raw in constrained_residues or []:
+            idx: int | None = None
+            if isinstance(raw, (int, np.integer)):
+                v = int(raw)
+                if v in resid_to_index:
+                    idx = resid_to_index[v]
+                elif 0 <= v < N:
+                    idx = v
+            else:
+                s = str(raw).strip()
+                if not s:
+                    continue
+                if s in key_to_index:
+                    idx = key_to_index[s]
+                else:
+                    m = re.search(r"(\d+)", s)
+                    if m:
+                        v = int(m.group(1))
+                        if v in resid_to_index:
+                            idx = resid_to_index[v]
+                        elif 0 <= v < N:
+                            idx = v
+            if idx is None:
+                raise ValueError(f"Unable to resolve constrained residue: {raw!r}")
+            if idx not in parsed_constraints:
+                parsed_constraints.append(int(idx))
+        if not parsed_constraints:
+            raise ValueError("No constrained residues resolved.")
+    else:
+        raw_ref = str(resolved_constraint_delta_js_id or "").strip()
+        c_djs_npz_path: Path | None = None
+        ref_path = Path(raw_ref)
+        if ref_path.suffix:
+            if not ref_path.is_absolute():
+                ref_path = store.resolve_path(project_id, system_id, str(ref_path))
+            c_djs_npz_path = ref_path
+        else:
+            candidate = cluster_dir / "analyses" / "delta_js" / raw_ref / "analysis.npz"
+            if candidate.exists():
+                c_djs_npz_path = candidate
+        if c_djs_npz_path is None or not c_djs_npz_path.exists():
+            raise FileNotFoundError(f"Constraint delta-js analysis NPZ not found: {raw_ref}")
+
+        target_sample_id = str(constraint_delta_js_sample_id or md_sample_id).strip()
+        if not target_sample_id:
+            raise ValueError("constraint_delta_js_sample_id resolution failed.")
+        constraint_auto_row_sample_id = target_sample_id
+
+        with np.load(c_djs_npz_path, allow_pickle=False) as djs:
+            sample_ids = [str(v) for v in np.asarray(djs.get("sample_ids", np.asarray([], dtype=str)), dtype=str).tolist()]
+            if not sample_ids:
+                raise ValueError("Constraint delta-js analysis has no sample_ids.")
+            try:
+                row = sample_ids.index(target_sample_id)
+            except Exception:
+                raise ValueError(
+                    f"Sample '{target_sample_id}' not found in constraint delta-js analysis '{raw_ref}'."
+                )
+
+            D_residue = np.asarray(djs.get("D_residue", np.zeros((0,), dtype=float)), dtype=float).ravel()
+            if D_residue.shape[0] != N:
+                raise ValueError(
+                    f"Constraint delta-js residue size mismatch: expected {N}, got {D_residue.shape[0]}."
+                )
+            js_node_a = np.asarray(djs.get("js_node_a", np.zeros((0, 0), dtype=float)), dtype=float)
+            js_node_b = np.asarray(djs.get("js_node_b", np.zeros((0, 0), dtype=float)), dtype=float)
+            if js_node_a.ndim != 2 or js_node_b.ndim != 2 or js_node_a.shape != js_node_b.shape:
+                raise ValueError("Constraint delta-js analysis has invalid js_node arrays.")
+            if row >= js_node_a.shape[0] or js_node_a.shape[1] != N:
+                raise ValueError("Constraint delta-js js_node dimensions mismatch.")
+
+            node_term = np.asarray(D_residue, dtype=float) * np.abs(js_node_a[row] - js_node_b[row])
+            node_term = np.where(np.isfinite(node_term), node_term, 0.0)
+
+            edge_alpha = float(constraint_auto_edge_alpha)
+            if not np.isfinite(edge_alpha):
+                edge_alpha = 0.3
+            edge_alpha = max(0.0, min(1.0, edge_alpha))
+
+            edges_all = np.asarray(djs.get("edges", np.zeros((0, 2), dtype=int)), dtype=np.int32).reshape(-1, 2)
+            D_edge = np.asarray(djs.get("D_edge", np.zeros((edges_all.shape[0],), dtype=float)), dtype=float).ravel()
+            top_edge_indices = np.asarray(
+                djs.get("top_edge_indices", np.arange(edges_all.shape[0], dtype=int)),
+                dtype=np.int32,
+            ).ravel()
+            js_edge_a = np.asarray(djs.get("js_edge_a", np.zeros((0, 0), dtype=float)), dtype=float)
+            js_edge_b = np.asarray(djs.get("js_edge_b", np.zeros((0, 0), dtype=float)), dtype=float)
+
+            edge_term = np.zeros((N,), dtype=float)
+            edge_counts = np.zeros((N,), dtype=float)
+            if (
+                edge_alpha > 0.0
+                and edges_all.shape[0] > 0
+                and top_edge_indices.size > 0
+                and js_edge_a.ndim == 2
+                and js_edge_b.ndim == 2
+                and js_edge_a.shape == js_edge_b.shape
+                and row < js_edge_a.shape[0]
+            ):
+                n_cols = min(js_edge_a.shape[1], top_edge_indices.shape[0])
+                for col in range(n_cols):
+                    eidx = int(top_edge_indices[col])
+                    if eidx < 0 or eidx >= edges_all.shape[0] or eidx >= D_edge.shape[0]:
+                        continue
+                    r, s = int(edges_all[eidx, 0]), int(edges_all[eidx, 1])
+                    if r < 0 or s < 0 or r >= N or s >= N:
+                        continue
+                    d = float(D_edge[eidx])
+                    if not np.isfinite(d):
+                        continue
+                    v = float(abs(js_edge_a[row, col] - js_edge_b[row, col]))
+                    if not np.isfinite(v):
+                        continue
+                    contrib = max(0.0, d) * v
+                    edge_term[r] += contrib
+                    edge_term[s] += contrib
+                    edge_counts[r] += 1.0
+                    edge_counts[s] += 1.0
+            edge_term = edge_term / np.where(edge_counts > 0, edge_counts, 1.0)
+
+            impact = (1.0 - edge_alpha) * node_term + edge_alpha * edge_term
+            impact = np.where(np.isfinite(impact), impact, 0.0)
+            impact = np.maximum(impact, 0.0)
+            constraint_auto_impact = np.asarray(impact, dtype=np.float32)
+
+            if delta_js_filter_rules:
+                filt_a, filt_b = _delta_js_row_node_edge_values(
+                    row=row,
+                    N=N,
+                    js_node_a=js_node_a,
+                    js_node_b=js_node_b,
+                    js_edge_a=js_edge_a,
+                    js_edge_b=js_edge_b,
+                    edges_all=edges_all,
+                    top_edge_indices=top_edge_indices,
+                    D_edge=D_edge,
+                    edge_alpha=float(delta_js_filter_edge_alpha),
+                )
+                target_candidates = [
+                    int(i)
+                    for i in range(N)
+                    if _passes_js_filter_rules(float(filt_a[i]), float(filt_b[i]), delta_js_filter_rules)
+                ]
+                delta_js_filter_target_candidates = np.asarray(sorted(set(target_candidates)), dtype=np.int32)
+                if delta_js_filter_success_union.size == 0:
+                    try:
+                        row_ref_a = sample_ids.index(str(ref_id_a))
+                        row_ref_b = sample_ids.index(str(ref_id_b))
+                    except Exception as exc:
+                        raise ValueError(
+                            "Filter setup requires reference sample rows in selected Delta-JS analysis "
+                            f"('{ref_id_a}', '{ref_id_b}')."
+                        ) from exc
+                    ref_a1, ref_a2 = _delta_js_row_node_edge_values(
+                        row=row_ref_a,
+                        N=N,
+                        js_node_a=js_node_a,
+                        js_node_b=js_node_b,
+                        js_edge_a=js_edge_a,
+                        js_edge_b=js_edge_b,
+                        edges_all=edges_all,
+                        top_edge_indices=top_edge_indices,
+                        D_edge=D_edge,
+                        edge_alpha=float(delta_js_filter_edge_alpha),
+                    )
+                    ref_b1, ref_b2 = _delta_js_row_node_edge_values(
+                        row=row_ref_b,
+                        N=N,
+                        js_node_a=js_node_a,
+                        js_node_b=js_node_b,
+                        js_edge_a=js_edge_a,
+                        js_edge_b=js_edge_b,
+                        edges_all=edges_all,
+                        top_edge_indices=top_edge_indices,
+                        D_edge=D_edge,
+                        edge_alpha=float(delta_js_filter_edge_alpha),
+                    )
+                    set_a = [
+                        int(i)
+                        for i in range(N)
+                        if _passes_js_filter_rules(float(ref_a1[i]), float(ref_a2[i]), delta_js_filter_rules)
+                    ]
+                    set_b = [
+                        int(i)
+                        for i in range(N)
+                        if _passes_js_filter_rules(float(ref_b1[i]), float(ref_b2[i]), delta_js_filter_rules)
+                    ]
+                    delta_js_filter_success_set_a = np.asarray(sorted(set(set_a)), dtype=np.int32)
+                    delta_js_filter_success_set_b = np.asarray(sorted(set(set_b)), dtype=np.int32)
+                    delta_js_filter_success_union = np.asarray(sorted(set(set_a + set_b)), dtype=np.int32)
+                success_union = {int(i) for i in delta_js_filter_success_union.tolist()}
+
+        exclude_set: set[int] = set()
+        if bool(constraint_auto_exclude_success):
+            exclude_set = {int(i) for i in delta_js_selected_residue_indices.tolist()}
+        if delta_js_filter_success_union.size:
+            exclude_set |= {int(i) for i in delta_js_filter_success_union.tolist()}
+        ranked = np.argsort(constraint_auto_impact)[::-1].tolist()
+        if exclude_set:
+            ranked = [int(i) for i in ranked if int(i) not in exclude_set]
+        if constraint_mode == "delta_js_auto" and delta_js_filter_rules:
+            allowed_local = (
+                {int(i) for i in delta_js_filter_target_candidates.tolist()}
+                - {int(i) for i in delta_js_filter_success_union.tolist()}
+            )
+            ranked = [int(i) for i in ranked if int(i) in allowed_local]
+        ranked = [int(i) for i in ranked if float(constraint_auto_impact[int(i)]) > 0.0]
+        if not ranked:
+            raise ValueError(
+                "No residues available for constraint auto-selection after exclusions/filters. "
+                "Adjust settings or disable exclude_success."
+            )
+        top_k = min(int(constraint_auto_top_k), len(ranked))
+        parsed_constraints = [int(i) for i in ranked[:top_k]]
+        constraint_auto_ranked_indices = [int(i) for i in ranked]
+
+    C = parsed_constraints
+
+    cw_mode = str(constraint_weight_mode or "uniform").strip().lower()
+    cmin = float(constraint_weight_min)
+    cmax = float(constraint_weight_max)
+    if not np.isfinite(cmin):
+        cmin = 0.0
+    if not np.isfinite(cmax):
+        cmax = 1.0
+    if cmax < cmin:
+        cmin, cmax = cmax, cmin
+
+    if constraint_weights is not None:
+        arr = np.asarray([float(v) for v in constraint_weights], dtype=float).ravel()
+        if arr.size != len(C):
+            raise ValueError("constraint_weights must have the same length as constrained_residues.")
+        c_weights = np.clip(arr, cmin, cmax)
+        cw_mode = "custom"
+    elif constraint_mode == "delta_js_auto":
+        arr = np.asarray([float(constraint_auto_impact[int(i)]) for i in C], dtype=float)
+        if arr.size and np.nanmax(arr) > np.nanmin(arr):
+            arr = (arr - np.nanmin(arr)) / max(1e-12, float(np.nanmax(arr) - np.nanmin(arr)))
+        else:
+            arr = np.ones((len(C),), dtype=float)
+        c_weights = np.clip(arr, cmin, cmax)
+        cw_mode = "delta_js_auto"
+    elif cw_mode == "js_abs":
+        p_start = marginals(X_start, K_list)
+        vals = []
+        for i in C:
+            js_a_i = float(js_divergence(np.asarray(p_start[i], dtype=float), np.asarray(p_ref_a[i], dtype=float)))
+            js_b_i = float(js_divergence(np.asarray(p_start[i], dtype=float), np.asarray(p_ref_b[i], dtype=float)))
+            vals.append(abs(js_b_i - js_a_i))
+        arr = np.asarray(vals, dtype=float)
+        if arr.size and np.nanmax(arr) > np.nanmin(arr):
+            arr = (arr - np.nanmin(arr)) / max(1e-12, float(np.nanmax(arr) - np.nanmin(arr)))
+        else:
+            arr = np.ones((len(C),), dtype=float)
+        c_weights = np.clip(arr, cmin, cmax)
+    else:
+        c_weights = np.ones((len(C),), dtype=float)
+        c_weights = np.clip(c_weights, cmin, cmax)
+        cw_mode = "uniform"
+
+    n_select = min(int(n_start_frames), int(X_start.shape[0]))
+    rng = np.random.default_rng(seed)
+    selected_local = np.asarray(rng.choice(X_start.shape[0], size=n_select, replace=False), dtype=np.int64)
+    X_sel = np.asarray(X_start[selected_local], dtype=np.int32)
+    frame_idx_sel = np.asarray(frame_idx_start[selected_local], dtype=np.int64)
+
+    half_w = int(max(0, target_window_size // 2))
+    penalty_by_frame: list[list[np.ndarray]] = []
+    for loc in selected_local.tolist():
+        lo = max(0, int(loc) - half_w)
+        hi = min(int(X_start.shape[0]), int(loc) + half_w + 1)
+        window = np.asarray(X_start[lo:hi], dtype=np.int32)
+        frame_phi: list[np.ndarray] = []
+        for i in C:
+            Ki = int(K_list[i])
+            vals = window[:, i]
+            vals = vals[(vals >= 0) & (vals < Ki)]
+            if vals.size == 0:
+                counts = np.ones((Ki,), dtype=float)
+            else:
+                counts = np.bincount(vals, minlength=Ki).astype(float)
+            counts = counts + float(target_pseudocount)
+            probs = counts / max(1e-12, float(np.sum(counts)))
+            phi = -np.log(np.clip(probs, float(epsilon_logpenalty), None))
+            frame_phi.append(np.asarray(phi, dtype=np.float32))
+        penalty_by_frame.append(frame_phi)
+
+    if completion_cost_if_unreached is None:
+        completion_cost_if_unreached = float(np.max(lambdas) + 1.0)
+
+    payloads: list[dict[str, Any]] = []
+    for row in range(n_select):
+        payloads.append(
+            {
+                "model_a_path": str(model_a_path),
+                "model_b_path": str(model_b_path),
+                "x0": np.asarray(X_sel[row], dtype=np.int32),
+                "K_list": K_list,
+                "lambda_values": np.asarray(lambdas, dtype=float),
+                "constrained_indices": C,
+                "constrained_weights": np.asarray(c_weights, dtype=float),
+                "penalty_phi": penalty_by_frame[row],
+                "sampler": sampler,
+                "n_steps": int(n_steps),
+                "tail_steps": int(tail_steps),
+                "n_samples_per_frame": int(n_samples_per_frame),
+                "gibbs_beta": float(gibbs_beta),
+                "sa_beta_hot": float(sa_beta_hot),
+                "sa_beta_cold": float(sa_beta_cold),
+                "sa_schedule": str(sa_schedule),
+                "success_metric_mode": str(success_mode),
+                "js_success_threshold": float(js_success_threshold),
+                "js_success_margin": float(js_success_margin),
+                "delta_js_eval_spec": delta_js_eval_spec,
+                "deltae_margin": float(deltae_margin),
+                "p_ref_a": np.asarray(p_ref_a_pad, dtype=np.float32),
+                "p_ref_b": np.asarray(p_ref_b_pad, dtype=np.float32),
+                "seed": int(seed) + row * 131,
+            }
+        )
+
+    if progress_callback:
+        progress_callback("Running conditional completion", 0, n_select)
+
+    out_rows: list[dict[str, Any] | None] = [None] * n_select
+    workers = max(1, int(n_workers))
+    if workers <= 1:
+        for row, payload in enumerate(payloads):
+            out_rows[row] = _single_frame_ligand_completion_worker(payload)
+            if progress_callback:
+                progress_callback("Running conditional completion", row + 1, n_select)
+    else:
+        workers = min(workers, n_select)
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_single_frame_ligand_completion_worker, payloads[row]): row for row in range(n_select)
+            }
+            done = 0
+            for fut in as_completed(futures):
+                row = futures[fut]
+                out_rows[row] = fut.result()
+                done += 1
+                if progress_callback:
+                    progress_callback("Running conditional completion", done, n_select)
+
+    if any(v is None for v in out_rows):
+        raise RuntimeError("Missing worker output while computing ligand completion analysis.")
+
+    L = int(lambdas.shape[0])
+    success_a = np.zeros((n_select, L), dtype=np.float32)
+    success_b = np.zeros((n_select, L), dtype=np.float32)
+    js_a_under_a = np.zeros((n_select, L), dtype=np.float32)
+    js_b_under_a = np.zeros((n_select, L), dtype=np.float32)
+    js_a_under_b = np.zeros((n_select, L), dtype=np.float32)
+    js_b_under_b = np.zeros((n_select, L), dtype=np.float32)
+    novelty_under_a = np.zeros((n_select, L), dtype=np.float32)
+    novelty_under_b = np.zeros((n_select, L), dtype=np.float32)
+    deltae_mean_under_a = np.zeros((n_select, L), dtype=np.float32)
+    deltae_mean_under_b = np.zeros((n_select, L), dtype=np.float32)
+    success_js_eval_under_a = np.zeros((n_select, L), dtype=np.float32)
+    success_js_eval_under_b = np.zeros((n_select, L), dtype=np.float32)
+    success_js_eval_node_under_a = np.zeros((n_select, L), dtype=np.float32)
+    success_js_eval_node_under_b = np.zeros((n_select, L), dtype=np.float32)
+    success_js_eval_edge_under_a = np.zeros((n_select, L), dtype=np.float32)
+    success_js_eval_edge_under_b = np.zeros((n_select, L), dtype=np.float32)
+    raw_deltae = np.zeros((n_select,), dtype=np.float32)
+    raw_js_a = np.zeros((n_select,), dtype=np.float32)
+    raw_js_b = np.zeros((n_select,), dtype=np.float32)
+
+    for row, out in enumerate(out_rows):
+        assert out is not None
+        success_a[row] = np.asarray(out["success_a"], dtype=np.float32)
+        success_b[row] = np.asarray(out["success_b"], dtype=np.float32)
+        js_a_under_a[row] = np.asarray(out["js_a_under_a"], dtype=np.float32)
+        js_b_under_a[row] = np.asarray(out["js_b_under_a"], dtype=np.float32)
+        js_a_under_b[row] = np.asarray(out["js_a_under_b"], dtype=np.float32)
+        js_b_under_b[row] = np.asarray(out["js_b_under_b"], dtype=np.float32)
+        novelty_under_a[row] = np.asarray(out["novelty_under_a"], dtype=np.float32)
+        novelty_under_b[row] = np.asarray(out["novelty_under_b"], dtype=np.float32)
+        deltae_mean_under_a[row] = np.asarray(out["deltae_mean_under_a"], dtype=np.float32)
+        deltae_mean_under_b[row] = np.asarray(out["deltae_mean_under_b"], dtype=np.float32)
+        success_js_eval_under_a[row] = np.asarray(out["success_js_eval_under_a"], dtype=np.float32)
+        success_js_eval_under_b[row] = np.asarray(out["success_js_eval_under_b"], dtype=np.float32)
+        success_js_eval_node_under_a[row] = np.asarray(out["success_js_eval_node_under_a"], dtype=np.float32)
+        success_js_eval_node_under_b[row] = np.asarray(out["success_js_eval_node_under_b"], dtype=np.float32)
+        success_js_eval_edge_under_a[row] = np.asarray(out["success_js_eval_edge_under_a"], dtype=np.float32)
+        success_js_eval_edge_under_b[row] = np.asarray(out["success_js_eval_edge_under_b"], dtype=np.float32)
+        raw_deltae[row] = np.float32(out["raw_deltae"])
+        raw_js_a[row] = np.float32(out["raw_js_a"])
+        raw_js_b[row] = np.float32(out["raw_js_b"])
+
+    auc_a = np.asarray([_normalized_auc(lambdas, success_a[i]) for i in range(n_select)], dtype=np.float32)
+    auc_b = np.asarray([_normalized_auc(lambdas, success_b[i]) for i in range(n_select)], dtype=np.float32)
+    auc_dir = np.asarray(auc_b - auc_a, dtype=np.float32)
+
+    cost_a = np.asarray(
+        [
+            _completion_cost_from_curve(
+                lambdas,
+                success_a[i],
+                target_success=float(completion_target_success),
+                unreached_value=float(completion_cost_if_unreached),
+            )
+            for i in range(n_select)
+        ],
+        dtype=np.float32,
+    )
+    cost_b = np.asarray(
+        [
+            _completion_cost_from_curve(
+                lambdas,
+                success_b[i],
+                target_success=float(completion_target_success),
+                unreached_value=float(completion_cost_if_unreached),
+            )
+            for i in range(n_select)
+        ],
+        dtype=np.float32,
+    )
+
+    novelty_frame = np.asarray(
+        0.5 * (np.mean(novelty_under_a, axis=1) + np.mean(novelty_under_b, axis=1)),
+        dtype=np.float32,
+    )
+    lacs_component_completion = np.asarray(auc_dir, dtype=np.float32)
+    # active-positive sign convention.
+    lacs_component_raw = np.asarray(-raw_deltae, dtype=np.float32)
+    lacs_component_novelty = np.asarray(novelty_frame, dtype=np.float32)
+
+    success_a_mean = np.asarray(np.mean(success_a, axis=0), dtype=np.float32)
+    success_b_mean = np.asarray(np.mean(success_b, axis=0), dtype=np.float32)
+    success_a_std = np.asarray(np.std(success_a, axis=0), dtype=np.float32)
+    success_b_std = np.asarray(np.std(success_b, axis=0), dtype=np.float32)
+
+    analysis_id = str(uuid.uuid4())
+    out_root = _ensure_analysis_dir(cluster_dir, "ligand_completion")
+    analysis_dir = out_root / analysis_id
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = analysis_dir / "analysis.npz"
+    meta_path = analysis_dir / ANALYSIS_METADATA_FILENAME
+
+    np.savez_compressed(
+        npz_path,
+        lambda_values=np.asarray(lambdas, dtype=np.float32),
+        frame_indices=np.asarray(frame_idx_sel, dtype=np.int64),
+        constrained_indices=np.asarray(C, dtype=np.int32),
+        constrained_keys=np.asarray([residue_keys[i] for i in C], dtype=str),
+        constraint_weights=np.asarray(c_weights, dtype=np.float32),
+        constraint_source_mode=np.asarray([str(constraint_mode)], dtype=str),
+        constraint_auto_row_sample_id=np.asarray(
+            [str(constraint_auto_row_sample_id)] if constraint_auto_row_sample_id else [],
+            dtype=str,
+        ),
+        constraint_auto_impact=np.asarray(constraint_auto_impact, dtype=np.float32),
+        constraint_auto_ranked_indices=np.asarray(constraint_auto_ranked_indices, dtype=np.int32),
+        success_a=np.asarray(success_a, dtype=np.float32),
+        success_b=np.asarray(success_b, dtype=np.float32),
+        success_a_mean=np.asarray(success_a_mean, dtype=np.float32),
+        success_b_mean=np.asarray(success_b_mean, dtype=np.float32),
+        success_a_std=np.asarray(success_a_std, dtype=np.float32),
+        success_b_std=np.asarray(success_b_std, dtype=np.float32),
+        auc_a=np.asarray(auc_a, dtype=np.float32),
+        auc_b=np.asarray(auc_b, dtype=np.float32),
+        auc_dir=np.asarray(auc_dir, dtype=np.float32),
+        cost_a=np.asarray(cost_a, dtype=np.float32),
+        cost_b=np.asarray(cost_b, dtype=np.float32),
+        raw_deltae=np.asarray(raw_deltae, dtype=np.float32),
+        raw_js_a=np.asarray(raw_js_a, dtype=np.float32),
+        raw_js_b=np.asarray(raw_js_b, dtype=np.float32),
+        js_a_under_a=np.asarray(js_a_under_a, dtype=np.float32),
+        js_b_under_a=np.asarray(js_b_under_a, dtype=np.float32),
+        js_a_under_b=np.asarray(js_a_under_b, dtype=np.float32),
+        js_b_under_b=np.asarray(js_b_under_b, dtype=np.float32),
+        novelty_under_a=np.asarray(novelty_under_a, dtype=np.float32),
+        novelty_under_b=np.asarray(novelty_under_b, dtype=np.float32),
+        success_js_eval_under_a=np.asarray(success_js_eval_under_a, dtype=np.float32),
+        success_js_eval_under_b=np.asarray(success_js_eval_under_b, dtype=np.float32),
+        success_js_eval_node_under_a=np.asarray(success_js_eval_node_under_a, dtype=np.float32),
+        success_js_eval_node_under_b=np.asarray(success_js_eval_node_under_b, dtype=np.float32),
+        success_js_eval_edge_under_a=np.asarray(success_js_eval_edge_under_a, dtype=np.float32),
+        success_js_eval_edge_under_b=np.asarray(success_js_eval_edge_under_b, dtype=np.float32),
+        novelty_frame=np.asarray(novelty_frame, dtype=np.float32),
+        deltae_mean_under_a=np.asarray(deltae_mean_under_a, dtype=np.float32),
+        deltae_mean_under_b=np.asarray(deltae_mean_under_b, dtype=np.float32),
+        lacs_component_completion=np.asarray(lacs_component_completion, dtype=np.float32),
+        lacs_component_raw=np.asarray(lacs_component_raw, dtype=np.float32),
+        lacs_component_novelty=np.asarray(lacs_component_novelty, dtype=np.float32),
+        success_mode=np.asarray([str(success_mode)], dtype=str),
+        js_success_threshold=np.asarray([float(js_success_threshold)], dtype=np.float32),
+        js_success_margin=np.asarray([float(js_success_margin)], dtype=np.float32),
+        delta_js_selected_residue_indices=np.asarray(delta_js_selected_residue_indices, dtype=np.int32),
+        delta_js_selected_residue_keys=np.asarray(
+            [str(residue_keys[int(i)]) for i in delta_js_selected_residue_indices.tolist()],
+            dtype=str,
+        ),
+        delta_js_selected_residue_weights=np.asarray(delta_js_selected_residue_weights, dtype=np.float32),
+        delta_js_selected_edge_indices=np.asarray(delta_js_selected_edge_indices, dtype=np.int32),
+        delta_js_selected_edges=np.asarray(delta_js_selected_edges, dtype=np.int32),
+        delta_js_selected_edge_weights=np.asarray(delta_js_selected_edge_weights, dtype=np.float32),
+        delta_js_node_edge_alpha=np.asarray([float(delta_js_effective_alpha)], dtype=np.float32),
+        delta_js_filter_setup_id=np.asarray(
+            [str(delta_js_filter_setup_id_resolved)] if delta_js_filter_setup_id_resolved else [],
+            dtype=str,
+        ),
+        delta_js_filter_edge_alpha=np.asarray([float(delta_js_filter_edge_alpha)], dtype=np.float32),
+        delta_js_filter_success_set_a=np.asarray(delta_js_filter_success_set_a, dtype=np.int32),
+        delta_js_filter_success_set_b=np.asarray(delta_js_filter_success_set_b, dtype=np.int32),
+        delta_js_filter_success_union=np.asarray(delta_js_filter_success_union, dtype=np.int32),
+        delta_js_filter_target_candidates=np.asarray(delta_js_filter_target_candidates, dtype=np.int32),
+    )
+
+    default_lacs_weights = {"completion": 1.0, "raw_bias": 0.5, "novelty": 0.5}
+    lacs_default = (
+        default_lacs_weights["completion"] * float(np.median(lacs_component_completion))
+        + default_lacs_weights["raw_bias"] * float(np.median(lacs_component_raw))
+        - default_lacs_weights["novelty"] * float(np.median(lacs_component_novelty))
+    )
+
+    now = _utc_now()
+    meta = {
+        "analysis_id": analysis_id,
+        "analysis_type": "ligand_completion",
+        "created_at": now,
+        "updated_at": now,
+        "project_id": project_id,
+        "system_id": system_id,
+        "cluster_id": cluster_id,
+        "model_a_id": model_a_id,
+        "model_a_name": model_a_name,
+        "model_a_path": _relativize(model_a_path, system_dir),
+        "model_b_id": model_b_id,
+        "model_b_name": model_b_name,
+        "model_b_path": _relativize(model_b_path, system_dir),
+        "md_sample_id": str(md_sample_id),
+        "md_sample_name": start_entry.get("name"),
+        "reference_sample_id_a": str(ref_id_a),
+        "reference_sample_name_a": ref_entry_a.get("name"),
+        "reference_sample_id_b": str(ref_id_b),
+        "reference_sample_name_b": ref_entry_b.get("name"),
+        "sampler": sampler,
+        "lambda_values": [float(v) for v in lambdas.tolist()],
+        "n_start_frames_requested": int(n_start_frames),
+        "n_start_frames_used": int(n_select),
+        "n_samples_per_frame": int(n_samples_per_frame),
+        "n_steps": int(n_steps),
+        "tail_steps": int(tail_steps),
+        "target_window_size": int(target_window_size),
+        "target_pseudocount": float(target_pseudocount),
+        "epsilon_logpenalty": float(epsilon_logpenalty),
+        "constraint_source_mode": str(constraint_mode),
+        "constraint_delta_js_analysis_id": (
+            str(resolved_constraint_delta_js_id).strip() if resolved_constraint_delta_js_id else None
+        ),
+        "constraint_delta_js_sample_id": (
+            str(constraint_auto_row_sample_id) if constraint_auto_row_sample_id else None
+        ),
+        "constraint_auto_top_k": int(constraint_auto_top_k),
+        "constraint_auto_edge_alpha": float(constraint_auto_edge_alpha),
+        "constraint_auto_exclude_success": bool(constraint_auto_exclude_success),
+        "constraint_weight_mode": cw_mode,
+        "constraint_weight_min": float(cmin),
+        "constraint_weight_max": float(cmax),
+        "constrained_indices": [int(v) for v in C],
+        "constrained_keys": [str(residue_keys[v]) for v in C],
+        "constraint_weights": [float(v) for v in c_weights.tolist()],
+        "gibbs_beta": float(gibbs_beta),
+        "sa_beta_hot": float(sa_beta_hot),
+        "sa_beta_cold": float(sa_beta_cold),
+        "sa_schedule": str(sa_schedule),
+        "md_label_mode": mode,
+        "drop_invalid": bool(drop_invalid),
+        "success_metric_mode": str(success_mode),
+        "js_success_threshold": float(js_success_threshold),
+        "js_success_margin": float(js_success_margin),
+        "delta_js_experiment_id": (str(shared_delta_js_id).strip() if shared_delta_js_id else None),
+        "delta_js_analysis_id": (str(resolved_success_delta_js_id).strip() if resolved_success_delta_js_id else None),
+        "delta_js_filter_setup_id": (str(delta_js_filter_setup_id_resolved) if delta_js_filter_setup_id_resolved else None),
+        "delta_js_filter_edge_alpha": float(delta_js_filter_edge_alpha),
+        "delta_js_d_residue_min": float(delta_js_d_residue_min),
+        "delta_js_d_residue_max": (float(delta_js_d_residue_max) if delta_js_d_residue_max is not None else None),
+        "delta_js_d_edge_min": float(delta_js_d_edge_min),
+        "delta_js_d_edge_max": (float(delta_js_d_edge_max) if delta_js_d_edge_max is not None else None),
+        "delta_js_node_edge_alpha": (float(delta_js_effective_alpha) if np.isfinite(delta_js_effective_alpha) else None),
+        "delta_js_selected_residue_indices": [int(v) for v in delta_js_selected_residue_indices.tolist()],
+        "delta_js_selected_residue_keys": [str(residue_keys[int(v)]) for v in delta_js_selected_residue_indices.tolist()],
+        "delta_js_selected_edge_indices": [int(v) for v in delta_js_selected_edge_indices.tolist()],
+        "delta_js_selected_edges": [[int(r), int(s)] for (r, s) in delta_js_selected_edges.tolist()],
+        "deltae_margin": float(deltae_margin),
+        "completion_target_success": float(completion_target_success),
+        "completion_cost_if_unreached": float(completion_cost_if_unreached),
+        "seed": int(seed),
+        "workers": int(max(1, n_workers)),
+        "paths": {"analysis_npz": str(npz_path.relative_to(system_dir))},
+        "lacs_default_weights": default_lacs_weights,
+        "summary": {
+            "n_residues": int(N),
+            "n_constrained": int(len(C)),
+            "n_constraint_auto_candidates": int(len(constraint_auto_ranked_indices)),
+            "n_delta_js_residues": int(delta_js_selected_residue_indices.shape[0]),
+            "n_delta_js_edges": int(delta_js_selected_edge_indices.shape[0]),
+            "n_delta_js_filter_success_a": int(delta_js_filter_success_set_a.shape[0]),
+            "n_delta_js_filter_success_b": int(delta_js_filter_success_set_b.shape[0]),
+            "n_delta_js_filter_success_union": int(delta_js_filter_success_union.shape[0]),
+            "n_delta_js_filter_target_candidates": int(delta_js_filter_target_candidates.shape[0]),
+            "auc_a_median": float(np.median(auc_a)),
+            "auc_b_median": float(np.median(auc_b)),
+            "auc_dir_median": float(np.median(auc_dir)),
+            "cost_a_median": float(np.median(cost_a)),
+            "cost_b_median": float(np.median(cost_b)),
+            "raw_deltae_median": float(np.median(raw_deltae)),
+            "novelty_median": float(np.median(novelty_frame)),
+            "lacs_default_median": float(lacs_default),
+            "success_js_eval_under_a_median": (
+                float(np.nanmedian(success_js_eval_under_a))
+                if success_mode == "delta_js_edge"
+                else None
+            ),
+            "success_js_eval_under_b_median": (
+                float(np.nanmedian(success_js_eval_under_b))
+                if success_mode == "delta_js_edge"
+                else None
+            ),
+        },
+    }
+    meta_path.write_text(json.dumps(_convert_nan_to_none(meta), indent=2), encoding="utf-8")
+    return {"metadata": _convert_nan_to_none(meta), "analysis_npz": str(npz_path), "analysis_dir": str(analysis_dir)}
 
 
 def compute_delta_transition_analysis(

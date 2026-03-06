@@ -173,6 +173,13 @@ export function fetchClusterAnalysisData(projectId, systemId, clusterId, analysi
   );
 }
 
+export function deleteClusterAnalysis(projectId, systemId, clusterId, analysisType, analysisId) {
+  return requestJSON(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/analyses/${analysisType}/${analysisId}`,
+    { method: 'DELETE' }
+  );
+}
+
 export function fetchClusterUiSetups(projectId, systemId, clusterId, options = {}) {
   const params = new URLSearchParams();
   if (options?.setupType) params.set('setup_type', String(options.setupType));

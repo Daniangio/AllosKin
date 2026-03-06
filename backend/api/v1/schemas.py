@@ -258,6 +258,79 @@ class LambdaSweepJobRequest(BaseModel):
     gibbs_thin: Optional[int] = None
 
     rex_betas: Optional[Union[str, List[float]]] = None
+    rex_beta_min: Optional[float] = None
+    rex_beta_max: Optional[float] = None
+    rex_spacing: Optional[str] = None
+    rex_n_replicas: Optional[int] = None
+    rex_rounds: Optional[int] = None
+    rex_burnin_rounds: Optional[int] = None
+    rex_sweeps_per_round: Optional[int] = None
+    rex_thin_rounds: Optional[int] = None
+
+
+class LigandCompletionJobRequest(BaseModel):
+    """
+    Ligand-guided conditional completion analysis (dev_docs.md).
+    """
+
+    project_id: str
+    system_id: str
+    cluster_id: str
+
+    model_a_id: str
+    model_b_id: str
+    md_sample_id: str
+    constrained_residues: Optional[List[Union[str, int]]] = None
+
+    reference_sample_id_a: Optional[str] = None
+    reference_sample_id_b: Optional[str] = None
+
+    sampler: Optional[str] = None  # sa|gibbs
+    lambda_values: Optional[List[float]] = None
+    n_start_frames: Optional[int] = None
+    n_samples_per_frame: Optional[int] = None
+    n_steps: Optional[int] = None
+    tail_steps: Optional[int] = None
+
+    target_window_size: Optional[int] = None
+    target_pseudocount: Optional[float] = None
+    epsilon_logpenalty: Optional[float] = None
+
+    constraint_weight_mode: Optional[str] = None  # uniform|js_abs|custom
+    constraint_weights: Optional[List[float]] = None
+    constraint_weight_min: Optional[float] = None
+    constraint_weight_max: Optional[float] = None
+    constraint_source_mode: Optional[str] = None  # manual|delta_js_auto
+    constraint_delta_js_analysis_id: Optional[str] = None
+    constraint_delta_js_sample_id: Optional[str] = None
+    constraint_auto_top_k: Optional[int] = None
+    constraint_auto_edge_alpha: Optional[float] = None
+    constraint_auto_exclude_success: Optional[bool] = None
+
+    gibbs_beta: Optional[float] = None
+    sa_beta_hot: Optional[float] = None
+    sa_beta_cold: Optional[float] = None
+    sa_schedule: Optional[str] = None  # geom|lin
+
+    md_label_mode: Optional[str] = None  # assigned|halo
+    keep_invalid: Optional[bool] = None
+    success_metric_mode: Optional[str] = None  # deltae|delta_js_edge
+    delta_js_experiment_id: Optional[str] = None
+    delta_js_analysis_id: Optional[str] = None
+    delta_js_filter_setup_id: Optional[str] = None
+    delta_js_filter_edge_alpha: Optional[float] = None
+    delta_js_d_residue_min: Optional[float] = None
+    delta_js_d_residue_max: Optional[float] = None
+    delta_js_d_edge_min: Optional[float] = None
+    delta_js_d_edge_max: Optional[float] = None
+    delta_js_node_edge_alpha: Optional[float] = None
+    js_success_threshold: Optional[float] = None
+    js_success_margin: Optional[float] = None
+    deltae_margin: Optional[float] = None
+    completion_target_success: Optional[float] = None
+    completion_cost_if_unreached: Optional[float] = None
+    workers: Optional[int] = None
+    seed: Optional[int] = None
 
 
 class UiSetupUpsertRequest(BaseModel):
@@ -268,14 +341,6 @@ class UiSetupUpsertRequest(BaseModel):
     page: Optional[str] = None
     payload: Dict[str, Any]
     setup_id: Optional[str] = None
-    rex_beta_min: Optional[float] = None
-    rex_beta_max: Optional[float] = None
-    rex_spacing: Optional[str] = None
-    rex_n_replicas: Optional[int] = None
-    rex_rounds: Optional[int] = None
-    rex_burnin_rounds: Optional[int] = None
-    rex_sweeps_per_round: Optional[int] = None
-    rex_thin_rounds: Optional[int] = None
 
 
 class GibbsRelaxationJobRequest(BaseModel):

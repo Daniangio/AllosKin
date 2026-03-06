@@ -845,6 +845,38 @@ async def get_cluster_analysis_data(
     return {"metadata": _convert_nan_to_none(meta), "data": _convert_nan_to_none(payload)}
 
 
+@router.delete(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/analyses/{analysis_type}/{analysis_id}",
+    summary="Delete a stored analysis folder.",
+)
+async def delete_cluster_analysis(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    analysis_type: str,
+    analysis_id: str,
+):
+    try:
+        project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="System not found.")
+
+    kind = str(analysis_type or "").strip()
+    aid = str(analysis_id or "").strip()
+    if not kind or not aid:
+        raise HTTPException(status_code=400, detail="analysis_type and analysis_id are required.")
+
+    cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    analysis_dir = cluster_dirs["cluster_dir"] / "analyses" / kind / aid
+    if not analysis_dir.exists() or not analysis_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Analysis not found on disk.")
+    try:
+        shutil.rmtree(analysis_dir)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to delete analysis: {exc}") from exc
+    return {"status": "deleted", "analysis_type": kind, "analysis_id": aid}
+
+
 @router.get(
     "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/samples/{sample_id}/stats",
     summary="Load basic stats for a saved sample NPZ (sample.npz or legacy).",

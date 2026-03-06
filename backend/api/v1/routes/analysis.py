@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from backend.api.v1.common import ensure_system_ready, get_cluster_entry, get_queue, project_store
 from backend.api.v1.schemas import (
     GibbsRelaxationJobRequest,
+    LigandCompletionJobRequest,
     DeltaEvalJobRequest,
     DeltaCommitmentJobRequest,
     DeltaJsJobRequest,
@@ -18,6 +19,7 @@ from backend.api.v1.schemas import (
     StaticJobRequest,
 )
 from backend.tasks import (
+    run_ligand_completion_job,
     run_gibbs_relaxation_job,
     run_analysis_job,
     run_delta_eval_job,
@@ -424,6 +426,168 @@ async def submit_gibbs_relaxation_job(
             job_timeout="6h",
             result_ttl=86400,
             job_id=f"gibbs-relaxation-{job_uuid}",
+        )
+        return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"Job submission failed: {exc}") from exc
+
+
+@router.post(
+    "/submit/ligand_completion",
+    summary="Submit ligand-guided conditional completion analysis (A/B endpoints).",
+)
+async def submit_ligand_completion_job(
+    payload: LigandCompletionJobRequest,
+    task_queue: Any = Depends(get_queue),
+):
+    try:
+        system_meta = project_store.get_system(payload.project_id, payload.system_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"System '{payload.system_id}' not found in project '{payload.project_id}'.",
+        )
+
+    get_cluster_entry(system_meta, payload.cluster_id)
+
+    if payload.model_a_id == payload.model_b_id:
+        raise HTTPException(status_code=400, detail="model_a_id and model_b_id must be different.")
+
+    constraint_mode = str(payload.constraint_source_mode or "manual").strip().lower()
+    if constraint_mode not in {"manual", "delta_js_auto"}:
+        raise HTTPException(status_code=400, detail="constraint_source_mode must be 'manual' or 'delta_js_auto'.")
+    if constraint_mode == "manual":
+        if not payload.constrained_residues or not isinstance(payload.constrained_residues, list):
+            raise HTTPException(status_code=400, detail="constrained_residues must be a non-empty list.")
+    else:
+        if not (
+            str(payload.constraint_delta_js_analysis_id or "").strip()
+            or str(payload.delta_js_experiment_id or "").strip()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="constraint_delta_js_analysis_id (or delta_js_experiment_id) is required when constraint_source_mode='delta_js_auto'.",
+            )
+        if payload.constraint_auto_top_k is not None and int(payload.constraint_auto_top_k) < 1:
+            raise HTTPException(status_code=400, detail="constraint_auto_top_k must be >= 1.")
+        if payload.constraint_auto_edge_alpha is not None:
+            alpha = float(payload.constraint_auto_edge_alpha)
+            if alpha < 0.0 or alpha > 1.0:
+                raise HTTPException(status_code=400, detail="constraint_auto_edge_alpha must be in [0,1].")
+
+    sampler = str(payload.sampler or "sa").strip().lower()
+    if sampler not in {"sa", "gibbs"}:
+        raise HTTPException(status_code=400, detail="sampler must be 'sa' or 'gibbs'.")
+
+    md_label_mode = (payload.md_label_mode or "assigned").lower()
+    if md_label_mode not in {"assigned", "halo"}:
+        raise HTTPException(status_code=400, detail="md_label_mode must be 'assigned' or 'halo'.")
+
+    success_mode = str(payload.success_metric_mode or "deltae").strip().lower()
+    if success_mode not in {"deltae", "delta_js_edge"}:
+        raise HTTPException(status_code=400, detail="success_metric_mode must be 'deltae' or 'delta_js_edge'.")
+    shared_delta_js_id = str(payload.delta_js_experiment_id or "").strip()
+    if success_mode == "delta_js_edge" and not (
+        str(payload.delta_js_analysis_id or "").strip() or shared_delta_js_id
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="delta_js_analysis_id (or delta_js_experiment_id) is required when success_metric_mode='delta_js_edge'.",
+        )
+    if payload.delta_js_node_edge_alpha is not None:
+        alpha = float(payload.delta_js_node_edge_alpha)
+        if alpha < 0.0 or alpha > 1.0:
+            raise HTTPException(status_code=400, detail="delta_js_node_edge_alpha must be in [0,1].")
+    if payload.delta_js_filter_edge_alpha is not None:
+        alpha = float(payload.delta_js_filter_edge_alpha)
+        if alpha < 0.0 or alpha > 1.0:
+            raise HTTPException(status_code=400, detail="delta_js_filter_edge_alpha must be in [0,1].")
+    if payload.js_success_threshold is not None and float(payload.js_success_threshold) < 0:
+        raise HTTPException(status_code=400, detail="js_success_threshold must be >= 0.")
+
+    if payload.lambda_values is not None:
+        if len(payload.lambda_values) < 2:
+            raise HTTPException(status_code=400, detail="lambda_values must contain at least 2 values.")
+        if any(float(v) < 0 for v in payload.lambda_values):
+            raise HTTPException(status_code=400, detail="lambda_values must be >= 0.")
+
+    for name, value in {
+        "n_start_frames": payload.n_start_frames,
+        "n_samples_per_frame": payload.n_samples_per_frame,
+        "n_steps": payload.n_steps,
+        "tail_steps": payload.tail_steps,
+        "target_window_size": payload.target_window_size,
+    }.items():
+        if value is not None and int(value) < 1:
+            raise HTTPException(status_code=400, detail=f"{name} must be >= 1.")
+
+    if payload.n_steps is not None and payload.tail_steps is not None:
+        if int(payload.tail_steps) > int(payload.n_steps):
+            raise HTTPException(status_code=400, detail="tail_steps cannot exceed n_steps.")
+
+    if payload.sa_beta_hot is not None and float(payload.sa_beta_hot) <= 0:
+        raise HTTPException(status_code=400, detail="sa_beta_hot must be > 0.")
+    if payload.sa_beta_cold is not None and float(payload.sa_beta_cold) <= 0:
+        raise HTTPException(status_code=400, detail="sa_beta_cold must be > 0.")
+    if payload.sa_beta_hot is not None and payload.sa_beta_cold is not None:
+        if float(payload.sa_beta_hot) > float(payload.sa_beta_cold):
+            raise HTTPException(status_code=400, detail="sa_beta_hot must be <= sa_beta_cold.")
+
+    if payload.gibbs_beta is not None and float(payload.gibbs_beta) <= 0:
+        raise HTTPException(status_code=400, detail="gibbs_beta must be > 0.")
+
+    if payload.target_pseudocount is not None and float(payload.target_pseudocount) < 0:
+        raise HTTPException(status_code=400, detail="target_pseudocount must be >= 0.")
+    if payload.epsilon_logpenalty is not None and float(payload.epsilon_logpenalty) <= 0:
+        raise HTTPException(status_code=400, detail="epsilon_logpenalty must be > 0.")
+
+    if payload.completion_target_success is not None:
+        pstar = float(payload.completion_target_success)
+        if not (0.0 < pstar <= 1.0):
+            raise HTTPException(status_code=400, detail="completion_target_success must be in (0,1].")
+
+    if payload.constraint_weights is not None and payload.constraint_weight_mode not in {None, "custom"}:
+        raise HTTPException(
+            status_code=400,
+            detail="constraint_weights may be provided only with constraint_weight_mode='custom' (or omitted mode).",
+        )
+    if (
+        constraint_mode == "manual"
+        and payload.constraint_weights is not None
+        and payload.constrained_residues is not None
+        and len(payload.constraint_weights) != len(payload.constrained_residues)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="constraint_weights must have the same length as constrained_residues.",
+        )
+
+    try:
+        project_meta = project_store.get_project(payload.project_id)
+        project_name = project_meta.name
+    except Exception:
+        project_name = None
+
+    dataset_ref = {
+        "project_id": payload.project_id,
+        "project_name": project_name,
+        "system_id": payload.system_id,
+        "system_name": system_meta.name,
+        "cluster_id": payload.cluster_id,
+    }
+
+    params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
+    # Webserver path: force single-process execution as requested.
+    params["workers"] = 1
+
+    try:
+        job_uuid = str(uuid.uuid4())
+        job = task_queue.enqueue(
+            run_ligand_completion_job,
+            args=(job_uuid, dataset_ref, params),
+            job_timeout="8h",
+            result_ttl=86400,
+            job_id=f"ligand-completion-{job_uuid}",
         )
         return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
     except Exception as exc:  # pragma: no cover

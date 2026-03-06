@@ -119,6 +119,15 @@ export default function SystemDetailSidebar({
         <button
           type="button"
           onClick={() =>
+            navigate(`/projects/${projectId}/systems/${systemId}/sampling/ligand_completion${buildSamplingSuffix()}`)
+          }
+          className="text-xs px-2 py-2 rounded-md border border-gray-700 text-gray-200 hover:bg-gray-700/40"
+        >
+          Ligand completion
+        </button>
+        <button
+          type="button"
+          onClick={() =>
             navigate(`/projects/${projectId}/systems/${systemId}/sampling/gibbs_relaxation_3d${buildSamplingSuffix()}`)
           }
           className="col-span-2 text-xs px-2 py-2 rounded-md border border-gray-700 text-gray-200 hover:bg-gray-700/40"

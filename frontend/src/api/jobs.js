@@ -77,6 +77,13 @@ export function submitGibbsRelaxationJob(payload) {
   });
 }
 
+export function submitLigandCompletionJob(payload) {
+  return requestJSON('/submit/ligand_completion', {
+    method: 'POST',
+    body: payload,
+  });
+}
+
 export function fetchResults() {
   return requestJSON('/results');
 }
