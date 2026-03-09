@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 import numpy as np
 
 from backend.api.v1.common import DATA_ROOT, get_queue, project_store, stream_upload, get_cluster_entry
+from backend.api.v1.analysis_cleanup import cleanup_orphan_cluster_analyses
 from backend.api.v1.schemas import LambdaPottsModelCreateRequest, UiSetupUpsertRequest
 from phase.workflows.clustering import (
     generate_metastable_cluster_npz,
@@ -1226,7 +1227,12 @@ async def delete_sampling_sample(
         cluster_id,
         sample_id=sample_id,
     )
-    return {"status": "deleted", "sample_id": sample_id}
+    analyses_deleted = cleanup_orphan_cluster_analyses(project_id, system_id, cluster_id)
+    return {
+        "status": "deleted",
+        "sample_id": sample_id,
+        "orphan_analyses_deleted": int(analyses_deleted),
+    }
 
 
 def _parse_cluster_payload(payload: Dict[str, Any]) -> Dict[str, Any]:

@@ -143,7 +143,9 @@ async def submit_simulation_job(
         "rex_burnin": payload.rex_burnin,
         "rex_thin": payload.rex_thin,
         "sa_reads": payload.sa_reads,
+        "sa_chains": payload.sa_chains,
         "sa_sweeps": payload.sa_sweeps,
+        "sa_num_sweeps_per_beta": payload.sa_num_sweeps_per_beta,
         "plm_epochs": payload.plm_epochs,
         "plm_batch_size": payload.plm_batch_size,
         "plm_progress_every": payload.plm_progress_every,
@@ -166,6 +168,10 @@ async def submit_simulation_job(
         mode = str(payload.contact_atom_mode).upper()
         if mode not in {"CA", "CM"}:
             raise HTTPException(status_code=400, detail="contact_atom_mode must be 'CA' or 'CM'.")
+    if payload.penalty_safety is not None and float(payload.penalty_safety) <= 0:
+        raise HTTPException(status_code=400, detail="penalty_safety must be > 0.")
+    if payload.repair is not None and str(payload.repair) not in {"none", "argmax"}:
+        raise HTTPException(status_code=400, detail="repair must be 'none' or 'argmax'.")
     if payload.sa_beta_hot is not None and float(payload.sa_beta_hot) <= 0:
         raise HTTPException(status_code=400, detail="sa_beta_hot must be > 0.")
     if payload.sa_beta_cold is not None and float(payload.sa_beta_cold) <= 0:
@@ -184,6 +190,24 @@ async def submit_simulation_job(
                 raise HTTPException(status_code=400, detail=f"sa_beta_schedules[{idx}] values must be > 0.")
             if float(hot) > float(cold):
                 raise HTTPException(status_code=400, detail=f"sa_beta_schedules[{idx}] must satisfy hot <= cold.")
+    if payload.sa_schedule_type is not None:
+        schedule_type = str(payload.sa_schedule_type).strip().lower()
+        if schedule_type not in {"geometric", "linear", "custom", "geom", "lin"}:
+            raise HTTPException(status_code=400, detail="sa_schedule_type must be geometric, linear, or custom.")
+        if schedule_type == "custom" and not payload.sa_custom_beta_schedule:
+            raise HTTPException(status_code=400, detail="sa_custom_beta_schedule is required when sa_schedule_type is custom.")
+    if payload.sa_custom_beta_schedule is not None:
+        if len(payload.sa_custom_beta_schedule) < 1:
+            raise HTTPException(status_code=400, detail="sa_custom_beta_schedule must be non-empty.")
+        for idx, beta in enumerate(payload.sa_custom_beta_schedule):
+            if float(beta) < 0:
+                raise HTTPException(status_code=400, detail=f"sa_custom_beta_schedule[{idx}] must be >= 0.")
+        if payload.sa_beta_hot is not None or payload.sa_beta_cold is not None:
+            raise HTTPException(status_code=400, detail="Use either sa_custom_beta_schedule or sa_beta_hot/sa_beta_cold, not both.")
+    if payload.sa_acceptance_criteria is not None:
+        criteria = str(payload.sa_acceptance_criteria).strip().lower()
+        if criteria not in {"metropolis", "gibbs"}:
+            raise HTTPException(status_code=400, detail="sa_acceptance_criteria must be 'Metropolis' or 'Gibbs'.")
 
     if payload.sa_init is not None:
         sa_init = str(payload.sa_init)
@@ -577,8 +601,6 @@ async def submit_ligand_completion_job(
     }
 
     params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
-    # Webserver path: force single-process execution as requested.
-    params["workers"] = 1
 
     try:
         job_uuid = str(uuid.uuid4())

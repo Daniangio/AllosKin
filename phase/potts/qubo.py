@@ -52,7 +52,7 @@ def _build_slices(K_list: Sequence[int]) -> List[slice]:
     return out
 
 
-def adaptive_penalties(model: PottsModel, safety: float = 3.0) -> np.ndarray:
+def adaptive_penalties(model: PottsModel, safety: float = 8.0) -> np.ndarray:
     """
     Residue-specific lambda_r ≥ max|h_r| + sum_neighbors max|J_rs|.
     """
@@ -73,7 +73,7 @@ def potts_to_qubo_onehot(
     *,
     beta: float = 1.0,
     penalty_lambda: np.ndarray | None = None,
-    penalty_safety: float = 3.0,
+    penalty_safety: float = 8.0,
 ) -> QUBO:
     """
     Map Potts to QUBO with one-hot constraints per residue:

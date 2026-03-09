@@ -288,6 +288,25 @@ export default function SamplingVizPage() {
 
   const infoSample = useMemo(() => sampleEntries.find((s) => s.sample_id === infoSampleId) || null, [sampleEntries, infoSampleId]);
   const infoSampleStats = useMemo(() => (infoSampleId ? sampleStatsCache[infoSampleId] : null), [sampleStatsCache, infoSampleId]);
+  const selectedSampleEntry = useMemo(
+    () => sampleEntries.find((s) => s.sample_id === selectedSampleId) || null,
+    [sampleEntries, selectedSampleId]
+  );
+  const selectedSampleStats = useMemo(
+    () => (selectedSampleId ? sampleStatsCache[selectedSampleId] : null),
+    [sampleStatsCache, selectedSampleId]
+  );
+  const selectedSampleAllInvalid = useMemo(() => {
+    if (keepInvalid) return false;
+    if (!selectedSampleEntry || selectedSampleEntry.method !== 'sa') return false;
+    if (!selectedSampleStats) return false;
+    return selectedSampleStats.n_frames > 0 && selectedSampleStats.invalid_count >= selectedSampleStats.n_frames;
+  }, [keepInvalid, selectedSampleEntry, selectedSampleStats]);
+  const analysisSummary = analysisJobStatus?.result?.results?.summary || analysisJobStatus?.meta?.summary || null;
+  const analysisSkippedSamples = useMemo(
+    () => (Array.isArray(analysisSummary?.skipped_samples) ? analysisSummary.skipped_samples : []),
+    [analysisSummary]
+  );
 
   useEffect(() => {
     const loadSystem = async () => {
@@ -621,12 +640,13 @@ export default function SamplingVizPage() {
         await deleteSamplingSample(projectId, systemId, selectedClusterId, sampleId);
         const data = await fetchSystem(projectId, systemId);
         setSystem(data);
+        await loadAnalyses();
         setInfoSampleId('');
       } catch (err) {
         setSystemError(err.message || 'Failed to delete sample.');
       }
     },
-    [projectId, systemId, selectedClusterId]
+    [projectId, systemId, selectedClusterId, loadAnalyses]
   );
 
   const toggleInfo = useCallback((sampleId) => {
@@ -647,6 +667,20 @@ export default function SamplingVizPage() {
     };
     load();
   }, [infoSampleId, sampleStatsCache, projectId, systemId, selectedClusterId]);
+
+  useEffect(() => {
+    const load = async () => {
+      if (!selectedSampleId) return;
+      if (sampleStatsCache[selectedSampleId]) return;
+      try {
+        const stats = await fetchSampleStats(projectId, systemId, selectedClusterId, selectedSampleId);
+        setSampleStatsCache((prev) => ({ ...prev, [selectedSampleId]: stats }));
+      } catch (err) {
+        setSampleStatsError(err.message || 'Failed to load sample stats.');
+      }
+    };
+    load();
+  }, [selectedSampleId, sampleStatsCache, projectId, systemId, selectedClusterId]);
 
   const energyAnalysesForModel = useMemo(() => {
     if (!selectedModelId) return [];
@@ -1142,6 +1176,29 @@ export default function SamplingVizPage() {
                 No analysis found for this pair/settings. Click <span className="font-semibold">Run analysis</span> to compute it.
               </div>
             )}
+            {selectedSampleAllInvalid && (
+              <div className="rounded-md border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200">
+                This SA sample has no valid frames after invalid-frame filtering. Enable <span className="font-semibold">Keep invalid SA</span>{' '}
+                to analyze decoded labels anyway, or adjust the SA settings to improve validity.
+              </div>
+            )}
+            {analysisJobStatus?.status === 'finished' && analysisSummary && (
+              <div className="rounded-md border border-cyan-800 bg-cyan-950/20 p-3 text-[12px] text-cyan-100 space-y-1">
+                <div>
+                  Wrote {analysisSummary.comparisons_written ?? 0} MD-vs-sample analyses and {analysisSummary.energies_written ?? 0}{' '}
+                  energy analyses.
+                </div>
+                {!!analysisSkippedSamples.length && (
+                  <div className="text-cyan-200/90">
+                    Skipped: {analysisSkippedSamples
+                      .slice(0, 5)
+                      .map((item) => `${item.sample_name || item.sample_id} (${item.stage}: ${item.reason})`)
+                      .join(', ')}
+                    {analysisSkippedSamples.length > 5 ? ` +${analysisSkippedSamples.length - 5} more` : ''}
+                  </div>
+                )}
+              </div>
+            )}
             {comparisonError && <ErrorMessage message={comparisonError} />}
             {comparisonLoading && <p className="text-sm text-gray-400">Loading…</p>}
 
@@ -1322,6 +1379,11 @@ export default function SamplingVizPage() {
               <div className="rounded-md border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200">
                 No energy analyses found for this model/settings. Click <span className="font-semibold">Run analysis</span>{' '}
                 to compute them.
+              </div>
+            )}
+            {selectedSampleAllInvalid && (
+              <div className="rounded-md border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200">
+                The selected SA sample contributes no traces here because all frames are currently filtered out as invalid.
               </div>
             )}
             {energyError && <ErrorMessage message={energyError} />}

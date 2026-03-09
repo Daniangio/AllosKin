@@ -51,6 +51,11 @@ def _filter_sampling_params(args: object, parser) -> dict:
             "sa_sweeps",
             "sa_beta_hot",
             "sa_beta_cold",
+            "sa_schedule_type",
+            "sa_custom_beta_schedule",
+            "sa_num_sweeps_per_beta",
+            "sa_randomize_order",
+            "sa_acceptance_criteria",
             "sa_init",
             "sa_init_md_frame",
             "sa_restart",
@@ -66,7 +71,7 @@ def _filter_sampling_params(args: object, parser) -> dict:
     else:
         # Keep key SA parameters even when defaults are used (mirrors the Gibbs behavior).
         out["beta"] = raw.get("beta")
-        out["sa_restart"] = raw.get("sa_restart") or "previous"
+        out["sa_restart"] = raw.get("sa_restart") or "independent"
         out["sa_sweeps"] = raw.get("sa_sweeps")
     for key in allow:
         if key not in raw:
@@ -120,12 +125,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sa-sweeps", type=int, default=2000)
     parser.add_argument("--sa-beta-hot", type=float, default=0.0)
     parser.add_argument("--sa-beta-cold", type=float, default=0.0)
+    parser.add_argument("--sa-schedule-type", type=str, default="geometric", choices=["geometric", "linear", "custom"])
+    parser.add_argument("--sa-custom-beta-schedule", type=str, default="", help="Comma-separated custom beta schedule.")
+    parser.add_argument("--sa-num-sweeps-per-beta", type=int, default=1)
+    parser.add_argument("--sa-randomize-order", action="store_true", help="Randomize variable update order within each sweep.")
+    parser.add_argument("--sa-acceptance-criteria", type=str, default="Metropolis", choices=["Metropolis", "Gibbs"])
     parser.add_argument("--sa-init", type=str, default="md", choices=["md", "md-frame", "random-h", "random-uniform"])
     parser.add_argument("--sa-init-md-frame", type=int, default=-1)
     parser.add_argument(
         "--sa-restart",
         type=str,
-        default="previous",
+        default="independent",
         choices=["previous", "md", "independent"],
         help="How to initialize each SA read after the first within a chain.",
     )
@@ -135,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="Comma-separated state IDs to restrict MD frames used for SA init (when using md/md-frame restart/init).",
     )
-    parser.add_argument("--penalty-safety", type=float, default=3.0)
+    parser.add_argument("--penalty-safety", type=float, default=8.0)
     parser.add_argument("--repair", type=str, default="none", choices=["none", "argmax"])
 
     parser.add_argument("--project-id", default="")
@@ -173,6 +183,11 @@ def main(argv: list[str] | None = None) -> int:
             sa_sweeps=int(args.sa_sweeps),
             sa_beta_hot=float(args.sa_beta_hot),
             sa_beta_cold=float(args.sa_beta_cold),
+            sa_schedule_type=str(args.sa_schedule_type),
+            sa_custom_beta_schedule=str(args.sa_custom_beta_schedule),
+            sa_num_sweeps_per_beta=int(args.sa_num_sweeps_per_beta),
+            sa_randomize_order=bool(args.sa_randomize_order),
+            sa_acceptance_criteria=str(args.sa_acceptance_criteria),
             sa_init=str(args.sa_init),
             sa_init_md_frame=int(args.sa_init_md_frame),
             sa_restart=str(args.sa_restart),

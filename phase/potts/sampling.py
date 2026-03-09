@@ -373,6 +373,11 @@ def sa_sample_qubo_neal(
     seed: int = 0,
     progress: bool = False,
     beta_range: Optional[Tuple[float, float]] = None,
+    beta_schedule_type: str = "geometric",
+    beta_schedule: Optional[Sequence[float]] = None,
+    num_sweeps_per_beta: int = 1,
+    randomize_order: bool = False,
+    proposal_acceptance_criteria: str = "Metropolis",
     initial_states: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
@@ -400,11 +405,33 @@ def sa_sample_qubo_neal(
     n_reads_eff = int(n_reads)
     kwargs: Dict[str, object] = {
         "num_reads": n_reads_eff,
-        "num_sweeps": sweeps,
         "seed": seed,
+        "num_sweeps_per_beta": int(num_sweeps_per_beta),
+        "randomize_order": bool(randomize_order),
+        "proposal_acceptance_criteria": str(proposal_acceptance_criteria),
     }
-    if beta_range is not None:
-        kwargs["beta_range"] = beta_range
+    schedule_type = str(beta_schedule_type or "geometric").strip().lower()
+    if schedule_type not in {"linear", "geometric", "custom"}:
+        raise ValueError("beta_schedule_type must be one of: linear, geometric, custom.")
+    if int(num_sweeps_per_beta) < 1:
+        raise ValueError("num_sweeps_per_beta must be >= 1.")
+    criteria = str(proposal_acceptance_criteria or "Metropolis").strip()
+    if criteria not in {"Metropolis", "Gibbs"}:
+        raise ValueError("proposal_acceptance_criteria must be 'Metropolis' or 'Gibbs'.")
+
+    if beta_schedule is not None:
+        schedule = np.asarray(list(beta_schedule), dtype=float)
+        if schedule.ndim != 1 or schedule.size == 0:
+            raise ValueError("beta_schedule must be a non-empty 1D sequence.")
+        if np.any(~np.isfinite(schedule)) or np.any(schedule < 0):
+            raise ValueError("beta_schedule values must be finite and >= 0.")
+        kwargs["beta_schedule"] = schedule
+        kwargs["beta_schedule_type"] = "custom"
+    else:
+        kwargs["num_sweeps"] = sweeps
+        kwargs["beta_schedule_type"] = schedule_type
+        if beta_range is not None:
+            kwargs["beta_range"] = beta_range
     if initial_states is not None:
         init = np.asarray(initial_states, dtype=np.int8)
         if init.ndim == 1:

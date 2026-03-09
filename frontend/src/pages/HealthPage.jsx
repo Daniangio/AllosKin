@@ -63,6 +63,9 @@ export default function HealthPage() {
           {cleanupInfo.orphan_simulation_results_removed !== undefined
             ? `, ${cleanupInfo.orphan_simulation_results_removed} orphan sampling results`
             : ''}
+          {cleanupInfo.orphan_cluster_analyses_removed !== undefined
+            ? `, ${cleanupInfo.orphan_cluster_analyses_removed} orphan cluster analyses`
+            : ''}
           .
         </div>
       )}

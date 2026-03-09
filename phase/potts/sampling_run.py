@@ -144,6 +144,50 @@ def _parse_float_list(raw: str) -> List[float]:
     return [float(p) for p in parts]
 
 
+def _normalize_sa_schedule_type(value: object) -> str:
+    raw = "" if value is None else str(value)
+    s = raw.strip().lower()
+    if s in {"geom", "geometric"}:
+        return "geometric"
+    if s in {"lin", "linear"}:
+        return "linear"
+    if s == "custom":
+        return "custom"
+    return s
+
+
+def _parse_sa_custom_schedule(value: object) -> List[float]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return _parse_float_list(value)
+    if isinstance(value, np.ndarray):
+        arr = np.asarray(value, dtype=float).ravel()
+        return [float(v) for v in arr.tolist()]
+    if isinstance(value, Sequence):
+        out: List[float] = []
+        for item in value:
+            out.append(float(item))
+        return out
+    return [float(value)]
+
+
+def _run_gibbs_chain_worker(payload: dict[str, object]) -> dict[str, object]:
+    labels = gibbs_sample_potts(
+        payload["model"],  # type: ignore[arg-type]
+        beta=float(payload["beta"]),
+        n_samples=int(payload["n_samples"]),
+        burn_in=int(payload["burn_in"]),
+        thinning=int(payload["thinning"]),
+        seed=int(payload["seed"]),
+        progress=bool(payload.get("progress", False)),
+        progress_mode=str(payload.get("progress_mode", "samples")),
+        progress_desc=str(payload.get("progress_desc", "Gibbs samples")),
+        progress_position=payload.get("progress_position"),  # type: ignore[arg-type]
+    )
+    return {"labels": labels}
+
+
 def _run_rex_chain_worker(payload: dict[str, object]) -> dict[str, object]:
     return replica_exchange_gibbs_potts(
         payload["model"],  # type: ignore[arg-type]
@@ -206,6 +250,23 @@ def _sa_decode_labels(
     return labels, invalid_mask.astype(bool), valid_counts
 
 
+def _sa_project_labels_for_restart(z: np.ndarray, qubo) -> np.ndarray:
+    """
+    Project a raw QUBO bitstring to one valid label per residue for chain restarts.
+
+    This is deliberately separate from the user-facing `repair` mode:
+    even if we keep invalid samples marked as invalid in the saved outputs,
+    a correlated SA chain needs a concrete next label assignment. Using argmax
+    within each residue slice is more stable than silently resetting invalid
+    residues to state 0.
+    """
+    z = np.asarray(z, dtype=int)
+    x = np.zeros(len(qubo.var_slices), dtype=np.int32)
+    for r, sl in enumerate(qubo.var_slices):
+        x[r] = int(np.argmax(z[sl]))
+    return x
+
+
 def _run_sa_independent_worker(payload: dict[str, object]) -> dict[str, object]:
     model = _load_combined_model(payload["model_npz"])  # type: ignore[arg-type]
     beta = float(payload["beta"])
@@ -214,6 +275,11 @@ def _run_sa_independent_worker(payload: dict[str, object]) -> dict[str, object]:
     sweeps = int(payload["sweeps"])
     seed = int(payload["seed"])
     beta_range = payload.get("beta_range")  # type: ignore[assignment]
+    beta_schedule_type = _normalize_sa_schedule_type(payload.get("sa_schedule_type", "geometric"))
+    beta_schedule = _parse_sa_custom_schedule(payload.get("sa_custom_beta_schedule"))
+    sweeps_per_beta = int(payload.get("sa_num_sweeps_per_beta", 1))
+    randomize_order = bool(payload.get("sa_randomize_order", False))
+    acceptance = str(payload.get("sa_acceptance_criteria", "Metropolis"))
     sa_init = str(payload.get("sa_init", "md"))
     sa_init_md_frame = int(payload.get("sa_init_md_frame", -1))
     repair = str(payload.get("repair", "none"))
@@ -243,6 +309,11 @@ def _run_sa_independent_worker(payload: dict[str, object]) -> dict[str, object]:
         seed=seed,
         progress=False,
         beta_range=beta_range,  # type: ignore[arg-type]
+        beta_schedule_type=beta_schedule_type,
+        beta_schedule=beta_schedule or None,
+        num_sweeps_per_beta=sweeps_per_beta,
+        randomize_order=randomize_order,
+        proposal_acceptance_criteria=acceptance,
         initial_states=init_states,
     )
     labels, invalid_mask, valid_counts = _sa_decode_labels(Z, qubo, repair=repair)
@@ -267,9 +338,14 @@ def _run_sa_chain_worker(payload: dict[str, object]) -> dict[str, object]:
     sweeps = int(payload["sweeps"])
     seed = int(payload["seed"])
     beta_range = payload.get("beta_range")  # type: ignore[assignment]
+    beta_schedule_type = _normalize_sa_schedule_type(payload.get("sa_schedule_type", "geometric"))
+    beta_schedule = _parse_sa_custom_schedule(payload.get("sa_custom_beta_schedule"))
+    sweeps_per_beta = int(payload.get("sa_num_sweeps_per_beta", 1))
+    randomize_order = bool(payload.get("sa_randomize_order", False))
+    acceptance = str(payload.get("sa_acceptance_criteria", "Metropolis"))
     sa_init = str(payload.get("sa_init", "md"))
     sa_init_md_frame = int(payload.get("sa_init_md_frame", -1))
-    sa_restart = _normalize_sa_restart(payload.get("sa_restart", "previous"))
+    sa_restart = _normalize_sa_restart(payload.get("sa_restart", "independent"))
     repair = str(payload.get("repair", "none"))
 
     if sa_restart not in {"previous", "md"}:
@@ -316,11 +392,19 @@ def _run_sa_chain_worker(payload: dict[str, object]) -> dict[str, object]:
 
         kwargs: Dict[str, object] = {
             "num_reads": 1,
-            "num_sweeps": sweeps,
             "seed": int(seed) + int(i),
             "initial_states": init,
+            "num_sweeps_per_beta": int(sweeps_per_beta),
+            "randomize_order": bool(randomize_order),
+            "proposal_acceptance_criteria": str(acceptance),
         }
-        if beta_range is not None:
+        if beta_schedule:
+            kwargs["beta_schedule_type"] = "custom"
+            kwargs["beta_schedule"] = np.asarray(beta_schedule, dtype=float)
+        else:
+            kwargs["num_sweeps"] = sweeps
+            kwargs["beta_schedule_type"] = str(beta_schedule_type)
+        if beta_range is not None and not beta_schedule:
             kwargs["beta_range"] = beta_range  # type: ignore[assignment]
 
         def _sample_with_kwargs(sample_kwargs: Dict[str, object]):
@@ -352,7 +436,7 @@ def _run_sa_chain_worker(payload: dict[str, object]) -> dict[str, object]:
         invalid_mask[i] = vc != int(labels.shape[1])
 
         if sa_restart == "previous":
-            next_init = x
+            next_init = _sa_project_labels_for_restart(z, qubo)
         else:
             # fresh MD init for each sample
             next_init = _build_sa_initial_labels(
@@ -400,236 +484,73 @@ def run_sampling(
     sa_sweeps: int = 2000,
     sa_beta_hot: float = 0.0,
     sa_beta_cold: float = 0.0,
+    sa_schedule_type: str = "geometric",
+    sa_custom_beta_schedule: Sequence[float] | str | None = None,
+    sa_num_sweeps_per_beta: int = 1,
+    sa_randomize_order: bool = False,
+    sa_acceptance_criteria: str = "Metropolis",
     sa_init: str = "md",
     sa_init_md_frame: int = -1,
-    sa_restart: str = "previous",
+    sa_restart: str = "independent",
     sa_restart_topk: int = 200,
     sa_md_state_ids: str = "",
-    penalty_safety: float = 3.0,
+    penalty_safety: float = 8.0,
     repair: str = "none",
     progress_callback: Callable[[str, int], None] | None = None,
 ) -> SamplingResult:
-    """
-    Run a sampler and write results_dir/sample.npz (minimal sample schema).
-    """
-    results_dir = Path(results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    sample_path = results_dir / SAMPLE_NPZ_FILENAME
+    from phase.potts.orchestration import run_sampling_local
 
-    def report(msg: str, pct: int) -> None:
-        if progress_callback:
-            progress_callback(msg, int(pct))
+    def report(message: str, current: int, total: int) -> None:
+        if progress_callback is None or total <= 0:
+            return
+        pct = int(round(100.0 * float(current) / float(total)))
+        progress_callback(message, pct)
 
-    model = _load_combined_model(model_npz)
-
-    method = (sampling_method or "gibbs").strip().lower()
-    if method not in {"gibbs", "sa"}:
-        raise ValueError("--sampling-method must be gibbs or sa.")
-
-    if method == "gibbs":
-        gm = (gibbs_method or "single").strip().lower()
-        if gm not in {"single", "rex"}:
-            raise ValueError("--gibbs-method must be single or rex.")
-
-        if gm == "single":
-            # Optionally split across independent chains and concatenate.
-            n_chains = max(1, int(gibbs_chains))
-            total_samples = max(0, int(gibbs_samples))
-            if n_chains > max(1, total_samples):
-                n_chains = max(1, total_samples)
-            base = total_samples // n_chains if n_chains else total_samples
-            extra = total_samples % n_chains if n_chains else 0
-            chain_samples = [base + (1 if i < extra else 0) for i in range(n_chains)]
-            parts: List[np.ndarray] = []
-            for idx, n_samp in enumerate(chain_samples):
-                if n_samp <= 0:
-                    continue
-                report(f"Gibbs sampling chain {idx + 1}/{n_chains}", 10 + int(80 * idx / max(1, n_chains)))
-                part = gibbs_sample_potts(
-                    model,
-                    beta=float(beta),
-                    n_samples=int(n_samp),
-                    burn_in=int(gibbs_burnin),
-                    thinning=int(gibbs_thin),
-                    seed=int(seed) + idx,
-                    progress=bool(progress),
-                    progress_mode="samples",
-                    progress_desc=f"Gibbs chain {idx + 1}/{n_chains} samples",
-                    progress_position=idx if progress and n_chains > 1 else None,
-                )
-                if part.size:
-                    parts.append(part)
-            labels = np.concatenate(parts, axis=0) if parts else np.zeros((0, len(model.h)), dtype=np.int32)
-            save_sample_npz(sample_path, labels=labels)
-            return SamplingResult(sample_path=sample_path, n_samples=int(labels.shape[0]), n_residues=int(labels.shape[1]))
-
-        # Replica exchange
-        if rex_betas.strip():
-            betas = _parse_float_list(rex_betas)
-        else:
-            betas = make_beta_ladder(
-                beta_min=float(rex_beta_min),
-                beta_max=float(rex_beta_max),
-                n_replicas=int(rex_n_replicas),
-                spacing=str(rex_spacing),
-            )
-        if all(abs(b - float(beta)) > 1e-12 for b in betas):
-            betas = sorted(set(betas + [float(beta)]))
-        betas = [float(b) for b in betas]
-
-        total_rounds = max(1, int(rex_rounds))
-        n_chains = max(1, int(rex_chains))
-        if n_chains > total_rounds:
-            n_chains = total_rounds
-        if n_chains > 1:
-            base_rounds = total_rounds // n_chains
-            extra = total_rounds % n_chains
-            chain_rounds = [base_rounds + (1 if i < extra else 0) for i in range(n_chains)]
-        else:
-            chain_rounds = [total_rounds]
-
-        chain_runs: List[dict[str, object] | None] = [None] * n_chains
-        burnin_clipped = False
-
-        if n_chains == 1:
-            burn_in = min(int(rex_burnin_rounds), max(0, total_rounds - 1))
-            burnin_clipped = burn_in != int(rex_burnin_rounds)
-            chain_runs[0] = replica_exchange_gibbs_potts(
-                model,
-                betas=betas,
-                sweeps_per_round=int(rex_sweeps_per_round),
-                n_rounds=int(total_rounds),
-                burn_in_rounds=int(burn_in),
-                thinning_rounds=int(rex_thin_rounds),
-                seed=int(seed),
-                progress=bool(progress),
-                progress_mode="samples",
-                progress_desc="REX samples",
-            )
-        else:
-            with ProcessPoolExecutor(max_workers=n_chains) as executor:
-                futures = {}
-                for idx in range(n_chains):
-                    rounds = int(chain_rounds[idx])
-                    burn_in = min(int(rex_burnin_rounds), max(0, rounds - 1))
-                    futures[executor.submit(
-                        _run_rex_chain_worker,
-                        {
-                            "model": model,
-                            "betas": betas,
-                            "sweeps_per_round": int(rex_sweeps_per_round),
-                            "n_rounds": rounds,
-                            "burn_in_rounds": burn_in,
-                            "thinning_rounds": int(rex_thin_rounds),
-                            "seed": int(seed) + idx,
-                            "progress": bool(progress),
-                            "progress_every": max(1, rounds // 20) if rounds else 1,
-                            "progress_mode": "samples",
-                            "progress_desc": f"REX chain {idx + 1}/{n_chains} samples",
-                            "progress_position": idx,
-                        },
-                    )] = (idx, burn_in != int(rex_burnin_rounds))
-
-                completed = 0
-                for future in as_completed(futures):
-                    idx, clipped = futures[future]
-                    chain_runs[idx] = future.result()
-                    burnin_clipped = burnin_clipped or clipped
-                    completed += 1
-                    report(f"Replica exchange chains {completed}/{n_chains}", 10 + int(80 * completed / max(1, n_chains)))
-
-        if burnin_clipped:
-            print("[rex] note: burn-in rounds truncated for short chains.")
-
-        parts = []
-        for run in chain_runs:
-            if not isinstance(run, dict):
-                continue
-            samples_by_beta = run.get("samples_by_beta")
-            if not isinstance(samples_by_beta, dict):
-                continue
-            arr = samples_by_beta.get(float(beta))
-            if isinstance(arr, np.ndarray) and arr.size:
-                parts.append(arr)
-        labels = np.concatenate(parts, axis=0) if parts else np.zeros((0, len(model.h)), dtype=np.int32)
-        save_sample_npz(sample_path, labels=labels)
-        return SamplingResult(sample_path=sample_path, n_samples=int(labels.shape[0]), n_residues=int(labels.shape[1]))
-
-    # SA/QUBO
-    if (sa_beta_hot and not sa_beta_cold) or (sa_beta_cold and not sa_beta_hot):
-        raise ValueError("Provide both --sa-beta-hot and --sa-beta-cold, or neither.")
-    beta_range = None
-    if sa_beta_hot and sa_beta_cold:
-        beta_range = (float(sa_beta_hot), float(sa_beta_cold))
-
-    restart = _normalize_sa_restart(sa_restart or "previous")
-    if restart not in {"previous", "md", "independent"}:
-        raise ValueError("--sa-restart must be one of: previous, md, independent.")
-
-    n_chains = max(1, int(sa_chains))
-    total_reads = max(0, int(sa_reads))
-    if total_reads <= 0:
-        labels = np.zeros((0, len(model.h)), dtype=np.int32)
-        save_sample_npz(sample_path, labels=labels)
-        return SamplingResult(sample_path=sample_path, n_samples=0, n_residues=int(labels.shape[1]))
-    if n_chains > max(1, total_reads):
-        n_chains = max(1, total_reads)
-    base = total_reads // n_chains if n_chains else total_reads
-    extra = total_reads % n_chains if n_chains else 0
-    chain_reads = [base + (1 if i < extra else 0) for i in range(n_chains)]
-    worker_fn = _run_sa_independent_worker if restart == "independent" else _run_sa_chain_worker
-
-    def _payload(idx: int, n: int) -> dict[str, object]:
-        common: dict[str, object] = {
-            "model_npz": model_npz,
-            "cluster_npz": cluster_npz,
-            "beta": float(beta),
-            "penalty_safety": float(penalty_safety),
-            "sweeps": int(sa_sweeps),
-            "seed": int(seed) + idx,
-            "beta_range": beta_range,
-            "sa_init": str(sa_init),
-            "sa_init_md_frame": int(sa_init_md_frame),
-            "sa_md_state_ids": str(sa_md_state_ids),
-            "repair": str(repair),
-        }
-        if restart == "independent":
-            common["n_reads"] = int(n)
-        else:
-            common["n_samples"] = int(n)
-            common["sa_restart"] = restart
-        return common
-
-    parts_labels: List[np.ndarray] = []
-    parts_invalid: List[np.ndarray] = []
-    parts_valid_counts: List[np.ndarray] = []
-
-    if n_chains <= 1:
-        out = worker_fn(_payload(0, int(total_reads)))
-        parts_labels.append(np.asarray(out["labels"], dtype=np.int32))
-        parts_invalid.append(np.asarray(out["invalid_mask"], dtype=bool))
-        parts_valid_counts.append(np.asarray(out["valid_counts"], dtype=np.int32))
-    else:
-        with ProcessPoolExecutor(max_workers=n_chains) as executor:
-            futures = {}
-            for idx, n in enumerate(chain_reads):
-                if int(n) <= 0:
-                    continue
-                futures[executor.submit(worker_fn, _payload(idx, int(n)))] = idx
-            completed = 0
-            for future in as_completed(futures):
-                out = future.result()
-                parts_labels.append(np.asarray(out["labels"], dtype=np.int32))
-                parts_invalid.append(np.asarray(out["invalid_mask"], dtype=bool))
-                parts_valid_counts.append(np.asarray(out["valid_counts"], dtype=np.int32))
-                completed += 1
-                report(f"SA chains {completed}/{n_chains}", 10 + int(80 * completed / max(1, n_chains)))
-
-    labels = np.concatenate(parts_labels, axis=0) if parts_labels else np.zeros((0, len(model.h)), dtype=np.int32)
-    invalid_mask = np.concatenate(parts_invalid, axis=0) if parts_invalid else np.zeros((labels.shape[0],), dtype=bool)
-    valid_counts = (
-        np.concatenate(parts_valid_counts, axis=0) if parts_valid_counts else np.zeros((labels.shape[0],), dtype=np.int32)
+    out = run_sampling_local(
+        cluster_npz=cluster_npz,
+        results_dir=results_dir,
+        model_npz=model_npz,
+        sampling_method=sampling_method,
+        beta=beta,
+        seed=seed,
+        progress=progress,
+        gibbs_method=gibbs_method,
+        gibbs_samples=gibbs_samples,
+        gibbs_burnin=gibbs_burnin,
+        gibbs_thin=gibbs_thin,
+        gibbs_chains=gibbs_chains,
+        rex_betas=rex_betas,
+        rex_n_replicas=rex_n_replicas,
+        rex_beta_min=rex_beta_min,
+        rex_beta_max=rex_beta_max,
+        rex_spacing=rex_spacing,
+        rex_rounds=rex_rounds,
+        rex_burnin_rounds=rex_burnin_rounds,
+        rex_sweeps_per_round=rex_sweeps_per_round,
+        rex_thin_rounds=rex_thin_rounds,
+        rex_chains=rex_chains,
+        sa_reads=sa_reads,
+        sa_chains=sa_chains,
+        sa_sweeps=sa_sweeps,
+        sa_beta_hot=sa_beta_hot,
+        sa_beta_cold=sa_beta_cold,
+        sa_schedule_type=sa_schedule_type,
+        sa_custom_beta_schedule=sa_custom_beta_schedule,
+        sa_num_sweeps_per_beta=sa_num_sweeps_per_beta,
+        sa_randomize_order=sa_randomize_order,
+        sa_acceptance_criteria=sa_acceptance_criteria,
+        sa_init=sa_init,
+        sa_init_md_frame=sa_init_md_frame,
+        sa_restart=sa_restart,
+        sa_restart_topk=sa_restart_topk,
+        sa_md_state_ids=sa_md_state_ids,
+        penalty_safety=penalty_safety,
+        repair=repair,
+        progress_callback=report,
     )
-
-    save_sample_npz(sample_path, labels=labels, invalid_mask=invalid_mask, valid_counts=valid_counts)
-    return SamplingResult(sample_path=sample_path, n_samples=int(labels.shape[0]), n_residues=int(labels.shape[1]))
+    sample_path = Path(str(out["sample_path"]))
+    return SamplingResult(
+        sample_path=sample_path,
+        n_samples=int(out["n_samples"]),
+        n_residues=int(out["n_residues"]),
+    )

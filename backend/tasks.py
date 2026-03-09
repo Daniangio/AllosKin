@@ -28,8 +28,27 @@ from phase.potts.analysis_run import (
     upsert_delta_js_analysis,
     compute_lambda_sweep_analysis,
     compute_md_delta_preference,
-    run_gibbs_relaxation_analysis,
-    run_ligand_completion_analysis,
+    _gibbs_relax_worker,
+    _single_frame_ligand_completion_worker,
+)
+from phase.potts.orchestration import (
+    aggregate_gibbs_relaxation_batch,
+    aggregate_ligand_completion_batch,
+    aggregate_lambda_sweep_batch,
+    aggregate_sampling_batch,
+    load_partial_errors,
+    load_partial_results,
+    orchestration_paths,
+    pickle_load,
+    prepare_gibbs_relaxation_batch,
+    prepare_ligand_completion_batch,
+    prepare_lambda_sweep_batch,
+    prepare_sampling_batch,
+    run_local_payload_batch,
+    run_lambda_sweep_payload,
+    run_sampling_chain_payload,
+    write_partial_error,
+    write_partial_result,
 )
 from phase.potts.potts_model import interpolate_potts_models, load_potts_model, zero_sum_gauge_model
 from phase.potts.sample_io import save_sample_npz
@@ -688,7 +707,7 @@ def run_simulation_job(
         effective_beta = float(beta_override) if beta_override is not None else float(sim_params.get("beta", 1.0))
         effective_seed = int(sim_params.get("seed", 0) or 0)
 
-        # Backwards-compatible support for the UI's SA schedule editor: we only run one SA range.
+        # Backwards-compatible support for older UIs that sent one SA range in sa_beta_schedules.
         if sampling_method == "sa":
             schedules = sim_params.get("sa_beta_schedules")
             if isinstance(schedules, list) and schedules:
@@ -704,7 +723,7 @@ def run_simulation_job(
         save_progress("Running Potts sampling", 20)
 
         # Normalize legacy SA restart modes ("prev-topk"/"prev-uniform") emitted by older UIs.
-        raw_sa_restart = str(sim_params.get("sa_restart") or "previous").strip().lower()
+        raw_sa_restart = str(sim_params.get("sa_restart") or "independent").strip().lower()
         if raw_sa_restart in {"prev-topk", "prev-uniform", "prev", "chain"}:
             raw_sa_restart = "previous"
         elif raw_sa_restart in {"md-frame", "md_random", "md-random"}:
@@ -712,7 +731,7 @@ def run_simulation_job(
         elif raw_sa_restart in {"indep", "iid", "rand", "random"}:
             raw_sa_restart = "independent"
 
-        run_sampling(
+        prepared = prepare_sampling_batch(
             cluster_npz=str(cluster_path),
             results_dir=results_dir,
             model_npz=[str(p) for p in model_paths],
@@ -740,14 +759,88 @@ def run_simulation_job(
             sa_sweeps=int(sim_params.get("sa_sweeps") or 2000),
             sa_beta_hot=float(sim_params.get("sa_beta_hot") or 0.0),
             sa_beta_cold=float(sim_params.get("sa_beta_cold") or 0.0),
+            sa_schedule_type=str(sim_params.get("sa_schedule_type") or "geometric"),
+            sa_custom_beta_schedule=sim_params.get("sa_custom_beta_schedule"),
+            sa_num_sweeps_per_beta=int(sim_params.get("sa_num_sweeps_per_beta") or 1),
+            sa_randomize_order=bool(sim_params.get("sa_randomize_order") or False),
+            sa_acceptance_criteria=str(sim_params.get("sa_acceptance_criteria") or "Metropolis"),
             sa_init=str(sim_params.get("sa_init") or "md"),
             sa_init_md_frame=int(sim_params.get("sa_init_md_frame") or -1),
             sa_restart=raw_sa_restart,
+            sa_restart_topk=int(sim_params.get("sa_restart_topk") or 200),
             sa_md_state_ids=str(sim_params.get("sa_md_state_ids") or ""),
-            penalty_safety=float(sim_params.get("penalty_safety") or 3.0),
+            penalty_safety=float(sim_params.get("penalty_safety") or 8.0),
             repair=str(sim_params.get("repair") or "none"),
-            progress_callback=save_progress,
         )
+        payloads = prepared.get("payloads") or []
+        redis_conn = getattr(job, "connection", None)
+        queue_name = getattr(job, "origin", "phase-jobs")
+        queue = Queue(queue_name, connection=redis_conn) if redis_conn is not None else None
+        available_queue_workers = _count_queue_workers(queue) if queue is not None else 0
+        distributed_parallelism = _distributed_batch_parallelism(
+            requested_workers=int(prepared.get("requested_workers", 1)),
+            available_queue_workers=available_queue_workers,
+            n_payloads=len(payloads),
+        )
+
+        if distributed_parallelism > 1 and queue is not None:
+            keys = _simulation_batch_keys(job_uuid)
+            redis_conn.delete(keys["done"], keys["error"], keys["child_error"])
+            redis_conn.set(keys["remaining"], int(len(payloads)), ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["state"], "running", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            save_progress(
+                f"Dispatching {len(payloads)} sampling tasks across {distributed_parallelism} queue workers...",
+                25,
+            )
+            for row in range(len(payloads)):
+                queue.enqueue(
+                    run_simulation_chain_job,
+                    args=(job_uuid, str(results_dir), int(row), int(distributed_parallelism)),
+                    job_timeout="8h",
+                    result_ttl=86400,
+                    job_id=f"simulation-chain-{job_uuid}-{row:06d}",
+                )
+            while True:
+                done = _decode_redis_value(redis_conn.get(keys["done"]))
+                remaining_raw = _decode_redis_value(redis_conn.get(keys["remaining"]))
+                remaining = int(remaining_raw) if remaining_raw is not None else len(payloads)
+                state = _decode_redis_value(redis_conn.get(keys["state"])) or "running"
+                child_error = _decode_redis_value(redis_conn.get(keys["child_error"]))
+                if done:
+                    break
+                if remaining <= 0:
+                    save_progress("Aggregating distributed sampling results...", 90)
+                else:
+                    completed = max(0, min(len(payloads), len(payloads) - remaining))
+                    pct = 25 + int(60 * (float(completed) / float(max(1, len(payloads)))))
+                    status = f"Running distributed sampling ({completed}/{len(payloads)} chains)"
+                    if child_error:
+                        status = f"{status}; worker error recorded, waiting for aggregation"
+                    elif state and state != "running":
+                        status = f"{status}; state={state}"
+                    save_progress(status, pct)
+                time.sleep(1.0)
+            error = _decode_redis_value(redis_conn.get(keys["error"]))
+            if error:
+                raise RuntimeError(error)
+            sampling_out = pickle_load(orchestration_paths(results_dir)["aggregate"])
+        else:
+            def progress_cb(message: str, current: int, total: int):
+                if total <= 0:
+                    return
+                ratio = max(0.0, min(1.0, float(current) / float(total)))
+                save_progress(message, 25 + int(60 * ratio))
+
+            out_rows = run_local_payload_batch(
+                payloads,
+                worker_fn=run_sampling_chain_payload,
+                max_workers=1,
+                progress_callback=progress_cb,
+                progress_label=str(prepared.get("progress_label") or "Running sampling"),
+            )
+            sampling_out = aggregate_sampling_batch(prepared, out_rows, workers_used=1)
+
+        summary_path = Path(str(sampling_out["sample_path"]))
 
         potts_model_rels = [str(rel) for rel in model_rels] if model_rels else []
         cluster_name = entry.get("name") if isinstance(entry, dict) else None
@@ -759,7 +852,7 @@ def run_simulation_job(
                 model_name = " + ".join(Path(rel).stem for rel in potts_model_rels)
 
         sample_paths: Dict[str, str] = {}
-        summary_path = sample_dir / "sample.npz"
+        summary_path = Path(summary_path)
         if summary_path.exists():
             try:
                 sample_paths["summary_npz"] = str(summary_path.relative_to(cluster_dirs["system_dir"]))
@@ -785,8 +878,12 @@ def run_simulation_job(
                 "rex_beta_max": 1.0,
                 "sa_reads": 2000,
                 "sa_sweeps": 2000,
+                "sa_schedule_type": "geometric",
+                "sa_num_sweeps_per_beta": 1,
+                "sa_randomize_order": False,
+                "sa_acceptance_criteria": "Metropolis",
                 "sa_init": "md",
-                "sa_restart": "previous",
+                "sa_restart": "independent",
                 "sa_chains": 1,
             }
 
@@ -821,7 +918,7 @@ def run_simulation_job(
             else:
                 # Keep a few key SA parameters even when defaults are used (mirrors offline sampling metadata).
                 out["beta"] = float(effective_beta)
-                sr = str(raw.get("sa_restart") or "previous").strip().lower()
+                sr = str(raw.get("sa_restart") or "independent").strip().lower()
                 if sr in {"prev-topk", "prev-uniform", "prev", "chain"}:
                     sr = "previous"
                 elif sr in {"md-frame", "md_random", "md-random"}:
@@ -834,6 +931,16 @@ def run_simulation_job(
                 _maybe("sa_reads", int(raw.get("sa_reads")) if raw.get("sa_reads") is not None else None)
                 _maybe("sa_beta_hot", float(raw.get("sa_beta_hot")) if raw.get("sa_beta_hot") is not None else None)
                 _maybe("sa_beta_cold", float(raw.get("sa_beta_cold")) if raw.get("sa_beta_cold") is not None else None)
+                _maybe("sa_schedule_type", str(raw.get("sa_schedule_type") or "geometric"))
+                custom_schedule = raw.get("sa_custom_beta_schedule")
+                if custom_schedule not in (None, "", [], {}):
+                    if isinstance(custom_schedule, str):
+                        _maybe("sa_custom_beta_schedule", custom_schedule)
+                    else:
+                        _maybe("sa_custom_beta_schedule", list(custom_schedule))
+                _maybe("sa_num_sweeps_per_beta", int(raw.get("sa_num_sweeps_per_beta")) if raw.get("sa_num_sweeps_per_beta") is not None else None)
+                _maybe("sa_randomize_order", bool(raw.get("sa_randomize_order")) if raw.get("sa_randomize_order") is not None else None)
+                _maybe("sa_acceptance_criteria", str(raw.get("sa_acceptance_criteria") or "Metropolis"))
                 _maybe("sa_init", str(raw.get("sa_init") or "md"))
                 _maybe("sa_init_md_frame", int(raw.get("sa_init_md_frame")) if raw.get("sa_init_md_frame") is not None else None)
                 _maybe("sa_chains", int(raw.get("sa_chains")) if raw.get("sa_chains") is not None else None)
@@ -894,6 +1001,8 @@ def run_simulation_job(
 
     save_progress("Simulation completed", 100)
     return sanitized_payload
+
+
 
 
 def run_lambda_sweep_job(
@@ -963,359 +1072,137 @@ def run_lambda_sweep_job(
             payload["status"] = "failed"
             payload["error"] = f"Failed to save result file: {e}"
 
-    def _parse_float_list(raw: str) -> List[float]:
-        parts = [p.strip() for p in str(raw or "").split(",") if p.strip()]
-        return [float(p) for p in parts]
-
-    def _filter_sampling_params(raw: Dict[str, Any]) -> Dict[str, Any]:
-        # Keep a minimal, stable configuration in metadata (skip defaults).
-        defaults = {
-            "gibbs_samples": 500,
-            "gibbs_burnin": 50,
-            "gibbs_thin": 2,
-            "rex_beta_min": 0.2,
-            "rex_beta_max": 1.0,
-            "rex_spacing": "geom",
-            "rex_n_replicas": 8,
-            "rex_rounds": 2000,
-            "rex_burnin_rounds": 50,
-            "rex_sweeps_per_round": 2,
-            "rex_thin_rounds": 1,
-        }
-
-        out: Dict[str, Any] = {"sampling_method": "gibbs"}
-
-        def _maybe(key: str, value: Any) -> None:
-            if value in (None, "", [], {}):
-                return
-            if key in defaults and value == defaults[key]:
-                return
-            out[key] = value
-
-        gm = str(raw.get("gibbs_method") or "rex").lower()
-        if gm not in {"single", "rex"}:
-            gm = "rex"
-        _maybe("gibbs_method", gm)
-        beta = float(raw.get("beta") or 1.0)
-        _maybe("beta", beta)
-
-        if gm == "single":
-            _maybe("gibbs_samples", int(raw.get("gibbs_samples") or defaults["gibbs_samples"]))
-            _maybe("gibbs_burnin", int(raw.get("gibbs_burnin") or defaults["gibbs_burnin"]))
-            _maybe("gibbs_thin", int(raw.get("gibbs_thin") or defaults["gibbs_thin"]))
-        else:
-            rex_betas = raw.get("rex_betas")
-            if isinstance(rex_betas, list):
-                rex_betas = ",".join(str(v) for v in rex_betas)
-            if isinstance(rex_betas, str) and rex_betas.strip():
-                _maybe("rex_betas", str(rex_betas).strip())
-            else:
-                _maybe("rex_beta_min", float(raw.get("rex_beta_min") or defaults["rex_beta_min"]))
-                _maybe("rex_beta_max", float(raw.get("rex_beta_max") or defaults["rex_beta_max"]))
-                _maybe("rex_n_replicas", int(raw.get("rex_n_replicas") or defaults["rex_n_replicas"]))
-                _maybe("rex_spacing", str(raw.get("rex_spacing") or defaults["rex_spacing"]))
-
-            _maybe("rex_rounds", int(raw.get("rex_rounds") or raw.get("rex_samples") or defaults["rex_rounds"]))
-            _maybe("rex_burnin_rounds", int(raw.get("rex_burnin_rounds") or raw.get("rex_burnin") or defaults["rex_burnin_rounds"]))
-            _maybe("rex_sweeps_per_round", int(raw.get("rex_sweeps_per_round") or defaults["rex_sweeps_per_round"]))
-            _maybe("rex_thin_rounds", int(raw.get("rex_thin_rounds") or raw.get("rex_thin") or defaults["rex_thin_rounds"]))
-
-        seed = raw.get("seed")
-        if seed is not None:
-            _maybe("seed", int(seed))
-        return out
-
     try:
         force_single_thread()
         save_progress("Initializing...", 0)
         write_result_to_disk(result_payload)
 
-        system_meta = project_store.get_system(project_id, system_id)
-        clusters = system_meta.metastable_clusters or []
-        entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
-        if not isinstance(entry, dict):
-            raise FileNotFoundError(f"Cluster '{cluster_id}' not found.")
+        workers = params.get("workers")
+        workers_val = int(workers) if workers is not None else None
 
-        # Endpoint models
-        model_a_id = str(params.get("model_a_id") or "").strip()
-        model_b_id = str(params.get("model_b_id") or "").strip()
-        if not model_a_id or not model_b_id:
-            raise ValueError("lambda_sweep requires model_a_id and model_b_id.")
-        if model_a_id == model_b_id:
-            raise ValueError("Select two different endpoint models.")
-
-        models_meta = entry.get("potts_models") or []
-        model_a_meta = next((m for m in models_meta if isinstance(m, dict) and m.get("model_id") == model_a_id), None)
-        model_b_meta = next((m for m in models_meta if isinstance(m, dict) and m.get("model_id") == model_b_id), None)
-        if not model_a_meta or not model_a_meta.get("path"):
-            raise FileNotFoundError(f"Endpoint model A not found on this cluster: {model_a_id}")
-        if not model_b_meta or not model_b_meta.get("path"):
-            raise FileNotFoundError(f"Endpoint model B not found on this cluster: {model_b_id}")
-
-        def _reject_delta_only(meta: Dict[str, Any], label: str) -> None:
-            p = meta.get("params") or {}
-            kind = str(p.get("delta_kind") or "")
-            if kind.startswith("delta"):
-                raise ValueError(f"{label} is a delta-only model ({kind}); choose the combined model_* endpoint instead.")
-
-        _reject_delta_only(model_a_meta, "model_a_id")
-        _reject_delta_only(model_b_meta, "model_b_id")
-
-        model_a_name = model_a_meta.get("name") or model_a_id
-        model_b_name = model_b_meta.get("name") or model_b_id
-        model_a_path = project_store.resolve_path(project_id, system_id, str(model_a_meta.get("path")))
-        model_b_path = project_store.resolve_path(project_id, system_id, str(model_b_meta.get("path")))
-        if not model_a_path.exists():
-            raise FileNotFoundError(f"Model A NPZ missing on disk: {model_a_path}")
-        if not model_b_path.exists():
-            raise FileNotFoundError(f"Model B NPZ missing on disk: {model_b_path}")
-
-        endpoint_a = zero_sum_gauge_model(load_potts_model(str(model_a_path)))
-        endpoint_b = zero_sum_gauge_model(load_potts_model(str(model_b_path)))
-
-        # Lambda grid
-        lambda_count = int(params.get("lambda_count") or 11)
-        if lambda_count < 2:
-            raise ValueError("lambda_count must be >= 2.")
-        lambdas = np.linspace(0.0, 1.0, lambda_count).astype(float).tolist()
-
-        series_id = str(params.get("series_id") or uuid.uuid4())
-        series_label = str(params.get("series_label") or "").strip()
-        if not series_label:
-            series_label = f"Lambda sweep {datetime.utcnow().strftime('%Y%m%d %H:%M')}"
-
-        # Sampling params (Gibbs only)
-        gibbs_method = str(params.get("gibbs_method") or "rex").lower()
-        if gibbs_method not in {"single", "rex"}:
-            gibbs_method = "rex"
-        beta = float(params.get("beta") or 1.0)
-        base_seed = int(params.get("seed") or 0)
-
-        gibbs_samples = int(params.get("gibbs_samples") or 500)
-        gibbs_burnin = int(params.get("gibbs_burnin") or 50)
-        gibbs_thin = int(params.get("gibbs_thin") or 2)
-
-        rex_betas_raw = params.get("rex_betas")
-        rex_beta_min = float(params.get("rex_beta_min") or 0.2)
-        rex_beta_max = float(params.get("rex_beta_max") or 1.0)
-        rex_spacing = str(params.get("rex_spacing") or "geom")
-        rex_n_replicas = int(params.get("rex_n_replicas") or 8)
-        rex_rounds = int(params.get("rex_rounds") or params.get("rex_samples") or 2000)
-        rex_burnin_rounds = int(params.get("rex_burnin_rounds") or params.get("rex_burnin") or 50)
-        rex_sweeps_per_round = int(params.get("rex_sweeps_per_round") or 2)
-        rex_thin_rounds = int(params.get("rex_thin_rounds") or params.get("rex_thin") or 1)
-
-        md_label_mode = (params.get("md_label_mode") or "assigned").lower()
-        keep_invalid = bool(params.get("keep_invalid", False))
-        alpha = float(params.get("alpha", 0.5))
-
-        ref_md_ids = [
-            str(params.get("md_sample_id_1") or "").strip(),
-            str(params.get("md_sample_id_2") or "").strip(),
-            str(params.get("md_sample_id_3") or "").strip(),
-        ]
-        if not all(ref_md_ids):
-            raise ValueError("lambda_sweep requires md_sample_id_1, md_sample_id_2, md_sample_id_3.")
-
-        # Output sample folders
-        cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
-        system_dir = cluster_dirs["system_dir"]
-        samples_dir = cluster_dirs["samples_dir"]
-
-        sample_ids: List[str] = []
-        sample_names: List[str] = []
-
-        save_progress("Sampling lambda grid...", 10)
-
-        for idx, lam in enumerate(lambdas):
-            pct = 10 + int(60 * (idx / max(1, len(lambdas))))
-            save_progress(f"Sampling λ={lam:.3f} ({idx + 1}/{len(lambdas)})", pct)
-
-            sample_id = str(uuid.uuid4())
-            sample_dir = samples_dir / sample_id
-            sample_dir.mkdir(parents=True, exist_ok=True)
-
-            model_lam = interpolate_potts_models(endpoint_b, endpoint_a, float(lam))
-
-            # Sample labels
-            seed = base_seed + idx
-            if gibbs_method == "single":
-                labels = gibbs_sample_potts(
-                    model_lam,
-                    beta=float(beta),
-                    n_samples=int(gibbs_samples),
-                    burn_in=int(gibbs_burnin),
-                    thinning=int(gibbs_thin),
-                    seed=int(seed),
-                    progress=False,
-                    progress_mode="samples",
-                )
-            else:
-                if isinstance(rex_betas_raw, list):
-                    betas = [float(v) for v in rex_betas_raw]
-                elif isinstance(rex_betas_raw, str) and rex_betas_raw.strip():
-                    betas = _parse_float_list(rex_betas_raw)
-                else:
-                    betas = make_beta_ladder(
-                        beta_min=float(rex_beta_min),
-                        beta_max=float(rex_beta_max),
-                        n_replicas=int(rex_n_replicas),
-                        spacing=str(rex_spacing),
-                    )
-                if all(abs(float(b) - float(beta)) > 1e-12 for b in betas):
-                    betas = sorted(set(list(betas) + [float(beta)]))
-
-                burn_in = min(int(rex_burnin_rounds), max(0, int(rex_rounds) - 1))
-                run = replica_exchange_gibbs_potts(
-                    model_lam,
-                    betas=betas,
-                    sweeps_per_round=int(rex_sweeps_per_round),
-                    n_rounds=int(rex_rounds),
-                    burn_in_rounds=int(burn_in),
-                    thinning_rounds=int(rex_thin_rounds),
-                    seed=int(seed),
-                    progress=False,
-                    progress_mode="samples",
-                )
-                samples_by_beta = run.get("samples_by_beta")
-                labels = None
-                if isinstance(samples_by_beta, dict):
-                    labels = samples_by_beta.get(float(beta))
-                if not isinstance(labels, np.ndarray):
-                    labels = np.zeros((0, len(model_lam.h)), dtype=int)
-
-            summary_path = save_sample_npz(sample_dir / "sample.npz", labels=labels)
-            try:
-                rel_summary = str(summary_path.relative_to(system_dir))
-            except Exception:
-                rel_summary = str(summary_path)
-
-            display_name = f"{series_label} λ={float(lam):.3f}"
-
-            sample_entry: Dict[str, Any] = {
-                "sample_id": sample_id,
-                "name": display_name,
-                "type": "potts_lambda_sweep",
-                "method": "gibbs",
-                "source": "lambda_sweep",
-                "model_id": None,
-                "model_ids": [model_b_id, model_a_id],
-                "model_names": [str(model_b_name), str(model_a_name)],
-                "created_at": datetime.utcnow().isoformat(),
-                "path": rel_summary,
-                "paths": {"summary_npz": rel_summary},
-                "params": _filter_sampling_params(params),
-                # Correlation metadata
-                "series_kind": "lambda_sweep",
-                "series_id": series_id,
-                "series_label": series_label,
-                "lambda": float(lam),
-                "lambda_index": int(idx),
-                "lambda_count": int(lambda_count),
-                "endpoint_model_a_id": model_a_id,
-                "endpoint_model_b_id": model_b_id,
-            }
-
-            # Persist into system metadata immediately so partial progress is visible if the job is interrupted.
-            system_meta = project_store.get_system(project_id, system_id)
-            clusters = system_meta.metastable_clusters or []
-            cluster_entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
-            if not isinstance(cluster_entry, dict):
-                raise FileNotFoundError(f"Cluster '{cluster_id}' not found while persisting samples.")
-            samples_list = cluster_entry.get("samples")
-            if not isinstance(samples_list, list):
-                samples_list = []
-            samples_list.append(sample_entry)
-            cluster_entry["samples"] = samples_list
-            system_meta.metastable_clusters = clusters
-            project_store.save_system(system_meta)
-
-            sample_ids.append(sample_id)
-            sample_names.append(display_name)
-
-        # Analysis
-        save_progress("Computing lambda-sweep analysis...", 75)
-        analysis_payload = compute_lambda_sweep_analysis(
+        save_progress("Preparing lambda sweep...", 10)
+        prepared = prepare_lambda_sweep_batch(
             project_id=project_id,
             system_id=system_id,
             cluster_id=cluster_id,
-            model_a_ref=model_a_id,
-            model_b_ref=model_b_id,
-            lambda_sample_ids=sample_ids,
-            lambdas=lambdas,
-            ref_md_sample_ids=ref_md_ids,
-            md_label_mode=md_label_mode,
-            drop_invalid=not keep_invalid,
-            alpha=float(alpha),
+            model_a_id=str(params.get("model_a_id") or "").strip(),
+            model_b_id=str(params.get("model_b_id") or "").strip(),
+            md_sample_id_1=str(params.get("md_sample_id_1") or "").strip(),
+            md_sample_id_2=str(params.get("md_sample_id_2") or "").strip(),
+            md_sample_id_3=str(params.get("md_sample_id_3") or "").strip(),
+            series_id=str(params.get("series_id") or "").strip() or None,
+            series_label=str(params.get("series_label") or "").strip() or None,
+            lambda_count=int(params.get("lambda_count") or 11),
+            alpha=float(params.get("alpha") or 0.5),
+            md_label_mode=str(params.get("md_label_mode") or "assigned"),
+            keep_invalid=bool(params.get("keep_invalid", False)),
+            gibbs_method=str(params.get("gibbs_method") or "rex"),
+            beta=float(params.get("beta") or 1.0),
+            seed=int(params.get("seed") or 0),
+            gibbs_samples=int(params.get("gibbs_samples") or 500),
+            gibbs_burnin=int(params.get("gibbs_burnin") or 50),
+            gibbs_thin=int(params.get("gibbs_thin") or 2),
+            gibbs_chains=int(params.get("gibbs_chains") or 1),
+            rex_betas=params.get("rex_betas"),
+            rex_beta_min=float(params.get("rex_beta_min") or 0.2),
+            rex_beta_max=float(params.get("rex_beta_max") or 1.0),
+            rex_spacing=str(params.get("rex_spacing") or "geom"),
+            rex_n_replicas=int(params.get("rex_n_replicas") or 8),
+            rex_rounds=int(params.get("rex_rounds") or params.get("rex_samples") or 2000),
+            rex_burnin_rounds=int(params.get("rex_burnin_rounds") or params.get("rex_burnin") or 50),
+            rex_sweeps_per_round=int(params.get("rex_sweeps_per_round") or 2),
+            rex_thin_rounds=int(params.get("rex_thin_rounds") or params.get("rex_thin") or 1),
+            rex_chains=int(params.get("rex_chains") or 1),
+            n_workers=workers_val,
+        )
+        payloads = prepared.get("payloads") or []
+        analysis_id = str(prepared.get("analysis_id") or "")
+        analysis_dir = Path(str(prepared.get("analysis_dir") or "")).resolve()
+        redis_conn = getattr(job, "connection", None)
+        queue_name = getattr(job, "origin", "phase-jobs")
+        queue = Queue(queue_name, connection=redis_conn) if redis_conn is not None else None
+        available_queue_workers = _count_queue_workers(queue) if queue is not None else 0
+        distributed_parallelism = _distributed_batch_parallelism(
+            requested_workers=int(prepared.get("requested_workers", workers_val or 1)),
+            available_queue_workers=available_queue_workers,
+            n_payloads=len(payloads),
         )
 
-        analyses_dir = cluster_dirs["cluster_dir"] / "analyses" / "lambda_sweep"
-        analyses_dir.mkdir(parents=True, exist_ok=True)
-        analysis_id = str(uuid.uuid4())
-        out_dir = analyses_dir / analysis_id
-        out_dir.mkdir(parents=True, exist_ok=True)
-        npz_path = out_dir / "analysis.npz"
-        meta_path = out_dir / "analysis_metadata.json"
+        if distributed_parallelism > 1 and queue is not None:
+            keys = _lambda_sweep_batch_keys(analysis_id)
+            redis_conn.delete(keys["done"], keys["error"], keys["child_error"])
+            redis_conn.set(keys["remaining"], int(len(payloads)), ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["state"], "running", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            save_progress(
+                f"Dispatching {len(payloads)} lambda sweep tasks across {distributed_parallelism} queue workers...",
+                15,
+            )
+            for row in range(len(payloads)):
+                queue.enqueue(
+                    run_lambda_sweep_payload_job,
+                    args=(analysis_id, str(analysis_dir), int(row), int(distributed_parallelism)),
+                    job_timeout="8h",
+                    result_ttl=86400,
+                    job_id=f"lambda-sweep-task-{analysis_id}-{row:06d}",
+                )
+            while True:
+                done = _decode_redis_value(redis_conn.get(keys["done"]))
+                remaining_raw = _decode_redis_value(redis_conn.get(keys["remaining"]))
+                remaining = int(remaining_raw) if remaining_raw is not None else len(payloads)
+                state = _decode_redis_value(redis_conn.get(keys["state"])) or "running"
+                child_error = _decode_redis_value(redis_conn.get(keys["child_error"]))
+                if done:
+                    break
+                if remaining <= 0:
+                    save_progress("Aggregating distributed lambda sweep results...", 92)
+                else:
+                    completed = max(0, min(len(payloads), len(payloads) - remaining))
+                    pct = 15 + int(70 * (float(completed) / float(max(1, len(payloads)))))
+                    status = f"Running distributed lambda sweep ({completed}/{len(payloads)} tasks)"
+                    if child_error:
+                        status = f"{status}; worker error recorded, waiting for aggregation"
+                    elif state and state != "running":
+                        status = f"{status}; state={state}"
+                    save_progress(status, pct)
+                time.sleep(1.0)
+            error = _decode_redis_value(redis_conn.get(keys["error"]))
+            if error:
+                raise RuntimeError(error)
+            out = pickle_load(orchestration_paths(analysis_dir)["aggregate"])
+        else:
+            save_progress("Running lambda sweep locally...", 15)
 
-        np.savez_compressed(
-            npz_path,
-            lambdas=np.asarray(analysis_payload["lambdas"], dtype=float),
-            edges=np.asarray(analysis_payload["edges"], dtype=int),
-            node_js_mean=np.asarray(analysis_payload["node_js_mean"], dtype=float),
-            edge_js_mean=np.asarray(analysis_payload["edge_js_mean"], dtype=float),
-            combined_distance=np.asarray(analysis_payload["combined_distance"], dtype=float),
-            deltaE_mean=np.asarray(analysis_payload["deltaE_mean"], dtype=float),
-            deltaE_q25=np.asarray(analysis_payload["deltaE_q25"], dtype=float),
-            deltaE_q75=np.asarray(analysis_payload["deltaE_q75"], dtype=float),
-            sample_ids=np.asarray(analysis_payload["sample_ids"], dtype=str),
-            sample_names=np.asarray(analysis_payload["sample_names"], dtype=str),
-            ref_md_sample_ids=np.asarray(analysis_payload["ref_md_sample_ids"], dtype=str),
-            ref_md_sample_names=np.asarray(analysis_payload["ref_md_sample_names"], dtype=str),
-            alpha=np.asarray([analysis_payload["alpha"]], dtype=float),
-            match_ref_index=np.asarray([analysis_payload["match_ref_index"]], dtype=int),
-            lambda_star_index=np.asarray([analysis_payload["lambda_star_index"]], dtype=int),
-            lambda_star=np.asarray([analysis_payload["lambda_star"]], dtype=float),
-            match_min=np.asarray([analysis_payload["match_min"]], dtype=float),
-        )
+            def progress_cb(message: str, current: int, total: int):
+                if total <= 0:
+                    return
+                ratio = max(0.0, min(1.0, float(current) / float(total)))
+                save_progress(message, 15 + int(70 * ratio))
 
-        meta = {
-            "analysis_id": analysis_id,
-            "analysis_type": "lambda_sweep",
-            "created_at": datetime.utcnow().isoformat(),
-            "project_id": project_id,
-            "system_id": system_id,
-            "cluster_id": cluster_id,
-            "series_kind": "lambda_sweep",
-            "series_id": series_id,
-            "series_label": series_label,
-            "model_a_id": model_a_id,
-            "model_a_name": model_a_name,
-            "model_b_id": model_b_id,
-            "model_b_name": model_b_name,
-            "md_sample_ids": ref_md_ids,
-            "md_sample_names": analysis_payload.get("ref_md_sample_names") or [],
-            "md_label_mode": md_label_mode,
-            "drop_invalid": bool(not keep_invalid),
-            "alpha": float(alpha),
-            "lambda_count": int(lambda_count),
-            "paths": {
-                "analysis_npz": str(npz_path.relative_to(system_dir)),
-            },
-            "summary": {
-                "lambda_star": analysis_payload.get("lambda_star"),
-                "match_min": analysis_payload.get("match_min"),
-            },
-        }
-        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            out_rows = run_local_payload_batch(
+                payloads,
+                worker_fn=run_lambda_sweep_payload,
+                max_workers=1,
+                progress_callback=progress_cb,
+                progress_label="Running lambda sweep",
+            )
+            out = aggregate_lambda_sweep_batch(prepared, out_rows, workers_used=1)
+
+        meta = out.get("metadata") or {}
+        analysis_id = str(out.get("analysis_id") or meta.get("analysis_id") or "")
+        analysis_dir = Path(str(out.get("analysis_dir") or "")).resolve()
+        npz_path = Path(str(out.get("analysis_npz") or "")).resolve()
+        if not analysis_id or not analysis_dir.exists() or not npz_path.exists():
+            raise RuntimeError("lambda_sweep did not write analysis artifacts as expected.")
 
         result_payload["status"] = "finished"
         result_payload["results"] = {
-            "series_id": series_id,
-            "series_label": series_label,
-            "sample_ids": sample_ids,
+            "analysis_type": "lambda_sweep",
             "analysis_id": analysis_id,
-            "analysis_dir": _relativize_path(out_dir),
+            "analysis_dir": _relativize_path(analysis_dir),
             "analysis_npz": _relativize_path(npz_path),
+            "series_id": out.get("series_id"),
+            "sample_ids": out.get("sample_ids") or [],
+            "sample_names": out.get("sample_names") or [],
         }
 
     except Exception as e:
@@ -1333,7 +1220,6 @@ def run_lambda_sweep_job(
 
     save_progress("Lambda sweep completed", 100)
     return sanitized_payload
-
 
 def run_potts_analysis_job(
     job_uuid: str,
@@ -2314,6 +2200,96 @@ def run_delta_js_job(
     save_progress("Delta JS analysis completed", 100)
     return sanitized_payload
 
+def _gibbs_relaxation_batch_keys(analysis_id: str) -> Dict[str, str]:
+    return _analysis_batch_keys("gibbs_relaxation", analysis_id)
+
+
+def run_gibbs_relaxation_frame_job(
+    analysis_id: str,
+    analysis_dir: str,
+    row: int,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    queue_name = getattr(job, "origin", "phase-jobs")
+    keys = _gibbs_relaxation_batch_keys(str(analysis_id))
+    analysis_dir_path = Path(str(analysis_dir))
+    prepared = pickle_load(orchestration_paths(analysis_dir_path)["prepared"])
+    payloads = prepared.get("payloads") or []
+    row = int(row)
+    if row < 0 or row >= len(payloads):
+        raise IndexError(f"Invalid Gibbs relaxation row index: {row}")
+    try:
+        out = _gibbs_relax_worker(payloads[row])
+        write_partial_result(analysis_dir_path, row, out)
+    except Exception as exc:
+        write_partial_error(analysis_dir_path, row, f"{type(exc).__name__}: {exc}")
+        if redis_conn is not None and redis_conn.get(keys["child_error"]) is None:
+            redis_conn.set(
+                keys["child_error"],
+                f"row {row}: {type(exc).__name__}: {exc}",
+                ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS,
+            )
+        raise
+    finally:
+        if redis_conn is not None:
+            remaining = int(redis_conn.decr(keys["remaining"]))
+            if remaining <= 0:
+                redis_conn.set(keys["state"], "aggregating", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+                Queue(queue_name, connection=redis_conn).enqueue(
+                    run_gibbs_relaxation_aggregate_job,
+                    args=(str(analysis_id), str(analysis_dir_path), int(max(1, workers_used))),
+                    job_timeout="8h",
+                    result_ttl=86400,
+                    job_id=f"gibbs-relaxation-aggregate-{analysis_id}",
+                )
+
+
+def run_gibbs_relaxation_aggregate_job(
+    analysis_id: str,
+    analysis_dir: str,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    keys = _gibbs_relaxation_batch_keys(str(analysis_id))
+    analysis_dir_path = Path(str(analysis_dir))
+    try:
+        prepared = pickle_load(orchestration_paths(analysis_dir_path)["prepared"])
+        errors = load_partial_errors(analysis_dir_path)
+        if errors:
+            summary = "; ".join(
+                f"row {err.get('row')}: {err.get('error')}" for err in errors[:3]
+            )
+            if len(errors) > 3:
+                summary = f"{summary}; ... ({len(errors)} worker failures total)"
+            raise RuntimeError(f"Distributed Gibbs relaxation worker failures: {summary}")
+        out_rows = load_partial_results(
+            analysis_dir_path,
+            expected_rows=len(prepared.get("payloads") or []),
+        )
+        result = aggregate_gibbs_relaxation_batch(
+            prepared,
+            out_rows,
+            workers_used=max(1, int(workers_used)),
+        )
+        if redis_conn is not None:
+            redis_conn.delete(keys["error"])
+            redis_conn.set(keys["state"], "finished", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        return result
+    except Exception as exc:
+        if redis_conn is not None:
+            redis_conn.set(
+                keys["error"],
+                f"{type(exc).__name__}: {exc}",
+                ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS,
+            )
+            redis_conn.set(keys["state"], "failed", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        raise
+
 
 def run_gibbs_relaxation_job(
     job_uuid: str,
@@ -2372,13 +2348,6 @@ def run_gibbs_relaxation_job(
             payload["status"] = "failed"
             payload["error"] = f"Failed to save result file: {e}"
 
-    def progress_cb(message: str, current: int, total: int):
-        if total <= 0:
-            return
-        ratio = max(0.0, min(1.0, float(current) / float(total)))
-        pct = 10 + int(80 * ratio)
-        save_progress(message, pct)
-
     try:
         save_progress("Initializing...", 0)
         write_result_to_disk(result_payload)
@@ -2402,8 +2371,8 @@ def run_gibbs_relaxation_job(
         start_label_mode = str(params.get("start_label_mode") or "assigned").strip().lower()
         keep_invalid = bool(params.get("keep_invalid", False))
 
-        save_progress("Running Gibbs relaxation analysis...", 10)
-        out = run_gibbs_relaxation_analysis(
+        save_progress("Preparing Gibbs relaxation analysis...", 10)
+        prepared = prepare_gibbs_relaxation_batch(
             project_id=project_id,
             system_id=system_id,
             cluster_id=cluster_id,
@@ -2416,8 +2385,80 @@ def run_gibbs_relaxation_job(
             start_label_mode=start_label_mode,
             drop_invalid=not keep_invalid,
             n_workers=workers_val,
-            progress_callback=progress_cb,
         )
+        payloads = prepared.get("payloads") or []
+        n_payloads = len(payloads)
+        analysis_id = str(prepared.get("analysis_id") or "")
+        analysis_dir = Path(str(prepared.get("analysis_dir") or "")).resolve()
+        redis_conn = getattr(job, "connection", None)
+        queue_name = getattr(job, "origin", "phase-jobs")
+        queue = Queue(queue_name, connection=redis_conn) if redis_conn is not None else None
+        available_queue_workers = _count_queue_workers(queue) if queue is not None else 0
+        distributed_parallelism = _distributed_batch_parallelism(
+            requested_workers=int(prepared.get("requested_workers", workers_val or 1)),
+            available_queue_workers=available_queue_workers,
+            n_payloads=n_payloads,
+        )
+
+        if distributed_parallelism > 1 and queue is not None:
+            keys = _gibbs_relaxation_batch_keys(analysis_id)
+            redis_conn.delete(keys["done"], keys["error"], keys["child_error"])
+            redis_conn.set(keys["remaining"], int(n_payloads), ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["state"], "running", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            save_progress(
+                f"Dispatching {n_payloads} relaxation tasks across {distributed_parallelism} queue workers...",
+                15,
+            )
+            for row in range(n_payloads):
+                queue.enqueue(
+                    run_gibbs_relaxation_frame_job,
+                    args=(analysis_id, str(analysis_dir), int(row), int(distributed_parallelism)),
+                    job_timeout="8h",
+                    result_ttl=86400,
+                    job_id=f"gibbs-relaxation-frame-{analysis_id}-{row:06d}",
+                )
+            while True:
+                done = _decode_redis_value(redis_conn.get(keys["done"]))
+                remaining_raw = _decode_redis_value(redis_conn.get(keys["remaining"]))
+                remaining = int(remaining_raw) if remaining_raw is not None else n_payloads
+                state = _decode_redis_value(redis_conn.get(keys["state"])) or "running"
+                child_error = _decode_redis_value(redis_conn.get(keys["child_error"]))
+                if done:
+                    break
+                if remaining <= 0:
+                    save_progress("Aggregating distributed Gibbs relaxation results...", 92)
+                else:
+                    completed = max(0, min(n_payloads, n_payloads - remaining))
+                    pct = 15 + int(70 * (float(completed) / float(max(1, n_payloads))))
+                    status = f"Running distributed Gibbs relaxation ({completed}/{n_payloads} frames)"
+                    if child_error:
+                        status = f"{status}; worker error recorded, waiting for aggregation"
+                    elif state and state != "running":
+                        status = f"{status}; state={state}"
+                    save_progress(status, pct)
+                time.sleep(1.0)
+            error = _decode_redis_value(redis_conn.get(keys["error"]))
+            if error:
+                raise RuntimeError(error)
+            out = pickle_load(orchestration_paths(analysis_dir)["aggregate"])
+        else:
+            save_progress("Running Gibbs relaxation analysis locally...", 15)
+
+            def progress_cb(message: str, current: int, total: int):
+                if total <= 0:
+                    return
+                ratio = max(0.0, min(1.0, float(current) / float(total)))
+                pct = 15 + int(70 * ratio)
+                save_progress(message, pct)
+
+            out_rows = run_local_payload_batch(
+                payloads,
+                worker_fn=_gibbs_relax_worker,
+                max_workers=1,
+                progress_callback=progress_cb,
+                progress_label="Running Gibbs relaxations",
+            )
+            out = aggregate_gibbs_relaxation_batch(prepared, out_rows, workers_used=1)
 
         meta = out.get("metadata") or {}
         analysis_id = str(meta.get("analysis_id") or "")
@@ -2449,6 +2490,311 @@ def run_gibbs_relaxation_job(
 
     save_progress("Gibbs relaxation analysis completed", 100)
     return sanitized_payload
+
+
+_LIGAND_COMPLETION_BATCH_TTL_SECONDS = 86400
+
+
+def _analysis_batch_keys(prefix: str, analysis_id: str) -> Dict[str, str]:
+    base = f"{prefix}:{analysis_id}"
+    return {
+        "remaining": f"{base}:remaining",
+        "done": f"{base}:done",
+        "error": f"{base}:error",
+        "state": f"{base}:state",
+        "child_error": f"{base}:child_error",
+    }
+
+
+def _ligand_completion_batch_keys(analysis_id: str) -> Dict[str, str]:
+    return _analysis_batch_keys("ligand_completion", analysis_id)
+
+
+def _decode_redis_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _count_queue_workers(queue: Queue) -> int:
+    try:
+        workers = Worker.all(connection=queue.connection)
+    except Exception:
+        return 0
+    total = 0
+    for worker in workers:
+        try:
+            queue_names = set(worker.queue_names())
+        except Exception:
+            queue_names = set()
+        if queue.name in queue_names:
+            total += 1
+    return total
+
+
+def _distributed_batch_parallelism(
+    *,
+    requested_workers: int,
+    available_queue_workers: int,
+    n_payloads: int,
+) -> int:
+    if int(n_payloads) <= 1:
+        return 0
+    usable_workers = max(0, int(available_queue_workers) - 1)
+    if usable_workers <= 0:
+        return 0
+    if int(requested_workers) > 0:
+        usable_workers = min(usable_workers, int(requested_workers))
+    return min(int(n_payloads), usable_workers)
+
+
+def _simulation_batch_keys(job_uuid: str) -> Dict[str, str]:
+    return _analysis_batch_keys("simulation", job_uuid)
+
+
+def run_simulation_chain_job(
+    job_uuid: str,
+    sample_dir: str,
+    row: int,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    queue_name = getattr(job, "origin", "phase-jobs")
+    keys = _simulation_batch_keys(str(job_uuid))
+    sample_dir_path = Path(str(sample_dir))
+    prepared = pickle_load(orchestration_paths(sample_dir_path)["prepared"])
+    payloads = prepared.get("payloads") or []
+    row = int(row)
+    if row < 0 or row >= len(payloads):
+        raise IndexError(f"Invalid simulation chain row index: {row}")
+    try:
+        out = run_sampling_chain_payload(payloads[row])
+        write_partial_result(sample_dir_path, row, out)
+    except Exception as exc:
+        write_partial_error(sample_dir_path, row, f"{type(exc).__name__}: {exc}")
+        if redis_conn is not None and redis_conn.get(keys["child_error"]) is None:
+            redis_conn.set(
+                keys["child_error"],
+                f"row {row}: {type(exc).__name__}: {exc}",
+                ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS,
+            )
+        raise
+    finally:
+        if redis_conn is not None:
+            remaining = int(redis_conn.decr(keys["remaining"]))
+            if remaining <= 0:
+                redis_conn.set(keys["state"], "aggregating", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+                Queue(queue_name, connection=redis_conn).enqueue(
+                    run_simulation_aggregate_job,
+                    args=(str(job_uuid), str(sample_dir_path), int(max(1, workers_used))),
+                    job_timeout="8h",
+                    result_ttl=86400,
+                    job_id=f"simulation-aggregate-{job_uuid}",
+                )
+
+
+def run_simulation_aggregate_job(
+    job_uuid: str,
+    sample_dir: str,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    keys = _simulation_batch_keys(str(job_uuid))
+    sample_dir_path = Path(str(sample_dir))
+    try:
+        prepared = pickle_load(orchestration_paths(sample_dir_path)["prepared"])
+        errors = load_partial_errors(sample_dir_path)
+        if errors:
+            summary = "; ".join(f"row {err.get('row')}: {err.get('error')}" for err in errors[:3])
+            if len(errors) > 3:
+                summary = f"{summary}; ... ({len(errors)} worker failures total)"
+            raise RuntimeError(f"Distributed simulation worker failures: {summary}")
+        out_rows = load_partial_results(sample_dir_path, expected_rows=len(prepared.get("payloads") or []))
+        result = aggregate_sampling_batch(prepared, out_rows, workers_used=max(1, int(workers_used)))
+        if redis_conn is not None:
+            redis_conn.delete(keys["error"])
+            redis_conn.set(keys["state"], "finished", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        return result
+    except Exception as exc:
+        if redis_conn is not None:
+            redis_conn.set(keys["error"], f"{type(exc).__name__}: {exc}", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["state"], "failed", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        raise
+
+
+def _lambda_sweep_batch_keys(analysis_id: str) -> Dict[str, str]:
+    return _analysis_batch_keys("lambda_sweep", analysis_id)
+
+
+def run_lambda_sweep_payload_job(
+    analysis_id: str,
+    analysis_dir: str,
+    row: int,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    queue_name = getattr(job, "origin", "phase-jobs")
+    keys = _lambda_sweep_batch_keys(str(analysis_id))
+    analysis_dir_path = Path(str(analysis_dir))
+    prepared = pickle_load(orchestration_paths(analysis_dir_path)["prepared"])
+    payloads = prepared.get("payloads") or []
+    row = int(row)
+    if row < 0 or row >= len(payloads):
+        raise IndexError(f"Invalid lambda sweep row index: {row}")
+    try:
+        out = run_lambda_sweep_payload(payloads[row])
+        write_partial_result(analysis_dir_path, row, out)
+    except Exception as exc:
+        write_partial_error(analysis_dir_path, row, f"{type(exc).__name__}: {exc}")
+        if redis_conn is not None and redis_conn.get(keys["child_error"]) is None:
+            redis_conn.set(
+                keys["child_error"],
+                f"row {row}: {type(exc).__name__}: {exc}",
+                ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS,
+            )
+        raise
+    finally:
+        if redis_conn is not None:
+            remaining = int(redis_conn.decr(keys["remaining"]))
+            if remaining <= 0:
+                redis_conn.set(keys["state"], "aggregating", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+                Queue(queue_name, connection=redis_conn).enqueue(
+                    run_lambda_sweep_aggregate_job,
+                    args=(str(analysis_id), str(analysis_dir_path), int(max(1, workers_used))),
+                    job_timeout="8h",
+                    result_ttl=86400,
+                    job_id=f"lambda-sweep-aggregate-{analysis_id}",
+                )
+
+
+def run_lambda_sweep_aggregate_job(
+    analysis_id: str,
+    analysis_dir: str,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    keys = _lambda_sweep_batch_keys(str(analysis_id))
+    analysis_dir_path = Path(str(analysis_dir))
+    try:
+        prepared = pickle_load(orchestration_paths(analysis_dir_path)["prepared"])
+        errors = load_partial_errors(analysis_dir_path)
+        if errors:
+            summary = "; ".join(f"row {err.get('row')}: {err.get('error')}" for err in errors[:3])
+            if len(errors) > 3:
+                summary = f"{summary}; ... ({len(errors)} worker failures total)"
+            raise RuntimeError(f"Distributed lambda sweep worker failures: {summary}")
+        out_rows = load_partial_results(analysis_dir_path, expected_rows=len(prepared.get("payloads") or []))
+        result = aggregate_lambda_sweep_batch(prepared, out_rows, workers_used=max(1, int(workers_used)))
+        if redis_conn is not None:
+            redis_conn.delete(keys["error"])
+            redis_conn.set(keys["state"], "finished", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        return result
+    except Exception as exc:
+        if redis_conn is not None:
+            redis_conn.set(keys["error"], f"{type(exc).__name__}: {exc}", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["state"], "failed", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        raise
+
+
+def run_ligand_completion_frame_job(
+    analysis_id: str,
+    analysis_dir: str,
+    row: int,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    queue_name = getattr(job, "origin", "phase-jobs")
+    keys = _ligand_completion_batch_keys(str(analysis_id))
+    analysis_dir_path = Path(str(analysis_dir))
+    prepared = pickle_load(orchestration_paths(analysis_dir_path)["prepared"])
+    payloads = prepared.get("payloads") or []
+    row = int(row)
+    if row < 0 or row >= len(payloads):
+        raise IndexError(f"Invalid ligand completion row index: {row}")
+    try:
+        out = _single_frame_ligand_completion_worker(payloads[row])
+        write_partial_result(analysis_dir_path, row, out)
+    except Exception as exc:
+        write_partial_error(analysis_dir_path, row, f"{type(exc).__name__}: {exc}")
+        if redis_conn is not None and redis_conn.get(keys["child_error"]) is None:
+            redis_conn.set(
+                keys["child_error"],
+                f"row {row}: {type(exc).__name__}: {exc}",
+                ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS,
+            )
+        raise
+    finally:
+        if redis_conn is not None:
+            remaining = int(redis_conn.decr(keys["remaining"]))
+            if remaining <= 0:
+                redis_conn.set(
+                    keys["state"],
+                    "aggregating",
+                    ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS,
+                )
+                Queue(queue_name, connection=redis_conn).enqueue(
+                    run_ligand_completion_aggregate_job,
+                    args=(str(analysis_id), str(analysis_dir_path), int(max(1, workers_used))),
+                    job_timeout="8h",
+                    result_ttl=86400,
+                    job_id=f"ligand-completion-aggregate-{analysis_id}",
+                )
+
+
+def run_ligand_completion_aggregate_job(
+    analysis_id: str,
+    analysis_dir: str,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    keys = _ligand_completion_batch_keys(str(analysis_id))
+    analysis_dir_path = Path(str(analysis_dir))
+    try:
+        prepared = pickle_load(orchestration_paths(analysis_dir_path)["prepared"])
+        errors = load_partial_errors(analysis_dir_path)
+        if errors:
+            summary = "; ".join(
+                f"row {err.get('row')}: {err.get('error')}" for err in errors[:3]
+            )
+            if len(errors) > 3:
+                summary = f"{summary}; ... ({len(errors)} worker failures total)"
+            raise RuntimeError(f"Distributed ligand completion worker failures: {summary}")
+        out_rows = load_partial_results(
+            analysis_dir_path,
+            expected_rows=len(prepared.get("payloads") or []),
+        )
+        result = aggregate_ligand_completion_batch(
+            prepared,
+            out_rows,
+            workers_used=max(1, int(workers_used)),
+        )
+        if redis_conn is not None:
+            redis_conn.delete(keys["error"])
+            redis_conn.set(keys["state"], "finished", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        return result
+    except Exception as exc:
+        if redis_conn is not None:
+            redis_conn.set(
+                keys["error"],
+                f"{type(exc).__name__}: {exc}",
+                ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS,
+            )
+            redis_conn.set(keys["state"], "failed", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        raise
 
 
 def run_ligand_completion_job(
@@ -2505,13 +2851,6 @@ def run_ligand_completion_job(
             payload["status"] = "failed"
             payload["error"] = f"Failed to save result file: {e}"
 
-    def progress_cb(message: str, current: int, total: int):
-        if total <= 0:
-            return
-        ratio = max(0.0, min(1.0, float(current) / float(total)))
-        pct = 10 + int(80 * ratio)
-        save_progress(message, pct)
-
     try:
         save_progress("Initializing...", 0)
         write_result_to_disk(result_payload)
@@ -2535,8 +2874,8 @@ def run_ligand_completion_job(
         elif not isinstance(constrained_residues, list):
             constrained_residues = []
 
-        save_progress("Running ligand completion analysis...", 10)
-        out = run_ligand_completion_analysis(
+        requested_workers = int(params.get("workers") or 0)
+        analysis_kwargs = dict(
             project_id=project_id,
             system_id=system_id,
             cluster_id=cluster_id,
@@ -2597,8 +2936,8 @@ def run_ligand_completion_job(
                 if params.get("delta_js_node_edge_alpha") is not None
                 else None
             ),
-            js_success_threshold=float(params.get("js_success_threshold", 0.10)),
-            js_success_margin=float(params.get("js_success_margin", 0.0)),
+            js_success_threshold=float(params.get("js_success_threshold", 0.15)),
+            js_success_margin=float(params.get("js_success_margin", 0.02)),
             deltae_margin=float(params.get("deltae_margin", 0.0)),
             completion_target_success=float(params.get("completion_target_success", 0.7)),
             completion_cost_if_unreached=(
@@ -2606,10 +2945,84 @@ def run_ligand_completion_job(
                 if params.get("completion_cost_if_unreached") is not None
                 else None
             ),
-            n_workers=int(params.get("workers", 1)),
+            n_workers=max(1, requested_workers or 1),
             seed=int(params.get("seed", 0)),
-            progress_callback=progress_cb,
         )
+        save_progress("Preparing ligand completion analysis...", 10)
+        prepared = prepare_ligand_completion_batch(**analysis_kwargs)
+        payloads = prepared.get("payloads") or []
+        n_payloads = len(payloads)
+        analysis_id = str(prepared.get("analysis_id") or "")
+        analysis_dir = Path(str(prepared.get("analysis_dir") or "")).resolve()
+        redis_conn = getattr(job, "connection", None)
+        queue_name = getattr(job, "origin", "phase-jobs")
+        queue = Queue(queue_name, connection=redis_conn) if redis_conn is not None else None
+        available_queue_workers = _count_queue_workers(queue) if queue is not None else 0
+        distributed_parallelism = _distributed_batch_parallelism(
+            requested_workers=requested_workers,
+            available_queue_workers=available_queue_workers,
+            n_payloads=n_payloads,
+        )
+
+        if distributed_parallelism > 1 and queue is not None:
+            keys = _ligand_completion_batch_keys(analysis_id)
+            redis_conn.delete(keys["done"], keys["error"], keys["child_error"])
+            redis_conn.set(keys["remaining"], int(n_payloads), ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["state"], "running", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            save_progress(
+                f"Dispatching {n_payloads} frame tasks across {distributed_parallelism} queue workers...",
+                15,
+            )
+            for row in range(n_payloads):
+                queue.enqueue(
+                    run_ligand_completion_frame_job,
+                    args=(analysis_id, str(analysis_dir), int(row), int(distributed_parallelism)),
+                    job_timeout="8h",
+                    result_ttl=86400,
+                    job_id=f"ligand-completion-frame-{analysis_id}-{row:06d}",
+                )
+            while True:
+                done = _decode_redis_value(redis_conn.get(keys["done"]))
+                remaining_raw = _decode_redis_value(redis_conn.get(keys["remaining"]))
+                remaining = int(remaining_raw) if remaining_raw is not None else n_payloads
+                state = _decode_redis_value(redis_conn.get(keys["state"])) or "running"
+                child_error = _decode_redis_value(redis_conn.get(keys["child_error"]))
+                if done:
+                    break
+                if remaining <= 0:
+                    save_progress("Aggregating distributed ligand completion results...", 92)
+                else:
+                    completed = max(0, min(n_payloads, n_payloads - remaining))
+                    pct = 15 + int(70 * (float(completed) / float(max(1, n_payloads))))
+                    status = f"Running distributed ligand completion ({completed}/{n_payloads} frames)"
+                    if child_error:
+                        status = f"{status}; worker error recorded, waiting for aggregation"
+                    elif state and state != "running":
+                        status = f"{status}; state={state}"
+                    save_progress(status, pct)
+                time.sleep(1.0)
+            error = _decode_redis_value(redis_conn.get(keys["error"]))
+            if error:
+                raise RuntimeError(error)
+            out = pickle_load(orchestration_paths(analysis_dir)["aggregate"])
+        else:
+            save_progress("Running ligand completion analysis locally...", 15)
+
+            def progress_cb(message: str, current: int, total: int):
+                if total <= 0:
+                    return
+                ratio = max(0.0, min(1.0, float(current) / float(total)))
+                pct = 15 + int(70 * ratio)
+                save_progress(message, pct)
+
+            out_rows = run_local_payload_batch(
+                payloads,
+                worker_fn=_single_frame_ligand_completion_worker,
+                max_workers=1,
+                progress_callback=progress_cb,
+                progress_label="Running conditional completion",
+            )
+            out = aggregate_ligand_completion_batch(prepared, out_rows, workers_used=1)
 
         meta = out.get("metadata") or {}
         analysis_id = str(meta.get("analysis_id") or "")

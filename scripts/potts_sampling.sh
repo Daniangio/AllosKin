@@ -214,14 +214,57 @@ else
   SA_READS="$(prompt "SA reads" "2000")"
   SA_CHAINS="$(prompt "SA chain count (parallel independent chains)" "1")"
   SA_SWEEPS="$(prompt "SA sweeps" "2000")"
-  SA_BETA_HOT="$(prompt "SA beta hot (0 = default)" "0")"
-  SA_BETA_COLD="$(prompt "SA beta cold (0 = default)" "0")"
-  SA_RESTART="$(prompt "SA restart (previous/md/independent)" "previous")"
+  SA_SCHEDULE_MODE="$(prompt "SA schedule mode (auto/range/custom)" "auto")"
+  SA_SCHEDULE_MODE="$(printf "%s" "$SA_SCHEDULE_MODE" | tr '[:upper:]' '[:lower:]')"
+  if [ "$SA_SCHEDULE_MODE" != "range" ] && [ "$SA_SCHEDULE_MODE" != "custom" ]; then
+    SA_SCHEDULE_MODE="auto"
+  fi
+  SA_SCHEDULE_TYPE="geometric"
+  SA_CUSTOM_BETA_SCHEDULE=""
+  SA_BETA_HOT="0"
+  SA_BETA_COLD="0"
+  if [ "$SA_SCHEDULE_MODE" = "custom" ]; then
+    SA_CUSTOM_BETA_SCHEDULE="$(prompt "SA custom beta schedule (comma separated)" "0.8,1.0,1.5,2.0,3.0,5.0,8.0,10.0")"
+  else
+    SA_SCHEDULE_TYPE="$(prompt "SA schedule type (geometric/linear)" "geometric")"
+    SA_SCHEDULE_TYPE="$(printf "%s" "$SA_SCHEDULE_TYPE" | tr '[:upper:]' '[:lower:]')"
+    if [ "$SA_SCHEDULE_TYPE" != "linear" ]; then
+      SA_SCHEDULE_TYPE="geometric"
+    fi
+    if [ "$SA_SCHEDULE_MODE" = "range" ]; then
+      SA_BETA_HOT="$(prompt "SA beta hot" "0.8")"
+      SA_BETA_COLD="$(prompt "SA beta cold" "10.0")"
+    fi
+  fi
+  SA_NUM_SWEEPS_PER_BETA="$(prompt "SA sweeps per beta" "1")"
+  SA_ACCEPTANCE_CRITERIA="$(prompt "SA acceptance criteria (Metropolis/Gibbs)" "Metropolis")"
+  if [ "$SA_ACCEPTANCE_CRITERIA" != "Gibbs" ]; then
+    SA_ACCEPTANCE_CRITERIA="Metropolis"
+  fi
+  SA_RANDOMIZE_ORDER="false"
+  if prompt_bool "Randomize SA update order? (y/N)" "N"; then
+    SA_RANDOMIZE_ORDER="true"
+  fi
+  SA_RESTART="$(prompt "SA restart (previous/md/independent)" "independent")"
   SA_RESTART="$(printf "%s" "$SA_RESTART" | tr '[:upper:]' '[:lower:]')"
   if [ "$SA_RESTART" != "md" ] && [ "$SA_RESTART" != "independent" ]; then
     SA_RESTART="previous"
   fi
+  SA_INIT="$(prompt "SA init (md/md-frame/random-h/random-uniform)" "md")"
+  SA_INIT="$(printf "%s" "$SA_INIT" | tr '[:upper:]' '[:lower:]')"
+  if [ "$SA_INIT" != "md-frame" ] && [ "$SA_INIT" != "random-h" ] && [ "$SA_INIT" != "random-uniform" ]; then
+    SA_INIT="md"
+  fi
+  SA_INIT_MD_FRAME=""
+  if [ "$SA_INIT" = "md-frame" ]; then
+    SA_INIT_MD_FRAME="$(prompt "SA init MD frame index" "0")"
+  fi
   SA_MD_STATE_IDS="$(prompt "SA MD state IDs (comma separated, blank = all)" "")"
+  PENALTY_SAFETY="$(prompt "Penalty safety" "8.0")"
+  REPAIR="$(prompt "Decode repair (none/argmax)" "none")"
+  if [ "$REPAIR" != "argmax" ]; then
+    REPAIR="none"
+  fi
 fi
 
 SEED="$(prompt "Random seed" "0")"
@@ -271,7 +314,24 @@ elif [ "$SAMPLING_METHOD" = "gibbs" ]; then
 fi
 
 if [ "$SAMPLING_METHOD" = "sa" ]; then
-  CMD+=(--sa-reads "$SA_READS" --sa-chains "$SA_CHAINS" --sa-sweeps "$SA_SWEEPS" --sa-restart "$SA_RESTART")
+  CMD+=(
+    --sa-reads "$SA_READS"
+    --sa-chains "$SA_CHAINS"
+    --sa-sweeps "$SA_SWEEPS"
+    --sa-schedule-type "$SA_SCHEDULE_TYPE"
+    --sa-num-sweeps-per-beta "$SA_NUM_SWEEPS_PER_BETA"
+    --sa-acceptance-criteria "$SA_ACCEPTANCE_CRITERIA"
+    --sa-init "$SA_INIT"
+    --sa-restart "$SA_RESTART"
+    --penalty-safety "$PENALTY_SAFETY"
+    --repair "$REPAIR"
+  )
+  if [ "$SA_RANDOMIZE_ORDER" = "true" ]; then
+    CMD+=(--sa-randomize-order)
+  fi
+  if [ -n "$(trim "$SA_INIT_MD_FRAME")" ]; then
+    CMD+=(--sa-init-md-frame "$(trim "$SA_INIT_MD_FRAME")")
+  fi
   if [ -n "$(trim "$SA_MD_STATE_IDS")" ]; then
     CMD+=(--sa-md-state-ids "$(trim "$SA_MD_STATE_IDS")")
   fi
@@ -279,6 +339,9 @@ fi
 
 if [ "$SAMPLING_METHOD" = "sa" ] && [ "$SA_BETA_HOT" != "0" ] && [ "$SA_BETA_COLD" != "0" ]; then
   CMD+=(--sa-beta-hot "$SA_BETA_HOT" --sa-beta-cold "$SA_BETA_COLD")
+fi
+if [ "$SAMPLING_METHOD" = "sa" ] && [ "$SA_SCHEDULE_MODE" = "custom" ] && [ -n "$(trim "$SA_CUSTOM_BETA_SCHEDULE")" ]; then
+  CMD+=(--sa-custom-beta-schedule "$(trim "$SA_CUSTOM_BETA_SCHEDULE")" --sa-schedule-type custom)
 fi
 
 if [ "$SHOW_PROGRESS" = "true" ]; then

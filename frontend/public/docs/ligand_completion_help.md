@@ -54,10 +54,15 @@ For sampled states, compute:
 
 `DeltaE_BA = E_B - E_A`
 
-- Success under A: `DeltaE_BA > +margin`
-- Success under B: `DeltaE_BA < -margin`
+- In `deltae` mode, success is evaluated **state by state on the sampled tail**:
+  - success under A for one sampled state means `DeltaE_BA > +margin`
+  - success under B for one sampled state means `DeltaE_BA < -margin`
+- For one start frame and one `lambda`, the displayed success value is then:
+  - the **fraction of tail states** that satisfy the A condition
+  - or the **fraction of tail states** that satisfy the B condition
 
-This gives `success_A(lambda)` and `success_B(lambda)` curves per frame.
+So the success curves are **not binary pass/fail per trajectory**.
+They are tail-state fractions in `[0,1]`, averaged later across selected start frames.
 
 Alternative mode (`delta_js_edge`):
 
@@ -67,12 +72,47 @@ Alternative mode (`delta_js_edge`):
   - node-weighted JS on selected residues
   - edge-weighted JS on selected edges
   - blended with `alpha` (`mixed = (1-alpha)*node + alpha*edge`)
-- Success under A if:
-  - `JS_A_mixed <= js_success_threshold`
-  - and `JS_A_mixed + js_success_margin <= JS_B_mixed`
+- For one start frame, one `lambda`, and one endpoint target:
+  - compute the tail distribution
+  - compare that tail to reference A and reference B
+  - obtain two scores: `JS_A_mixed` and `JS_B_mixed`
+- A tail is counted as a **success under A** only if both are true:
+  - it is absolutely close enough to A:
+    - `JS_A_mixed <= js_success_threshold`
+  - and it is also clearly closer to A than to B:
+    - `JS_A_mixed + js_success_margin <= JS_B_mixed`
 - Success under B is symmetric (swap A/B).
 
+This means a tail can legitimately be:
+
+- successful for A only
+- successful for B only
+- successful for neither
+
+The last case is common if the trajectory tail is still intermediate, too noisy, or simply not close enough to either reference under the chosen threshold.
+
 This mode avoids selecting extra manual residue sets and reuses the discriminative filter from Delta-JS.
+
+### Recommended defaults
+
+If you often see `0%` success for both A and B with `delta_js_edge`, the most common cause is that the success threshold is too strict for the tail length you are using.
+
+Recommended defaults:
+
+- `js_success_threshold = 0.15`
+- `js_success_margin = 0.02`
+
+Practical interpretation:
+
+- threshold controls **absolute closeness** to one reference
+- margin controls **how much better** one side must be than the other
+
+If both A and B remain near `0%` even after relaxing the threshold:
+
+- first increase `n_steps` from `1000` to `2000`
+- then increase `tail_steps` from `200` to `400`
+
+This usually helps more than lowering the threshold too aggressively, because it gives the trajectory more time to settle and makes the tail estimate less noisy.
 
 ## How to read the plots
 

@@ -4,7 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
-from phase.potts.analysis_run import run_gibbs_relaxation_analysis
+from phase.potts.orchestration import run_gibbs_relaxation_local
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         last_pct["value"] = pct
         print(f"[gibbs_relax] {message} {current}/{total} ({pct}%)")
 
-    out = run_gibbs_relaxation_analysis(
+    out = run_gibbs_relaxation_local(
         project_id=str(args.project_id),
         system_id=str(args.system_id),
         cluster_id=str(args.cluster_id),
@@ -79,4 +79,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

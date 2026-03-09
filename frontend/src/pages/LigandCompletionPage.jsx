@@ -98,8 +98,8 @@ export default function LigandCompletionPage() {
   const [deltaJsDEdgeMin, setDeltaJsDEdgeMin] = useState(0.0);
   const [deltaJsDEdgeMax, setDeltaJsDEdgeMax] = useState('');
   const [deltaJsNodeEdgeAlpha, setDeltaJsNodeEdgeAlpha] = useState('');
-  const [jsSuccessThreshold, setJsSuccessThreshold] = useState(0.1);
-  const [jsSuccessMargin, setJsSuccessMargin] = useState(0.0);
+  const [jsSuccessThreshold, setJsSuccessThreshold] = useState(0.15);
+  const [jsSuccessMargin, setJsSuccessMargin] = useState(0.02);
   const [deltaEMargin, setDeltaEMargin] = useState(0.0);
   const [completionTargetSuccess, setCompletionTargetSuccess] = useState(0.7);
   const [seed, setSeed] = useState(0);

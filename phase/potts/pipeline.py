@@ -4,7 +4,6 @@ import argparse
 import json
 import re
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Sequence
 
@@ -24,6 +23,7 @@ from phase.potts.potts_model import (
     save_potts_model,
 )
 from phase.potts.qubo import potts_to_qubo_onehot, decode_onehot, encode_onehot
+from phase.potts.orchestration import run_local_payload_batch
 from phase.potts.sampling import (
     gibbs_sample_potts,
     make_beta_ladder,
@@ -1246,7 +1246,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=200,
         help="If --sa-restart prev-topk, sample initial states from the top-k lowest-energy previous samples.",
     )
-    ap.add_argument("--penalty-safety", type=float, default=3.0, help="Controls how strong the one-hot constraint penalties are in the QUBO. Higher = fewer invalid assignments, but can make the QUBO landscape harder.")
+    ap.add_argument("--penalty-safety", type=float, default=8.0, help="Controls how strong the one-hot constraint penalties are in the QUBO. Higher = fewer invalid assignments, but can make the QUBO landscape harder.")
     ap.add_argument("--repair", type=str, default="none", choices=["none", "argmax"], help="What to do when a QUBO bitstring violates one-hot constraints: none: decode invalid slices as “invalid” (still assigns label 0, but validity is tracked; best for honesty). argmax: forcibly repair each residue by picking the largest bit (hides violations but produces a valid label vector).")
 
     # beta_eff estimation
@@ -1306,6 +1306,39 @@ def _run_rex_chain_worker(payload: dict[str, object]) -> dict[str, object]:
         progress_desc=payload.get("progress_desc"),
         progress_position=payload.get("progress_position"),
         progress_mode=str(payload.get("progress_mode", "samples")),
+    )
+
+
+def _run_chain_batch(
+    payloads: list[dict[str, object]],
+    *,
+    worker_fn,
+    max_workers: int,
+    report,
+    report_message: str,
+    report_start: float,
+    report_span: float,
+    quiet_print_prefix: str | None = None,
+    quiet_mode: bool = False,
+):
+    if not payloads:
+        return []
+
+    def _progress(_label: str, current: int, total: int) -> None:
+        if quiet_mode and quiet_print_prefix:
+            print(f"{quiet_print_prefix} {current}/{total} complete")
+        if report is not None:
+            report(
+                report_message.format(current=current, total=total),
+                report_start + report_span * current / max(1, total),
+            )
+
+    return run_local_payload_batch(
+        payloads,
+        worker_fn=worker_fn,
+        max_workers=max(1, int(max_workers)),
+        progress_callback=_progress if (report is not None or (quiet_mode and quiet_print_prefix)) else None,
+        progress_label=report_message.format(current=0, total=len(payloads)),
     )
 
 
@@ -1719,14 +1752,10 @@ def run_pipeline(
             base_samples = total_samples // gibbs_chains
             extra = total_samples % gibbs_chains
             chain_samples = [base_samples + (1 if i < extra else 0) for i in range(gibbs_chains)]
-
-            chain_runs: list[np.ndarray | None] = [None] * gibbs_chains
-            completed = 0
-
-            with ProcessPoolExecutor(max_workers=gibbs_chains) as executor:
-                futures = {}
-                for idx in range(gibbs_chains):
-                    payload = {
+            payloads = []
+            for idx in range(gibbs_chains):
+                payloads.append(
+                    {
                         "model": model,
                         "beta": args.beta,
                         "n_samples": chain_samples[idx],
@@ -1738,19 +1767,18 @@ def run_pipeline(
                         "progress_desc": f"Gibbs chain {idx + 1}/{gibbs_chains} samples",
                         "progress_position": idx,
                     }
-                    futures[executor.submit(_run_gibbs_chain_worker, payload)] = idx
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    chain_runs[idx] = future.result()
-                    completed += 1
-                    if not args.progress:
-                        print(f"[gibbs] chain {completed}/{gibbs_chains} complete")
-                    if callbacks:
-                        report(
-                            f"Gibbs chains {completed}/{gibbs_chains}",
-                            50 + 10 * completed / max(1, gibbs_chains),
-                        )
-
+                )
+            chain_runs = _run_chain_batch(
+                payloads,
+                worker_fn=_run_gibbs_chain_worker,
+                max_workers=gibbs_chains,
+                report=report if callbacks else None,
+                report_message="Gibbs chains {current}/{total}",
+                report_start=50,
+                report_span=10,
+                quiet_print_prefix="[gibbs] chain",
+                quiet_mode=not args.progress,
+            )
             parts = [run for run in chain_runs if isinstance(run, np.ndarray) and run.size]
             if parts:
                 X_gibbs = np.concatenate(parts, axis=0)
@@ -1821,14 +1849,13 @@ def run_pipeline(
             chain_runs = [rex_info]
         else:
             print(f"[rex] running {rex_chains} parallel chains (total rounds={total_rounds})")
-            chain_runs = [None] * rex_chains
-
-            with ProcessPoolExecutor(max_workers=rex_chains) as executor:
-                futures = {}
-                for idx in range(rex_chains):
-                    rounds = chain_rounds[idx]
-                    burn_in = min(args.rex_burnin_rounds, max(0, rounds - 1))
-                    payload = {
+            payloads = []
+            burnin_flags = []
+            for idx in range(rex_chains):
+                rounds = chain_rounds[idx]
+                burn_in = min(args.rex_burnin_rounds, max(0, rounds - 1))
+                payloads.append(
+                    {
                         "model": model,
                         "betas": betas,
                         "sweeps_per_round": args.rex_sweeps_per_round,
@@ -1843,20 +1870,20 @@ def run_pipeline(
                         "progress_desc": f"REX chain {idx + 1}/{rex_chains} samples",
                         "progress_position": idx,
                     }
-                    futures[executor.submit(_run_rex_chain_worker, payload)] = (idx, burn_in != args.rex_burnin_rounds)
-                completed = 0
-                for future in as_completed(futures):
-                    idx, clipped = futures[future]
-                    chain_runs[idx] = future.result()
-                    burnin_clipped = burnin_clipped or clipped
-                    completed += 1
-                    if not args.progress:
-                        print(f"[rex] chain {completed}/{rex_chains} complete")
-                    if callbacks:
-                        report(
-                            f"Replica exchange chains {completed}/{rex_chains}",
-                            50 + 10 * completed / max(1, rex_chains),
-                        )
+                )
+                burnin_flags.append(burn_in != args.rex_burnin_rounds)
+            chain_runs = _run_chain_batch(
+                payloads,
+                worker_fn=_run_rex_chain_worker,
+                max_workers=rex_chains,
+                report=report if callbacks else None,
+                report_message="Replica exchange chains {current}/{total}",
+                report_start=50,
+                report_span=10,
+                quiet_print_prefix="[rex] chain",
+                quiet_mode=not args.progress,
+            )
+            burnin_clipped = burnin_clipped or any(burnin_flags)
 
         if burnin_clipped:
             print("[rex] note: burn-in rounds truncated for short chains.")

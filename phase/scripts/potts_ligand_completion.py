@@ -4,7 +4,7 @@ import argparse
 import os
 from pathlib import Path
 
-from phase.potts.analysis_run import run_ligand_completion_analysis
+from phase.potts.orchestration import run_ligand_completion_local
 
 
 def _parse_list(value: str) -> list[str]:
@@ -90,8 +90,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--delta-js-d-edge-min", type=float, default=0.0)
     ap.add_argument("--delta-js-d-edge-max", type=float, default=None)
     ap.add_argument("--delta-js-node-edge-alpha", type=float, default=None)
-    ap.add_argument("--js-success-threshold", type=float, default=0.10)
-    ap.add_argument("--js-success-margin", type=float, default=0.0)
+    ap.add_argument("--js-success-threshold", type=float, default=0.15)
+    ap.add_argument("--js-success-margin", type=float, default=0.02)
     ap.add_argument("--deltae-margin", type=float, default=0.0)
     ap.add_argument("--completion-target-success", type=float, default=0.7)
     ap.add_argument("--completion-cost-if-unreached", type=float, default=None)
@@ -140,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         last_pct["value"] = pct
         print(f"[ligand_completion] {message} {current}/{total} ({pct}%)")
 
-    out = run_ligand_completion_analysis(
+    out = run_ligand_completion_local(
         project_id=str(args.project_id),
         system_id=str(args.system_id),
         cluster_id=str(args.cluster_id),
