@@ -176,6 +176,134 @@ def _dedupe_preserve_order(values: List[str]) -> List[str]:
     return ordered
 
 
+def _build_standard_fit_dataset_from_md_samples(
+    *,
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    cluster_path: Path,
+    sample_entries: List[Dict[str, Any]],
+    sample_ids: List[str],
+    output_path: Path,
+) -> Dict[str, Any]:
+    requested_ids = _dedupe_preserve_order(_coerce_str_list(sample_ids))
+    if not requested_ids:
+        raise ValueError("Standard Potts fit requires at least one MD sample.")
+
+    cluster_npz = np.load(cluster_path, allow_pickle=True)
+    residue_keys = np.asarray(cluster_npz["residue_keys"])
+    if "cluster_counts" in cluster_npz:
+        cluster_counts = np.asarray(cluster_npz["cluster_counts"], dtype=np.int32)
+    elif "merged__cluster_counts" in cluster_npz:
+        cluster_counts = np.asarray(cluster_npz["merged__cluster_counts"], dtype=np.int32)
+    else:
+        raise KeyError("Cluster NPZ is missing cluster_counts.")
+
+    cluster_meta: Dict[str, Any] = {}
+    if "metadata_json" in cluster_npz:
+        try:
+            raw_meta = cluster_npz["metadata_json"]
+            if isinstance(raw_meta, np.ndarray):
+                raw_meta = raw_meta.item()
+            cluster_meta = json.loads(str(raw_meta))
+        except Exception:
+            cluster_meta = {}
+
+    sample_by_id = {str(entry.get("sample_id") or ""): entry for entry in sample_entries if isinstance(entry, dict)}
+    labels_parts: List[np.ndarray] = []
+    frame_state_parts: List[np.ndarray] = []
+    frame_index_parts: List[np.ndarray] = []
+    selected_sample_names: List[str] = []
+    selected_state_ids: List[str] = []
+
+    for sample_id in requested_ids:
+        meta = sample_by_id.get(sample_id)
+        if not meta:
+            raise FileNotFoundError(f"Sample '{sample_id}' not found in cluster '{cluster_id}'.")
+        if str(meta.get("type") or "") != "md_eval":
+            raise ValueError(f"Sample '{sample_id}' is not an MD evaluation sample.")
+
+        raw_npz = meta.get("path") or (meta.get("paths") or {}).get("summary_npz")
+        if not raw_npz:
+            raise FileNotFoundError(f"Sample '{sample_id}' is missing its NPZ path.")
+        sample_path = Path(str(raw_npz))
+        if not sample_path.is_absolute():
+            sample_path = project_store.resolve_path(project_id, system_id, str(raw_npz))
+        if not sample_path.exists():
+            raise FileNotFoundError(f"Sample NPZ is missing on disk: {sample_path}")
+
+        sample_npz = np.load(sample_path, allow_pickle=True)
+        if "labels" not in sample_npz:
+            raise KeyError(f"Sample '{sample_id}' does not contain assigned labels.")
+        labels = np.asarray(sample_npz["labels"], dtype=np.int32)
+        if labels.ndim != 2:
+            raise ValueError(f"Sample '{sample_id}' labels must have shape (frames, residues).")
+        if labels.shape[1] != residue_keys.shape[0]:
+            raise ValueError(
+                f"Sample '{sample_id}' residue count mismatch: expected {residue_keys.shape[0]}, got {labels.shape[1]}."
+            )
+
+        labels_parts.append(labels)
+        selected_sample_names.append(str(meta.get("name") or sample_id))
+
+        state_id = str(meta.get("state_id") or "").strip()
+        if state_id:
+            selected_state_ids.append(state_id)
+
+        frame_state_ids = None
+        if "frame_state_ids" in sample_npz:
+            frame_state_ids = np.asarray(sample_npz["frame_state_ids"], dtype=str)
+            if frame_state_ids.shape[0] != labels.shape[0]:
+                frame_state_ids = None
+        if frame_state_ids is None:
+            frame_state_ids = np.asarray([state_id] * labels.shape[0], dtype=str)
+        frame_state_parts.append(frame_state_ids)
+
+        if "frame_indices" in sample_npz:
+            frame_indices = np.asarray(sample_npz["frame_indices"], dtype=np.int64)
+            if frame_indices.shape[0] == labels.shape[0]:
+                frame_index_parts.append(frame_indices)
+
+    if not labels_parts:
+        raise ValueError("Selected MD samples did not provide any labels for fitting.")
+
+    fit_metadata = dict(cluster_meta) if isinstance(cluster_meta, dict) else {}
+    fit_metadata.update(
+        {
+            "fit_dataset_type": "selected_md_samples",
+            "fit_sample_ids": requested_ids,
+            "fit_sample_names": selected_sample_names,
+            "fit_state_ids": _dedupe_preserve_order([sid for sid in selected_state_ids if sid]),
+            "source_cluster_npz": _relativize_path(cluster_path),
+        }
+    )
+
+    arrays: Dict[str, Any] = {
+        "residue_keys": residue_keys,
+        "merged__labels": np.concatenate(labels_parts, axis=0),
+        "merged__labels_assigned": np.concatenate(labels_parts, axis=0),
+        "cluster_counts": cluster_counts,
+        "merged__cluster_counts": cluster_counts,
+        "metadata_json": np.asarray(json.dumps(fit_metadata), dtype=str),
+    }
+    if "contact_edge_index" in cluster_npz:
+        arrays["contact_edge_index"] = np.asarray(cluster_npz["contact_edge_index"], dtype=np.int32)
+    if frame_state_parts:
+        arrays["merged__frame_state_ids"] = np.concatenate(frame_state_parts, axis=0)
+    if frame_index_parts and sum(arr.shape[0] for arr in frame_index_parts) == arrays["merged__labels"].shape[0]:
+        arrays["merged__frame_indices"] = np.concatenate(frame_index_parts, axis=0)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output_path, **arrays)
+    return {
+        "path": output_path,
+        "sample_ids": requested_ids,
+        "sample_names": selected_sample_names,
+        "state_ids": _dedupe_preserve_order([sid for sid in selected_state_ids if sid]),
+        "n_frames": int(arrays["merged__labels"].shape[0]),
+    }
+
+
 def _update_cluster_entry(
     project_id: str,
     system_id: str,
@@ -1014,7 +1142,7 @@ def run_lambda_sweep_job(
     Run the validation_ladder4.MD lambda-interpolation experiment:
       - sample N ensembles from interpolated endpoint models with λ in [0,1]
       - persist each ensemble as an independent sample folder (correlated via series metadata)
-      - compute a dedicated lambda_sweep analysis vs 3 reference MD samples
+      - compute a dedicated lambda_sweep analysis vs flexible reference/comparison samples
 
     Results:
       - samples written under clusters/<cluster_id>/samples/<sample_id>/sample.npz
@@ -1080,6 +1208,20 @@ def run_lambda_sweep_job(
         workers = params.get("workers")
         workers_val = int(workers) if workers is not None else None
 
+        reference_a = str(params.get("reference_sample_id_a") or params.get("md_sample_id_1") or "").strip()
+        reference_b = str(params.get("reference_sample_id_b") or params.get("md_sample_id_2") or "").strip()
+        comparison_ids = params.get("comparison_sample_ids") or []
+        if isinstance(comparison_ids, str):
+            comparison_ids = [v.strip() for v in comparison_ids.split(",") if v.strip()]
+        elif isinstance(comparison_ids, (tuple, list, set)):
+            comparison_ids = [str(v).strip() for v in comparison_ids if str(v).strip()]
+        else:
+            comparison_ids = []
+        if not comparison_ids:
+            legacy_c = str(params.get("md_sample_id_3") or "").strip()
+            if legacy_c:
+                comparison_ids = [legacy_c]
+
         save_progress("Preparing lambda sweep...", 10)
         prepared = prepare_lambda_sweep_batch(
             project_id=project_id,
@@ -1087,9 +1229,9 @@ def run_lambda_sweep_job(
             cluster_id=cluster_id,
             model_a_id=str(params.get("model_a_id") or "").strip(),
             model_b_id=str(params.get("model_b_id") or "").strip(),
-            md_sample_id_1=str(params.get("md_sample_id_1") or "").strip(),
-            md_sample_id_2=str(params.get("md_sample_id_2") or "").strip(),
-            md_sample_id_3=str(params.get("md_sample_id_3") or "").strip(),
+            reference_sample_id_a=reference_a,
+            reference_sample_id_b=reference_b,
+            comparison_sample_ids=comparison_ids,
             series_id=str(params.get("series_id") or "").strip() or None,
             series_label=str(params.get("series_label") or "").strip() or None,
             lambda_count=int(params.get("lambda_count") or 11),
@@ -3324,6 +3466,7 @@ def run_potts_fit_job(
 
             resolved_resume_model = _resolve_potts_model_path(fit_params.get("plm_resume_model"))
             resume_in_place = bool(resolved_resume_model)
+            requested_sample_ids = _dedupe_preserve_order(_coerce_str_list(fit_params.get("sample_ids")))
 
             if resume_in_place:
                 model_path = Path(resolved_resume_model)
@@ -3345,9 +3488,31 @@ def run_potts_fit_job(
                 model_dir.mkdir(parents=True, exist_ok=True)
                 model_path = model_dir / f"{_sanitize_model_filename(display_name)}.npz"
 
+            fit_dataset_summary = None
+            fit_dataset_path = cluster_path
+            fit_sample_state_ids: List[str] = []
+            if requested_sample_ids:
+                fit_dataset_summary = _build_standard_fit_dataset_from_md_samples(
+                    project_id=project_id,
+                    system_id=system_id,
+                    cluster_id=cluster_id,
+                    cluster_path=cluster_path,
+                    sample_entries=list(entry.get("samples") or project_store.list_samples(project_id, system_id, cluster_id)),
+                    sample_ids=requested_sample_ids,
+                    output_path=model_dir / "fit_dataset.npz",
+                )
+                fit_dataset_path = Path(fit_dataset_summary["path"])
+                fit_sample_state_ids = list(fit_dataset_summary.get("state_ids") or [])
+                fit_params["fit_dataset_type"] = "selected_md_samples"
+                fit_params["fit_sample_ids"] = requested_sample_ids
+                fit_params["fit_sample_state_ids"] = fit_sample_state_ids
+                fit_params["data_npz"] = _relativize_path(fit_dataset_path)
+            else:
+                fit_params.pop("data_npz", None)
+
             args_list = [
                 "--npz",
-                str(cluster_path),
+                str(fit_dataset_path),
                 "--results-dir",
                 str(model_dir),
                 "--fit-only",
@@ -3376,7 +3541,7 @@ def run_potts_fit_job(
                     system_id,
                     _collect_contact_pdbs(
                         system_meta,
-                        entry.get("state_ids") or entry.get("metastable_ids") or [],
+                        fit_sample_state_ids or entry.get("state_ids") or entry.get("metastable_ids") or [],
                         system_meta.analysis_mode,
                     ),
                 )
@@ -3426,6 +3591,19 @@ def run_potts_fit_job(
                 progress_callback=save_progress,
                 runtime=RuntimePolicy(allow_multiprocessing=False),
             )
+            if fit_dataset_summary:
+                metadata_path = model_dir / "model_metadata.json"
+                try:
+                    metadata_payload: Dict[str, Any] = {}
+                    if metadata_path.exists():
+                        metadata_payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    metadata_payload["data_npz"] = _relativize_path(fit_dataset_path)
+                    metadata_payload["fit_dataset_type"] = "selected_md_samples"
+                    metadata_payload["fit_sample_ids"] = requested_sample_ids
+                    metadata_payload["fit_sample_state_ids"] = fit_sample_state_ids or None
+                    metadata_path.write_text(json.dumps(metadata_payload, indent=2), encoding="utf-8")
+                except Exception as exc:
+                    print(f"[PottsFit {job_uuid}] warning: failed to update model metadata provenance: {exc}")
             if resume_in_place:
                 potts_model_rel = _relativize_path(Path(model_path))
             else:
@@ -3445,6 +3623,8 @@ def run_potts_fit_job(
                 "results_dir": _relativize_path(model_dir),
                 "potts_model": potts_model_rel,
                 "cluster_npz": _relativize_path(cluster_path),
+                "fit_dataset_npz": _relativize_path(fit_dataset_path) if fit_dataset_summary else None,
+                "sample_ids": requested_sample_ids or None,
                 "metadata_json": _relativize_path(run_result.get("metadata_path")) if run_result.get("metadata_path") else None,
             }
 

@@ -13,3 +13,4 @@ dadapy @ git+https://github.com/sissa-data-science/DADApy.git@cluster_predict_de
 pyyaml
 redis
 rq
+pytest

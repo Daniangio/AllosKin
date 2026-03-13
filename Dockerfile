@@ -59,6 +59,6 @@ WORKDIR /app
 EXPOSE 8000
 
 # Run the FastAPI server
-# This command is overridden in docker-compose.override.yml for development.
+# This command is overridden in docker-compose.dev.yml for development.
 # The `backend.main:app` module is now correctly resolved from the /app directory.
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]

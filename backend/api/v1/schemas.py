@@ -98,6 +98,7 @@ class PottsFitJobRequest(BaseModel):
     model_name: Optional[str] = None
     fit_method: Optional[str] = None
     fit_mode: Optional[str] = None
+    sample_ids: Optional[List[str]] = None
     base_model_id: Optional[str] = None
     base_model_path: Optional[str] = None
     state_ids: Optional[List[str]] = None
@@ -243,10 +244,17 @@ class LambdaSweepJobRequest(BaseModel):
     model_a_id: str
     model_b_id: str
 
-    # Reference MD samples (three macro-state evaluations on this cluster)
-    md_sample_id_1: str
-    md_sample_id_2: str
-    md_sample_id_3: str
+    # Generic reference samples:
+    #   - A/B anchor the endpoint interpretation
+    #   - comparison samples define the match curves
+    reference_sample_id_a: Optional[str] = None
+    reference_sample_id_b: Optional[str] = None
+    comparison_sample_ids: Optional[List[str]] = None
+
+    # Backward compatibility for the old fixed 3-MD flow.
+    md_sample_id_1: Optional[str] = None
+    md_sample_id_2: Optional[str] = None
+    md_sample_id_3: Optional[str] = None
 
     series_id: Optional[str] = None
     series_label: Optional[str] = None

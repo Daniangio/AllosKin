@@ -6,12 +6,10 @@ import ErrorMessage from '../common/ErrorMessage';
 export default function SystemDetailSidebar({
   states,
   metastableStates,
-  metastableLocked,
   clustersUnlocked,
   clusterError,
   clusterLoading,
   clusterRuns,
-  analysisMode,
   clusterJobStatus,
   setInfoOverlayState,
   setPottsFitClusterId,
@@ -22,8 +20,6 @@ export default function SystemDetailSidebar({
   selectedClusterId,
   openDescriptorExplorer,
   openDoc,
-  handleEnableMacroEditing,
-  macroLocked,
   navigate,
   projectId,
   systemId,
@@ -39,10 +35,8 @@ export default function SystemDetailSidebar({
     <aside className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-4 lg:sticky lg:top-6 h-fit">
       <div>
         <p className="text-xs uppercase tracking-[0.2em] text-gray-500">System state</p>
-        <h2 className="text-base font-semibold text-white mt-2">Macro-states</h2>
-        <p className="text-xs text-gray-400">
-          {metastableLocked ? 'Metastable locked' : 'Metastable pending'}
-        </p>
+        <h2 className="text-base font-semibold text-white mt-2">States & clusters</h2>
+        <p className="text-xs text-gray-400">{states.length} states · {metastableStates.length} metastable states</p>
       </div>
       <button
         type="button"
@@ -52,15 +46,6 @@ export default function SystemDetailSidebar({
         <Eye className="h-4 w-4" />
         Visualize descriptors
       </button>
-      {macroLocked && (
-        <button
-          type="button"
-          onClick={handleEnableMacroEditing}
-          className="w-full text-xs px-3 py-2 rounded-md border border-emerald-500 text-emerald-300 hover:bg-emerald-500/10 inline-flex items-center justify-center gap-2"
-        >
-          Enable macro-state editing
-        </button>
-      )}
       <button
         type="button"
         onClick={() => navigate(`/projects/${projectId}/systems/${systemId}/sampling/visualize${buildSamplingSuffix()}`)}
@@ -140,7 +125,7 @@ export default function SystemDetailSidebar({
           const metaForState = metastableStates.filter((m) => m.macro_state_id === state.state_id);
           return (
             <div key={state.state_id} className="rounded-md border border-gray-700 bg-gray-900/60 px-3 py-2">
-              {metastableLocked && metaForState.length > 0 ? (
+              {metaForState.length > 0 ? (
                 <details className="group">
                   <summary className="flex items-center justify-between cursor-pointer text-sm text-gray-200">
                     <span className="flex items-center gap-2">
@@ -233,11 +218,9 @@ export default function SystemDetailSidebar({
               <Plus className="h-4 w-4" />
             </button>
           </div>
-          {analysisMode === 'macro' && (
-            <p className="text-[11px] text-cyan-300">
-              Macro and metastable states can both be selected when clustering.
-            </p>
-          )}
+          <p className="text-[11px] text-cyan-300">
+            Macro and metastable states can both be selected when clustering.
+          </p>
           {clusterError && <ErrorMessage message={clusterError} />}
           {clusterRuns.length === 0 && <p className="text-xs text-gray-400">No cluster runs yet.</p>}
           {clusterRuns.length > 0 && (
@@ -284,7 +267,7 @@ export default function SystemDetailSidebar({
                             </span>
                           </div>
                           <p className="text-[11px] text-gray-400 mt-1">
-                            {analysisMode === 'macro' ? 'States' : 'Metastable'}:{' '}
+                            Selected states:{' '}
                             {Array.isArray(run.state_ids || run.metastable_ids)
                               ? (run.state_ids || run.metastable_ids).length
                               : '—'}{' '}
@@ -320,7 +303,7 @@ export default function SystemDetailSidebar({
                         </span>
                       </div>
                       <p className="text-[11px] text-gray-400 mt-1">
-                        {analysisMode === 'macro' ? 'States' : 'Metastable'}:{' '}
+                        Selected states:{' '}
                         {Array.isArray(run.state_ids || run.metastable_ids)
                           ? (run.state_ids || run.metastable_ids).length
                           : '—'}

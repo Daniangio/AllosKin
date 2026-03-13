@@ -4,18 +4,20 @@ import { InfoTooltip } from './SystemDetailWidgets';
 import { MetastableCard } from './StateCards';
 
 export default function SystemDetailMetastablePanel({
-  metastableLocked,
   metaLoading,
   metaParamsOpen,
   setMetaParamsOpen,
   metaParams,
   setMetaParams,
+  descriptorStates,
+  selectedMetastableStateId,
+  setSelectedMetastableStateId,
   metaError,
   metaActionError,
   metastableStates,
   handleRunMetastable,
-  handleConfirmMetastable,
   handleRenameMetastable,
+  handleDeleteMetastable,
   openDoc,
   navigate,
   projectId,
@@ -33,20 +35,18 @@ export default function SystemDetailMetastablePanel({
           />
         </div>
         <div className="flex items-center space-x-2">
-          {!metastableLocked && (
-            <button
-              onClick={() => setMetaParamsOpen((prev) => !prev)}
-              className="text-xs px-3 py-1 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60"
-            >
-              Hyperparams
-            </button>
-          )}
+          <button
+            onClick={() => setMetaParamsOpen((prev) => !prev)}
+            className="text-xs px-3 py-1 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60"
+          >
+            Hyperparams
+          </button>
           <button
             onClick={handleRunMetastable}
-            disabled={metaLoading || metastableLocked}
+            disabled={metaLoading || descriptorStates.length === 0 || !selectedMetastableStateId}
             className="text-xs px-3 py-1 rounded-md border border-cyan-500 text-cyan-300 hover:bg-cyan-500/10 disabled:opacity-50"
           >
-            {metastableLocked ? 'Locked' : metaLoading ? 'Running…' : 'Recompute'}
+            {metaLoading ? 'Running…' : 'Recompute'}
           </button>
           <button
             onClick={() => navigate(`/projects/${projectId}/systems/${systemId}/metastable/visualize`)}
@@ -54,19 +54,32 @@ export default function SystemDetailMetastablePanel({
           >
             Visualize
           </button>
-          {!metastableLocked && (
-            <button
-              onClick={handleConfirmMetastable}
-              disabled={metaLoading || metastableStates.length === 0}
-              className="text-xs px-3 py-1 rounded-md border border-emerald-500 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
-            >
-              Confirm metastable
-            </button>
-          )}
         </div>
       </div>
-      {metaParamsOpen && !metastableLocked && (
+      {metaParamsOpen && (
         <div className="bg-gray-900 border border-gray-700 rounded-md p-3 space-y-3 text-sm">
+          <label className="space-y-1 block">
+            <span className="flex items-center gap-2 text-xs text-gray-400">
+              Source state
+              <InfoTooltip
+                ariaLabel="Metastable source state info"
+                text="Run VAMP/TICA on one descriptor-ready uploaded state at a time. Metastable substates are derived only within that state."
+              />
+            </span>
+            <select
+              value={selectedMetastableStateId}
+              onChange={(e) => setSelectedMetastableStateId(e.target.value)}
+              disabled={descriptorStates.length === 0}
+              className="w-full bg-gray-800 border border-gray-700 rounded-md px-2 py-1 text-white"
+            >
+              {descriptorStates.length === 0 && <option value="">No descriptor-ready states</option>}
+              {descriptorStates.map((state) => (
+                <option key={state.state_id} value={state.state_id}>
+                  {state.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <div className="grid md:grid-cols-3 gap-3">
             {[
               {
@@ -143,6 +156,7 @@ export default function SystemDetailMetastablePanel({
               key={m.metastable_id || `${m.macro_state}-${m.metastable_index}`}
               meta={m}
               onRename={handleRenameMetastable}
+              onDelete={handleDeleteMetastable}
             />
           ))}
         </div>

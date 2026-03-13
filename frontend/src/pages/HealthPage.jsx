@@ -66,6 +66,9 @@ export default function HealthPage() {
           {cleanupInfo.orphan_cluster_analyses_removed !== undefined
             ? `, ${cleanupInfo.orphan_cluster_analyses_removed} orphan cluster analyses`
             : ''}
+          {cleanupInfo.state_linked_results_removed !== undefined
+            ? `, ${cleanupInfo.state_linked_results_removed} state-linked results`
+            : ''}
           .
         </div>
       )}

@@ -15,7 +15,7 @@ RUN npm install
 COPY tailwind.config.js ./
 COPY postcss.config.js ./
 
-# Mounts (from docker-compose.override.yml)
+# Mounts (from docker-compose.dev.yml)
 # will provide the /src and /public
 # so we just start the server.
 EXPOSE 3000

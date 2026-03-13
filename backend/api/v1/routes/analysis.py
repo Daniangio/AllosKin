@@ -297,8 +297,30 @@ async def submit_lambda_sweep_job(
     if md_label_mode not in {"assigned", "halo"}:
         raise HTTPException(status_code=400, detail="md_label_mode must be 'assigned' or 'halo'.")
 
-    if len({payload.md_sample_id_1, payload.md_sample_id_2, payload.md_sample_id_3}) < 3:
-        raise HTTPException(status_code=400, detail="md_sample_id_1/2/3 must be three distinct samples.")
+    reference_a = str(payload.reference_sample_id_a or payload.md_sample_id_1 or "").strip()
+    reference_b = str(payload.reference_sample_id_b or payload.md_sample_id_2 or "").strip()
+    comparison_ids = [str(v).strip() for v in (payload.comparison_sample_ids or []) if str(v).strip()]
+    if not comparison_ids:
+        legacy_c = str(payload.md_sample_id_3 or "").strip()
+        if legacy_c:
+            comparison_ids = [legacy_c]
+
+    if not reference_a or not reference_b:
+        raise HTTPException(
+            status_code=400,
+            detail="reference_sample_id_a and reference_sample_id_b are required.",
+        )
+    if not comparison_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="comparison_sample_ids must contain at least one sample id.",
+        )
+    all_reference_ids = [reference_a, reference_b, *comparison_ids]
+    if len(set(all_reference_ids)) != len(all_reference_ids):
+        raise HTTPException(
+            status_code=400,
+            detail="Lambda sweep reference and comparison samples must be distinct.",
+        )
 
     gibbs_method = (payload.gibbs_method or "rex").lower()
     if gibbs_method not in {"single", "rex"}:
@@ -335,6 +357,12 @@ async def submit_lambda_sweep_job(
     }
 
     params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
+    params.pop("md_sample_id_1", None)
+    params.pop("md_sample_id_2", None)
+    params.pop("md_sample_id_3", None)
+    params["reference_sample_id_a"] = reference_a
+    params["reference_sample_id_b"] = reference_b
+    params["comparison_sample_ids"] = comparison_ids
 
     try:
         job_uuid = str(uuid.uuid4())
@@ -934,6 +962,11 @@ async def submit_potts_fit_job(
         raise HTTPException(status_code=400, detail="fit_mode must be 'standard' or 'delta'.")
 
     if fit_mode != "delta":
+        if payload.sample_ids is not None:
+            sample_ids = [str(v).strip() for v in payload.sample_ids if str(v).strip()]
+            if not sample_ids:
+                raise HTTPException(status_code=400, detail="sample_ids must contain at least one MD sample when provided.")
+            payload.sample_ids = sample_ids
         if payload.fit_method is not None and payload.fit_method not in {"pmi", "plm", "pmi+plm"}:
             raise HTTPException(status_code=400, detail="fit_method must be 'pmi', 'plm', or 'pmi+plm'.")
 

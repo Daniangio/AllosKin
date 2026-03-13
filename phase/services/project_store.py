@@ -27,6 +27,7 @@ MODEL_METADATA_FILENAME = "model_metadata.json"
 SAMPLE_METADATA_FILENAME = "sample_metadata.json"
 STATES_METADATA_FILENAME = "states_metadata.json"
 METASTABLE_METADATA_FILENAME = "metastable_metadata.json"
+STATE_METADATA_FILENAME = "state_metadata.json"
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -88,7 +89,9 @@ class DescriptorState:
     residue_selection: Optional[str] = None
     residue_keys: List[str] = field(default_factory=list)
     residue_mapping: Dict[str, str] = field(default_factory=dict)
+    storage_key: Optional[str] = None
     metastable_labels_file: Optional[str] = None
+    metastable_metadata_file: Optional[str] = None
     role: Optional[str] = None  # Legacy compatibility
     created_at: str = field(default_factory=_utc_now)
 
@@ -198,6 +201,48 @@ class ProjectStore:
     def _system_meta_path(self, project_id: str, system_id: str) -> Path:
         return self._system_dir(project_id, system_id) / "system.json"
 
+    def _states_root_dir(self, project_id: str, system_id: str) -> Path:
+        return self._system_dir(project_id, system_id) / "states"
+
+    def _state_storage_key(self, state: DescriptorState | Dict[str, Any] | str) -> str:
+        if isinstance(state, str):
+            return state
+        if isinstance(state, DescriptorState):
+            return str(state.storage_key or state.state_id)
+        return str(state.get("storage_key") or state.get("state_id"))
+
+    def _state_dir(
+        self,
+        project_id: str,
+        system_id: str,
+        state: DescriptorState | Dict[str, Any] | str,
+    ) -> Path:
+        return self._states_root_dir(project_id, system_id) / self._state_storage_key(state)
+
+    def _state_metadata_path(
+        self,
+        project_id: str,
+        system_id: str,
+        state: DescriptorState | Dict[str, Any] | str,
+    ) -> Path:
+        return self._state_dir(project_id, system_id, state) / STATE_METADATA_FILENAME
+
+    def _state_metastable_dir(
+        self,
+        project_id: str,
+        system_id: str,
+        state: DescriptorState | Dict[str, Any] | str,
+    ) -> Path:
+        return self._state_dir(project_id, system_id, state) / "metastable"
+
+    def _state_metastable_metadata_path(
+        self,
+        project_id: str,
+        system_id: str,
+        state: DescriptorState | Dict[str, Any] | str,
+    ) -> Path:
+        return self._state_metastable_dir(project_id, system_id, state) / METASTABLE_METADATA_FILENAME
+
     def list_systems(self, project_id: str) -> List[SystemMetadata]:
         systems: List[SystemMetadata] = []
         systems_root = self._systems_dir(project_id)
@@ -249,8 +294,6 @@ class ProjectStore:
             "states",
             "metastable_states",
             "metastable_model_dir",
-            "metastable_locked",
-            "analysis_mode",
         ):
             payload.pop(key, None)
         return payload
@@ -267,6 +310,7 @@ class ProjectStore:
         system_id = system_id or str(uuid.uuid4())
         system_dir = self._system_dir(project_id, system_id)
         system_dir.mkdir(parents=True, exist_ok=False)
+        (system_dir / "states").mkdir(parents=True, exist_ok=True)
         (system_dir / "structures").mkdir(parents=True, exist_ok=True)
         (system_dir / "descriptors").mkdir(parents=True, exist_ok=True)
 
@@ -288,10 +332,18 @@ class ProjectStore:
 
     def save_system(self, metadata: SystemMetadata) -> None:
         self._sync_states_metadata(metadata)
-        self._sync_metastable_metadata(metadata)
+        self._sync_state_metastable_metadata(metadata)
         self._sync_cluster_metadata(metadata)
         meta_path = self._system_meta_path(metadata.project_id, metadata.system_id)
         _write_json(meta_path, self._encode_system(metadata))
+        for legacy_path in (
+            self._states_metadata_path(metadata.project_id, metadata.system_id),
+            self._metastable_metadata_path(metadata.project_id, metadata.system_id),
+        ):
+            try:
+                legacy_path.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def rename_state(self, project_id: str, system_id: str, state_id: str, new_name: str) -> SystemMetadata:
         system_meta = self.get_system(project_id, system_id)
@@ -308,11 +360,13 @@ class ProjectStore:
 
     def ensure_directories(self, project_id: str, system_id: str) -> Dict[str, Path]:
         system_dir = self._system_dir(project_id, system_id)
+        states_dir = system_dir / "states"
         structures_dir = system_dir / "structures"
         descriptors_dir = system_dir / "descriptors"
         trajectories_dir = system_dir / "trajectories"
         clusters_dir = system_dir / "clusters"
         tmp_dir = system_dir / "tmp"
+        states_dir.mkdir(parents=True, exist_ok=True)
         structures_dir.mkdir(parents=True, exist_ok=True)
         descriptors_dir.mkdir(parents=True, exist_ok=True)
         trajectories_dir.mkdir(parents=True, exist_ok=True)
@@ -320,11 +374,36 @@ class ProjectStore:
         tmp_dir.mkdir(parents=True, exist_ok=True)
         return {
             "system_dir": system_dir,
+            "states_dir": states_dir,
             "structures_dir": structures_dir,
             "descriptors_dir": descriptors_dir,
             "trajectories_dir": trajectories_dir,
             "clusters_dir": clusters_dir,
             "tmp_dir": tmp_dir,
+        }
+
+    def ensure_state_directories(
+        self,
+        project_id: str,
+        system_id: str,
+        state_id: str,
+        *,
+        storage_key: Optional[str] = None,
+    ) -> Dict[str, Path]:
+        dirs = self.ensure_directories(project_id, system_id)
+        state_stub = DescriptorState(
+            state_id=state_id,
+            name=state_id,
+            storage_key=storage_key or state_id,
+        )
+        state_dir = self._state_dir(project_id, system_id, state_stub)
+        metastable_dir = state_dir / "metastable"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        metastable_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            **dirs,
+            "state_dir": state_dir,
+            "metastable_dir": metastable_dir,
         }
 
     def ensure_cluster_directories(
@@ -499,18 +578,26 @@ class ProjectStore:
 
     def _hydrate_system(self, system_meta: SystemMetadata) -> None:
         state_sidecar = self._load_states_metadata(system_meta.project_id, system_meta.system_id)
-        metastable_sidecar = self._load_metastable_metadata(system_meta.project_id, system_meta.system_id)
-        if metastable_sidecar is not None:
-            system_meta.metastable_states = list(metastable_sidecar.get("metastable_states") or [])
-            system_meta.metastable_model_dir = metastable_sidecar.get("metastable_model_dir")
-            system_meta.metastable_locked = bool(metastable_sidecar.get("metastable_locked", False))
-            system_meta.analysis_mode = metastable_sidecar.get("analysis_mode")
-
         system_meta.states = self._scan_states_from_disk(
             system_meta.project_id,
             system_meta.system_id,
             state_sidecar if state_sidecar is not None else (system_meta.states or {}),
         )
+        metastable_states, model_dirs = self._load_state_metastable_entries(
+            system_meta.project_id,
+            system_meta.system_id,
+            system_meta.states,
+        )
+        if metastable_states:
+            system_meta.metastable_states = metastable_states
+            system_meta.metastable_model_dir = model_dirs[0] if len(model_dirs) == 1 else None
+        else:
+            metastable_sidecar = self._load_metastable_metadata(system_meta.project_id, system_meta.system_id)
+            if metastable_sidecar is not None:
+                system_meta.metastable_states = list(metastable_sidecar.get("metastable_states") or [])
+                system_meta.metastable_model_dir = metastable_sidecar.get("metastable_model_dir")
+                system_meta.metastable_locked = bool(metastable_sidecar.get("metastable_locked", False))
+                system_meta.analysis_mode = metastable_sidecar.get("analysis_mode")
         descriptor_keys = set()
         for state in system_meta.states.values():
             residue_keys = getattr(state, "residue_keys", None) or []
@@ -573,6 +660,7 @@ class ProjectStore:
     ) -> Dict[str, DescriptorState]:
         dirs = self.ensure_directories(project_id, system_id)
         system_dir = dirs["system_dir"]
+        states_dir = dirs["states_dir"]
         structures_dir = dirs["structures_dir"]
         descriptors_dir = dirs["descriptors_dir"]
         trajectories_dir = dirs["trajectories_dir"]
@@ -581,6 +669,25 @@ class ProjectStore:
         for sid, st in (existing_states or {}).items():
             state_id = getattr(st, "state_id", None) or sid
             states[state_id] = st if isinstance(st, DescriptorState) else DescriptorState(**dict(st))
+
+        for meta_path in sorted(states_dir.glob(f"*/{STATE_METADATA_FILENAME}")):
+            try:
+                raw = _read_json(meta_path)
+            except Exception:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            state_id = str(raw.get("state_id") or meta_path.parent.name)
+            merged = {
+                **raw,
+                "state_id": state_id,
+                "name": str(raw.get("name") or state_id),
+                "storage_key": str(raw.get("storage_key") or meta_path.parent.name),
+            }
+            try:
+                states[state_id] = DescriptorState(**merged)
+            except Exception:
+                continue
 
         discovered_ids: set[str] = set()
         for p in structures_dir.glob("*.pdb"):
@@ -639,26 +746,97 @@ class ProjectStore:
                     st.trajectory_file = str(traj_candidates[0].relative_to(system_dir))
                     st.source_traj = traj_candidates[0].name
 
+        for state_id, st in states.items():
+            if not st.storage_key:
+                st.storage_key = state_id
+
         return states
 
     def _sync_states_metadata(self, metadata: SystemMetadata) -> None:
-        path = self._states_metadata_path(metadata.project_id, metadata.system_id)
-        states_payload: Dict[str, Any] = {}
         for sid, st in (metadata.states or {}).items():
-            state_id = getattr(st, "state_id", None) or sid
-            states_payload[state_id] = asdict(st)
-            states_payload[state_id]["state_id"] = state_id
-        _write_json(path, {"states": states_payload})
+            state = st if isinstance(st, DescriptorState) else DescriptorState(**dict(st))
+            state_id = getattr(state, "state_id", None) or sid
+            if not state.storage_key:
+                state.storage_key = state_id
+            payload = asdict(state)
+            payload["state_id"] = state_id
+            payload["storage_key"] = state.storage_key
+            meta_path = self._state_metadata_path(metadata.project_id, metadata.system_id, state)
+            _write_json(meta_path, payload)
 
-    def _sync_metastable_metadata(self, metadata: SystemMetadata) -> None:
-        path = self._metastable_metadata_path(metadata.project_id, metadata.system_id)
-        payload = {
-            "metastable_states": metadata.metastable_states or [],
-            "metastable_model_dir": metadata.metastable_model_dir,
-            "metastable_locked": bool(metadata.metastable_locked),
-            "analysis_mode": metadata.analysis_mode,
-        }
-        _write_json(path, payload)
+    def _sync_state_metastable_metadata(self, metadata: SystemMetadata) -> None:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for meta in metadata.metastable_states or []:
+            if not isinstance(meta, dict):
+                continue
+            state_id = meta.get("macro_state_id")
+            if not state_id:
+                continue
+            grouped.setdefault(str(state_id), []).append(dict(meta))
+
+        system_dir = self._system_dir(metadata.project_id, metadata.system_id)
+        for state_id, state in (metadata.states or {}).items():
+            state_obj = state if isinstance(state, DescriptorState) else DescriptorState(**dict(state))
+            meta_path = self._state_metastable_metadata_path(metadata.project_id, metadata.system_id, state_obj)
+            existing: Dict[str, Any] = {}
+            if meta_path.exists():
+                try:
+                    existing = _read_json(meta_path)
+                except Exception:
+                    existing = {}
+            metas = grouped.get(str(state_id), [])
+            if metas or state_obj.metastable_labels_file or existing.get("model_dir"):
+                payload = {
+                    **existing,
+                    "state_id": state_obj.state_id,
+                    "state_name": state_obj.name,
+                    "storage_key": state_obj.storage_key or state_obj.state_id,
+                    "metastable_states": metas,
+                    "metastable_labels_file": state_obj.metastable_labels_file,
+                    "model_dir": existing.get("model_dir"),
+                }
+                _write_json(meta_path, payload)
+                state_obj.metastable_metadata_file = str(meta_path.relative_to(system_dir))
+            else:
+                try:
+                    meta_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def _load_state_metastable_entries(
+        self,
+        project_id: str,
+        system_id: str,
+        states: Dict[str, DescriptorState],
+    ) -> tuple[List[Dict[str, Any]], List[str]]:
+        system_dir = self._system_dir(project_id, system_id)
+        aggregated: List[Dict[str, Any]] = []
+        model_dirs: List[str] = []
+        for state_id, state in (states or {}).items():
+            state_obj = state if isinstance(state, DescriptorState) else DescriptorState(**dict(state))
+            meta_path = self._state_metastable_metadata_path(project_id, system_id, state_obj)
+            if not meta_path.exists():
+                continue
+            try:
+                payload = _read_json(meta_path)
+            except Exception:
+                continue
+            state_obj.metastable_metadata_file = str(meta_path.relative_to(system_dir))
+            label_rel = payload.get("metastable_labels_file")
+            if isinstance(label_rel, str) and label_rel:
+                state_obj.metastable_labels_file = label_rel
+            model_dir = payload.get("model_dir")
+            if isinstance(model_dir, str) and model_dir:
+                model_dirs.append(model_dir)
+            for meta in payload.get("metastable_states") or []:
+                if not isinstance(meta, dict):
+                    continue
+                merged = dict(meta)
+                merged.setdefault("macro_state_id", state_id)
+                merged.setdefault("macro_state", state_obj.name)
+                merged.setdefault("name", merged.get("default_name") or merged.get("metastable_id"))
+                aggregated.append(merged)
+        return aggregated, model_dirs
 
     def _sync_cluster_metadata(self, metadata: SystemMetadata) -> None:
         project_id = metadata.project_id

@@ -4,6 +4,21 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT_DIR}/scripts/offline_select.sh"
 
+CLI_ROOT=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --root)
+      CLI_ROOT="${2:-}"
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      echo "Usage: $0 [--root PATH]" >&2
+      exit 1
+      ;;
+  esac
+done
+
 if [ -d "${ROOT_DIR}/.venv-potts-fit" ]; then
   DEFAULT_ENV="${ROOT_DIR}/.venv-potts-fit"
 elif [ -d "${ROOT_DIR}/.venv" ]; then
@@ -12,7 +27,7 @@ else
   DEFAULT_ENV="${ROOT_DIR}/.venv-potts-fit"
 fi
 USE_SLUG_IDS="false"
-DEFAULT_ROOT="${PHASE_DATA_ROOT:-${ROOT_DIR}/data}"
+DEFAULT_ROOT="${CLI_ROOT:-${OFFLINE_ROOT:-${PHASE_DATA_ROOT:-${ROOT_DIR}/data}}}"
 
 ensure_env() {
   if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/python" ]; then

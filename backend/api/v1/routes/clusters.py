@@ -1333,15 +1333,6 @@ async def build_metastable_cluster_vectors(
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
 
-    if not getattr(system_meta, "macro_locked", False):
-        raise HTTPException(status_code=400, detail="Lock macro-states before clustering.")
-    analysis_mode = getattr(system_meta, "analysis_mode", None)
-    if not getattr(system_meta, "metastable_locked", False) and analysis_mode != "macro":
-        raise HTTPException(
-            status_code=400,
-            detail="Lock metastable states or confirm macro-only before clustering.",
-        )
-
     parsed = _parse_cluster_payload(payload)
     cluster_id = str(uuid.uuid4())
     cluster_name = parsed.get("cluster_name")
@@ -1449,14 +1440,6 @@ async def submit_metastable_cluster_job(
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
-
-    if not getattr(system_meta, "macro_locked", False):
-        raise HTTPException(status_code=400, detail="Lock macro-states before clustering.")
-    if not getattr(system_meta, "metastable_locked", False) and getattr(system_meta, "analysis_mode", None) != "macro":
-        raise HTTPException(
-            status_code=400,
-            detail="Lock metastable states or confirm macro-only before clustering.",
-        )
 
     parsed = _parse_cluster_payload(payload)
     cluster_id = str(uuid.uuid4())
@@ -1973,11 +1956,6 @@ async def delete_metastable_cluster_npz(project_id: str, system_id: str, cluster
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
-
-    if not getattr(system_meta, "macro_locked", False):
-        raise HTTPException(status_code=400, detail="Lock macro-states before deleting cluster NPZ.")
-    if not getattr(system_meta, "metastable_locked", False) and getattr(system_meta, "analysis_mode", None) != "macro":
-        raise HTTPException(status_code=400, detail="Lock metastable states or confirm macro-only before deleting cluster NPZ.")
 
     clusters = system_meta.metastable_clusters or []
     entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)

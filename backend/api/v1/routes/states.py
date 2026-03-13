@@ -7,9 +7,9 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
+from backend.api.v1.analysis_cleanup import cleanup_state_linked_artifacts
 from backend.api.v1.common import (
     build_state_descriptors,
-    ensure_not_macro_locked,
     get_state_or_404,
     normalize_stride,
     project_store,
@@ -18,7 +18,7 @@ from backend.api.v1.common import (
     stream_upload,
     stride_to_slice,
 )
-from phase.workflows.macro_states import register_state_from_pdb
+from phase.workflows.macro_states import allocate_state_storage_key, register_state_from_pdb
 from phase.common.slice_utils import parse_slice_spec
 from backend.services.project_store import DescriptorState
 
@@ -43,6 +43,17 @@ def _unlink_if_inside_system(project_id: str, system_id: str, rel_path: Optional
         abs_path.unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def _drop_state_metastable_data(system_meta, state_id: str) -> None:
+    system_meta.metastable_states = [
+        meta
+        for meta in (system_meta.metastable_states or [])
+        if str(meta.get("macro_state_id") or "") != str(state_id)
+    ]
+    if not system_meta.metastable_states:
+        system_meta.metastable_locked = False
+        system_meta.analysis_mode = "macro" if system_meta.macro_locked else None
 
 
 @router.get(
@@ -116,7 +127,6 @@ async def add_system_state(
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
-    ensure_not_macro_locked(system_meta)
 
     state_name = name.strip()
     if not state_name:
@@ -125,15 +135,13 @@ async def add_system_state(
     if not pdb and not source_state_id:
         raise HTTPException(status_code=400, detail="Provide a PDB file or choose an existing state to copy from.")
 
-    dirs = project_store.ensure_directories(project_id, system_id)
-    system_dir = dirs["system_dir"]
-    structures_dir = dirs["structures_dir"]
-
     state_id = str(uuid.uuid4())
-    pdb_path = structures_dir / f"{state_id}.pdb"
-
+    storage_key = allocate_state_storage_key(system_meta, state_name, state_id)
+    state_dirs = project_store.ensure_state_directories(project_id, system_id, state_id, storage_key=storage_key)
     shift_value = int(resid_shift or 0)
     if pdb:
+        pdb_ext = os.path.splitext(pdb.filename or "state.pdb")[1] or ".pdb"
+        pdb_path = state_dirs["state_dir"] / f"structure{pdb_ext}"
         await stream_upload(pdb, pdb_path)
     else:
         source_state = get_state_or_404(system_meta, source_state_id)
@@ -142,6 +150,8 @@ async def add_system_state(
         source_path = project_store.resolve_path(project_id, system_id, source_state.pdb_file)
         if not source_path.exists():
             raise HTTPException(status_code=404, detail="Source PDB file missing on disk.")
+        pdb_ext = source_path.suffix or ".pdb"
+        pdb_path = state_dirs["state_dir"] / f"structure{pdb_ext}"
         shutil.copy(source_path, pdb_path)
         if resid_shift is None:
             shift_value = int(getattr(source_state, "resid_shift", 0) or 0)
@@ -155,6 +165,7 @@ async def add_system_state(
         pdb_path=pdb_path,
         stride=1,
         resid_shift=shift_value,
+        storage_key=storage_key,
     )
     return serialize_system(system_meta)
 
@@ -168,129 +179,28 @@ async def rescan_states_from_disk(project_id: str, system_id: str):
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
+    current_ids = set((system_meta.states or {}).keys())
+    refreshed = project_store.get_system(project_id, system_id)
+    discovered_ids = set((refreshed.states or {}).keys())
+    added = len(discovered_ids - current_ids)
+    updated = len(discovered_ids & current_ids)
 
-    dirs = project_store.ensure_directories(project_id, system_id)
-    system_dir = dirs["system_dir"]
-    structures_dir = dirs["structures_dir"]
-    descriptors_dir = dirs["descriptors_dir"]
-    trajectories_dir = dirs["trajectories_dir"]
+    if added > 0 and getattr(refreshed, "macro_locked", False):
+        refreshed.macro_locked = False
+        refreshed.metastable_locked = False
+        refreshed.analysis_mode = None
 
-    states = dict(system_meta.states or {})
-    discovered_ids: set[str] = set()
-    added = 0
-    updated = 0
-
-    for pdb_path in sorted(structures_dir.glob("*.pdb")):
-        state_id = pdb_path.stem
-        discovered_ids.add(state_id)
-        state_meta = states.get(state_id)
-        is_new = False
-        if not state_meta:
-            state_meta = DescriptorState(state_id=state_id, name=state_id)
-            states[state_id] = state_meta
-            is_new = True
-
-        new_pdb_rel = str(pdb_path.relative_to(system_dir))
-        changed = bool(state_meta.pdb_file != new_pdb_rel)
-        state_meta.pdb_file = new_pdb_rel
-        if not state_meta.name:
-            state_meta.name = state_id
-            changed = True
-
-        desc_npz = descriptors_dir / f"{state_id}_descriptors.npz"
-        if desc_npz.exists():
-            rel = str(desc_npz.relative_to(system_dir))
-            if state_meta.descriptor_file != rel:
-                state_meta.descriptor_file = rel
-                changed = True
-
-        desc_meta = descriptors_dir / f"{state_id}_descriptor_metadata.json"
-        if desc_meta.exists():
-            rel = str(desc_meta.relative_to(system_dir))
-            if state_meta.descriptor_metadata_file != rel:
-                state_meta.descriptor_metadata_file = rel
-                changed = True
-            try:
-                payload = json.loads(desc_meta.read_text(encoding="utf-8"))
-            except Exception:
-                payload = {}
-            keys = payload.get("descriptor_keys")
-            if isinstance(keys, list):
-                clean_keys = [str(v) for v in keys]
-                if clean_keys != list(state_meta.residue_keys or []):
-                    state_meta.residue_keys = clean_keys
-                    changed = True
-            mapping = payload.get("residue_mapping")
-            if isinstance(mapping, dict):
-                clean_map = {str(k): str(v) for k, v in mapping.items()}
-                if clean_map != dict(state_meta.residue_mapping or {}):
-                    state_meta.residue_mapping = clean_map
-                    changed = True
-            n_frames = payload.get("n_frames")
-            if isinstance(n_frames, (int, float)):
-                nf = int(n_frames)
-                if nf >= 0 and state_meta.n_frames != nf:
-                    state_meta.n_frames = nf
-                    changed = True
-            selection = payload.get("residue_selection")
-            if isinstance(selection, str) and selection.strip() and not state_meta.residue_selection:
-                state_meta.residue_selection = selection.strip()
-                changed = True
-            resid_shift = payload.get("resid_shift")
-            if isinstance(resid_shift, (int, float)):
-                shift_val = int(resid_shift)
-                if state_meta.resid_shift != shift_val:
-                    state_meta.resid_shift = shift_val
-                    changed = True
-
-        if not state_meta.trajectory_file:
-            traj_candidates = sorted(p for p in trajectories_dir.glob(f"{state_id}.*") if p.is_file())
-            if traj_candidates:
-                rel = str(traj_candidates[0].relative_to(system_dir))
-                state_meta.trajectory_file = rel
-                state_meta.source_traj = traj_candidates[0].name
-                changed = True
-
-        if is_new:
-            added += 1
-        elif changed:
-            updated += 1
-
-    # If new states appeared while macro was locked, require reconfirmation.
-    if added > 0 and getattr(system_meta, "macro_locked", False):
-        system_meta.macro_locked = False
-        system_meta.metastable_locked = False
-        system_meta.analysis_mode = None
-
-    system_meta.states = states
-    refresh_system_metadata(system_meta)
-    project_store.save_system(system_meta)
+    refresh_system_metadata(refreshed)
+    project_store.save_system(refreshed)
 
     return {
-        **serialize_system(system_meta),
+        **serialize_system(refreshed),
         "rescan_summary": {
             "states_discovered_from_structures": len(discovered_ids),
             "states_added": added,
             "states_updated": updated,
         },
     }
-
-
-@router.post(
-    "/projects/{project_id}/systems/{system_id}/states/unlock-editing",
-    summary="Unlock macro state editing and reset downstream locks",
-)
-async def unlock_macro_state_editing(project_id: str, system_id: str):
-    try:
-        system_meta = project_store.get_system(project_id, system_id)
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
-
-    system_meta.macro_locked = False
-    system_meta.metastable_locked = False
-    system_meta.analysis_mode = None
-    project_store.save_system(system_meta)
-    return serialize_system(system_meta)
 
 
 @router.post(
@@ -311,7 +221,6 @@ async def upload_state_trajectory(
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
-    ensure_not_macro_locked(system_meta)
 
     state_meta = get_state_or_404(system_meta, state_id)
     if slice_spec:
@@ -323,17 +232,21 @@ async def upload_state_trajectory(
         stride_val = normalize_stride(state_meta.name, stride)
         slice_spec = stride_to_slice(stride_val)
 
-    dirs = project_store.ensure_directories(project_id, system_id)
-    system_dir = dirs["system_dir"]
-    tmp_dir = dirs["tmp_dir"]
-
-    traj_path = tmp_dir / f"{state_id}_{trajectory.filename or 'traj'}"
+    state_dirs = project_store.ensure_state_directories(
+        project_id,
+        system_id,
+        state_meta.state_id,
+        storage_key=state_meta.storage_key or state_meta.state_id,
+    )
+    system_dir = state_dirs["system_dir"]
+    traj_ext = os.path.splitext(trajectory.filename or "traj.xtc")[1] or ".xtc"
+    traj_path = state_dirs["state_dir"] / f"trajectory{traj_ext}"
     await stream_upload(trajectory, traj_path)
 
     if state_meta.trajectory_file:
         _unlink_if_inside_system(project_id, system_id, state_meta.trajectory_file)
-        state_meta.trajectory_file = None
     state_meta.source_traj = trajectory.filename
+    state_meta.trajectory_file = str(traj_path.relative_to(system_dir))
     state_meta.stride = stride_val
     state_meta.slice_spec = slice_spec
     state_meta.resid_shift = int(state_meta.resid_shift if resid_shift is None else resid_shift)
@@ -344,6 +257,13 @@ async def upload_state_trajectory(
         _unlink_if_inside_system(project_id, system_id, state_meta.descriptor_metadata_file)
     state_meta.descriptor_file = None
     state_meta.descriptor_metadata_file = None
+    if state_meta.metastable_metadata_file:
+        _unlink_if_inside_system(project_id, system_id, state_meta.metastable_metadata_file)
+        state_meta.metastable_metadata_file = None
+    if state_meta.metastable_labels_file:
+        _unlink_if_inside_system(project_id, system_id, state_meta.metastable_labels_file)
+        state_meta.metastable_labels_file = None
+    _drop_state_metastable_data(system_meta, state_id)
     state_meta.residue_keys = []
     state_meta.residue_mapping = {}
     state_meta.n_frames = 0
@@ -366,12 +286,6 @@ async def upload_state_trajectory(
         system_meta.status = "failed"
         project_store.save_system(system_meta)
         raise HTTPException(status_code=500, detail=f"Descriptor build failed after upload: {exc}") from exc
-    finally:
-        try:
-            traj_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
     return serialize_system(system_meta)
 
 
@@ -384,7 +298,6 @@ async def delete_state_trajectory(project_id: str, system_id: str, state_id: str
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
-    ensure_not_macro_locked(system_meta)
 
     state_meta = get_state_or_404(system_meta, state_id)
 
@@ -399,6 +312,13 @@ async def delete_state_trajectory(project_id: str, system_id: str, state_id: str
         _unlink_if_inside_system(project_id, system_id, state_meta.trajectory_file)
         state_meta.trajectory_file = None
         state_meta.source_traj = None
+    if state_meta.metastable_metadata_file:
+        _unlink_if_inside_system(project_id, system_id, state_meta.metastable_metadata_file)
+        state_meta.metastable_metadata_file = None
+    if state_meta.metastable_labels_file:
+        _unlink_if_inside_system(project_id, system_id, state_meta.metastable_labels_file)
+        state_meta.metastable_labels_file = None
+    _drop_state_metastable_data(system_meta, state_id)
 
     state_meta.residue_keys = []
     state_meta.residue_mapping = {}
@@ -420,17 +340,36 @@ async def delete_state(project_id: str, system_id: str, state_id: str):
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
-    ensure_not_macro_locked(system_meta)
 
     state_meta = get_state_or_404(system_meta, state_id)
 
     for field in ("descriptor_file", "descriptor_metadata_file", "trajectory_file", "pdb_file"):
         _unlink_if_inside_system(project_id, system_id, getattr(state_meta, field, None))
+    if state_meta.metastable_metadata_file:
+        _unlink_if_inside_system(project_id, system_id, state_meta.metastable_metadata_file)
+    if state_meta.metastable_labels_file:
+        _unlink_if_inside_system(project_id, system_id, state_meta.metastable_labels_file)
 
+    try:
+        state_dir = project_store.ensure_state_directories(
+            project_id,
+            system_id,
+            state_meta.state_id,
+            storage_key=state_meta.storage_key or state_meta.state_id,
+        )["state_dir"]
+        shutil.rmtree(state_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    _drop_state_metastable_data(system_meta, state_id)
     system_meta.states.pop(state_id, None)
     refresh_system_metadata(system_meta)
     project_store.save_system(system_meta)
-    return serialize_system(system_meta)
+    cleanup = cleanup_state_linked_artifacts(project_id, system_id)
+    return {
+        **serialize_system(system_meta),
+        "cleanup_summary": cleanup,
+    }
 
 
 @router.patch(
@@ -447,7 +386,6 @@ async def rename_system_state(
         system_meta = project_store.get_system(project_id, system_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"System '{system_id}' not found.")
-    ensure_not_macro_locked(system_meta)
 
     new_name = (payload or {}).get("name")
     if not new_name or not str(new_name).strip():

@@ -6,7 +6,6 @@ export default function SystemDetailMacroPanel({
   states,
   systemStatus,
   descriptorsReady,
-  handleConfirmMacro,
   downloadError,
   actionError,
   actionMessage,
@@ -24,23 +23,14 @@ export default function SystemDetailMacroPanel({
     <section className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold text-white">States</h2>
-        <div className="flex items-center space-x-3">
-          <p className="text-xs text-gray-400">Status: {systemStatus}</p>
-          <button
-            onClick={handleConfirmMacro}
-            disabled={states.length === 0 || !descriptorsReady}
-            className="text-xs px-3 py-1 rounded-md border border-emerald-500 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-50"
-          >
-            Confirm states
-          </button>
-        </div>
+        <p className="text-xs text-gray-400">Status: {systemStatus}</p>
       </div>
       {downloadError && <ErrorMessage message={downloadError} />}
       {actionError && <ErrorMessage message={actionError} />}
       {actionMessage && <p className="text-sm text-emerald-400">{actionMessage}</p>}
       {!descriptorsReady && states.length > 0 && (
         <p className="text-xs text-amber-300">
-          Upload trajectories and build descriptors for every state before confirming.
+          Upload trajectories and build descriptors for every state before downstream analysis.
         </p>
       )}
       <div className="grid md:grid-cols-3 gap-4">

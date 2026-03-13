@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import Loader from '../components/common/Loader';
 import ErrorMessage from '../components/common/ErrorMessage';
@@ -20,17 +20,14 @@ import {
   uploadStateTrajectory,
   deleteStateTrajectory,
   addSystemState,
-  unlockMacroStateEditing,
   deleteState,
   renameState, // Import the new renameState function
   fetchMetastableStates,
   recomputeMetastableStates,
   renameMetastableState,
+  deleteMetastableState,
   submitMetastableClusterJob,
   uploadMetastableClusterNp,
-  confirmMacroStates,
-  confirmMetastableStates,
-  setMacroOnlyAnalysis,
   downloadSavedCluster,
   downloadBackmappingCluster,
   submitBackmappingClusterJob,
@@ -80,6 +77,7 @@ export default function SystemDetailPage() {
     tica_dim: 5,
     random_state: 0,
   });
+  const [selectedMetastableStateId, setSelectedMetastableStateId] = useState('');
   const [selectedMetastableIds, setSelectedMetastableIds] = useState([]);
   const [clusterError, setClusterError] = useState(null);
   const [clusterLoading, setClusterLoading] = useState(false);
@@ -98,11 +96,9 @@ export default function SystemDetailPage() {
   const [densityZMode, setDensityZMode] = useState('manual');
   const [densityZValue, setDensityZValue] = useState(2.0);
   const [densityMaxk, setDensityMaxk] = useState(100);
-  const [metaChoice, setMetaChoice] = useState(null);
   const [analysisFocus, setAnalysisFocus] = useState('');
   const [showMetastableInfo, setShowMetastableInfo] = useState(false);
   const [docId, setDocId] = useState('metastable_states');
-  const [macroChoiceLoading, setMacroChoiceLoading] = useState(false);
   const [infoOverlayState, setInfoOverlayState] = useState(null); // New state for info overlay
   const [resultsList, setResultsList] = useState([]);
   const [resultsLoading, setResultsLoading] = useState(false);
@@ -116,11 +112,13 @@ export default function SystemDetailPage() {
   const [pottsFitKind, setPottsFitKind] = useState('standard');
   const [pottsFitStartMode, setPottsFitStartMode] = useState('scratch');
   const [pottsFitBaseModelId, setPottsFitBaseModelId] = useState('');
+  const [pottsFitSampleIds, setPottsFitSampleIds] = useState([]);
   const [pottsFitExistingMode, setPottsFitExistingMode] = useState('resume');
   const [pottsDeltaBaseModelId, setPottsDeltaBaseModelId] = useState('');
   const [pottsDeltaStateIds, setPottsDeltaStateIds] = useState([]);
   const [pottsModelName, setPottsModelName] = useState('');
   const [pottsFitParams, setPottsFitParams] = useState({
+    plm_device: 'auto',
     plm_epochs: '',
     plm_lr: '',
     plm_lr_min: '',
@@ -194,9 +192,17 @@ export default function SystemDetailPage() {
   const states = useMemo(() => Object.values(system?.states || {}), [system]);
   const descriptorStates = useMemo(() => states.filter((s) => s.descriptor_file), [states]);
   const metastableStates = useMemo(() => metastable.states || [], [metastable.states]);
-  const macroLocked = system?.macro_locked;
-  const metastableLocked = system?.metastable_locked;
-  const analysisMode = system?.analysis_mode || null;
+
+  useEffect(() => {
+    if (!descriptorStates.length) {
+      setSelectedMetastableStateId('');
+      return;
+    }
+    if (selectedMetastableStateId && descriptorStates.some((s) => s.state_id === selectedMetastableStateId)) {
+      return;
+    }
+    setSelectedMetastableStateId(descriptorStates[0].state_id);
+  }, [descriptorStates, selectedMetastableStateId]);
   const clusterRuns = useMemo(() => system?.metastable_clusters || [], [system]);
   const clusterNameById = useMemo(() => {
     const mapping = new Map();
@@ -216,6 +222,7 @@ export default function SystemDetailPage() {
     () => clusterRuns.find((run) => run.cluster_id === pottsFitClusterId) || null,
     [clusterRuns, pottsFitClusterId]
   );
+  const pottsFitSampleClusterRef = useRef('');
   const pottsModels = useMemo(() => {
     if (!selectedCluster) return [];
     const models = selectedCluster.potts_models || [];
@@ -296,18 +303,24 @@ export default function SystemDetailPage() {
     () => sampleEntries.filter((s) => s.type === 'potts_sampling' && s.method === 'sa'),
     [sampleEntries]
   );
-  const macroReady = Boolean(macroLocked && descriptorsReady);
-  const showSidebar = macroReady;
-  const effectiveChoice = analysisMode || metaChoice;
-  const clustersUnlocked = macroReady && (analysisMode === 'macro' || metastableLocked);
-  const analysisUnlocked = macroReady && (metastableLocked || effectiveChoice === 'macro');
-  const analysisNote =
-    metastableLocked || effectiveChoice === 'macro'
-      ? 'Static needs two descriptor-ready states; Potts uses saved cluster NPZ files.'
-      : 'Static needs two descriptor-ready states. Potts requires metastable discovery and saved cluster NPZ files.';
-  const showMacroChoicePanel =
-    macroReady && !metastableLocked && effectiveChoice !== 'macro' && analysisMode !== 'metastable';
-  const showMetastablePanel = macroReady && effectiveChoice !== 'macro' && !metastableLocked;
+
+  useEffect(() => {
+    const clusterKey = selectedCluster?.cluster_id || '';
+    const availableMdIds = (selectedCluster?.samples || [])
+      .filter((sample) => sample?.type === 'md_eval' && sample?.sample_id)
+      .map((sample) => sample.sample_id);
+    if (pottsFitSampleClusterRef.current !== clusterKey) {
+      pottsFitSampleClusterRef.current = clusterKey;
+      setPottsFitSampleIds(availableMdIds);
+      return;
+    }
+    setPottsFitSampleIds((prev) => prev.filter((sampleId) => availableMdIds.includes(sampleId)));
+  }, [selectedCluster]);
+  const showSidebar = descriptorStates.length > 0 || readyClusterRuns.length > 0;
+  const clustersUnlocked = descriptorStates.length > 0;
+  const analysisUnlocked = descriptorStates.length >= 2 || readyClusterRuns.length > 0;
+  const analysisNote = 'Static needs two descriptor-ready states; Potts uses saved cluster NPZ files.';
+  const showMetastablePanel = descriptorStates.length > 0;
   const clusterSelectableStates = useMemo(() => {
     if (Array.isArray(system?.analysis_states) && system.analysis_states.length > 0) {
       return system.analysis_states;
@@ -451,20 +464,6 @@ export default function SystemDetailPage() {
     };
   }, [activeBackmappingJobs]);
 
-  useEffect(() => {
-    if (!macroReady) {
-      setMetaChoice(null);
-      return;
-    }
-    if (analysisMode) {
-      setMetaChoice(analysisMode);
-      return;
-    }
-    if (!metaChoice && metastableStates.length > 0) {
-      setMetaChoice('metastable');
-    }
-  }, [analysisMode, macroReady, metaChoice, metastableStates.length]);
-
   const openDoc = (nextDocId = 'metastable_states') => {
     setDocId(nextDocId);
     setShowMetastableInfo(true);
@@ -477,9 +476,6 @@ export default function SystemDetailPage() {
       macroId: s.state_id,
       label: s.name,
     }));
-    if (!metastableLocked) {
-      return macroOpts;
-    }
     const metaOpts = metastableStates
       .filter((m) => m.macro_state_id)
       .map((m) => ({
@@ -489,7 +485,7 @@ export default function SystemDetailPage() {
         label: `[Meta] ${m.name || m.default_name || m.metastable_id} (${m.macro_state})`,
       }));
     return [...macroOpts, ...metaOpts];
-  }, [descriptorStates, metastableStates, metastableLocked]);
+  }, [descriptorStates, metastableStates]);
 
   useEffect(() => {
     const macroOpts = analysisStateOptions.filter((o) => o.kind === 'macro');
@@ -514,19 +510,6 @@ export default function SystemDetailPage() {
       });
     } catch (err) {
       setActionError(err.message);
-    }
-  };
-
-  const handleEnableMacroEditing = async () => {
-    setActionError(null);
-    setActionMessage('Enabling macro-state editing...');
-    try {
-      await unlockMacroStateEditing(projectId, systemId);
-      await refreshSystem();
-      setActionMessage('Macro-state editing enabled. Reconfirm states after edits.');
-    } catch (err) {
-      setActionError(err.message || 'Failed to enable macro-state editing.');
-      setActionMessage(null);
     }
   };
 
@@ -706,6 +689,12 @@ export default function SystemDetailPage() {
           payload[key] = value;
         });
       } else {
+        if (!pottsFitSampleIds.length) {
+          setPottsFitError('Select at least one MD sample to fit the Potts model.');
+          setPottsFitSubmitting(false);
+          return;
+        }
+        payload.sample_ids = pottsFitSampleIds;
         const useExistingModel = pottsFitStartMode === 'existing';
         if (useExistingModel) {
           const baseModel = pottsModels.find((model) => model.model_id === pottsFitBaseModelId);
@@ -879,6 +868,7 @@ export default function SystemDetailPage() {
       await deleteState(projectId, systemId, stateId);
       setActionMessage(`State "${name}" deleted.`);
       await refreshSystem();
+      await loadResults();
     } catch (err) {
       setActionError(err.message);
     }
@@ -944,8 +934,12 @@ export default function SystemDetailPage() {
     setMetaActionError(null);
     setMetaLoading(true);
     try {
+      if (!selectedMetastableStateId) {
+        throw new Error('Select one descriptor-ready state for metastable analysis.');
+      }
       const payload = {
         ...metaParams,
+        state_id: selectedMetastableStateId,
         k_meta_max: Math.max(metaParams.k_meta_min, metaParams.k_meta_max),
       };
       await recomputeMetastableStates(projectId, systemId, payload);
@@ -975,6 +969,7 @@ export default function SystemDetailPage() {
     setMetaActionError(null);
     try {
       await renameMetastableState(projectId, systemId, metastableId, name.trim());
+      await refreshSystem();
       await loadMetastable();
       setInfoOverlayState(null); // Close overlay after rename
     } catch (err) {
@@ -982,39 +977,21 @@ export default function SystemDetailPage() {
     }
   };
 
-  const handleConfirmMacro = async () => {
-    setActionError(null);
-    try {
-      await confirmMacroStates(projectId, systemId);
-      await refreshSystem();
-    } catch (err) {
-      setActionError(err.message);
-    }
-  };
-
-  const handleConfirmMetastable = async () => {
+  const handleDeleteMetastable = async (metastableId, name) => {
+    if (!metastableId) return;
+    if (!window.confirm(`Delete metastable state "${name}" and its files?`)) return;
     setMetaActionError(null);
     try {
-      await confirmMetastableStates(projectId, systemId);
+      await deleteMetastableState(projectId, systemId, metastableId);
+      setActionMessage(`Metastable state "${name}" deleted.`);
       await refreshSystem();
       await loadMetastable();
+      await loadResults();
+      if (infoOverlayState?.type === 'meta' && infoOverlayState?.data?.metastable_id === metastableId) {
+        setInfoOverlayState(null);
+      }
     } catch (err) {
-      setMetaActionError(err.message);
-    }
-  };
-
-  const handleConfirmMacroOnly = async () => {
-    setMetaActionError(null);
-    setMacroChoiceLoading(true);
-    try {
-      await setMacroOnlyAnalysis(projectId, systemId);
-      setMetaChoice('macro');
-      await refreshSystem();
-      await loadMetastable();
-    } catch (err) {
-      setMetaActionError(err.message);
-    } finally {
-      setMacroChoiceLoading(false);
+      setMetaActionError(err.message || 'Failed to delete metastable state.');
     }
   };
 
@@ -1255,17 +1232,6 @@ export default function SystemDetailPage() {
         </button>
         <h1 className="text-2xl font-bold text-white">{system.name}</h1>
         <p className="text-gray-400 text-sm">{system.description || 'No description provided.'}</p>
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          {macroLocked && (
-            <button
-              type="button"
-              onClick={handleEnableMacroEditing}
-              className="text-xs px-3 py-2 rounded-md border border-emerald-500 text-emerald-300 hover:bg-emerald-500/10"
-            >
-              Enable macro-state editing
-            </button>
-          )}
-        </div>
       </div>
 
       <div className={showSidebar ? 'lg:grid lg:grid-cols-[260px_1fr] gap-6' : ''}>
@@ -1273,12 +1239,10 @@ export default function SystemDetailPage() {
           <SystemDetailSidebar
             states={states}
             metastableStates={metastableStates}
-            metastableLocked={metastableLocked}
             clustersUnlocked={clustersUnlocked}
             clusterError={clusterError}
             clusterLoading={clusterLoading}
             clusterRuns={clusterRuns}
-            analysisMode={analysisMode}
             clusterJobStatus={clusterJobStatus}
             setInfoOverlayState={setInfoOverlayState}
             setPottsFitClusterId={setPottsFitClusterId}
@@ -1289,8 +1253,6 @@ export default function SystemDetailPage() {
             selectedClusterId={pottsFitClusterId}
             openDescriptorExplorer={openDescriptorExplorer}
             openDoc={openDoc}
-            handleEnableMacroEditing={handleEnableMacroEditing}
-            macroLocked={macroLocked}
             navigate={navigate}
             projectId={projectId}
             systemId={systemId}
@@ -1298,133 +1260,40 @@ export default function SystemDetailPage() {
         )}
 
         <div className="space-y-8">
-          {macroLocked && !showSidebar && (
-            <section className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-white">System Snapshot</h2>
-            {descriptorStates.length > 0 && (
-              <button
-                onClick={() => navigate(`/projects/${projectId}/systems/${systemId}/descriptors/visualize`)}
-                className="text-xs px-3 py-1 rounded-md border border-cyan-500 text-cyan-300 hover:bg-cyan-500/10"
-              >
-                Visualize descriptors
-              </button>
-            )}
-          </div>
-          <div className="grid md:grid-cols-2 gap-3">
-            <div className="bg-gray-900 border border-gray-700 rounded-md p-3">
-              <p className="text-xs text-gray-400 mb-1">Macro-states (locked)</p>
-              <ul className="space-y-1 text-sm text-gray-200">
-                {states.map((s) => (
-                  <li key={s.state_id} className="flex justify-between border-b border-gray-800 pb-1">
-                    <span>{s.name}</span>
-                    <span className="text-xs text-gray-400">
-                      {s.descriptor_file ? 'Descriptors ready' : 'No descriptors'}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-            <div className="bg-gray-900 border border-gray-700 rounded-md p-3 space-y-1">
-              <div className="flex items-center justify-between">
-                <p className="text-xs text-gray-400">Metastable states</p>
-                {metastableLocked ? (
-                  <span className="text-emerald-300 text-xs">Locked</span>
-                ) : (
-                  <span className="text-amber-300 text-xs">Editable</span>
-                )}
-              </div>
-              {metastableStates.length === 0 && (
-                <p className="text-xs text-gray-500">Not computed yet.</p>
-              )}
-              {metastableStates.length > 0 && (
-                <ul className="space-y-1 text-sm text-gray-200">
-                  {metastableStates.map((m) => (
-                    <li key={m.metastable_id || `${m.macro_state}-${m.metastable_index}`} className="flex justify-between border-b border-gray-800 pb-1">
-                      <span>{m.name || m.default_name || m.metastable_id}</span>
-                      <span className="text-xs text-gray-400">{m.macro_state}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </div>
-        </section>
-          )}
-
-          {!macroLocked && (
-            <SystemDetailMacroPanel
-              states={states}
-              systemStatus={system.status}
-              descriptorsReady={descriptorsReady}
-              handleConfirmMacro={handleConfirmMacro}
-              downloadError={downloadError}
-              actionError={actionError}
-              actionMessage={actionMessage}
-              handleDownloadStructure={handleDownloadStructure}
-              handleUploadTrajectory={handleUploadTrajectory}
-              handleDeleteTrajectory={handleDeleteTrajectory}
-              handleDeleteState={handleDeleteState}
-              uploadingState={uploadingState}
-              uploadProgress={uploadProgress}
-              processingState={processingState}
-              handleAddState={handleAddState}
-              addingState={addingState}
-            />
-          )}
-
-          {showMacroChoicePanel && (
-            <section className="bg-gray-800 border border-gray-700 rounded-lg p-4 space-y-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h2 className="text-lg font-semibold text-white">Use macro-states only (optional)</h2>
-              <p className="text-sm text-gray-400 mt-1">
-                Your macro-states are confirmed. You can proceed with static analysis using only macro-states, or run
-                the metastable algorithm manually below.
-              </p>
-            </div>
-            <InfoTooltip
-              ariaLabel="Metastable algorithm info"
-              text="Metastable discovery uses per-residue dihedral descriptors, TICA projection, and k-means clustering."
-              onClick={() => openDoc('metastable_states')}
-            />
-          </div>
-          <div className="rounded-lg border border-gray-700 bg-gray-900/60 p-4 space-y-3">
-            <p className="text-xs text-gray-400">
-              If you prefer to skip metastable discovery, confirm macro-only. Existing metastable data will be kept
-              but ignored in analyses.
-            </p>
-            <button
-              type="button"
-              onClick={handleConfirmMacroOnly}
-              disabled={macroChoiceLoading || metaChoice === 'macro'}
-              className="text-xs px-3 py-2 rounded-md border border-emerald-500 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-60"
-            >
-              {macroChoiceLoading
-                ? 'Confirming…'
-                : metaChoice === 'macro'
-                ? 'Macro-only selected'
-                : 'Use macro-states only'}
-            </button>
-            {metaActionError && <ErrorMessage message={metaActionError} />}
-          </div>
-        </section>
-          )}
+          <SystemDetailMacroPanel
+            states={states}
+            systemStatus={system.status}
+            descriptorsReady={descriptorsReady}
+            downloadError={downloadError}
+            actionError={actionError}
+            actionMessage={actionMessage}
+            handleDownloadStructure={handleDownloadStructure}
+            handleUploadTrajectory={handleUploadTrajectory}
+            handleDeleteTrajectory={handleDeleteTrajectory}
+            handleDeleteState={handleDeleteState}
+            uploadingState={uploadingState}
+            uploadProgress={uploadProgress}
+            processingState={processingState}
+            handleAddState={handleAddState}
+            addingState={addingState}
+          />
 
           {showMetastablePanel && (
             <SystemDetailMetastablePanel
-              metastableLocked={metastableLocked}
               metaLoading={metaLoading}
               metaParamsOpen={metaParamsOpen}
               setMetaParamsOpen={setMetaParamsOpen}
               metaParams={metaParams}
               setMetaParams={setMetaParams}
+              descriptorStates={descriptorStates}
+              selectedMetastableStateId={selectedMetastableStateId}
+              setSelectedMetastableStateId={setSelectedMetastableStateId}
               metaError={metaError}
               metaActionError={metaActionError}
               metastableStates={metastableStates}
               handleRunMetastable={handleRunMetastable}
-              handleConfirmMetastable={handleConfirmMetastable}
               handleRenameMetastable={handleRenameMetastable}
+              handleDeleteMetastable={handleDeleteMetastable}
               openDoc={openDoc}
               navigate={navigate}
               projectId={projectId}
@@ -1545,6 +1414,8 @@ export default function SystemDetailPage() {
               setPottsFitStartMode={setPottsFitStartMode}
               pottsFitBaseModelId={pottsFitBaseModelId}
               setPottsFitBaseModelId={setPottsFitBaseModelId}
+              pottsFitSampleIds={pottsFitSampleIds}
+              setPottsFitSampleIds={setPottsFitSampleIds}
               pottsFitExistingMode={pottsFitExistingMode}
               setPottsFitExistingMode={setPottsFitExistingMode}
               pottsDeltaBaseModelId={pottsDeltaBaseModelId}

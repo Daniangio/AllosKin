@@ -2093,9 +2093,12 @@ def prepare_lambda_sweep_batch(
     cluster_id: str,
     model_a_id: str,
     model_b_id: str,
-    md_sample_id_1: str,
-    md_sample_id_2: str,
-    md_sample_id_3: str,
+    reference_sample_id_a: str | None = None,
+    reference_sample_id_b: str | None = None,
+    comparison_sample_ids: Sequence[str] | str | None = None,
+    md_sample_id_1: str | None = None,
+    md_sample_id_2: str | None = None,
+    md_sample_id_3: str | None = None,
     series_id: str | None = None,
     series_label: str | None = None,
     lambda_count: int = 11,
@@ -2128,16 +2131,32 @@ def prepare_lambda_sweep_batch(
         raise ValueError("lambda_count must be >= 2.")
     if not (0.0 <= float(alpha) <= 1.0):
         raise ValueError("alpha must be in [0,1].")
-    if len({str(md_sample_id_1), str(md_sample_id_2), str(md_sample_id_3)}) < 3:
-        raise ValueError("md_sample_id_1/2/3 must be three distinct samples.")
+    def _normalize_ids(values: Sequence[str] | str | None) -> list[str]:
+        if values is None:
+            return []
+        if isinstance(values, str):
+            return [v.strip() for v in values.split(",") if v.strip()]
+        return [str(v).strip() for v in values if str(v).strip()]
+
+    resolved_reference_a = str(reference_sample_id_a or md_sample_id_1 or "").strip()
+    resolved_reference_b = str(reference_sample_id_b or md_sample_id_2 or "").strip()
+    resolved_comparison_ids = _normalize_ids(comparison_sample_ids)
+    if not resolved_comparison_ids:
+        legacy_c = str(md_sample_id_3 or "").strip()
+        if legacy_c:
+            resolved_comparison_ids = [legacy_c]
+
+    if not resolved_reference_a or not resolved_reference_b:
+        raise ValueError("reference_sample_id_a and reference_sample_id_b are required.")
+    if not resolved_comparison_ids:
+        raise ValueError("comparison_sample_ids must contain at least one sample id.")
+    reference_sample_ids = [resolved_reference_a, resolved_reference_b, *resolved_comparison_ids]
+    if len(set(reference_sample_ids)) != len(reference_sample_ids):
+        raise ValueError("Lambda sweep reference and comparison samples must be distinct.")
 
     data_root = Path(os.getenv("PHASE_DATA_ROOT", "/app/data"))
     store = ProjectStore(base_dir=data_root / "projects")
-    system_meta = store.get_system(project_id, system_id)
-    clusters = system_meta.metastable_clusters or []
-    entry = next((c for c in clusters if c.get("cluster_id") == cluster_id), None)
-    if not isinstance(entry, dict):
-        raise FileNotFoundError(f"Cluster '{cluster_id}' not found.")
+    entry = store.get_cluster_entry(project_id, system_id, cluster_id)
 
     models_meta = entry.get("potts_models") or []
     model_a_meta = next((m for m in models_meta if isinstance(m, dict) and m.get("model_id") == model_a_id), None)
@@ -2158,6 +2177,12 @@ def prepare_lambda_sweep_batch(
     samples_dir = cluster_dirs["samples_dir"]
     analyses_dir = cluster_dirs["cluster_dir"] / "analyses" / "lambda_sweep"
     analyses_dir.mkdir(parents=True, exist_ok=True)
+
+    existing_samples = store.list_samples(project_id, system_id, cluster_id)
+    existing_sample_ids = {str(s.get("sample_id") or "") for s in existing_samples if isinstance(s, dict)}
+    missing_samples = [sid for sid in reference_sample_ids if sid not in existing_sample_ids]
+    if missing_samples:
+        raise FileNotFoundError(f"Reference/comparison sample(s) not found on this cluster: {', '.join(missing_samples)}")
 
     model_a_name = str(model_a_meta.get("name") or model_a_id)
     model_b_name = str(model_b_meta.get("name") or model_b_id)
@@ -2316,7 +2341,10 @@ def prepare_lambda_sweep_batch(
         "model_b_name": model_b_name,
         "model_a_path": str(model_a_path),
         "model_b_path": str(model_b_path),
-        "md_sample_ids": [str(md_sample_id_1), str(md_sample_id_2), str(md_sample_id_3)],
+        "reference_sample_id_a": resolved_reference_a,
+        "reference_sample_id_b": resolved_reference_b,
+        "comparison_sample_ids": resolved_comparison_ids,
+        "reference_sample_ids": reference_sample_ids,
         "series_id": resolved_series_id,
         "series_label": resolved_series_label,
         "lambda_values": np.asarray(lambda_values, dtype=np.float32),
@@ -2468,7 +2496,7 @@ def aggregate_lambda_sweep_batch(
         model_b_ref=str(prepared["model_b_id"]),
         lambda_sample_ids=sample_ids,
         lambdas=lambda_values.tolist(),
-        ref_md_sample_ids=[str(v) for v in prepared["md_sample_ids"]],
+        reference_sample_ids=[str(v) for v in prepared["reference_sample_ids"]],
         md_label_mode=str(prepared["md_label_mode"]),
         drop_invalid=bool(prepared["drop_invalid"]),
         alpha=float(prepared["alpha"]),
@@ -2486,13 +2514,21 @@ def aggregate_lambda_sweep_batch(
         deltaE_q75=np.asarray(analysis_payload["deltaE_q75"], dtype=float),
         sample_ids=np.asarray(analysis_payload["sample_ids"], dtype=str),
         sample_names=np.asarray(analysis_payload["sample_names"], dtype=str),
+        reference_sample_ids=np.asarray(analysis_payload["reference_sample_ids"], dtype=str),
+        reference_sample_names=np.asarray(analysis_payload["reference_sample_names"], dtype=str),
+        comparison_sample_ids=np.asarray(analysis_payload["comparison_sample_ids"], dtype=str),
+        comparison_sample_names=np.asarray(analysis_payload["comparison_sample_names"], dtype=str),
         ref_md_sample_ids=np.asarray(analysis_payload["ref_md_sample_ids"], dtype=str),
         ref_md_sample_names=np.asarray(analysis_payload["ref_md_sample_names"], dtype=str),
         alpha=np.asarray([analysis_payload["alpha"]], dtype=float),
         match_ref_index=np.asarray([analysis_payload["match_ref_index"]], dtype=int),
+        comparison_ref_indices=np.asarray(analysis_payload["comparison_ref_indices"], dtype=int),
         lambda_star_index=np.asarray([analysis_payload["lambda_star_index"]], dtype=int),
         lambda_star=np.asarray([analysis_payload["lambda_star"]], dtype=float),
+        lambda_star_index_by_reference=np.asarray(analysis_payload["lambda_star_index_by_reference"], dtype=int),
+        lambda_star_by_reference=np.asarray(analysis_payload["lambda_star_by_reference"], dtype=float),
         match_min=np.asarray([analysis_payload["match_min"]], dtype=float),
+        match_min_by_reference=np.asarray(analysis_payload["match_min_by_reference"], dtype=float),
     )
 
     meta = {
@@ -2509,8 +2545,14 @@ def aggregate_lambda_sweep_batch(
         "model_a_name": str(prepared["model_a_name"]),
         "model_b_id": str(prepared["model_b_id"]),
         "model_b_name": str(prepared["model_b_name"]),
-        "md_sample_ids": [str(v) for v in prepared["md_sample_ids"]],
-        "md_sample_names": analysis_payload.get("ref_md_sample_names") or [],
+        "reference_sample_id_a": str(prepared["reference_sample_id_a"]),
+        "reference_sample_id_b": str(prepared["reference_sample_id_b"]),
+        "comparison_sample_ids": [str(v) for v in prepared["comparison_sample_ids"]],
+        "reference_sample_ids": [str(v) for v in prepared["reference_sample_ids"]],
+        "reference_sample_names": analysis_payload.get("reference_sample_names") or [],
+        "comparison_sample_names": analysis_payload.get("comparison_sample_names") or [],
+        "md_sample_ids": [str(v) for v in prepared["reference_sample_ids"]],
+        "md_sample_names": analysis_payload.get("reference_sample_names") or [],
         "md_label_mode": str(prepared["md_label_mode"]),
         "drop_invalid": bool(prepared["drop_invalid"]),
         "alpha": float(prepared["alpha"]),
@@ -2519,7 +2561,11 @@ def aggregate_lambda_sweep_batch(
         "paths": {"analysis_npz": _relativize(npz_path, system_dir)},
         "summary": {
             "lambda_star": analysis_payload.get("lambda_star"),
+            "lambda_star_index": analysis_payload.get("lambda_star_index"),
             "match_min": analysis_payload.get("match_min"),
+            "lambda_star_by_reference": [float(v) for v in np.asarray(analysis_payload["lambda_star_by_reference"], dtype=float).tolist()],
+            "lambda_star_index_by_reference": [int(v) for v in np.asarray(analysis_payload["lambda_star_index_by_reference"], dtype=int).tolist()],
+            "match_min_by_reference": [float(v) for v in np.asarray(analysis_payload["match_min_by_reference"], dtype=float).tolist()],
             "burnin_clipped": bool(burnin_clipped),
             "sample_ids": sample_ids,
             "sample_names": sample_names,

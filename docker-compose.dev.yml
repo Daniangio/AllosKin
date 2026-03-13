@@ -1,5 +1,6 @@
 # This file is for LOCAL DEVELOPMENT only.
-# It overrides settings in docker-compose.yml
+# Use it explicitly with:
+#   docker compose -f docker-compose.yaml -f docker-compose.dev.yml up
 
 services:
   backend:
@@ -10,7 +11,7 @@ services:
       # but we re-state them here for clarity.
       - ./phase:/app/phase
       - ./backend:/app/backend
-      - /scratch/docker/phase-data:/data/phase
+      - ${PHASE_DATA_ROOT:-./data}:/data/phase
 
   frontend:
     # Use the dev-specific Dockerfile

@@ -116,6 +116,8 @@ def _fit_density_peaks(
     if samples.size == 0:
         raise ValueError("No samples provided for density peaks.")
     emb, period = _angles_to_periodic(samples)
+    if emb.ndim != 2 or emb.shape[1] == 0:
+        raise ValueError("No informative dihedral dimensions available for density peaks.")
     n = emb.shape[0]
     dp_maxk = max(1, min(int(density_maxk), n - 1))
     dp_data = Data(coordinates=emb, maxk=dp_maxk, verbose=False, n_jobs=1, period=period)
@@ -196,9 +198,44 @@ def _predict_cluster_adp(
     return _coerce_labels(labels_assigned), _coerce_labels(labels_halo)
 
 
+def _effective_angle_columns(samples: np.ndarray) -> np.ndarray:
+    """
+    Select informative dihedral columns.
+
+    Missing dihedrals are encoded as all-zero columns in the descriptor arrays.
+    Those columns should not participate in clustering/prediction.
+    """
+    arr = np.asarray(samples, dtype=np.float64)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    keep: List[int] = []
+    for j in range(arr.shape[1]):
+        col = arr[:, j]
+        finite = np.isfinite(col)
+        if not np.any(finite):
+            continue
+        finite_vals = col[finite]
+        if finite_vals.size == 0:
+            continue
+        # Missing dihedrals are stored as constant 0.0 across all frames.
+        if np.all(np.abs(finite_vals) < 1e-12):
+            continue
+        keep.append(j)
+    if keep:
+        return np.asarray(keep, dtype=np.int32)
+    finite_cols = [j for j in range(arr.shape[1]) if np.any(np.isfinite(arr[:, j]))]
+    return np.asarray(finite_cols, dtype=np.int32)
+
+
 def _angles_to_periodic(samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Center angle triplets into [0, 2pi) and return periodicity vector."""
-    angles = samples[:, :3]
+    """Center informative dihedral columns into [0, 2pi) and return periodicity vector."""
+    arr = np.asarray(samples, dtype=np.float64)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    cols = _effective_angle_columns(arr)
+    if cols.size == 0:
+        return np.zeros((arr.shape[0], 0), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+    angles = arr[:, cols]
     two_pi = 2.0 * np.pi
     centered = np.mod(angles, two_pi)
     centered = np.nan_to_num(centered, nan=0.0, posinf=0.0, neginf=0.0)
@@ -207,8 +244,10 @@ def _angles_to_periodic(samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _angles_to_circular_features(samples: np.ndarray) -> np.ndarray:
-    """Map angle triplets to a wrap-safe embedding using sin/cos per angle."""
+    """Map informative dihedrals to a wrap-safe embedding using sin/cos per angle."""
     centered, _ = _angles_to_periodic(samples)
+    if centered.shape[1] == 0:
+        return np.zeros((centered.shape[0], 0), dtype=np.float64)
     sin_part = np.sin(centered)
     cos_part = np.cos(centered)
     return np.concatenate([sin_part, cos_part], axis=1).astype(np.float64, copy=False)
@@ -330,6 +369,10 @@ def _fit_hierarchical_frozen_gmm(
         return empty, empty, 0, {"algorithm": "hierarchical_gmm"}, 0, model
 
     features = _angles_to_circular_features(samples)
+    if features.ndim != 2 or features.shape[1] == 0:
+        empty = np.full((samples.shape[0],), -1, dtype=np.int32)
+        model = {"kind": "frozen_gmm", "feature_space": "sin_cos_dihedrals_v2", "means": [], "covariances": [], "weights": []}
+        return empty, empty, 0, {"algorithm": "hierarchical_gmm", "reason": "no_informative_dimensions"}, 0, model
     n_frames = features.shape[0]
     if max_cluster_frames and max_cluster_frames > 0 and n_frames > int(max_cluster_frames):
         sub_idx = (
@@ -405,7 +448,7 @@ def _fit_hierarchical_frozen_gmm(
 
     model = {
         "kind": "frozen_gmm",
-        "feature_space": "sin_cos_3angles_v1",
+        "feature_space": "sin_cos_dihedrals_v2",
         "covariance_type": cov_kind,
         "cluster_selection_mode": selection_mode,
         "inconsistent_threshold": float(inconsistent_threshold) if inconsistent_threshold is not None else None,
@@ -499,8 +542,8 @@ def _cluster_residue_samples(
         )
     if samples.ndim == 1:
         samples = samples.reshape(1, -1)
-    if samples.ndim != 2 or samples.shape[1] < 3:
-        raise ValueError("Residue samples must be (n_frames, >=3) shaped.")
+    if samples.ndim != 2 or samples.shape[1] < 1:
+        raise ValueError("Residue samples must be (n_frames, >=1) shaped.")
 
     dp_data, labels_assigned, labels_halo, k_final, diagnostics = _fit_density_peaks(
         samples,
@@ -749,15 +792,11 @@ def _extract_angles_array(features: Dict[str, Any], key: str) -> Optional[np.nda
         return None
     arr = np.asarray(arr)
     if arr.ndim >= 3:
-        arr = arr[:, 0, :3]
+        arr = arr[:, 0, :]
     elif arr.ndim == 2:
-        arr = arr[:, :3]
+        arr = arr[:, :]
     elif arr.ndim == 1:
         arr = arr.reshape(-1, 1)
-    if arr.shape[1] < 3:
-        padded = np.zeros((arr.shape[0], 3), dtype=float)
-        padded[:, : arr.shape[1]] = arr
-        arr = padded
     return np.asarray(arr, dtype=float)
 
 
@@ -1106,8 +1145,8 @@ def evaluate_state_with_models(
         if key not in feature_dict:
             raise ValueError(f"Descriptor missing residue key '{key}'.")
         arr = feature_dict[key]
-        if arr.ndim != 3 or arr.shape[2] < 3:
-            raise ValueError(f"Descriptor for '{key}' must be (n_frames, 1, >=3).")
+        if arr.ndim != 3 or arr.shape[2] < 1:
+            raise ValueError(f"Descriptor for '{key}' must be (n_frames, 1, >=1).")
         samples = np.asarray(arr[:, 0, :], dtype=float)
         if n_frames is None:
             n_frames = samples.shape[0]
@@ -2090,18 +2129,12 @@ def _collect_cluster_inputs(
                             f"Descriptor array for '{key}' is missing or misaligned in state '{state.state_id}'."
                         )
                     if arr.ndim >= 3:
-                        vec = arr[idx, 0, :3]
+                        vec = arr[idx, 0, :]
                     elif arr.ndim == 2:
-                        vec = arr[idx, :3]
+                        vec = arr[idx, :]
                     else:
                         vec = arr[idx : idx + 1]
                     vec = np.asarray(vec, dtype=float).reshape(-1)
-                    if vec.size < 3:
-                        padded = np.zeros(3, dtype=float)
-                        padded[: vec.size] = vec
-                        vec = padded
-                    else:
-                        vec = vec[:3]
                     merged_angles_per_residue[col].append(vec)
                 matched_frames += 1
 
@@ -2800,18 +2833,12 @@ def generate_cluster_npz_from_descriptors(
                         f"Descriptor array for '{key}' is missing or misaligned in '{state_id}'."
                     )
                 if arr.ndim >= 3:
-                    vec = arr[idx, 0, :3]
+                    vec = arr[idx, 0, :]
                 elif arr.ndim == 2:
-                    vec = arr[idx, :3]
+                    vec = arr[idx, :]
                 else:
                     vec = arr[idx : idx + 1]
                 vec = np.asarray(vec, dtype=float).reshape(-1)
-                if vec.size < 3:
-                    padded = np.zeros(3, dtype=float)
-                    padded[: vec.size] = vec
-                    vec = padded
-                else:
-                    vec = vec[:3]
                 merged_angles_per_residue[col].append(vec)
 
     merged_frame_count = len(merged_frame_state_ids)

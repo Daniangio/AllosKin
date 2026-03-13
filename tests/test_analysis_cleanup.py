@@ -11,10 +11,22 @@ from backend.api.v1 import analysis_cleanup
 
 
 class _FakeStore:
-    def __init__(self, cluster_dir: Path, sample_ids: list[str], model_ids: list[str] | None = None):
+    def __init__(
+        self,
+        cluster_dir: Path,
+        sample_ids: list[str],
+        model_ids: list[str] | None = None,
+        *,
+        state_ids: list[str] | None = None,
+        metastable_ids: list[str] | None = None,
+        base_dir: Path | None = None,
+    ):
         self._cluster_dir = cluster_dir
         self._sample_ids = sample_ids
         self._model_ids = model_ids or []
+        self._state_ids = state_ids or []
+        self._metastable_ids = metastable_ids or []
+        self.base_dir = base_dir or cluster_dir.parent
 
     def ensure_cluster_directories(self, project_id: str, system_id: str, cluster_id: str):
         return {"cluster_dir": self._cluster_dir}
@@ -24,6 +36,17 @@ class _FakeStore:
 
     def list_potts_models(self, project_id: str, system_id: str, cluster_id: str):
         return [{"model_id": mid} for mid in self._model_ids]
+
+    def get_system(self, project_id: str, system_id: str):
+        return SimpleNamespace(
+            states={sid: object() for sid in self._state_ids},
+            metastable_states=[{"metastable_id": mid} for mid in self._metastable_ids],
+            system_id=system_id,
+            project_id=project_id,
+        )
+
+    def resolve_path(self, project_id: str, system_id: str, rel_path: str):
+        return (self.base_dir / project_id / "systems" / system_id / rel_path).resolve()
 
 
 def _write_analysis(root: Path, analysis_type: str, analysis_id: str, meta: dict):
@@ -113,3 +136,80 @@ def test_cleanup_orphan_cluster_analyses_removes_delta_js_if_all_tracked_samples
 
     assert removed == 1
     assert not (cluster_dir / "analyses" / "delta_js" / "djs2").exists()
+
+
+def test_cleanup_orphan_cluster_analyses_removes_analysis_with_missing_state_refs(monkeypatch, tmp_path):
+    cluster_dir = tmp_path / "cluster"
+    _write_analysis(
+        cluster_dir,
+        "delta_js",
+        "djs3",
+        {
+            "analysis_type": "delta_js",
+            "analysis_id": "djs3",
+            "model_a_id": "ma",
+            "model_b_id": "mb",
+            "contact_state_ids": ["state_ok", "state_missing"],
+            "summary": {"sample_ids": ["keep_me"]},
+        },
+    )
+    monkeypatch.setattr(
+        analysis_cleanup,
+        "project_store",
+        _FakeStore(
+            cluster_dir=cluster_dir,
+            sample_ids=["keep_me"],
+            model_ids=["ma", "mb"],
+            state_ids=["state_ok"],
+        ),
+    )
+
+    removed = analysis_cleanup.cleanup_orphan_cluster_analyses("p", "s", "c")
+
+    assert removed == 1
+    assert not (cluster_dir / "analyses" / "delta_js" / "djs3").exists()
+
+
+def test_cleanup_state_linked_results_removes_jobs_referencing_missing_states(monkeypatch, tmp_path):
+    project_id = "proj"
+    system_id = "sys"
+    system_dir = tmp_path / project_id / "systems" / system_id
+    jobs_dir = system_dir / "results" / "jobs"
+    artifact_dir = system_dir / "results" / "ligand_completion" / "job-1"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "dummy.txt").write_text("x", encoding="utf-8")
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "analysis_type": "ligand_completion",
+        "system_reference": {
+            "project_id": project_id,
+            "system_id": system_id,
+            "states": {
+                "state_a": {"id": "state_ok"},
+                "state_b": {"id": "meta_missing"},
+            },
+        },
+        "results": {
+            "results_dir": f"projects/{project_id}/systems/{system_id}/results/ligand_completion/job-1",
+        },
+    }
+    (jobs_dir / "job-1.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    monkeypatch.setattr(
+        analysis_cleanup,
+        "project_store",
+        _FakeStore(
+            cluster_dir=tmp_path / "cluster",
+            sample_ids=[],
+            model_ids=[],
+            state_ids=["state_ok"],
+            metastable_ids=["meta_ok"],
+            base_dir=tmp_path,
+        ),
+    )
+
+    removed = analysis_cleanup.cleanup_state_linked_results(project_id, system_id)
+
+    assert removed == 1
+    assert not (jobs_dir / "job-1.json").exists()
+    assert not artifact_dir.exists()

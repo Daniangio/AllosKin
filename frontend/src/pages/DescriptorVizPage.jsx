@@ -25,6 +25,7 @@ const colors = [
   '#60a5fa',
   '#f59e0b',
 ];
+const DEFAULT_DIHEDRAL_KEYS = ['phi', 'psi', 'omega', 'chi1', 'chi2'];
 
 function pieColor(idx) {
   const hue = (idx * 137.507764) % 360;
@@ -86,6 +87,9 @@ export default function DescriptorVizPage() {
   const [selectedResidue, setSelectedResidue] = useState('');
   const [residueOptions, setResidueOptions] = useState([]);
   const [residueLabelCache, setResidueLabelCache] = useState({});
+  const [axisX, setAxisX] = useState('phi');
+  const [axisY, setAxisY] = useState('psi');
+  const [axisZ, setAxisZ] = useState('omega');
 
   const sortResidues = useCallback((keys) => {
     const unique = Array.from(new Set(keys || [])).filter((k) => k.startsWith('res_'));
@@ -131,7 +135,9 @@ export default function DescriptorVizPage() {
   const axisLabel = useCallback((key) => {
     if (key === 'phi') return 'Phi';
     if (key === 'psi') return 'Psi';
+    if (key === 'omega') return 'Omega';
     if (key === 'chi1') return 'Chi1';
+    if (key === 'chi2') return 'Chi2';
     return String(key || '');
   }, []);
 
@@ -438,7 +444,7 @@ export default function DescriptorVizPage() {
             `Residue: ${residueLabel(residueKey)}<br>State: ${macroLabel}` +
             metaHover +
             (axes.zKey
-              ? '<br>Phi: %{x:.2f}°<br>Psi: %{y:.2f}°<br>Chi1: %{z:.2f}°'
+              ? `<br>${axisLabel(axes.xKey)}: %{x:.2f}°<br>${axisLabel(axes.yKey)}: %{y:.2f}°<br>${axisLabel(axes.zKey)}: %{z:.2f}°`
               : `<br>${axisLabel(axes.xKey)}: %{x:.2f}°<br>${axisLabel(axes.yKey)}: %{y:.2f}°`) +
             (clusterHover ? '<br>Cluster: %{customdata}' : '') +
             '<extra></extra>',
@@ -459,6 +465,30 @@ export default function DescriptorVizPage() {
       normalizeClusterId,
     ]
   );
+
+  const dihedralKeys = useMemo(() => {
+    const merged = new Set();
+    Object.values(metaByState || {}).forEach((meta) => {
+      (meta?.dihedral_keys || []).forEach((key) => merged.add(String(key)));
+    });
+    if (!merged.size) {
+      DEFAULT_DIHEDRAL_KEYS.forEach((key) => merged.add(key));
+    }
+    return DEFAULT_DIHEDRAL_KEYS.filter((key) => merged.has(key));
+  }, [metaByState]);
+
+  useEffect(() => {
+    if (!dihedralKeys.length) return;
+    setAxisX((prev) => (dihedralKeys.includes(prev) ? prev : dihedralKeys[0]));
+    setAxisY((prev) => {
+      if (dihedralKeys.includes(prev)) return prev;
+      return dihedralKeys.find((key) => key !== axisX) || dihedralKeys[0];
+    });
+    setAxisZ((prev) => {
+      if (dihedralKeys.includes(prev)) return prev;
+      return dihedralKeys.find((key) => key !== axisX && key !== axisY) || dihedralKeys[0];
+    });
+  }, [axisX, axisY, dihedralKeys]);
 
 
   const selectResidue = (key) => {
@@ -548,6 +578,7 @@ export default function DescriptorVizPage() {
         newAngles[stateId] = data.angles || {};
         newMeta[stateId] = {
           residue_keys: data.residue_keys || [],
+          dihedral_keys: data.dihedral_keys || DEFAULT_DIHEDRAL_KEYS,
           residue_mapping: data.residue_mapping || {},
           residue_labels: data.residue_labels || {},
           n_frames: data.n_frames,
@@ -820,7 +851,7 @@ export default function DescriptorVizPage() {
         const data = perState[key];
         if (!data) return;
         traces.push(
-          ...buildGroupedTraces(stateId, key, data, { xKey: 'phi', yKey: 'psi', zKey: 'chi1' })
+          ...buildGroupedTraces(stateId, key, data, { xKey: axisX, yKey: axisY, zKey: axisZ })
         );
       });
     });
@@ -841,7 +872,7 @@ export default function DescriptorVizPage() {
       });
     }
     return traces;
-  }, [anglesByState, buildGroupedTraces, clusterColorMap, clusterLegend, selectedResidue, selectedStates]);
+  }, [anglesByState, axisX, axisY, axisZ, buildGroupedTraces, clusterColorMap, clusterLegend, selectedResidue, selectedStates]);
 
   const make2DTraces = useCallback(
     (axisX, axisY) =>
@@ -1018,7 +1049,7 @@ export default function DescriptorVizPage() {
         <div>
           <h1 className="text-2xl font-bold text-white">Descriptor Explorer</h1>
           <p className="text-sm text-gray-400">
-            Visualize per-residue phi/psi/chi1 angles. Data are down-sampled for plotting.
+            Visualize per-residue dihedral angles (phi, psi, omega, chi1, chi2). Data are down-sampled for plotting.
           </p>
         </div>
         <div className="flex items-start gap-3">
@@ -1289,6 +1320,31 @@ export default function DescriptorVizPage() {
             {hasAngles && (
               <div className="space-y-4">
                 <div className="bg-gray-800 border border-gray-700 rounded-lg p-3">
+                  <div className="grid md:grid-cols-3 gap-3">
+                    {[
+                      { label: 'X axis', value: axisX, setter: setAxisX },
+                      { label: 'Y axis', value: axisY, setter: setAxisY },
+                      { label: 'Z axis', value: axisZ, setter: setAxisZ },
+                    ].map((entry) => (
+                      <div key={entry.label}>
+                        <label className="block text-xs text-gray-400 mb-1">{entry.label}</label>
+                        <select
+                          value={entry.value}
+                          onChange={(e) => entry.setter(e.target.value)}
+                          className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
+                        >
+                          {dihedralKeys.map((key) => (
+                            <option key={`${entry.label}:${key}`} value={key}>
+                              {axisLabel(key)}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="bg-gray-800 border border-gray-700 rounded-lg p-3">
                   <Plot
                     data={traces3d}
                     layout={{
@@ -1297,9 +1353,9 @@ export default function DescriptorVizPage() {
                       plot_bgcolor: '#111827',
                       font: { color: '#e5e7eb' },
                       scene: {
-                        xaxis: { title: 'Phi (°)', range: [-180, 180] },
-                        yaxis: { title: 'Psi (°)', range: [-180, 180] },
-                        zaxis: { title: 'Chi1 (°)', range: [-180, 180] },
+                        xaxis: { title: `${axisLabel(axisX)} (°)`, range: [-180, 180] },
+                        yaxis: { title: `${axisLabel(axisY)} (°)`, range: [-180, 180] },
+                        zaxis: { title: `${axisLabel(axisZ)} (°)`, range: [-180, 180] },
                         aspectmode: 'cube',
                       },
                       margin: { l: 0, r: 0, t: 10, b: 0 },
@@ -1313,9 +1369,9 @@ export default function DescriptorVizPage() {
 
                 <div className="grid md:grid-cols-3 gap-3">
                   {[
-                    { x: 'phi', y: 'psi', title: 'Phi vs Psi' },
-                    { x: 'phi', y: 'chi1', title: 'Phi vs Chi1' },
-                    { x: 'psi', y: 'chi1', title: 'Psi vs Chi1' },
+                    { x: axisX, y: axisY, title: `${axisLabel(axisX)} vs ${axisLabel(axisY)}` },
+                    { x: axisX, y: axisZ, title: `${axisLabel(axisX)} vs ${axisLabel(axisZ)}` },
+                    { x: axisY, y: axisZ, title: `${axisLabel(axisY)} vs ${axisLabel(axisZ)}` },
                   ].map((axes) => (
                     <div key={axes.title} className="bg-gray-800 border border-gray-700 rounded-lg p-3">
                       <Plot

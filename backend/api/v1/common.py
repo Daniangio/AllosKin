@@ -101,16 +101,6 @@ def get_state_or_404(system_meta: SystemMetadata, state_id: str) -> DescriptorSt
     return state
 
 
-def ensure_not_macro_locked(system_meta: SystemMetadata):
-    if getattr(system_meta, "macro_locked", False):
-        raise HTTPException(status_code=400, detail="System macro-states are locked; no further edits allowed.")
-
-
-def ensure_not_metastable_locked(system_meta: SystemMetadata):
-    if getattr(system_meta, "metastable_locked", False):
-        raise HTTPException(status_code=400, detail="Metastable states are locked; recomputation is disabled.")
-
-
 async def build_state_descriptors(
     project_id: str,
     system_meta: SystemMetadata,

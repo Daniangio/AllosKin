@@ -1204,7 +1204,8 @@ def compute_lambda_sweep_analysis(
     model_b_ref: str,
     lambda_sample_ids: Sequence[str],
     lambdas: Sequence[float],
-    ref_md_sample_ids: Sequence[str],
+    reference_sample_ids: Sequence[str] | None = None,
+    ref_md_sample_ids: Sequence[str] | None = None,
     md_label_mode: str = "assigned",
     drop_invalid: bool = True,
     alpha: float = 0.5,
@@ -1216,15 +1217,16 @@ def compute_lambda_sweep_analysis(
     Given endpoint models A/B (λ=1 and λ=0) and a series of sampled ensembles from E_λ,
     compute:
       - ΔE(s) = E_A(s) - E_B(s): mean + IQR vs λ (order parameter)
-      - Node/edge JS divergence vs 3 reference MD ensembles, as curves vs λ
-      - Combined match curve D(λ) to the 3rd reference: α*JS_node_mean + (1-α)*JS_edge_mean
+      - Node/edge JS divergence vs flexible reference/comparison ensembles, as curves vs λ
+      - Combined match curves D(λ) to each comparison reference: α*JS_node_mean + (1-α)*JS_edge_mean
 
     Returns a dict of arrays ready to be persisted into analysis.npz plus metadata helpers.
     """
     if len(lambda_sample_ids) != len(lambdas):
         raise ValueError("lambda_sample_ids and lambdas must have the same length.")
-    if len(ref_md_sample_ids) != 3:
-        raise ValueError("ref_md_sample_ids must contain exactly 3 sample ids.")
+    reference_sample_ids = [str(v).strip() for v in (reference_sample_ids or ref_md_sample_ids or []) if str(v).strip()]
+    if len(reference_sample_ids) < 3:
+        raise ValueError("reference_sample_ids must contain at least 3 sample ids (A, B, and one comparison).")
     alpha = float(alpha)
     if not np.isfinite(alpha) or alpha < 0.0 or alpha > 1.0:
         raise ValueError("alpha must be in [0,1].")
@@ -1315,21 +1317,19 @@ def compute_lambda_sweep_analysis(
 
     # Precompute reference ensemble distributions (marginals + edge joints).
     ref_entries: list[dict[str, Any]] = []
-    ref_labels: list[np.ndarray] = []
     ref_marginals: list[list[np.ndarray]] = []
     ref_p2_flat: list[np.ndarray] = []
     ref_names: list[str] = []
 
-    for sid in ref_md_sample_ids:
+    for sid in reference_sample_ids:
         entry = next((s for s in samples if s.get("sample_id") == sid), None)
         if not entry:
-            raise FileNotFoundError(f"Reference MD sample not found: {sid}")
+            raise FileNotFoundError(f"Reference sample not found: {sid}")
         ref_entries.append(entry)
         ref_names.append(str(entry.get("name") or sid))
-        X_ref = _load_labels(entry, md_mode=True)
+        X_ref = _load_labels(entry, md_mode=str(entry.get("type") or "") == "md_eval")
         if X_ref.ndim != 2 or X_ref.size == 0:
-            raise ValueError(f"Reference MD sample is empty: {sid}")
-        ref_labels.append(X_ref)
+            raise ValueError(f"Reference sample is empty: {sid}")
         ref_marginals.append(marginals(X_ref, K))
         if edges and max_k > 0:
             ref_p2_flat.append(_pairwise_joints_flat_on_edges(X_ref, edges, max_k=max_k, chunk_edges=edge_chunk))
@@ -1342,7 +1342,7 @@ def compute_lambda_sweep_analysis(
     sample_ids_sorted = [str(lambda_sample_ids[i]) for i in order.tolist()]
 
     n_lambda = len(sample_ids_sorted)
-    n_ref = 3
+    n_ref = len(reference_sample_ids)
 
     node_js_mean = np.full((n_ref, n_lambda), np.nan, dtype=float)
     edge_js_mean = np.full((n_ref, n_lambda), np.nan, dtype=float)
@@ -1392,13 +1392,24 @@ def compute_lambda_sweep_analysis(
                 edge_js_mean[i, j] = 0.0
             combined[i, j] = alpha * node_js_mean[i, j] + (1.0 - alpha) * edge_js_mean[i, j]
 
-    match_ref_index = 2  # the "third" reference is the comparison ensemble
-    match_curve = combined[match_ref_index]
-    finite_mask = np.isfinite(match_curve)
-    if finite_mask.any():
-        best_idx = int(np.nanargmin(match_curve))
-        best_lambda = float(lambdas_sorted[best_idx])
-        best_value = float(match_curve[best_idx])
+    comparison_ref_indices = np.asarray(list(range(2, n_ref)), dtype=int)
+    lambda_star_index_by_reference = np.full((comparison_ref_indices.shape[0],), -1, dtype=int)
+    lambda_star_by_reference = np.full((comparison_ref_indices.shape[0],), np.nan, dtype=float)
+    match_min_by_reference = np.full((comparison_ref_indices.shape[0],), np.nan, dtype=float)
+    for out_idx, ref_idx in enumerate(comparison_ref_indices.tolist()):
+        match_curve = combined[ref_idx]
+        finite_mask = np.isfinite(match_curve)
+        if finite_mask.any():
+            best_idx = int(np.nanargmin(match_curve))
+            lambda_star_index_by_reference[out_idx] = best_idx
+            lambda_star_by_reference[out_idx] = float(lambdas_sorted[best_idx])
+            match_min_by_reference[out_idx] = float(match_curve[best_idx])
+
+    match_ref_index = int(comparison_ref_indices[0]) if comparison_ref_indices.size else -1
+    if comparison_ref_indices.size:
+        best_idx = int(lambda_star_index_by_reference[0])
+        best_lambda = float(lambda_star_by_reference[0])
+        best_value = float(match_min_by_reference[0])
     else:
         best_idx = -1
         best_lambda = float("nan")
@@ -1411,7 +1422,11 @@ def compute_lambda_sweep_analysis(
         "model_b_id": model_b_id,
         "model_b_name": model_b_name,
         "model_b_path": model_b_path,
-        "ref_md_sample_ids": list(ref_md_sample_ids),
+        "reference_sample_ids": list(reference_sample_ids),
+        "reference_sample_names": ref_names,
+        "comparison_sample_ids": list(reference_sample_ids[2:]),
+        "comparison_sample_names": ref_names[2:],
+        "ref_md_sample_ids": list(reference_sample_ids),
         "ref_md_sample_names": ref_names,
         "md_label_mode": md_label_mode,
         "drop_invalid": bool(drop_invalid),
@@ -1427,9 +1442,13 @@ def compute_lambda_sweep_analysis(
         "deltaE_q25": np.asarray(deltaE_q25, dtype=float),
         "deltaE_q75": np.asarray(deltaE_q75, dtype=float),
         "match_ref_index": int(match_ref_index),
+        "comparison_ref_indices": np.asarray(comparison_ref_indices, dtype=int),
         "lambda_star_index": int(best_idx),
         "lambda_star": float(best_lambda),
         "match_min": float(best_value),
+        "lambda_star_index_by_reference": np.asarray(lambda_star_index_by_reference, dtype=int),
+        "lambda_star_by_reference": np.asarray(lambda_star_by_reference, dtype=float),
+        "match_min_by_reference": np.asarray(match_min_by_reference, dtype=float),
     }
 
 

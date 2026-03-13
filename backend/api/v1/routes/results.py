@@ -10,7 +10,10 @@ import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Response, UploadFile, File, Form
 from fastapi.responses import FileResponse
 
-from backend.api.v1.analysis_cleanup import cleanup_orphan_analyses_all_systems
+from backend.api.v1.analysis_cleanup import (
+    cleanup_orphan_analyses_all_systems,
+    cleanup_state_linked_artifacts_all_systems,
+)
 from backend.api.v1.common import DATA_ROOT, get_cluster_entry, project_store, stream_upload
 
 
@@ -1084,6 +1087,7 @@ async def cleanup_results(include_tmp: bool = Query(True)):
     empty_removed = _cleanup_empty_result_dirs()
     orphan_removed = _cleanup_orphan_simulation_results()
     orphan_analysis_removed = cleanup_orphan_analyses_all_systems()
+    state_cleanup = cleanup_state_linked_artifacts_all_systems()
     tmp_removed = 0
     tmp_root_value = None
     if include_tmp:
@@ -1099,6 +1103,7 @@ async def cleanup_results(include_tmp: bool = Query(True)):
         "empty_result_dirs_removed": empty_removed,
         "orphan_simulation_results_removed": orphan_removed,
         "orphan_cluster_analyses_removed": orphan_analysis_removed,
+        "state_linked_results_removed": state_cleanup.get("results_removed", 0),
         "tmp_artifacts_removed": tmp_removed,
         "tmp_root": tmp_root_value,
     }

@@ -356,13 +356,6 @@ export function rescanSystemStates(projectId, systemId) {
   });
 }
 
-export function unlockMacroStateEditing(projectId, systemId) {
-  return requestJSON(`/projects/${projectId}/systems/${systemId}/states/unlock-editing`, {
-    method: 'POST',
-  });
-}
-
-
 export function renameState(projectId, systemId, stateId, name) {
   return requestJSON(`/projects/${projectId}/systems/${systemId}/states/${stateId}`, {
     method: 'PATCH',
@@ -396,6 +389,7 @@ export function fetchMetastableStates(projectId, systemId) {
 
 export function recomputeMetastableStates(projectId, systemId, params = {}) {
   const qs = new URLSearchParams();
+  if (params.state_id) qs.set('state_id', params.state_id);
   if (params.n_microstates) qs.set('n_microstates', params.n_microstates);
   if (params.k_meta_min) qs.set('k_meta_min', params.k_meta_min);
   if (params.k_meta_max) qs.set('k_meta_max', params.k_meta_max);
@@ -414,16 +408,16 @@ export function clearMetastableStates(projectId, systemId) {
   });
 }
 
-export function setMacroOnlyAnalysis(projectId, systemId) {
-  return requestJSON(`/projects/${projectId}/systems/${systemId}/analysis/macro`, {
-    method: 'POST',
-  });
-}
-
 export function renameMetastableState(projectId, systemId, metastableId, name) {
   return requestJSON(`/projects/${projectId}/systems/${systemId}/metastable/${encodeURIComponent(metastableId)}`, {
     method: 'PATCH',
     body: { name },
+  });
+}
+
+export function deleteMetastableState(projectId, systemId, metastableId) {
+  return requestJSON(`/projects/${projectId}/systems/${systemId}/metastable/${encodeURIComponent(metastableId)}`, {
+    method: 'DELETE',
   });
 }
 
@@ -593,14 +587,6 @@ export function renameMetastableCluster(projectId, systemId, clusterId, name) {
     method: 'PATCH',
     body: { name },
   });
-}
-
-export function confirmMacroStates(projectId, systemId) {
-  return requestJSON(`/projects/${projectId}/systems/${systemId}/states/confirm`, { method: 'POST' });
-}
-
-export function confirmMetastableStates(projectId, systemId) {
-  return requestJSON(`/projects/${projectId}/systems/${systemId}/metastable/confirm`, { method: 'POST' });
 }
 
 export function downloadSavedCluster(projectId, systemId, clusterId) {

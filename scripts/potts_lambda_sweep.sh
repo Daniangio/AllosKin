@@ -31,6 +31,17 @@ trim() {
   printf "%s" "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
+sample_id_from_row() {
+  local row="$1"
+  local p
+  p="$(printf "%s" "$row" | awk -F'|' '{print $4}')"
+  p="$(trim "$p")"
+  if [ -z "$p" ]; then
+    return 1
+  fi
+  basename "$(dirname "$p")"
+}
+
 OFFLINE_ROOT=""
 OFFLINE_PROJECT_ID=""
 OFFLINE_SYSTEM_ID=""
@@ -119,32 +130,50 @@ fi
 
 SAMPLE_LINES="$(_offline_list list-sampling --project-id "$OFFLINE_PROJECT_ID" --system-id "$OFFLINE_SYSTEM_ID" || true)"
 SAMPLE_LINES="$(printf "%s\n" "$SAMPLE_LINES" | awk -F'|' -v cid="$CLUSTER_ID" '$1==cid')"
-MD_LINES="$(printf "%s\n" "$SAMPLE_LINES" | awk -F'|' '$3=="md_eval"')"
-if [ -z "$(trim "$MD_LINES")" ]; then
-  echo "No MD samples (md_eval) found in this cluster. Run \"Recompute MD samples\" first."
+if [ -z "$(trim "$SAMPLE_LINES")" ]; then
+  echo "No samples found in this cluster."
   exit 1
 fi
 echo ""
-echo "Select 3 MD reference samples (these define the comparison targets):"
-MD_ROWS="$(offline_choose_multi "Available MD samples:" "$MD_LINES")"
-MD_IDS=()
+echo "Select reference sample A (endpoint A anchor):"
+REF_A_ROW="$(offline_choose_one "Available samples:" "$SAMPLE_LINES")"
+REF_A_ID="$(sample_id_from_row "$REF_A_ROW" || true)"
+if [ -z "$REF_A_ID" ]; then
+  echo "Failed to resolve reference sample A."
+  exit 1
+fi
 
-# offline_choose_multi returns full rows; list-sampling columns are: cluster_id|name|type|path
-# We need sample_id, so query via project store in python after selecting by name+path is messy.
-# Instead, use the sample directory name from the 'path' column (clusters/.../samples/<id>/sample.npz).
+AVAILABLE_FOR_B="$(printf "%s\n" "$SAMPLE_LINES" | grep -F -v "$REF_A_ROW" || true)"
+if [ -z "$(trim "$AVAILABLE_FOR_B")" ]; then
+  echo "Need at least two distinct samples."
+  exit 1
+fi
+echo ""
+echo "Select reference sample B (endpoint B anchor):"
+REF_B_ROW="$(offline_choose_one "Available samples:" "$AVAILABLE_FOR_B")"
+REF_B_ID="$(sample_id_from_row "$REF_B_ROW" || true)"
+if [ -z "$REF_B_ID" ]; then
+  echo "Failed to resolve reference sample B."
+  exit 1
+fi
+
+AVAILABLE_FOR_COMPARE="$(printf "%s\n" "$AVAILABLE_FOR_B" | grep -F -v "$REF_B_ROW" || true)"
+if [ -z "$(trim "$AVAILABLE_FOR_COMPARE")" ]; then
+  echo "Need at least one comparison sample beyond the two references."
+  exit 1
+fi
+echo ""
+echo "Select one or more comparison samples:"
+COMPARE_ROWS="$(offline_choose_multi "Available comparison samples:" "$AVAILABLE_FOR_COMPARE")"
+COMPARE_IDS=()
 while IFS= read -r row; do
   [ -z "$row" ] && continue
-  p="$(printf "%s" "$row" | awk -F'|' '{print $4}')"
-  p="$(trim "$p")"
-  if [ -z "$p" ]; then
-    continue
-  fi
-  base="$(basename "$(dirname "$p")")"
-  MD_IDS+=("$base")
-done <<< "$MD_ROWS"
-
-if [ "${#MD_IDS[@]}" -ne 3 ]; then
-  echo "Please select exactly 3 MD samples (selected: ${#MD_IDS[@]})."
+  sid="$(sample_id_from_row "$row" || true)"
+  [ -z "$sid" ] && continue
+  COMPARE_IDS+=("$sid")
+done <<< "$COMPARE_ROWS"
+if [ "${#COMPARE_IDS[@]}" -lt 1 ]; then
+  echo "Please select at least one comparison sample."
   exit 1
 fi
 
@@ -217,9 +246,8 @@ CMD=(
   --cluster-id "$CLUSTER_ID"
   --model-a-id "$MODEL_A_ID"
   --model-b-id "$MODEL_B_ID"
-  --md-sample-id-1 "${MD_IDS[0]}"
-  --md-sample-id-2 "${MD_IDS[1]}"
-  --md-sample-id-3 "${MD_IDS[2]}"
+  --reference-sample-id-a "$REF_A_ID"
+  --reference-sample-id-b "$REF_B_ID"
   --md-label-mode "$MD_LABEL_MODE"
   --lambda-count "$LAMBDA_COUNT"
   --alpha "$ALPHA"
@@ -260,12 +288,18 @@ else
   )
 fi
 
+for sid in "${COMPARE_IDS[@]}"; do
+  CMD+=(--comparison-sample-id "$sid")
+done
+
 echo ""
 echo "Running lambda sweep..."
 echo "  cluster: $CLUSTER_ID"
 echo "  model B (λ=0): ${MODEL_B_NAME:-$MODEL_B_ID} (${MODEL_B_ID})"
 echo "  model A (λ=1): ${MODEL_A_NAME:-$MODEL_A_ID} (${MODEL_A_ID})"
-echo "  MD refs: ${MD_IDS[*]}"
+echo "  reference A: $REF_A_ID"
+echo "  reference B: $REF_B_ID"
+echo "  comparisons: ${COMPARE_IDS[*]}"
 echo ""
 
 exec "${CMD[@]}"

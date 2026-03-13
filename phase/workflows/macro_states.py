@@ -18,6 +18,24 @@ _RESIDUE_KEY_PATTERN = re.compile(r"^res_(-?\d+(?:_-?\d+)*)$")
 _RESID_SELECTION_PATTERN = re.compile(r"\bresid\s+((?:-?\d+\s*)+)")
 
 
+def _slugify_state_storage_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower()).strip("_")
+
+
+def allocate_state_storage_key(system_meta: SystemMetadata, state_name: str, fallback: str) -> str:
+    existing = {
+        str(getattr(state, "storage_key", None) or getattr(state, "state_id", sid))
+        for sid, state in (system_meta.states or {}).items()
+    }
+    base = _slugify_state_storage_key(state_name) or _slugify_state_storage_key(fallback) or str(fallback)
+    candidate = base
+    idx = 2
+    while candidate in existing:
+        candidate = f"{base}_{idx}"
+        idx += 1
+    return candidate
+
+
 def _shift_residue_key(key: str, resid_shift: int) -> str:
     if resid_shift == 0:
         return key
@@ -135,7 +153,7 @@ def _build_state_artifacts(
     *,
     traj_path: Path,
     pdb_path: Path,
-    descriptors_dir: Path,
+    state_dir: Path,
     slice_spec: Optional[str],
     resid_shift: int,
     state_id: str,
@@ -154,11 +172,12 @@ def _build_state_artifacts(
         resid_shift=resid_shift,
     )
     artifact_paths = {
-        "npz": descriptors_dir / f"{state_id}_descriptors.npz",
-        "metadata": descriptors_dir / f"{state_id}_descriptor_metadata.json",
+        "npz": state_dir / "descriptors.npz",
+        "metadata": state_dir / "descriptor_metadata.json",
     }
     save_descriptor_npz(artifact_paths["npz"], build_result.features)
     metadata_payload = {
+        "state_id": state_id,
         "state_name": state_name or state_id,
         "descriptor_keys": build_result.residue_keys,
         "residue_mapping": build_result.residue_mapping,
@@ -187,7 +206,13 @@ def build_state_descriptors(
 
     dirs = store.ensure_directories(project_id, system_meta.system_id)
     system_dir = dirs["system_dir"]
-    descriptors_dir = dirs["descriptors_dir"]
+    state_dirs = store.ensure_state_directories(
+        project_id,
+        system_meta.system_id,
+        state_meta.state_id,
+        storage_key=state_meta.storage_key or state_meta.state_id,
+    )
+    state_dir = state_dirs["state_dir"]
 
     if traj_path_override is not None:
         traj_path = traj_path_override
@@ -207,7 +232,7 @@ def build_state_descriptors(
         preprocessor,
         traj_path=traj_path,
         pdb_path=pdb_path,
-        descriptors_dir=descriptors_dir,
+        state_dir=state_dir,
         slice_spec=state_meta.slice_spec,
         resid_shift=shift_value,
         state_id=state_meta.state_id,
@@ -246,16 +271,18 @@ def add_state(
     resid_shift: int = 0,
 ) -> DescriptorState:
     system = store.get_system(project_id, system_id)
-    dirs = store.ensure_directories(project_id, system_id)
 
     if state_id in system.states:
         raise ValueError(f"State '{state_id}' already exists.")
 
+    state_name = name or state_id
+    storage_key = allocate_state_storage_key(system, state_name, state_id)
+    dirs = store.ensure_state_directories(project_id, system_id, state_id, storage_key=storage_key)
     pdb_ext = pdb_path.suffix or ".pdb"
     traj_ext = traj_path.suffix or ".xtc"
 
-    pdb_dest = dirs["structures_dir"] / f"{state_id}{pdb_ext}"
-    traj_dest = dirs["trajectories_dir"] / f"{state_id}{traj_ext}"
+    pdb_dest = dirs["state_dir"] / f"structure{pdb_ext}"
+    traj_dest = dirs["state_dir"] / f"trajectory{traj_ext}"
 
     pdb_dest.parent.mkdir(parents=True, exist_ok=True)
     traj_dest.parent.mkdir(parents=True, exist_ok=True)
@@ -273,13 +300,14 @@ def add_state(
             slice_value, stride_val = parse_slice_spec(slice_value)
         state = DescriptorState(
             state_id=state_id,
-            name=name or state_id,
+            name=state_name,
             pdb_file=str(pdb_dest.relative_to(dirs["system_dir"])),
             trajectory_file=traj_value,
             residue_selection=residue_selection,
             slice_spec=slice_value,
             stride=stride_val,
             resid_shift=int(resid_shift),
+            storage_key=storage_key,
         )
         system.states[state_id] = state
         refresh_system_metadata(system)
@@ -322,10 +350,12 @@ def register_state_from_pdb(
     pdb_path: Path,
     stride: int = 1,
     resid_shift: int = 0,
+    storage_key: Optional[str] = None,
 ) -> DescriptorState:
     if state_id in system_meta.states:
         raise ValueError(f"State '{state_id}' already exists.")
-    dirs = store.ensure_directories(project_id, system_meta.system_id)
+    storage_key = storage_key or allocate_state_storage_key(system_meta, name, state_id)
+    dirs = store.ensure_state_directories(project_id, system_meta.system_id, state_id, storage_key=storage_key)
     system_dir = dirs["system_dir"]
     rel_pdb = str(pdb_path)
     if pdb_path.is_absolute():
@@ -336,6 +366,7 @@ def register_state_from_pdb(
         pdb_file=rel_pdb,
         stride=stride,
         resid_shift=int(resid_shift),
+        storage_key=storage_key,
     )
     system_meta.states[state_id] = state
     refresh_system_metadata(system_meta)

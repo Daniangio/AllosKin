@@ -5,6 +5,7 @@ import numpy as np
 from fastapi import APIRouter, HTTPException, Query
 
 from backend.api.v1.common import get_state_or_404, project_store
+from phase.features.extraction import DIHEDRAL_KEYS
 from phase.io.descriptors import load_descriptor_npz
 
 
@@ -47,7 +48,7 @@ async def get_state_descriptors(
     ),
 ):
     """
-    Returns a down-sampled set of phi/psi/chi1 angles (in degrees) for the requested state.
+    Returns a down-sampled set of descriptor dihedrals (in degrees) for the requested state.
     Intended for client-side scatter plotting; not for bulk export.
     """
     try:
@@ -204,6 +205,12 @@ async def get_state_descriptors(
 
     first_arr = feature_dict[keys_to_use[0]]
     total_frames = first_arr.shape[0] if hasattr(first_arr, "shape") else 0
+    n_dihedral_dims = (
+        min(int(first_arr.shape[2]), len(DIHEDRAL_KEYS))
+        if hasattr(first_arr, "shape") and len(first_arr.shape) >= 3
+        else 0
+    )
+    dihedral_keys = list(DIHEDRAL_KEYS[:n_dihedral_dims]) if n_dihedral_dims > 0 else []
     indices = np.arange(total_frames)
     if metastable_filter_ids:
         selected_idx = {meta_id_to_index.get(mid) for mid in metastable_filter_ids if mid in meta_id_to_index}
@@ -221,14 +228,14 @@ async def get_state_descriptors(
 
     for key in keys_to_use:
         arr = feature_dict[key]
-        if arr.ndim != 3 or arr.shape[2] < 3:
+        if arr.ndim != 3 or arr.shape[2] < 1:
             continue
 
         sampled = arr[sample_indices, 0, :]
-        phi = (sampled[:, 0] * 180.0 / 3.141592653589793).tolist()
-        psi = (sampled[:, 1] * 180.0 / 3.141592653589793).tolist()
-        chi1 = (sampled[:, 2] * 180.0 / 3.141592653589793).tolist()
-        angles_payload[key] = {"phi": phi, "psi": psi, "chi1": chi1}
+        angles_payload[key] = {}
+        n_dims = min(sampled.shape[1], len(dihedral_keys))
+        for dim_idx, dim_name in enumerate(dihedral_keys[:n_dims]):
+            angles_payload[key][dim_name] = (sampled[:, dim_idx] * 180.0 / np.pi).tolist()
 
         if state_labels_arr is not None:
             res_idx = key_to_col.get(key)
@@ -356,6 +363,7 @@ async def get_state_descriptors(
 
     response = {
         "residue_keys": keys_to_use,
+        "dihedral_keys": dihedral_keys,
         "residue_mapping": state_meta.residue_mapping or {},
         "residue_labels": residue_labels,
         "n_frames": n_frames_out,

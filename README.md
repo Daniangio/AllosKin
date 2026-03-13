@@ -49,7 +49,230 @@ Schemas are documented in `docs/metadata/`:
 
 Background jobs (metastable discovery, clustering, Potts sampling) are executed by RQ workers. See `docs/clustering_architecture.md` for the clustering fan-out flow.
 
-## Running with Docker (Recommended)
+## Recommended Pipeline
+
+The recommended way to run PHASE is:
+
+- keep one shared project tree on the host, for example `/scratch/$USER/phase-data`
+- let Docker use that tree for the webserver
+- let `phase_console` use that same tree locally
+
+This is the best operational model because:
+
+- there is no upload/download step between local CLI and webserver
+- local CLI can run heavy jobs directly on the host
+- the web UI can immediately visualize the same files
+- metadata stays in one place
+
+The rest of this README assumes that this shared-data workflow is your default setup.
+
+See also:
+
+- `docs/shared_data_root.md`
+- `docs/docker_gpu.md`
+
+## Shared-Root Setup
+
+This section is the recommended setup to do once, then reuse every day.
+
+### 1. Choose the shared host data root
+
+Use one host directory for all PHASE projects, for example:
+
+```bash
+export PHASE_DATA_ROOT=/scratch/$USER/phase-data
+mkdir -p "$PHASE_DATA_ROOT"
+```
+
+To avoid thinking about this again, make it permanent in your shell startup file.
+
+For `bash`:
+
+```bash
+echo 'export PHASE_DATA_ROOT=/scratch/$USER/phase-data' >> ~/.bashrc
+source ~/.bashrc
+```
+
+For `zsh`:
+
+```bash
+echo 'export PHASE_DATA_ROOT=/scratch/$USER/phase-data' >> ~/.zshrc
+source ~/.zshrc
+```
+
+After that, `phase_console` and local CLI scripts will default to the shared root automatically.
+
+You can verify it with:
+
+```bash
+echo "$PHASE_DATA_ROOT"
+```
+
+### 2. Make Docker write files as your user
+
+Generate `.env` for Docker Compose:
+
+```bash
+./scripts/compose_env.sh
+```
+
+This writes:
+
+```bash
+PHASE_UID=<your uid>
+PHASE_GID=<your gid>
+```
+
+The compose file uses these values so `backend` and `worker` write files as your host user, not as `root`.
+
+### 3. Start the web stack
+
+CPU-only:
+
+```bash
+docker compose up --build
+```
+
+With GPU access:
+
+```bash
+PHASE_GPU_CDI_DEVICE=nvidia.com/gpu=0 \
+docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up --build
+```
+
+### 4. Verify the permission model once
+
+Inside the worker container:
+
+```bash
+docker compose exec worker id
+```
+
+You should see your host UID/GID, not `0:0`.
+
+On the host:
+
+```bash
+find "$PHASE_DATA_ROOT" -maxdepth 2 ! -user "$(id -un)" | head
+```
+
+This should ideally return nothing.
+
+### 5. If you already have a root-owned tree
+
+If old Docker runs wrote files as `root`, repair ownership once:
+
+```bash
+sudo ./scripts/fix_shared_data_root.sh "$PHASE_DATA_ROOT"
+./scripts/compose_env.sh
+```
+
+Then restart the stack.
+
+## Normal Daily Usage
+
+After the setup above, day-to-day usage should be simple.
+
+### Start the webserver
+
+CPU-only:
+
+```bash
+docker compose up -d
+```
+
+With GPU:
+
+```bash
+PHASE_GPU_CDI_DEVICE=nvidia.com/gpu=0 \
+docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up -d
+```
+
+The web UI is then available at:
+
+- `http://localhost:3000`
+
+### Development stack
+
+If you explicitly want live reload for frontend/backend/worker, use the
+development compose file:
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.dev.yml up --build
+```
+
+That stack runs:
+
+- `uvicorn --reload`
+- CRA `react-scripts start`
+- auto-restarting RQ worker
+
+It is intentionally not the default. If you see webpack/eslint warnings in the
+frontend container logs, you are running the development stack.
+
+### Start `phase_console`
+
+Because `PHASE_DATA_ROOT` is already exported in your shell, just run:
+
+```bash
+./scripts/phase_console.sh
+```
+
+`phase_console` will now operate by default on the same shared root used by the webserver.
+
+### How to work normally
+
+The intended workflow is:
+
+1. create/manage projects and systems in the web UI or in `phase_console`
+2. run heavy fits, sampling, or multiprocessing tasks locally with `phase_console`
+3. open the web UI to inspect the exact same outputs
+4. alternate freely between local CLI and webserver, because both are reading and writing the same project tree
+
+### What path each side should use
+
+Use:
+
+- local CLI: `PHASE_DATA_ROOT=/scratch/$USER/phase-data`
+- inside Docker: `/data/phase`
+
+This is expected and correct. They point to the same files through the Docker bind mount.
+
+### What not to do
+
+- do not run `phase_console` with `sudo`
+- do not point local CLI tools at `/data/phase`
+- do not keep a separate local `./data` tree if your real projects are in `/scratch/$USER/phase-data`
+- do not start Docker before running `./scripts/compose_env.sh` at least once
+
+## Quick Start Summary
+
+One-time setup:
+
+```bash
+echo 'export PHASE_DATA_ROOT=/scratch/$USER/phase-data' >> ~/.bashrc  # or ~/.zshrc
+source ~/.bashrc  # or source ~/.zshrc
+mkdir -p "$PHASE_DATA_ROOT"
+./scripts/compose_env.sh
+docker compose up --build
+```
+
+Normal use:
+
+```bash
+docker compose up -d
+./scripts/phase_console.sh
+```
+
+Normal use with GPU web jobs:
+
+```bash
+PHASE_GPU_CDI_DEVICE=nvidia.com/gpu=0 \
+docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up -d
+./scripts/phase_console.sh
+```
+
+## Running with Docker
 
 Requirements: Docker + Docker Compose.
 
@@ -58,21 +281,17 @@ Requirements: Docker + Docker Compose.
 docker compose up --build
 ```
 
+If you want Docker containers to use host GPUs for Potts fitting, see `docs/docker_gpu.md`.
+
 Services:
 - Backend API: `http://localhost:8000` (OpenAPI docs at `/docs`)
 - Frontend: `http://localhost:3000`
 
-Data is stored under the Docker volume mapped to `PHASE_DATA_ROOT` (default in compose: `/data/phase`).
+Data is stored under the Docker volume mapped to `PHASE_DATA_ROOT` inside the container (default in compose: `/data/phase`).
 
 ## Shared Data Root
 
-If you want to run local CLI scripts against the same datasets used by the webserver, point `PHASE_DATA_ROOT` to the host path that is mounted into Docker (default: `/scratch/docker/phase-data`). The compose file runs containers as your UID/GID, so both Docker and local scripts can read/write the same files.
-
-```bash
-export PHASE_DATA_ROOT=/scratch/docker/phase-data
-./scripts/compose_env.sh
-docker compose up --build
-```
+This is the recommended setup. The full operational guide is in `docs/shared_data_root.md`.
 
 ### Multiple Workers
 
@@ -88,6 +307,9 @@ Note: more workers increases CPU and memory usage. If you only run one worker, t
 ## Running Locally (Without Docker)
 
 Python 3.11+ recommended.
+
+This mode is mainly useful for development of the backend/frontend themselves.
+For normal project work, prefer the shared-data workflow above instead of a fully separate local-only tree.
 
 ```bash
 uv venv .venv

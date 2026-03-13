@@ -9,14 +9,17 @@ unset LD_LIBRARY_PATH
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_PY="3.10"
+DEFAULT_DEPS_DIR="${ROOT_DIR}/deps"
+DEFAULT_GEQTRAIN_REF="main"
+DEFAULT_GEQDIFF_REF="main"
 
 # Default venv location logic
-if [ -d "${ROOT_DIR}/.venv-potts-fit" ]; then
-  DEFAULT_ENV="${ROOT_DIR}/.venv-potts-fit"
+if [ -d "${ROOT_DIR}/.venv-phase" ]; then
+  DEFAULT_ENV="${ROOT_DIR}/.venv-phase"
 elif [ -d "${ROOT_DIR}/.venv" ]; then
   DEFAULT_ENV="${ROOT_DIR}/.venv"
 else
-  DEFAULT_ENV="${ROOT_DIR}/.venv-potts-fit"
+  DEFAULT_ENV="${ROOT_DIR}/.venv-phase"
 fi
 
 prompt() {
@@ -25,6 +28,60 @@ prompt() {
   local var
   read -r -p "${label} [${default}]: " var
   if [ -z "$var" ]; then echo "$default"; else echo "$var"; fi
+}
+
+sync_repo() {
+  local url="$1"
+  local dir="$2"
+  local ref="$3"
+  local update_existing="$4"
+
+  mkdir -p "$(dirname "${dir}")"
+
+  if [[ ! -d "${dir}/.git" ]]; then
+    echo "Cloning ${url} -> ${dir}"
+    git clone "${url}" "${dir}"
+  else
+    echo "Repository already exists: ${dir}"
+    if [[ "${update_existing}" =~ ^[Yy]$ ]]; then
+      echo "Fetching updates for ${dir}"
+      git -C "${dir}" fetch --all --tags
+    fi
+  fi
+
+  if [[ -z "${ref}" ]]; then
+    return
+  fi
+
+  if git -C "${dir}" show-ref --verify --quiet "refs/heads/${ref}"; then
+    git -C "${dir}" checkout "${ref}"
+    if [[ "${update_existing}" =~ ^[Yy]$ ]]; then
+      git -C "${dir}" pull --ff-only || true
+    fi
+    return
+  fi
+
+  if git -C "${dir}" show-ref --verify --quiet "refs/tags/${ref}"; then
+    git -C "${dir}" checkout "tags/${ref}"
+    return
+  fi
+
+  if git -C "${dir}" ls-remote --exit-code --heads origin "${ref}" >/dev/null 2>&1; then
+    git -C "${dir}" fetch origin "${ref}"
+    git -C "${dir}" checkout -B "${ref}" "origin/${ref}"
+    return
+  fi
+
+  git -C "${dir}" checkout "${ref}"
+}
+
+install_rdkit() {
+  if uv pip install rdkit; then
+    return
+  fi
+
+  echo "PyPI install for rdkit failed; trying rdkit-pypi..."
+  uv pip install rdkit-pypi
 }
 
 # Install uv if missing
@@ -93,10 +150,48 @@ if [[ "$INSTALL_TORCH" =~ ^[Yy]$ ]]; then
   uv pip install "$TORCH_SPEC" --torch-backend "${CUDA_FLAVOR}"
 fi
 
+INSTALL_BACKMAPPING_STACK="$(prompt "Install backmapping stack (GEqTrain + GEqDiff) now (y/N)" "Y")"
+if [[ "$INSTALL_BACKMAPPING_STACK" =~ ^[Yy]$ ]]; then
+  DEPS_DIR="$(prompt "Dependencies directory" "${DEFAULT_DEPS_DIR}")"
+  GEQTRAIN_REF="$(prompt "GEqTrain git ref" "${DEFAULT_GEQTRAIN_REF}")"
+  GEQDIFF_REF="$(prompt "GEqDiff git ref" "${DEFAULT_GEQDIFF_REF}")"
+  UPDATE_REPOS="$(prompt "Update existing GEqTrain/GEqDiff repos (y/N)" "N")"
+
+  GEQTRAIN_DIR="${DEPS_DIR}/GEqTrain"
+  GEQDIFF_DIR="${DEPS_DIR}/GEqDiff"
+
+  sync_repo "https://github.com/limresgrp/GEqTrain.git" "${GEQTRAIN_DIR}" "${GEQTRAIN_REF}" "${UPDATE_REPOS}"
+  sync_repo "https://github.com/limresgrp/GEqDiff.git" "${GEQDIFF_DIR}" "${GEQDIFF_REF}" "${UPDATE_REPOS}"
+
+  echo "Installing GEqTrain/GEqDiff runtime dependencies..."
+  BACKMAPPING_DEPS=(
+    numpy
+    scipy
+    tqdm
+    e3nn
+    MDAnalysis
+    matplotlib
+    plotly
+  )
+  uv pip install "${BACKMAPPING_DEPS[@]}"
+  install_rdkit
+
+  echo "Installing GEqTrain (editable)..."
+  uv pip install -e "${GEQTRAIN_DIR}"
+
+  echo "Installing GEqDiff (editable)..."
+  uv pip install -e "${GEQDIFF_DIR}"
+fi
+
 echo "Installing phase package (no deps)..."
 uv pip install -e "${ROOT_DIR}" --no-deps
 
 echo "---------------------------------------------------"
 echo "Build Complete. Activate your environment with:"
 echo "source ${VENV_DIR}/bin/activate"
+if [[ "${INSTALL_BACKMAPPING_STACK}" =~ ^[Yy]$ ]]; then
+  echo "Backmapping repos:"
+  echo "  GEqTrain: ${GEQTRAIN_DIR}"
+  echo "  GEqDiff:  ${GEQDIFF_DIR}"
+fi
 echo "---------------------------------------------------"

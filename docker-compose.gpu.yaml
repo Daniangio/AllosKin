@@ -1,0 +1,8 @@
+services:
+  backend:
+    devices:
+      - ${PHASE_GPU_CDI_DEVICE:-nvidia.com/gpu=all}
+
+  worker:
+    devices:
+      - ${PHASE_GPU_CDI_DEVICE:-nvidia.com/gpu=all}

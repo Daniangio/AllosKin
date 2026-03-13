@@ -143,7 +143,7 @@ export function StateCard({
   );
 }
 
-export function MetastableCard({ meta, onRename }) {
+export function MetastableCard({ meta, onRename, onDelete }) {
   const [name, setName] = useState(meta.name || meta.default_name || `Meta ${meta.metastable_index}`);
   const [isSaving, setIsSaving] = useState(false);
 
@@ -173,13 +173,22 @@ export function MetastableCard({ meta, onRename }) {
       </div>
       <div className="flex items-center justify-between text-xs text-gray-400">
         <span>ID: {meta.metastable_id || meta.metastable_index}</span>
-        <button
-          onClick={handleSave}
-          disabled={isSaving || !meta.metastable_id}
-          className="text-cyan-400 hover:text-cyan-300 disabled:opacity-50"
-        >
-          {isSaving ? 'Saving…' : 'Save'}
-        </button>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleSave}
+            disabled={isSaving || !meta.metastable_id}
+            className="text-cyan-400 hover:text-cyan-300 disabled:opacity-50"
+          >
+            {isSaving ? 'Saving…' : 'Save'}
+          </button>
+          <button
+            onClick={() => onDelete?.(meta.metastable_id, meta.name || meta.default_name || meta.metastable_id)}
+            disabled={!meta.metastable_id}
+            className="text-red-300 hover:text-red-200 disabled:opacity-50"
+          >
+            Delete
+          </button>
+        </div>
       </div>
       {meta.representative_pdb && (
         <p className="text-xs text-cyan-400 break-all">

@@ -7,7 +7,7 @@ dimension estimate.
 Compared to the previous MI-based implementation, this version:
 
     * Uses the full multi-dimensional descriptor for each residue
-      (e.g. sin/cos of phi, psi, chi1) rather than averaging 1D MI values.
+      (e.g. phi, psi, omega, chi1, chi2) rather than averaging 1D MI values.
     * Reports a normalized state score in [0, 1] based on either
       cross-validated AUC (default) or, optionally, a cross-entropy based
       mutual-information surrogate.

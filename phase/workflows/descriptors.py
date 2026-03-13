@@ -36,7 +36,7 @@ SelectionInput = Union[Dict[str, str], List[str]]
 
 class DescriptorPreprocessor:
     """
-    Wraps the DatasetBuilder to extract the phi/psi/chi1 descriptors once,
+    Wraps the DatasetBuilder to extract the phi/psi/omega/chi1/chi2 descriptors once,
     without persisting the original trajectory files.
     """
 

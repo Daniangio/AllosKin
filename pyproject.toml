@@ -30,7 +30,8 @@ dependencies = [
     # "idtxl", # Or "pyJIDT" if you prefer
     "pyyaml",
     "redis", # Added for worker/backend
-    "rq"     # Added for worker/backend
+    "rq",    # Added for worker/backend
+    "pytest"
 ]
 
 [project.optional-dependencies]

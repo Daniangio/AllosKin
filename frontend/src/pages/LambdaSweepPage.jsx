@@ -36,9 +36,9 @@ export default function LambdaSweepPage() {
 
   const [modelAId, setModelAId] = useState('');
   const [modelBId, setModelBId] = useState('');
-  const [md1Id, setMd1Id] = useState('');
-  const [md2Id, setMd2Id] = useState('');
-  const [md3Id, setMd3Id] = useState('');
+  const [referenceAId, setReferenceAId] = useState('');
+  const [referenceBId, setReferenceBId] = useState('');
+  const [comparisonSampleIds, setComparisonSampleIds] = useState([]);
 
   const [seriesLabel, setSeriesLabel] = useState('');
   const [lambdaCount, setLambdaCount] = useState(11);
@@ -82,8 +82,13 @@ export default function LambdaSweepPage() {
     [clusterOptions, selectedClusterId]
   );
 
-  const mdSamples = useMemo(() => (selectedCluster?.samples || []).filter((s) => s.type === 'md_eval'), [selectedCluster]);
+  const sampleOptions = useMemo(() => selectedCluster?.samples || [], [selectedCluster]);
   const pottsModels = useMemo(() => selectedCluster?.potts_models || [], [selectedCluster]);
+  const sampleLabel = useCallback((sample) => {
+    const name = sample?.name || sample?.sample_id || 'sample';
+    const type = sample?.type || 'sample';
+    return `${name} (${type})`;
+  }, []);
 
   const endpointModelOptions = useMemo(() => {
     return pottsModels.filter((m) => {
@@ -119,27 +124,35 @@ export default function LambdaSweepPage() {
   }, [endpointModelOptions, modelAId, modelBId]);
 
   useEffect(() => {
-    if (!mdSamples.length) {
-      setMd1Id('');
-      setMd2Id('');
-      setMd3Id('');
+    if (!sampleOptions.length) {
+      setReferenceAId('');
+      setReferenceBId('');
+      setComparisonSampleIds([]);
       return;
     }
-    const has = (id) => id && mdSamples.some((s) => s.sample_id === id);
     const pickDistinct = (fallbackIndex, exclude) => {
-      if (mdSamples[fallbackIndex] && !exclude.includes(mdSamples[fallbackIndex].sample_id)) return mdSamples[fallbackIndex].sample_id;
-      const found = mdSamples.find((s) => !exclude.includes(s.sample_id));
-      return found ? found.sample_id : mdSamples[0].sample_id;
+      if (sampleOptions[fallbackIndex] && !exclude.includes(sampleOptions[fallbackIndex].sample_id)) {
+        return sampleOptions[fallbackIndex].sample_id;
+      }
+      const found = sampleOptions.find((s) => !exclude.includes(s.sample_id));
+      return found ? found.sample_id : '';
     };
-    let e1 = has(md1Id) ? md1Id : pickDistinct(0, []);
-    let e2 = has(md2Id) ? md2Id : pickDistinct(1, [e1]);
-    if (e2 === e1) e2 = pickDistinct(1, [e1]);
-    let e3 = has(md3Id) ? md3Id : pickDistinct(2, [e1, e2]);
-    if (e3 === e1 || e3 === e2) e3 = pickDistinct(2, [e1, e2]);
-    if (e1 !== md1Id) setMd1Id(e1);
-    if (e2 !== md2Id) setMd2Id(e2);
-    if (e3 !== md3Id) setMd3Id(e3);
-  }, [mdSamples, md1Id, md2Id, md3Id]);
+    const has = (id) => id && sampleOptions.some((s) => s.sample_id === id);
+    let nextA = has(referenceAId) ? referenceAId : pickDistinct(0, []);
+    let nextB = has(referenceBId) && referenceBId !== nextA ? referenceBId : pickDistinct(1, [nextA]);
+    if (nextB === nextA) nextB = pickDistinct(1, [nextA]);
+    const validComparisons = comparisonSampleIds.filter(
+      (id) => has(id) && id !== nextA && id !== nextB
+    );
+    const defaultComparison = pickDistinct(2, [nextA, nextB]);
+    const nextComparisons = validComparisons.length ? validComparisons : (defaultComparison ? [defaultComparison] : []);
+    if (nextA !== referenceAId) setReferenceAId(nextA);
+    if (nextB !== referenceBId) setReferenceBId(nextB);
+    const sameComparisons =
+      nextComparisons.length === comparisonSampleIds.length &&
+      nextComparisons.every((id, idx) => id === comparisonSampleIds[idx]);
+    if (!sameComparisons) setComparisonSampleIds(nextComparisons);
+  }, [sampleOptions, referenceAId, referenceBId, comparisonSampleIds]);
 
   const loadAnalyses = useCallback(async () => {
     if (!selectedClusterId) return;
@@ -238,9 +251,9 @@ export default function LambdaSweepPage() {
         cluster_id: selectedClusterId,
         model_a_id: modelAId,
         model_b_id: modelBId,
-        md_sample_id_1: md1Id,
-        md_sample_id_2: md2Id,
-        md_sample_id_3: md3Id,
+        reference_sample_id_a: referenceAId,
+        reference_sample_id_b: referenceBId,
+        comparison_sample_ids: comparisonSampleIds,
         series_label: seriesLabel || undefined,
         lambda_count: lambdaCount ? Number(lambdaCount) : undefined,
         alpha: alpha !== null && alpha !== undefined ? Number(alpha) : undefined,
@@ -264,9 +277,9 @@ export default function LambdaSweepPage() {
     selectedClusterId,
     modelAId,
     modelBId,
-    md1Id,
-    md2Id,
-    md3Id,
+    referenceAId,
+    referenceBId,
+    comparisonSampleIds,
     seriesLabel,
     lambdaCount,
     alpha,
@@ -314,7 +327,14 @@ export default function LambdaSweepPage() {
     const data = analysisData?.data || null;
     if (!data) return null;
     const lambdas = Array.isArray(data.lambdas) ? data.lambdas : [];
-    const refNames = Array.isArray(data.ref_md_sample_names) ? data.ref_md_sample_names : ['ref1', 'ref2', 'ref3'];
+    const refNames = Array.isArray(data.reference_sample_names)
+      ? data.reference_sample_names
+      : Array.isArray(data.ref_md_sample_names)
+        ? data.ref_md_sample_names
+        : [];
+    const comparisonNames = Array.isArray(data.comparison_sample_names)
+      ? data.comparison_sample_names
+      : refNames.slice(2);
     const nodeMean = Array.isArray(data.node_js_mean) ? data.node_js_mean : [];
     const edgeMean = Array.isArray(data.edge_js_mean) ? data.edge_js_mean : [];
     const combined = Array.isArray(data.combined_distance) ? data.combined_distance : [];
@@ -323,10 +343,21 @@ export default function LambdaSweepPage() {
     const dQ25 = Array.isArray(data.deltaE_q25) ? data.deltaE_q25 : [];
     const dQ75 = Array.isArray(data.deltaE_q75) ? data.deltaE_q75 : [];
 
-    const lambdaStar = Array.isArray(data.lambda_star) ? data.lambda_star[0] : data.lambda_star;
-    const bestIdx = Array.isArray(data.lambda_star_index) ? data.lambda_star_index[0] : data.lambda_star_index;
-
-    const curve3 = Array.isArray(combined?.[2]) ? combined[2] : [];
+    const comparisonRefIndices = Array.isArray(data.comparison_ref_indices)
+      ? data.comparison_ref_indices
+      : refNames.length > 2
+        ? refNames.slice(2).map((_, idx) => idx + 2)
+        : [];
+    const lambdaStarByReference = Array.isArray(data.lambda_star_by_reference)
+      ? data.lambda_star_by_reference
+      : data.lambda_star !== undefined
+        ? [Array.isArray(data.lambda_star) ? data.lambda_star[0] : data.lambda_star]
+        : [];
+    const matchMinByReference = Array.isArray(data.match_min_by_reference)
+      ? data.match_min_by_reference
+      : data.match_min !== undefined
+        ? [Array.isArray(data.match_min) ? data.match_min[0] : data.match_min]
+        : [];
 
     const orderParam = {
       data: [
@@ -408,16 +439,33 @@ export default function LambdaSweepPage() {
     };
 
     const matchPlot = {
-      data: [
-        {
-          x: lambdas,
-          y: curve3,
-          mode: 'lines+markers',
-          name: refNames[2] || 'ref3',
-          marker: { color: '#f97316' },
-          line: { color: '#f97316' },
-        },
-      ],
+      data: comparisonRefIndices.flatMap((refIndex, idx) => {
+        const color = pickColor(idx + 2);
+        const curve = Array.isArray(combined?.[refIndex]) ? combined[refIndex] : [];
+        const series = [
+          {
+            x: lambdas,
+            y: curve,
+            mode: 'lines+markers',
+            name: comparisonNames[idx] || refNames[refIndex] || `comparison ${idx + 1}`,
+            marker: { color },
+            line: { color },
+          },
+        ];
+        const bestX = lambdaStarByReference[idx];
+        const bestY = matchMinByReference[idx];
+        if (Number.isFinite(bestX) && Number.isFinite(bestY)) {
+          series.push({
+            x: [bestX],
+            y: [bestY],
+            mode: 'markers',
+            name: `${comparisonNames[idx] || refNames[refIndex] || `comparison ${idx + 1}`} λ*`,
+            marker: { color, size: 10, symbol: 'diamond' },
+            showlegend: false,
+          });
+        }
+        return series;
+      }),
       layout: {
         height: 260,
         margin: { l: 50, r: 10, t: 10, b: 40 },
@@ -425,22 +473,7 @@ export default function LambdaSweepPage() {
         plot_bgcolor: '#ffffff',
         font: { color: '#111827' },
         xaxis: { title: 'λ', color: '#111827' },
-        yaxis: { title: 'D(λ) vs reference 3', color: '#111827' },
-        shapes:
-          Number.isFinite(lambdaStar) && Number.isFinite(bestIdx)
-            ? [
-                {
-                  type: 'line',
-                  x0: lambdaStar,
-                  x1: lambdaStar,
-                  y0: 0,
-                  y1: 1,
-                  xref: 'x',
-                  yref: 'paper',
-                  line: { color: 'rgba(17,24,39,0.4)', width: 2, dash: 'dot' },
-                },
-              ]
-            : [],
+        yaxis: { title: 'D(λ) vs comparison samples', color: '#111827' },
       },
     };
 
@@ -463,7 +496,7 @@ export default function LambdaSweepPage() {
         <div>
           <h1 className="text-2xl font-semibold text-white">Lambda Sweep</h1>
           <p className="text-sm text-gray-400">
-            Sample from interpolated models <code>E_λ</code> between two endpoints and compare against three MD ensembles.
+            Sample from interpolated models <code>E_λ</code> between two endpoints and compare against flexible reference and comparison samples.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -544,46 +577,54 @@ export default function LambdaSweepPage() {
 
             <div className="grid grid-cols-1 gap-2">
               <div>
-                <label className="block text-xs text-gray-400 mb-1">MD reference 1</label>
+                <label className="block text-xs text-gray-400 mb-1">Reference sample A</label>
                 <select
-                  value={md1Id}
-                  onChange={(e) => setMd1Id(e.target.value)}
+                  value={referenceAId}
+                  onChange={(e) => setReferenceAId(e.target.value)}
                   className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
                 >
-                  {mdSamples.map((s) => (
+                  {sampleOptions.map((s) => (
                     <option key={s.sample_id} value={s.sample_id}>
-                      {s.name || s.sample_id}
+                      {sampleLabel(s)}
                     </option>
                   ))}
                 </select>
               </div>
               <div>
-                <label className="block text-xs text-gray-400 mb-1">MD reference 2</label>
+                <label className="block text-xs text-gray-400 mb-1">Reference sample B</label>
                 <select
-                  value={md2Id}
-                  onChange={(e) => setMd2Id(e.target.value)}
+                  value={referenceBId}
+                  onChange={(e) => setReferenceBId(e.target.value)}
                   className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
                 >
-                  {mdSamples.map((s) => (
+                  {sampleOptions.map((s) => (
                     <option key={s.sample_id} value={s.sample_id}>
-                      {s.name || s.sample_id}
+                      {sampleLabel(s)}
                     </option>
                   ))}
                 </select>
               </div>
               <div>
-                <label className="block text-xs text-gray-400 mb-1">MD reference 3 (match curve)</label>
+                <label className="block text-xs text-gray-400 mb-1">Comparison samples</label>
                 <select
-                  value={md3Id}
-                  onChange={(e) => setMd3Id(e.target.value)}
-                  className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
+                  multiple
+                  value={comparisonSampleIds}
+                  onChange={(e) => {
+                    const values = Array.from(e.target.selectedOptions).map((option) => option.value);
+                    const filtered = values.filter((id) => id !== referenceAId && id !== referenceBId);
+                    setComparisonSampleIds(filtered);
+                  }}
+                  className="w-full min-h-[10rem] bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
                 >
-                  {mdSamples.map((s) => (
+                  {sampleOptions
+                    .filter((s) => s.sample_id !== referenceAId && s.sample_id !== referenceBId)
+                    .map((s) => (
                     <option key={s.sample_id} value={s.sample_id}>
-                      {s.name || s.sample_id}
+                      {sampleLabel(s)}
                     </option>
                   ))}
                 </select>
+                <p className="mt-1 text-[11px] text-gray-500">Hold Ctrl/Cmd to select multiple comparison samples.</p>
               </div>
             </div>
 
@@ -624,7 +665,7 @@ export default function LambdaSweepPage() {
 
             <div className="grid grid-cols-2 gap-2">
               <div>
-                <label className="block text-xs text-gray-400 mb-1">MD label mode</label>
+                <label className="block text-xs text-gray-400 mb-1">MD reference label mode</label>
                 <select
                   value={mdLabelMode}
                   onChange={(e) => setMdLabelMode(e.target.value)}
@@ -722,7 +763,14 @@ export default function LambdaSweepPage() {
                 type="button"
                 onClick={handleSubmit}
                 className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-cyan-600 hover:bg-cyan-500 text-white text-sm"
-                disabled={!selectedClusterId || !modelAId || !modelBId || !md1Id || !md2Id || !md3Id}
+                disabled={
+                  !selectedClusterId ||
+                  !modelAId ||
+                  !modelBId ||
+                  !referenceAId ||
+                  !referenceBId ||
+                  comparisonSampleIds.length < 1
+                }
               >
                 <Play className="h-4 w-4" />
                 Run sweep
@@ -777,6 +825,11 @@ export default function LambdaSweepPage() {
                   <span className="text-gray-500">models:</span> {selectedAnalysisMeta.model_a_name || selectedAnalysisMeta.model_a_id}{' '}
                   vs {selectedAnalysisMeta.model_b_name || selectedAnalysisMeta.model_b_id}
                 </div>
+                {Array.isArray(selectedAnalysisMeta.comparison_sample_names) && selectedAnalysisMeta.comparison_sample_names.length > 0 && (
+                  <div>
+                    <span className="text-gray-500">comparisons:</span> {selectedAnalysisMeta.comparison_sample_names.join(', ')}
+                  </div>
+                )}
                 {selectedAnalysisMeta.summary?.lambda_star !== undefined && (
                   <div>
                     <span className="text-gray-500">λ*:</span> {Number(selectedAnalysisMeta.summary.lambda_star).toFixed(3)}
@@ -807,7 +860,7 @@ export default function LambdaSweepPage() {
               </section>
 
               <section className="rounded-lg border border-gray-800 bg-gray-900/40 p-4 space-y-3">
-                <h2 className="text-sm font-semibold text-gray-200">JS Distances vs MD</h2>
+                <h2 className="text-sm font-semibold text-gray-200">JS Distances vs Reference Samples</h2>
                 <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
                   <div className="rounded-md border border-gray-800 bg-white p-3">
                     <p className="text-xs font-semibold text-gray-800 mb-2">Node JS (mean)</p>
@@ -833,7 +886,7 @@ export default function LambdaSweepPage() {
               </section>
 
               <section className="rounded-lg border border-gray-800 bg-gray-900/40 p-4 space-y-3">
-                <h2 className="text-sm font-semibold text-gray-200">Match Curve</h2>
+                <h2 className="text-sm font-semibold text-gray-200">Match Curves</h2>
                 <div className="rounded-md border border-gray-800 bg-white p-3">
                   <Plot
                     data={plots.matchPlot.data}

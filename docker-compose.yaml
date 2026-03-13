@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    user: "${PHASE_UID:-1000}:${PHASE_GID:-1000}"
     ports:
       - "8000:8000"
     volumes:
@@ -10,7 +11,7 @@ services:
       - ./phase:/app/phase
       - ./backend:/app/backend
       # Persist application data (projects, trajectories, descriptors) on /scratch
-      - /scratch/docker/phase-data:/data/phase
+      - ${PHASE_DATA_ROOT:-./data}:/data/phase
     environment:
       - PYTHONUNBUFFERED=1
       # Note: We use the internal service name 'redis' and its default internal port '6379'
@@ -33,13 +34,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile # Uses the same Python environment
+    user: "${PHASE_UID:-1000}:${PHASE_GID:-1000}"
     # This is the PRODUCTION command
     command: rq worker phase-jobs --url redis://redis:6379/0
     volumes:
       # The worker needs the exact same volumes as the backend
       - ./phase:/app/phase
       - ./backend:/app/backend
-      - /scratch/docker/phase-data:/data/phase
+      - ${PHASE_DATA_ROOT:-./data}:/data/phase
     environment:
       - PYTHONUNBUFFERED=1
       - PHASE_DATA_ROOT=/data/phase

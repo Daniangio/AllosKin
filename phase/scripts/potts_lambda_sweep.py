@@ -11,7 +11,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run a lambda interpolation sweep between two Potts models (Gibbs sampling at each lambda), "
-            "persisting each lambda sample as a correlated sample series and writing a dedicated analysis."
+            "persisting each lambda sample as a correlated sample series and writing a dedicated analysis "
+            "against flexible reference and comparison samples."
         )
     )
     parser.add_argument("--root", default="", help="PHASE data root (defaults to $PHASE_DATA_ROOT or ./data).")
@@ -22,9 +23,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-a-id", required=True, help="Endpoint model A (lambda=1).")
     parser.add_argument("--model-b-id", required=True, help="Endpoint model B (lambda=0).")
 
-    parser.add_argument("--md-sample-id-1", required=True)
-    parser.add_argument("--md-sample-id-2", required=True)
-    parser.add_argument("--md-sample-id-3", required=True)
+    parser.add_argument("--reference-sample-id-a", default="", help="Reference sample anchoring endpoint A.")
+    parser.add_argument("--reference-sample-id-b", default="", help="Reference sample anchoring endpoint B.")
+    parser.add_argument(
+        "--comparison-sample-id",
+        action="append",
+        default=[],
+        help="Comparison sample id (repeatable). At least one is required.",
+    )
+    parser.add_argument("--md-sample-id-1", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--md-sample-id-2", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--md-sample-id-3", default="", help=argparse.SUPPRESS)
     parser.add_argument("--md-label-mode", default="assigned", choices=["assigned", "halo"])
 
     parser.add_argument("--lambda-count", type=int, default=21)
@@ -72,9 +81,18 @@ def main(argv: list[str] | None = None) -> int:
     if not (0.0 <= float(args.alpha) <= 1.0):
         raise SystemExit("--alpha must be in [0,1].")
 
-    md_ids = [str(args.md_sample_id_1), str(args.md_sample_id_2), str(args.md_sample_id_3)]
-    if len(set(md_ids)) != 3:
-        raise SystemExit("MD reference samples must be 3 distinct sample IDs.")
+    reference_sample_id_a = str(args.reference_sample_id_a or args.md_sample_id_1).strip()
+    reference_sample_id_b = str(args.reference_sample_id_b or args.md_sample_id_2).strip()
+    comparison_sample_ids = [str(v).strip() for v in (args.comparison_sample_id or []) if str(v).strip()]
+    if not comparison_sample_ids:
+        legacy_c = str(args.md_sample_id_3 or "").strip()
+        if legacy_c:
+            comparison_sample_ids = [legacy_c]
+    all_reference_ids = [reference_sample_id_a, reference_sample_id_b, *comparison_sample_ids]
+    if not reference_sample_id_a or not reference_sample_id_b or not comparison_sample_ids:
+        raise SystemExit("Provide reference-sample-id-a, reference-sample-id-b, and at least one comparison-sample-id.")
+    if len(set(all_reference_ids)) != len(all_reference_ids):
+        raise SystemExit("Reference and comparison samples must be distinct sample IDs.")
 
     root = (args.root or os.getenv("PHASE_DATA_ROOT") or "").strip()
     if not root:
@@ -92,9 +110,9 @@ def main(argv: list[str] | None = None) -> int:
         cluster_id=str(args.cluster_id),
         model_a_id=str(args.model_a_id),
         model_b_id=str(args.model_b_id),
-        md_sample_id_1=str(args.md_sample_id_1),
-        md_sample_id_2=str(args.md_sample_id_2),
-        md_sample_id_3=str(args.md_sample_id_3),
+        reference_sample_id_a=reference_sample_id_a,
+        reference_sample_id_b=reference_sample_id_b,
+        comparison_sample_ids=comparison_sample_ids,
         series_id=str(args.series_id or "").strip() or None,
         series_label=str(args.series_label or "").strip() or None,
         lambda_count=int(args.lambda_count),

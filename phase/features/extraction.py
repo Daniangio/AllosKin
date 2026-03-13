@@ -16,6 +16,7 @@ from typing import Dict, List, Optional, Tuple
 # Mock types for demonstration
 TrajectoryObject = mda.Universe
 FeatureDict = Dict[str, np.ndarray]
+DIHEDRAL_KEYS = ("phi", "psi", "omega", "chi1", "chi2")
 
 def deg2rad(deg_array: np.ndarray) -> np.ndarray:
     """Converts an array of degrees to radians."""
@@ -40,8 +41,8 @@ def transform_to_circular(angles_rad: np.ndarray) -> np.ndarray:
 
 class FeatureExtractor:
     """
-    Handles calculation of backbone (phi, psi) and sidechain (chi1)
-    dihedral angles and their sin/cos transformation.
+    Handles calculation of backbone/sidechain dihedral angles:
+    phi, psi, omega, chi1, chi2.
     """
     def __init__(self, residue_selections: Optional[Dict[str, str]] = None):
         """
@@ -115,6 +116,58 @@ class FeatureExtractor:
             
         return angles
 
+    @staticmethod
+    def _safe_residue_dihedral_selection(
+        residue: mda.ResidueGroup,
+        method_name: str,
+    ) -> Optional[mda.AtomGroup]:
+        """Return a residue dihedral selection or ``None`` when unavailable."""
+        method = getattr(residue, method_name, None)
+        if method is None:
+            return None
+        try:
+            ag = method()
+        except Exception:
+            return None
+        if ag is None:
+            return None
+        try:
+            return ag if int(ag.n_atoms) == 4 else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _chi2_selection(residue: mda.ResidueGroup) -> Optional[mda.AtomGroup]:
+        """
+        Build chi2 like MDAnalysis Janin:
+        CA - CB - (CG/CG1) - (CD/CD1/OD1/ND1/SD)
+        """
+        try:
+            atoms = residue.atoms
+            ag1 = atoms.select_atoms("name CA")
+            ag2 = atoms.select_atoms("name CB")
+            ag3 = atoms.select_atoms("name CG CG1")
+            ag4 = atoms.select_atoms("name CD CD1 OD1 ND1 SD")
+        except Exception:
+            return None
+        if any(int(ag.n_atoms) != 1 for ag in (ag1, ag2, ag3, ag4)):
+            return None
+        return ag1 + ag2 + ag3 + ag4
+
+    def _build_dihedral_selections(
+        self,
+        residues: mda.ResidueGroup,
+    ) -> Dict[str, List[Optional[mda.AtomGroup]]]:
+        """Collect per-residue 4-atom selections for all supported dihedrals."""
+        selections: Dict[str, List[Optional[mda.AtomGroup]]] = {name: [] for name in DIHEDRAL_KEYS}
+        for residue in residues:
+            selections["phi"].append(self._safe_residue_dihedral_selection(residue, "phi_selection"))
+            selections["psi"].append(self._safe_residue_dihedral_selection(residue, "psi_selection"))
+            selections["omega"].append(self._safe_residue_dihedral_selection(residue, "omega_selection"))
+            selections["chi1"].append(self._safe_residue_dihedral_selection(residue, "chi1_selection"))
+            selections["chi2"].append(self._chi2_selection(residue))
+        return selections
+
 
     def extract_features_for_residues(
         self,
@@ -133,7 +186,7 @@ class FeatureExtractor:
             slice_obj: A slice object for the trajectory.
 
         Returns:
-            - A dictionary mapping residue index (.ix) to its feature array (n_frames, 1, 6).
+            - A dictionary mapping residue index (.ix) to its feature array (n_frames, 1, 5).
             - The number of frames processed.
         """
         n_frames = self._get_sliced_length(traj, slice_obj)
@@ -144,12 +197,15 @@ class FeatureExtractor:
         print(f"    Calculating dihedrals for {len(protein_residues)} residues in one pass...")
 
         try:
-            # Get selections for ALL residues at once
-            phi_selections = protein_residues.phi_selections()
-            psi_selections = protein_residues.psi_selections()
-            chi1_selections = protein_residues.chi1_selections()
-
-            all_selections = phi_selections + psi_selections + chi1_selections
+            selections = self._build_dihedral_selections(protein_residues)
+            all_selections = []
+            dihedral_offsets: Dict[str, Tuple[int, int]] = {}
+            cursor = 0
+            for name in DIHEDRAL_KEYS:
+                items = selections[name]
+                dihedral_offsets[name] = (cursor, cursor + len(items))
+                all_selections.extend(items)
+                cursor += len(items)
             if not all_selections:
                 print("      Warning: No valid dihedrals found for the entire protein selection.")
                 return None, 0
@@ -158,31 +214,25 @@ class FeatureExtractor:
             all_angles_deg = self._calculate_dihedral_angle(all_selections, n_frames, slice_obj)
             # -------------------------------------------------------------
 
-            # De-multiplex the results
-            n_phi = len(phi_selections)
-            n_psi = len(psi_selections)
-            phi_angles_all = all_angles_deg[:, :n_phi]
-            psi_angles_all = all_angles_deg[:, n_phi : n_phi + n_psi]
-            chi1_angles_all = all_angles_deg[:, n_phi + n_psi :]
+            # Create a per-residue dictionary to store results.
+            # Shape: (n_frames, 5) for phi, psi, omega, chi1, chi2
+            res_angle_map = {
+                res.ix: np.zeros((n_frames, len(DIHEDRAL_KEYS)), dtype=np.float32)
+                for res in protein_residues
+            }
 
-            # Create a per-residue dictionary to store results
-            # Shape: (n_frames, 3) for phi, psi, chi1
-            res_angle_map = {res.ix: np.zeros((n_frames, 3)) for res in protein_residues}
-
-            # Populate the map
             res_indices = [res.ix for res in protein_residues]
             for i, res_ix in enumerate(res_indices):
-                res_angle_map[res_ix][:, 0] = phi_angles_all[:, i]
-                res_angle_map[res_ix][:, 1] = psi_angles_all[:, i]
-                res_angle_map[res_ix][:, 2] = chi1_angles_all[:, i]
+                for dim_idx, name in enumerate(DIHEDRAL_KEYS):
+                    start, end = dihedral_offsets[name]
+                    res_angle_map[res_ix][:, dim_idx] = all_angles_deg[:, start:end][:, i]
 
             # Now, transform to circular coordinates and store in the final dict
             all_residue_features: Dict[int, np.ndarray] = {}
             for res_ix, angles_deg in res_angle_map.items():
-                # Reshape to (n_frames, 1, 3) to match transform function's expectation
+                # Reshape to (n_frames, 1, 5) to match the stored descriptor layout.
                 angles_deg_reshaped = angles_deg[:, np.newaxis, :]
                 angles_rad = np.deg2rad(angles_deg_reshaped)
-                # Resulting shape is (n_frames, 1, 3)
                 all_residue_features[res_ix] = angles_rad
 
             print(f"      Bulk extraction complete. Found features for {len(all_residue_features)} residues.")
@@ -213,7 +263,7 @@ class FeatureExtractor:
 
         Returns:
             - A dictionary {selection_key: feature_array}
-              where each array has shape (n_sliced_frames, n_residues, 6).
+              where each array has shape (n_sliced_frames, n_residues, 5).
             - The number of frames actually processed (n_sliced_frames).
         """
         if not self.residue_selections:

@@ -1,6 +1,7 @@
 import json
 import re
 import uuid
+from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
@@ -13,6 +14,7 @@ from backend.api.v1.common import (
     stream_upload,
 )
 from backend.services.project_store import DescriptorState
+from phase.workflows.macro_states import allocate_state_storage_key
 
 
 router = APIRouter()
@@ -88,7 +90,6 @@ async def create_system_with_descriptors(
 
     dirs = project_store.ensure_directories(project_id, system_meta.system_id)
     system_dir = dirs["system_dir"]
-    structures_dir = dirs["structures_dir"]
     print(f"[system-create] Uploading {len(pdb_files)} states for project={project_id} system={system_meta.system_id}")
     for idx, upload in enumerate(pdb_files):
         state_id = str(uuid.uuid4())
@@ -96,7 +97,14 @@ async def create_system_with_descriptors(
         if idx < len(parsed_names) and isinstance(parsed_names[idx], str):
             state_name = parsed_names[idx].strip() or None
         state_name = (state_name or (upload.filename or f"State {idx + 1}")).strip()
-        pdb_path = structures_dir / f"{state_id}.pdb"
+        storage_key = allocate_state_storage_key(system_meta, state_name, state_id)
+        state_dirs = project_store.ensure_state_directories(
+            project_id,
+            system_meta.system_id,
+            state_id,
+            storage_key=storage_key,
+        )
+        pdb_path = state_dirs["state_dir"] / f"structure{Path(upload.filename or 'state.pdb').suffix or '.pdb'}"
         await stream_upload(upload, pdb_path)
 
         system_meta.states[state_id] = DescriptorState(
@@ -104,6 +112,7 @@ async def create_system_with_descriptors(
             name=state_name,
             pdb_file=str(pdb_path.relative_to(system_dir)),
             stride=1,
+            storage_key=storage_key,
         )
 
     refresh_system_metadata(system_meta)
