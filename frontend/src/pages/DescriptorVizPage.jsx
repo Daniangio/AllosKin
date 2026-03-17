@@ -131,6 +131,8 @@ export default function DescriptorVizPage() {
   const [loadingAngles, setLoadingAngles] = useState(false);
   const [anglesError, setAnglesError] = useState(null);
   const didHydrateQueryRef = useRef(false);
+  const bootstrapLabelsRequestIdRef = useRef(0);
+  const loadAnglesRequestIdRef = useRef(0);
 
   const axisLabel = useCallback((key) => {
     if (key === 'phi') return 'Phi';
@@ -499,9 +501,11 @@ export default function DescriptorVizPage() {
   useEffect(() => {
     const bootstrapLabels = async () => {
       if (!selectedStates.length) return;
+      const requestId = ++bootstrapLabelsRequestIdRef.current;
       try {
         const stateId = selectedStates[0];
         const data = await fetchStateDescriptors(projectId, systemId, stateId, { max_points: 10 });
+        if (requestId !== bootstrapLabelsRequestIdRef.current) return;
         const labels = data.residue_labels || {};
         const mapping = data.residue_mapping || {};
         const combined = { ...labels };
@@ -519,9 +523,7 @@ export default function DescriptorVizPage() {
             const merged = new Set([...(prev || []), ...data.residue_keys]);
             return sortResidues(Array.from(merged));
           });
-          if (!selectedResidue && data.residue_keys.length) {
-            setSelectedResidue(sortResidues(data.residue_keys)[0]);
-          }
+          setSelectedResidue((prev) => (prev || !data.residue_keys.length ? prev : sortResidues(data.residue_keys)[0]));
         }
       } catch (err) {
         // keep silent; fallback labels will be used
@@ -532,6 +534,7 @@ export default function DescriptorVizPage() {
   }, [projectId, systemId, selectedStates, sortResidues]);
 
   const loadAngles = useCallback(async () => {
+    const requestId = ++loadAnglesRequestIdRef.current;
     if (!selectedStates.length) {
       setAnglesByState({});
       setMetaByState({});
@@ -566,6 +569,7 @@ export default function DescriptorVizPage() {
           return { stateId, data };
         })
       );
+      if (requestId !== loadAnglesRequestIdRef.current) return;
 
       const newAngles = {};
       const newMeta = {};
@@ -684,13 +688,12 @@ export default function DescriptorVizPage() {
         const merged = [...(prev || []), ...sortedResidues];
         return sortResidues(merged);
       });
-      if (!selectedResidue && sortedResidues.length) {
-        setSelectedResidue(sortedResidues[0]);
-      } else if (selectedResidue && sortedResidues.length && !unionResidues.has(selectedResidue)) {
-        setSelectedResidue(sortedResidues[0]);
-      } else if (selectedResidue && !sortedResidues.length) {
-        setSelectedResidue('');
-      }
+      setSelectedResidue((prev) => {
+        if (!sortedResidues.length) return '';
+        if (!prev) return sortedResidues[0];
+        if (!unionResidues.has(prev)) return sortedResidues[0];
+        return prev;
+      });
 
       if (!bootstrapOnly && selectedResidue) {
         setAnglesByState(newAngles);
@@ -699,9 +702,12 @@ export default function DescriptorVizPage() {
         setAnglesByState({});
       }
     } catch (err) {
+      if (requestId !== loadAnglesRequestIdRef.current) return;
       setAnglesError(err.message);
     } finally {
-      setLoadingAngles(false);
+      if (requestId === loadAnglesRequestIdRef.current) {
+        setLoadingAngles(false);
+      }
     }
   }, [
     maxPoints,

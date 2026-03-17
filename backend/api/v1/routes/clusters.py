@@ -1273,7 +1273,7 @@ def _parse_cluster_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if density_z_raw is None:
         density_z_raw = (payload or {}).get("density_z")
     if density_z_raw is None:
-        density_z = 2.0
+        density_z = 3.0
     elif isinstance(density_z_raw, str) and density_z_raw.lower() == "auto":
         density_z = "auto"
     else:

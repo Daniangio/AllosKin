@@ -2502,7 +2502,7 @@ def generate_metastable_cluster_npz(
         except Exception as exc:
             raise ValueError("density_maxk must be an integer >=1.") from exc
     if density_z is None:
-        density_z_val: float | str = 2.0
+        density_z_val: float | str = 3.0
     elif isinstance(density_z, str) and density_z.lower() == "auto":
         density_z_val = "auto"
     else:
@@ -2736,7 +2736,7 @@ def generate_cluster_npz_from_descriptors(
         except Exception as exc:
             raise ValueError("density_maxk must be an integer >=1.") from exc
     if density_z is None:
-        density_z_val: float | str = 2.0
+        density_z_val: float | str = 3.0
     elif isinstance(density_z, str) and density_z.lower() == "auto":
         density_z_val = "auto"
     else:
@@ -3068,7 +3068,7 @@ def run_cluster_chunk(
     labels_halo, labels_assigned, k, diag, _, _ = _cluster_with_subsample(
         sample_arr,
         density_maxk=int(params.get("density_maxk", 100)),
-        density_z=params.get("density_z", 2.0),
+        density_z=params.get("density_z", 2.5),
         max_cluster_frames=params.get("max_cluster_frames"),
     )
 
@@ -3096,7 +3096,7 @@ def reduce_cluster_workspace(work_dir: Path) -> Tuple[Path, Dict[str, Any]]:
     cluster_params = manifest.get("cluster_params") or {}
 
     density_maxk_val = int(cluster_params.get("density_maxk", 100))
-    density_z_val = cluster_params.get("density_z", 2.0)
+    density_z_val = cluster_params.get("density_z", 3.0)
     max_cluster_frames_val = cluster_params.get("max_cluster_frames")
 
     angles_path = work_dir / manifest["angles_path"]

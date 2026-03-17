@@ -94,7 +94,7 @@ export default function SystemDetailPage() {
   const [backmappingJobStatus, setBackmappingJobStatus] = useState({});
   const [maxClusterFrames, setMaxClusterFrames] = useState(0);
   const [densityZMode, setDensityZMode] = useState('manual');
-  const [densityZValue, setDensityZValue] = useState(2.0);
+  const [densityZValue, setDensityZValue] = useState(3.0);
   const [densityMaxk, setDensityMaxk] = useState(100);
   const [analysisFocus, setAnalysisFocus] = useState('');
   const [showMetastableInfo, setShowMetastableInfo] = useState(false);
