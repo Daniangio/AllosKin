@@ -12,6 +12,7 @@ from phase.potts.potts_model import PottsModel, add_potts_models, load_potts_mod
 from phase.potts.qubo import decode_onehot, encode_onehot, potts_to_qubo_onehot
 from phase.potts.sample_io import SAMPLE_NPZ_FILENAME, save_sample_npz
 from phase.potts.sampling import (
+    _ProgressCounter,
     gibbs_sample_potts,
     make_beta_ladder,
     replica_exchange_gibbs_potts,
@@ -307,7 +308,7 @@ def _run_sa_independent_worker(payload: dict[str, object]) -> dict[str, object]:
         n_reads=n_reads,
         sweeps=sweeps,
         seed=seed,
-        progress=False,
+        progress=bool(payload.get("progress", False)),
         beta_range=beta_range,  # type: ignore[arg-type]
         beta_schedule_type=beta_schedule_type,
         beta_schedule=beta_schedule or None,
@@ -378,76 +379,86 @@ def _run_sa_chain_worker(payload: dict[str, object]) -> dict[str, object]:
     labels = np.zeros((n_samples, len(qubo.var_slices)), dtype=np.int32)
     valid_counts = np.zeros(n_samples, dtype=np.int32)
     invalid_mask = np.zeros(n_samples, dtype=bool)
+    sample_counter = _ProgressCounter(
+        n_samples,
+        str(payload.get("progress_desc") or "SA samples"),
+        bool(payload.get("progress", False)),
+        position=payload.get("progress_position"),  # type: ignore[arg-type]
+    )
 
-    for i in range(n_samples):
-        init_state = encode_onehot(next_init, qubo)
-        init = np.asarray(init_state, dtype=np.int8)[None, :]
-        init_min = int(init.min()) if init.size else 0
-        init_max = int(init.max()) if init.size else 0
-        if init_min >= 0 and init_max <= 1:
-            init = (init * 2 - 1).astype(np.int8, copy=False)
-        elif init_min < -1 or init_max > 1:
-            raise ValueError("initial state must be binary (0/1) or spin (-1/1).")
-        init = np.ascontiguousarray(init, dtype=np.int8)
+    try:
+        for i in range(n_samples):
+            init_state = encode_onehot(next_init, qubo)
+            init = np.asarray(init_state, dtype=np.int8)[None, :]
+            init_min = int(init.min()) if init.size else 0
+            init_max = int(init.max()) if init.size else 0
+            if init_min >= 0 and init_max <= 1:
+                init = (init * 2 - 1).astype(np.int8, copy=False)
+            elif init_min < -1 or init_max > 1:
+                raise ValueError("initial state must be binary (0/1) or spin (-1/1).")
+            init = np.ascontiguousarray(init, dtype=np.int8)
 
-        kwargs: Dict[str, object] = {
-            "num_reads": 1,
-            "seed": int(seed) + int(i),
-            "initial_states": init,
-            "num_sweeps_per_beta": int(sweeps_per_beta),
-            "randomize_order": bool(randomize_order),
-            "proposal_acceptance_criteria": str(acceptance),
-        }
-        if beta_schedule:
-            kwargs["beta_schedule_type"] = "custom"
-            kwargs["beta_schedule"] = np.asarray(beta_schedule, dtype=float)
-        else:
-            kwargs["num_sweeps"] = sweeps
-            kwargs["beta_schedule_type"] = str(beta_schedule_type)
-        if beta_range is not None and not beta_schedule:
-            kwargs["beta_range"] = beta_range  # type: ignore[assignment]
+            kwargs: Dict[str, object] = {
+                "num_reads": 1,
+                "seed": int(seed) + int(i),
+                "initial_states": init,
+                "num_sweeps_per_beta": int(sweeps_per_beta),
+                "randomize_order": bool(randomize_order),
+                "proposal_acceptance_criteria": str(acceptance),
+            }
+            if beta_schedule:
+                kwargs["beta_schedule_type"] = "custom"
+                kwargs["beta_schedule"] = np.asarray(beta_schedule, dtype=float)
+            else:
+                kwargs["num_sweeps"] = sweeps
+                kwargs["beta_schedule_type"] = str(beta_schedule_type)
+            if beta_range is not None and not beta_schedule:
+                kwargs["beta_range"] = beta_range  # type: ignore[assignment]
 
-        def _sample_with_kwargs(sample_kwargs: Dict[str, object]):
-            return sampler.sample(bqm, **sample_kwargs)
+            def _sample_with_kwargs(sample_kwargs: Dict[str, object]):
+                return sampler.sample(bqm, **sample_kwargs)
 
-        try:
-            ss = _sample_with_kwargs(kwargs)
-        except TypeError:
-            # Some neal versions require initial_states as a list[dict]
-            init_list = [{j: int(init[0, j]) for j in range(qubo.num_vars())}]
-            retry = dict(kwargs)
-            retry["initial_states"] = init_list
             try:
-                ss = _sample_with_kwargs(retry)
-            except Exception:
-                # Fall back to random init (best effort).
-                fallback = dict(kwargs)
-                fallback.pop("initial_states", None)
-                ss = _sample_with_kwargs(fallback)
+                ss = _sample_with_kwargs(kwargs)
+            except TypeError:
+                # Some neal versions require initial_states as a list[dict]
+                init_list = [{j: int(init[0, j]) for j in range(qubo.num_vars())}]
+                retry = dict(kwargs)
+                retry["initial_states"] = init_list
+                try:
+                    ss = _sample_with_kwargs(retry)
+                except Exception:
+                    # Fall back to random init (best effort).
+                    fallback = dict(kwargs)
+                    fallback.pop("initial_states", None)
+                    ss = _sample_with_kwargs(fallback)
 
-        sample = next(iter(ss.samples()))
-        z = np.zeros(qubo.num_vars(), dtype=int)
-        for j in range(qubo.num_vars()):
-            z[j] = int(sample[j])
-        x, valid = decode_onehot(z, qubo, repair=repair_mode)
-        labels[i] = x
-        vc = int(valid.sum())
-        valid_counts[i] = vc
-        invalid_mask[i] = vc != int(labels.shape[1])
+            sample = next(iter(ss.samples()))
+            z = np.zeros(qubo.num_vars(), dtype=int)
+            for j in range(qubo.num_vars()):
+                z[j] = int(sample[j])
+            x, valid = decode_onehot(z, qubo, repair=repair_mode)
+            labels[i] = x
+            vc = int(valid.sum())
+            valid_counts[i] = vc
+            invalid_mask[i] = vc != int(labels.shape[1])
 
-        if sa_restart == "previous":
-            next_init = _sa_project_labels_for_restart(z, qubo)
-        else:
-            # fresh MD init for each sample
-            next_init = _build_sa_initial_labels(
-                mode="md",
-                md_labels=md_labels,
-                model=model,
-                beta=beta,
-                n_reads=1,
-                md_frame=-1,
-                rng=init_rng,
-            )[0]
+            if sa_restart == "previous":
+                next_init = _sa_project_labels_for_restart(z, qubo)
+            else:
+                # fresh MD init for each sample
+                next_init = _build_sa_initial_labels(
+                    mode="md",
+                    md_labels=md_labels,
+                    model=model,
+                    beta=beta,
+                    n_reads=1,
+                    md_frame=-1,
+                    rng=init_rng,
+                )[0]
+            sample_counter.update(1)
+    finally:
+        sample_counter.close()
 
     return {"labels": labels, "invalid_mask": invalid_mask, "valid_counts": valid_counts}
 

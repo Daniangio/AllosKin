@@ -1681,9 +1681,10 @@ def run_sampling_chain_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "burn_in": int(payload["burn_in"]),
                 "thinning": int(payload["thinning"]),
                 "seed": int(payload["seed"]),
-                "progress": False,
-                "progress_mode": "samples",
+                "progress": bool(payload.get("progress", False)),
+                "progress_mode": str(payload.get("progress_mode", "samples")),
                 "progress_desc": str(payload.get("progress_desc") or "Gibbs samples"),
+                "progress_position": payload.get("progress_position"),
             }
         )
     if worker_kind == "gibbs_rex":
@@ -1697,9 +1698,10 @@ def run_sampling_chain_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "burn_in_rounds": int(payload["burn_in_rounds"]),
                 "thinning_rounds": int(payload["thinning_rounds"]),
                 "seed": int(payload["seed"]),
-                "progress": False,
-                "progress_mode": "samples",
+                "progress": bool(payload.get("progress", False)),
+                "progress_mode": str(payload.get("progress_mode", "samples")),
                 "progress_desc": str(payload.get("progress_desc") or "REX samples"),
+                "progress_position": payload.get("progress_position"),
             }
         )
         samples_by_beta = run.get("samples_by_beta") if isinstance(run, dict) else None
@@ -1809,7 +1811,10 @@ def prepare_sampling_batch(
                         "burn_in": int(gibbs_burnin),
                         "thinning": int(gibbs_thin),
                         "seed": int(seed) + idx,
+                        "progress": bool(progress),
+                        "progress_mode": "samples",
                         "progress_desc": f"Gibbs chain {idx + 1}/{max(1, n_chains)} samples",
+                        "progress_position": int(idx),
                     }
                 )
             requested_workers = max(1, min(max(1, n_chains), max(1, len(payloads))))
@@ -1850,7 +1855,10 @@ def prepare_sampling_batch(
                         "thinning_rounds": int(rex_thin_rounds),
                         "seed": int(seed) + idx,
                         "burnin_clipped": bool(burn_in != int(rex_burnin_rounds)),
+                        "progress": bool(progress),
+                        "progress_mode": "samples",
                         "progress_desc": f"REX chain {idx + 1}/{max(1, n_chains)} samples",
+                        "progress_position": int(idx),
                     }
                 )
             requested_workers = max(1, min(max(1, n_chains), max(1, len(payloads))))
@@ -1918,6 +1926,9 @@ def prepare_sampling_batch(
                     "sa_md_state_ids": str(sa_md_state_ids),
                     "repair": str(repair),
                     "sa_restart_topk": int(sa_restart_topk),
+                    "progress": bool(progress),
+                    "progress_desc": f"SA chain {idx + 1}/{max(1, n_chains)} samples",
+                    "progress_position": int(idx),
                 }
                 if worker_kind == "sa_independent":
                     payload["n_reads"] = int(n_reads)

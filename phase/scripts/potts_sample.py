@@ -154,6 +154,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sample-id", default="")
     parser.add_argument("--sample-name", default="")
     args = parser.parse_args(argv)
+    last_progress = {"message": None, "pct": -1}
+
+    def progress_cb(message: str, pct: int) -> None:
+        if not bool(args.progress):
+            return
+        pct = int(max(0, min(100, pct)))
+        if last_progress["message"] == message and last_progress["pct"] == pct:
+            return
+        last_progress["message"] = message
+        last_progress["pct"] = pct
+        print(f"[sampling] {message} ({pct}%)")
+
     try:
         results = run_sampling(
             cluster_npz=str(args.npz),
@@ -194,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
             sa_md_state_ids=str(args.sa_md_state_ids),
             penalty_safety=float(args.penalty_safety),
             repair=str(args.repair),
+            progress_callback=progress_cb if bool(args.progress) else None,
         )
     except SystemExit as exc:
         return int(exc.code) if exc.code is not None else 1
