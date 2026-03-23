@@ -30,7 +30,7 @@ export default function SystemDetailMacroPanel({
       {actionMessage && <p className="text-sm text-emerald-400">{actionMessage}</p>}
       {!descriptorsReady && states.length > 0 && (
         <p className="text-xs text-amber-300">
-          Upload trajectories and build descriptors for every state before downstream analysis.
+          Trajectories are optional. Upload them later to build descriptors; PDB-only states can still be used for single-pose Potts energy evaluation.
         </p>
       )}
       <div className="grid md:grid-cols-3 gap-4">

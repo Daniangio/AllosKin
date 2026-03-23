@@ -176,14 +176,58 @@ def _predict_cluster_adp(
     density_maxk: int,
     ) -> tuple[np.ndarray, np.ndarray]:
     """Predict ADP cluster labels for new samples using a fitted Data object."""
-    emb, _ = _angles_to_periodic(samples)
-    maxk_val = max(1, min(int(density_maxk), emb.shape[0] - 1))
-    result = dp_data.predict_cluster_ADP(
-        emb,
-        maxk=maxk_val,
-        density_est="kstarNN",
-        n_jobs=1,
-    )
+    expected_dims = None
+    model_X = getattr(dp_data, "X", None)
+    if model_X is not None:
+        try:
+            expected_dims = int(np.asarray(model_X).shape[1])
+        except Exception:
+            expected_dims = None
+    emb, _ = _angles_to_periodic(samples, expected_dims=expected_dims)
+    if emb.shape[0] == 0:
+        empty = np.zeros((0,), dtype=np.int32)
+        return empty, empty
+    # DADApy's ADP predictor is unstable on a single sample because the k* interpolation
+    # path expects a proper 2D neighborhood structure. For one-frame states, duplicate the
+    # point once, predict on the 2-sample batch, then keep the first label.
+    squeeze_single = emb.shape[0] == 1
+    emb_pred = np.concatenate([emb, emb], axis=0) if squeeze_single else emb
+    maxk_val = max(1, min(int(density_maxk), emb_pred.shape[0] - 1))
+    try:
+        result = dp_data.predict_cluster_ADP(
+            emb_pred,
+            maxk=maxk_val,
+            density_est="kstarNN",
+            n_jobs=1,
+        )
+    except ValueError as exc:
+        if "Buffer has wrong number of dimensions" not in str(exc):
+            raise
+        # Compatibility fallback for pickled DADApy models whose predict_cluster_ADP
+        # path breaks on the current runtime. For small query batches, assign by the
+        # nearest training sample in periodic angle space using the stored ADP labels.
+        train_X = np.asarray(getattr(dp_data, "X", None), dtype=np.float64)
+        train_assigned = np.asarray(getattr(dp_data, "cluster_assignment", None), dtype=np.int32).reshape(-1)
+        train_halo = np.asarray(
+            getattr(dp_data, "cluster_assignment_halo", train_assigned),
+            dtype=np.int32,
+        ).reshape(-1)
+        if train_X.ndim != 2 or train_X.shape[0] == 0 or train_X.shape[0] != train_assigned.shape[0]:
+            raise
+        two_pi = 2.0 * np.pi
+        assigned_rows: List[int] = []
+        halo_rows: List[int] = []
+        for row in emb_pred:
+            delta = np.abs(train_X - row.reshape(1, -1))
+            if delta.shape[1]:
+                delta = np.minimum(delta, two_pi - delta)
+            nearest_idx = int(np.argmin(np.sum(delta * delta, axis=1)))
+            assigned_rows.append(int(train_assigned[nearest_idx]))
+            halo_rows.append(int(train_halo[nearest_idx]))
+        result = (
+            np.asarray(assigned_rows, dtype=np.int32),
+            np.asarray(halo_rows, dtype=np.int32),
+        )
     labels_assigned = result[0] if isinstance(result, tuple) else result
     labels_halo = result[1] if isinstance(result, tuple) and len(result) > 1 else labels_assigned
 
@@ -195,7 +239,12 @@ def _predict_cluster_adp(
             return arr[:, 0]
         return arr
 
-    return _coerce_labels(labels_assigned), _coerce_labels(labels_halo)
+    assigned = _coerce_labels(labels_assigned)
+    halo = _coerce_labels(labels_halo)
+    if squeeze_single:
+        assigned = assigned[:1]
+        halo = halo[:1]
+    return assigned, halo
 
 
 def _effective_angle_columns(samples: np.ndarray) -> np.ndarray:
@@ -227,15 +276,21 @@ def _effective_angle_columns(samples: np.ndarray) -> np.ndarray:
     return np.asarray(finite_cols, dtype=np.int32)
 
 
-def _angles_to_periodic(samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _angles_to_periodic(samples: np.ndarray, *, expected_dims: int | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Center informative dihedral columns into [0, 2pi) and return periodicity vector."""
     arr = np.asarray(samples, dtype=np.float64)
     if arr.ndim == 1:
-        arr = arr.reshape(-1, 1)
-    cols = _effective_angle_columns(arr)
-    if cols.size == 0:
-        return np.zeros((arr.shape[0], 0), dtype=np.float64), np.zeros((0,), dtype=np.float64)
-    angles = arr[:, cols]
+        arr = arr.reshape(1, -1)
+    if expected_dims is not None:
+        exp_dims = max(0, int(expected_dims))
+        if arr.shape[1] < exp_dims:
+            arr = np.pad(arr, ((0, 0), (0, exp_dims - arr.shape[1])), constant_values=0.0)
+        angles = arr[:, :exp_dims]
+    else:
+        cols = _effective_angle_columns(arr)
+        if cols.size == 0:
+            return np.zeros((arr.shape[0], 0), dtype=np.float64), np.zeros((0,), dtype=np.float64)
+        angles = arr[:, cols]
     two_pi = 2.0 * np.pi
     centered = np.mod(angles, two_pi)
     centered = np.nan_to_num(centered, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1083,6 +1138,7 @@ def evaluate_state_with_models(
     store: ProjectStore | None = None,
     sample_id: str | None = None,
     workers: int = 1,
+    progress_callback: Callable[[str, int], None] | None = None,
 ) -> Dict[str, Any]:
     store = store or ProjectStore()
     system = store.get_system(project_id, system_id)
@@ -1155,6 +1211,7 @@ def evaluate_state_with_models(
         samples_by_residue[idx] = samples
 
     valid_residue_indices = [idx for idx, model in enumerate(residue_models) if model is not None]
+    total_valid = max(1, len(valid_residue_indices))
     if use_processes and valid_residue_indices:
         with ProcessPoolExecutor(max_workers=min(workers_i, len(valid_residue_indices))) as executor:
             futures: Dict[Any, int] = {}
@@ -1168,6 +1225,7 @@ def evaluate_state_with_models(
                         density_maxk,
                     )
                 ] = idx
+            completed = 0
             for fut in as_completed(futures):
                 idx = futures[fut]
                 try:
@@ -1180,8 +1238,14 @@ def evaluate_state_with_models(
                 labels_halo[:, idx] = labels_halo_res
                 if np.any(labels_assigned_res >= 0):
                     cluster_counts[idx] = int(labels_assigned_res.max()) + 1
+                completed += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        f"Assigning residue {completed}/{total_valid} for state '{state.name or state_id}'...",
+                        35 + int(50 * completed / total_valid),
+                    )
     else:
-        for idx in valid_residue_indices:
+        for completed, idx in enumerate(valid_residue_indices, start=1):
             labels_assigned_res, labels_halo_res = _predict_labels_with_model(
                 residue_models[idx],
                 samples_by_residue[idx],
@@ -1191,6 +1255,11 @@ def evaluate_state_with_models(
             labels_halo[:, idx] = labels_halo_res
             if np.any(labels_assigned_res >= 0):
                 cluster_counts[idx] = int(labels_assigned_res.max()) + 1
+            if progress_callback is not None:
+                progress_callback(
+                    f"Assigning residue {completed}/{total_valid} for state '{state.name or state_id}'...",
+                    35 + int(50 * completed / total_valid),
+                )
 
     labels_halo_full = labels_halo.copy()
     labels_assigned_full = labels_assigned.copy()

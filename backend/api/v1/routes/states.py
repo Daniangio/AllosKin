@@ -211,7 +211,7 @@ async def upload_state_trajectory(
     project_id: str,
     system_id: str,
     state_id: str,
-    trajectory: UploadFile = File(...),
+    trajectory: Optional[UploadFile] = File(None),
     stride: int = Form(1),
     slice_spec: str = Form(None),
     residue_selection: str = Form(None),
@@ -239,14 +239,23 @@ async def upload_state_trajectory(
         storage_key=state_meta.storage_key or state_meta.state_id,
     )
     system_dir = state_dirs["system_dir"]
-    traj_ext = os.path.splitext(trajectory.filename or "traj.xtc")[1] or ".xtc"
-    traj_path = state_dirs["state_dir"] / f"trajectory{traj_ext}"
-    await stream_upload(trajectory, traj_path)
+    traj_path_override = None
+    if trajectory is not None:
+        traj_ext = os.path.splitext(trajectory.filename or "traj.xtc")[1] or ".xtc"
+        traj_path = state_dirs["state_dir"] / f"trajectory{traj_ext}"
+        await stream_upload(trajectory, traj_path)
 
-    if state_meta.trajectory_file:
-        _unlink_if_inside_system(project_id, system_id, state_meta.trajectory_file)
-    state_meta.source_traj = trajectory.filename
-    state_meta.trajectory_file = str(traj_path.relative_to(system_dir))
+        if state_meta.trajectory_file:
+            _unlink_if_inside_system(project_id, system_id, state_meta.trajectory_file)
+        state_meta.source_traj = trajectory.filename
+        state_meta.trajectory_file = str(traj_path.relative_to(system_dir))
+        traj_path_override = traj_path
+    else:
+        if not state_meta.pdb_file:
+            raise HTTPException(status_code=400, detail="No stored PDB for this state. Upload PDB first.")
+        traj_path_override = project_store.resolve_path(project_id, system_id, state_meta.pdb_file)
+        if not traj_path_override.exists():
+            raise HTTPException(status_code=404, detail="Stored PDB file is missing on disk.")
     state_meta.stride = stride_val
     state_meta.slice_spec = slice_spec
     state_meta.resid_shift = int(state_meta.resid_shift if resid_shift is None else resid_shift)
@@ -280,12 +289,13 @@ async def upload_state_trajectory(
             state_meta,
             residue_filter=residue_selection,
             resid_shift=state_meta.resid_shift,
-            traj_path_override=traj_path,
+            traj_path_override=traj_path_override,
         )
     except Exception as exc:
         system_meta.status = "failed"
         project_store.save_system(system_meta)
-        raise HTTPException(status_code=500, detail=f"Descriptor build failed after upload: {exc}") from exc
+        action = "upload" if trajectory is not None else "PDB-only build"
+        raise HTTPException(status_code=500, detail=f"Descriptor build failed after {action}: {exc}") from exc
     return serialize_system(system_meta)
 
 

@@ -138,6 +138,8 @@ class PottsAnalysisJobRequest(BaseModel):
     model_path: Optional[str] = None
     md_label_mode: Optional[str] = None  # assigned|halo
     keep_invalid: Optional[bool] = None
+    pose_only: Optional[bool] = None
+    state_pose_ids: Optional[List[str]] = None
     plm_init: Optional[str] = None
     plm_init_model: Optional[str] = None
     plm_resume_model: Optional[str] = None
@@ -148,6 +150,7 @@ class MdSamplesRefreshJobRequest(BaseModel):
     project_id: str
     system_id: str
     cluster_id: str
+    state_ids: Optional[List[str]] = None
     overwrite: Optional[bool] = True
     cleanup: Optional[bool] = True
 

@@ -233,7 +233,7 @@ export function AddStateForm({ states, onAdd, isAdding }) {
         />
       </div>
       <p className="text-xs text-gray-500">
-        Provide a new PDB or select an existing state to duplicate its structure. Residue shift is applied when descriptors are built.
+        Provide a new PDB or select an existing state to duplicate its structure. Trajectory upload is optional and can be done later. Residue shift is applied when descriptors are built.
       </p>
       <button
         type="submit"

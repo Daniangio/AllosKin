@@ -44,6 +44,7 @@ import {
   submitPottsFitJob,
   submitStaticJob,
   submitSimulationJob,
+  submitMdSamplesRefreshJob,
   fetchJobStatus,
   uploadSimulationResults,
 } from '../api/jobs';
@@ -579,6 +580,18 @@ export default function SystemDetailPage() {
     navigate(`/jobs/${response.job_id}`, { state: { analysis_uuid: response.analysis_uuid } });
   };
 
+  const enqueueMdSamplesRefreshJob = async (params) => {
+    setActionError(null);
+    const response = await submitMdSamplesRefreshJob({
+      project_id: projectId,
+      system_id: systemId,
+      ...params,
+    });
+    loadResults();
+    navigate(`/jobs/${response.job_id}`, { state: { analysis_uuid: response.analysis_uuid } });
+    return response;
+  };
+
   const handleDeleteSample = useCallback(
     async (sampleId) => {
       if (!pottsFitClusterId) return;
@@ -808,12 +821,13 @@ export default function SystemDetailPage() {
   };
 
   const handleUploadTrajectory = async (stateId, file, sliceSpec, residueSelection, residShift) => {
-    if (!file) return;
     setUploadingState(stateId);
     setActionError(null);
     try {
       const payload = new FormData();
-      payload.append('trajectory', file);
+      if (file) {
+        payload.append('trajectory', file);
+      }
       if (sliceSpec && sliceSpec.trim()) {
         payload.append('slice_spec', sliceSpec.trim());
       } else {
@@ -834,7 +848,7 @@ export default function SystemDetailPage() {
           })),
         onProcessing: (processing) => setProcessingState(processing ? stateId : null),
       });
-      setActionMessage('Uploaded trajectory; rebuilding descriptors...');
+      setActionMessage(file ? 'Uploaded trajectory; rebuilding descriptors...' : 'Building descriptors from the stored PDB...');
       await refreshSystem();
     } catch (err) {
       setActionError(err.message);
@@ -1479,6 +1493,7 @@ export default function SystemDetailPage() {
               handleUploadSimulationResults={handleUploadSimulationResults}
               samplingUploadBusy={samplingUploadBusy}
               enqueueSimulationJob={enqueueSimulationJob}
+              enqueueMdSamplesRefreshJob={enqueueMdSamplesRefreshJob}
               navigate={navigate}
               projectId={projectId}
               systemId={systemId}

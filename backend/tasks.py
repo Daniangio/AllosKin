@@ -23,6 +23,7 @@ from phase.potts.pipeline import run_pipeline as run_simulation_pipeline
 from phase.potts.sampling_run import run_sampling
 from phase.potts.analysis_run import (
     analyze_cluster_samples,
+    append_state_pose_energies,
     compute_delta_transition_analysis,
     upsert_delta_commitment_analysis,
     upsert_delta_js_analysis,
@@ -71,6 +72,17 @@ from backend.services.project_store import ProjectStore
 # Define the persistent data root (aligned with PHASE_DATA_ROOT).
 DATA_ROOT = Path(os.getenv("PHASE_DATA_ROOT", "/app/data"))
 project_store = ProjectStore()
+
+
+def _default_state_assignment_workers() -> int:
+    raw = os.getenv("PHASE_STATE_ASSIGN_WORKERS", "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except Exception:
+            pass
+    return max(1, min(4, int(os.cpu_count() or 1)))
+
 
 # Helper to convert NaN to None for JSON serialization
 def _convert_nan_to_none(obj):
@@ -1441,16 +1453,34 @@ def run_potts_analysis_job(
 
         md_label_mode = (params.get("md_label_mode") or "assigned").lower()
         keep_invalid = bool(params.get("keep_invalid", False))
+        pose_only = bool(params.get("pose_only", False))
+        state_pose_ids = [str(v).strip() for v in (params.get("state_pose_ids") or []) if str(v).strip()]
 
         save_progress("Running analyses...", 20)
-        summary = analyze_cluster_samples(
-            project_id=project_id,
-            system_id=system_id,
-            cluster_id=cluster_id,
-            model_ref=model_ref,
-            md_label_mode=md_label_mode,
-            drop_invalid=not keep_invalid,
-        )
+        if pose_only:
+            if not model_ref:
+                raise ValueError("state pose energy analysis requires model_id or model_path.")
+            if not state_pose_ids:
+                raise ValueError("state pose energy analysis requires at least one state_pose_id.")
+            state_eval_workers = _default_state_assignment_workers()
+            summary = append_state_pose_energies(
+                project_id=project_id,
+                system_id=system_id,
+                cluster_id=cluster_id,
+                model_ref=model_ref,
+                state_ids=state_pose_ids,
+                state_eval_workers=state_eval_workers,
+                progress_callback=save_progress,
+            )
+        else:
+            summary = analyze_cluster_samples(
+                project_id=project_id,
+                system_id=system_id,
+                cluster_id=cluster_id,
+                model_ref=model_ref,
+                md_label_mode=md_label_mode,
+                drop_invalid=not keep_invalid,
+            )
 
         cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
         analyses_dir = cluster_dirs["cluster_dir"] / "analyses"
@@ -1536,6 +1566,15 @@ def run_md_samples_refresh_job(
 
     overwrite = bool(params.get("overwrite", True))
     cleanup = bool(params.get("cleanup", True))
+    state_eval_workers = _default_state_assignment_workers()
+    requested_state_ids: List[str] = []
+    seen_state_ids: set[str] = set()
+    for raw in params.get("state_ids") or []:
+        sid = str(raw or "").strip()
+        if not sid or sid in seen_state_ids:
+            continue
+        seen_state_ids.add(sid)
+        requested_state_ids.append(sid)
 
     try:
         save_progress("Initializing...", 0)
@@ -1555,10 +1594,22 @@ def run_md_samples_refresh_job(
             samples = []
 
         descriptor_states = [s for s in system_meta.states.values() if getattr(s, "descriptor_file", None)]
+        if requested_state_ids:
+            requested = set(requested_state_ids)
+            descriptor_states = [
+                state
+                for state in descriptor_states
+                if str(getattr(state, "state_id", "") or "") in requested
+            ]
         total = len(descriptor_states)
         if total == 0:
             result_payload["status"] = "finished"
-            result_payload["results"] = {"refreshed": 0, "states": 0, "sample_ids": []}
+            result_payload["results"] = {
+                "refreshed": 0,
+                "states": 0,
+                "sample_ids": [],
+                "requested_state_ids": requested_state_ids,
+            }
             return result_payload
 
         refreshed_ids: List[str] = []
@@ -1609,6 +1660,8 @@ def run_md_samples_refresh_job(
                 state_id,
                 store=project_store,
                 sample_id=reuse_id,
+                workers=state_eval_workers,
+                progress_callback=save_progress,
             )
 
             out_id = sample_entry.get("sample_id")
@@ -1642,6 +1695,7 @@ def run_md_samples_refresh_job(
             "refreshed": len(refreshed_ids),
             "states": total,
             "sample_ids": refreshed_ids,
+            "requested_state_ids": requested_state_ids,
         }
 
     except Exception as e:

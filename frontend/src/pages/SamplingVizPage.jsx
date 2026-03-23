@@ -7,6 +7,7 @@ import Loader from '../components/common/Loader';
 import ErrorMessage from '../components/common/ErrorMessage';
 import HelpDrawer from '../components/common/HelpDrawer';
 import {
+  deleteClusterAnalysis,
   deleteSamplingSample,
   fetchClusterAnalyses,
   fetchClusterAnalysisData,
@@ -200,10 +201,9 @@ export default function SamplingVizPage() {
   const analysisDataCacheRef = useRef({});
   const analysisDataInFlightRef = useRef({});
 
-  const [mdLabelMode, setMdLabelMode] = useState('assigned');
-  const [keepInvalid, setKeepInvalid] = useState(false);
-
-  const [selectedModelId, setSelectedModelId] = useState('');
+  const [selectedAnalysisModelId, setSelectedAnalysisModelId] = useState('');
+  const [runAnalysisModelId, setRunAnalysisModelId] = useState('');
+  const [selectedPoseStateId, setSelectedPoseStateId] = useState('');
 
   const [selectedMdSampleId, setSelectedMdSampleId] = useState('');
   const [selectedSampleId, setSelectedSampleId] = useState('');
@@ -234,18 +234,23 @@ export default function SamplingVizPage() {
 
   const sampleEntries = useMemo(() => selectedCluster?.samples || [], [selectedCluster]);
   const pottsModels = useMemo(() => selectedCluster?.potts_models || [], [selectedCluster]);
-
+  const stateEntries = useMemo(() => Object.values(system?.states || {}), [system]);
   const mdSamples = useMemo(() => sampleEntries.filter((s) => s.type === 'md_eval'), [sampleEntries]);
+  const poseEligibleStates = useMemo(
+    () => stateEntries.filter((state) => state?.pdb_file && state?.descriptor_file),
+    [stateEntries]
+  );
+
   const filteredSamples = useMemo(() => {
-    if (!selectedModelId) return sampleEntries;
+    if (!selectedAnalysisModelId) return sampleEntries;
     return sampleEntries.filter((s) => {
       if (s.type === 'md_eval') return true;
       if (s.type === 'potts_lambda_sweep') return true;
       const ids = Array.isArray(s.model_ids) ? s.model_ids : s.model_id ? [s.model_id] : [];
       if (!ids.length) return true;
-      return ids.includes(selectedModelId);
+      return ids.includes(selectedAnalysisModelId);
     });
-  }, [sampleEntries, selectedModelId]);
+  }, [sampleEntries, selectedAnalysisModelId]);
   const gibbsSamples = useMemo(
     () => filteredSamples.filter((s) => s.type === 'potts_sampling' && s.method === 'gibbs'),
     [filteredSamples]
@@ -297,11 +302,10 @@ export default function SamplingVizPage() {
     [sampleStatsCache, selectedSampleId]
   );
   const selectedSampleAllInvalid = useMemo(() => {
-    if (keepInvalid) return false;
     if (!selectedSampleEntry || selectedSampleEntry.method !== 'sa') return false;
     if (!selectedSampleStats) return false;
     return selectedSampleStats.n_frames > 0 && selectedSampleStats.invalid_count >= selectedSampleStats.n_frames;
-  }, [keepInvalid, selectedSampleEntry, selectedSampleStats]);
+  }, [selectedSampleEntry, selectedSampleStats]);
   const analysisSummary = analysisJobStatus?.result?.results?.summary || analysisJobStatus?.meta?.summary || null;
   const analysisSkippedSamples = useMemo(
     () => (Array.isArray(analysisSummary?.skipped_samples) ? analysisSummary.skipped_samples : []),
@@ -341,15 +345,16 @@ export default function SamplingVizPage() {
 
   useEffect(() => {
     if (!pottsModels.length) {
-      setSelectedModelId('');
+      setSelectedAnalysisModelId('');
+      setRunAnalysisModelId('');
       return;
     }
-    if (!selectedModelId) {
-      setSelectedModelId(pottsModels[0]?.model_id || '');
-    } else if (!pottsModels.some((m) => m.model_id === selectedModelId)) {
-      setSelectedModelId(pottsModels[0]?.model_id || '');
+    if (!runAnalysisModelId) {
+      setRunAnalysisModelId(pottsModels[0]?.model_id || '');
+    } else if (!pottsModels.some((m) => m.model_id === runAnalysisModelId)) {
+      setRunAnalysisModelId(pottsModels[0]?.model_id || '');
     }
-  }, [pottsModels, selectedModelId]);
+  }, [pottsModels, runAnalysisModelId]);
 
   const loadClusterInfo = useCallback(async (modelIdOverride) => {
     if (!selectedClusterId) return;
@@ -372,8 +377,16 @@ export default function SamplingVizPage() {
     setAnalysesLoading(true);
     setAnalysesError(null);
     try {
-      const data = await fetchClusterAnalyses(projectId, systemId, selectedClusterId);
-      setAnalyses(Array.isArray(data?.analyses) ? data.analyses : []);
+      const [mdVsData, energyData] = await Promise.all([
+        fetchClusterAnalyses(projectId, systemId, selectedClusterId, { analysisType: 'md_vs_sample' }),
+        fetchClusterAnalyses(projectId, systemId, selectedClusterId, { analysisType: 'model_energy' }),
+      ]);
+      const merged = [
+        ...(Array.isArray(mdVsData?.analyses) ? mdVsData.analyses : []),
+        ...(Array.isArray(energyData?.analyses) ? energyData.analyses : []),
+      ];
+      merged.sort((a, b) => String(b?.created_at || '').localeCompare(String(a?.created_at || '')));
+      setAnalyses(merged);
     } catch (err) {
       setAnalysesError(err.message || 'Failed to load analyses.');
       setAnalyses([]);
@@ -384,7 +397,7 @@ export default function SamplingVizPage() {
 
   useEffect(() => {
     if (!selectedClusterId) return;
-    loadClusterInfo(selectedModelId);
+    loadClusterInfo('');
     loadAnalyses();
     setAnalysisDataCache({});
     analysisDataCacheRef.current = {};
@@ -396,8 +409,8 @@ export default function SamplingVizPage() {
   useEffect(() => {
     if (!selectedClusterId) return;
     // Update edge count/info when switching the active Potts model.
-    loadClusterInfo(selectedModelId);
-  }, [selectedModelId, selectedClusterId, loadClusterInfo]);
+    loadClusterInfo(selectedAnalysisModelId);
+  }, [selectedAnalysisModelId, selectedClusterId, loadClusterInfo]);
 
   useEffect(() => {
     if (!mdSamples.length) {
@@ -428,7 +441,76 @@ export default function SamplingVizPage() {
     [analyses]
   );
 
-  const dropInvalid = !keepInvalid;
+  const analysisGroups = useMemo(() => {
+    const byModel = new Map();
+    const modelNameById = new Map((pottsModels || []).map((m) => [m.model_id, m.name || m.model_id]));
+    [...mdVsSampleAnalyses, ...modelEnergyAnalyses].forEach((analysis) => {
+      const modelId = String(analysis.model_id || '').trim();
+      if (!modelId) return;
+      const key = modelId;
+      if (!byModel.has(key)) {
+        byModel.set(key, {
+          modelId,
+          modelName: analysis.model_name || modelNameById.get(modelId) || modelId,
+          latestCreatedAt: String(analysis.created_at || ''),
+          mdVsCount: 0,
+          energyCount: 0,
+        });
+      }
+      const group = byModel.get(key);
+      if (analysis.analysis_type === 'md_vs_sample') group.mdVsCount += 1;
+      if (analysis.analysis_type === 'model_energy') group.energyCount += 1;
+      const createdAt = String(analysis.created_at || '');
+      if (createdAt > String(group.latestCreatedAt || '')) {
+        group.latestCreatedAt = createdAt;
+      }
+      if (!group.modelName && (analysis.model_name || modelNameById.get(modelId))) {
+        group.modelName = analysis.model_name || modelNameById.get(modelId) || modelId;
+      }
+    });
+    return Array.from(byModel.values()).sort((a, b) => String(b.latestCreatedAt || '').localeCompare(String(a.latestCreatedAt || '')));
+  }, [mdVsSampleAnalyses, modelEnergyAnalyses, pottsModels]);
+
+  const pendingAnalysisEntry = useMemo(() => {
+    const modelId = String(analysisJob?.model_id || '').trim();
+    if (!modelId || !selectedClusterId) return null;
+    const modelName =
+      pottsModels.find((m) => m.model_id === modelId)?.name ||
+      analysisGroups.find((g) => g.modelId === modelId)?.modelName ||
+      modelId;
+    const progress = typeof analysisJobStatus?.meta?.progress === 'number' ? analysisJobStatus.meta.progress : 0;
+    const status = String(analysisJobStatus?.status || analysisJobStatus?.meta?.status || 'queued');
+    return {
+      modelId,
+      modelName,
+      progress,
+      status,
+      jobId: analysisJob?.job_id || '',
+    };
+  }, [analysisGroups, analysisJob, analysisJobStatus, pottsModels, selectedClusterId]);
+
+  useEffect(() => {
+    if (!analysisGroups.length) {
+      setSelectedAnalysisModelId('');
+      return;
+    }
+    if (!selectedAnalysisModelId || !analysisGroups.some((g) => g.modelId === selectedAnalysisModelId)) {
+      setSelectedAnalysisModelId(analysisGroups[0].modelId);
+    }
+  }, [analysisGroups, selectedAnalysisModelId]);
+
+  useEffect(() => {
+    if (!poseEligibleStates.length) {
+      setSelectedPoseStateId('');
+      return;
+    }
+    if (!selectedPoseStateId || !poseEligibleStates.some((s) => s.state_id === selectedPoseStateId)) {
+      setSelectedPoseStateId(poseEligibleStates[0].state_id);
+    }
+  }, [poseEligibleStates, selectedPoseStateId]);
+
+  const mdLabelMode = 'assigned';
+  const dropInvalid = true;
 
   const selectedMdVsMeta = useMemo(() => {
     if (!selectedMdSampleId || !selectedSampleId) return null;
@@ -442,12 +524,12 @@ export default function SamplingVizPage() {
       );
     });
     if (!candidates.length) return null;
-    if (selectedModelId) {
-      const withModel = candidates.find((a) => a.model_id === selectedModelId);
+    if (selectedAnalysisModelId) {
+      const withModel = candidates.find((a) => a.model_id === selectedAnalysisModelId);
       if (withModel) return withModel;
     }
     return candidates[0];
-  }, [mdVsSampleAnalyses, selectedMdSampleId, selectedSampleId, mdLabelMode, dropInvalid, selectedModelId]);
+  }, [mdVsSampleAnalyses, selectedMdSampleId, selectedSampleId, selectedAnalysisModelId, mdLabelMode, dropInvalid]);
 
   const loadAnalysisData = useCallback(
     async (analysisType, analysisId) => {
@@ -546,16 +628,38 @@ export default function SamplingVizPage() {
         project_id: projectId,
         system_id: systemId,
         cluster_id: selectedClusterId,
-        md_label_mode: mdLabelMode,
-        keep_invalid: keepInvalid,
+        md_label_mode: 'assigned',
+        keep_invalid: false,
       };
-      if (selectedModelId) payload.model_id = selectedModelId;
+      if (runAnalysisModelId) payload.model_id = runAnalysisModelId;
       const res = await submitPottsAnalysisJob(payload);
-      setAnalysisJob(res);
+      setAnalysisJob({ ...res, model_id: runAnalysisModelId });
+      if (runAnalysisModelId) setSelectedAnalysisModelId(runAnalysisModelId);
     } catch (err) {
       setAnalysesError(err.message || 'Failed to submit analysis job.');
     }
-  }, [projectId, systemId, selectedClusterId, mdLabelMode, keepInvalid, selectedModelId]);
+  }, [projectId, systemId, selectedClusterId, runAnalysisModelId]);
+
+  const handleAppendStatePoseEnergy = useCallback(async () => {
+    if (!selectedClusterId || !selectedAnalysisModelId || !selectedPoseStateId) return;
+    setAnalysesError(null);
+    setAnalysisJob(null);
+    setAnalysisJobStatus(null);
+    try {
+      const payload = {
+        project_id: projectId,
+        system_id: systemId,
+        cluster_id: selectedClusterId,
+        model_id: selectedAnalysisModelId,
+        pose_only: true,
+        state_pose_ids: [selectedPoseStateId],
+      };
+      const res = await submitPottsAnalysisJob(payload);
+      setAnalysisJob({ ...res, model_id: selectedAnalysisModelId });
+    } catch (err) {
+      setAnalysesError(err.message || 'Failed to append state pose energy.');
+    }
+  }, [projectId, systemId, selectedClusterId, selectedAnalysisModelId, selectedPoseStateId]);
 
   const handleRefreshMdSamples = useCallback(async () => {
     if (!selectedClusterId) return;
@@ -589,7 +693,11 @@ export default function SamplingVizPage() {
         if (terminal.has(status?.status)) {
           // Stop polling once the job is done.
           clearInterval(timer);
-          if (status?.status === 'finished') await loadAnalyses();
+          if (status?.status === 'finished') {
+            await loadAnalyses();
+            const data = await fetchSystem(projectId, systemId);
+            if (!cancelled) setSystem(data);
+          }
         }
       } catch (err) {
         if (!cancelled) setAnalysesError(err.message || 'Failed to poll analysis job.');
@@ -601,7 +709,7 @@ export default function SamplingVizPage() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [analysisJob, loadAnalyses]);
+  }, [analysisJob, loadAnalyses, projectId, systemId]);
 
   useEffect(() => {
     if (!mdRefreshJob?.job_id) return;
@@ -653,6 +761,36 @@ export default function SamplingVizPage() {
     setInfoSampleId((prev) => (prev === sampleId ? '' : sampleId));
   }, []);
 
+  const handleDeleteAnalysisGroup = useCallback(
+    async (modelId) => {
+      if (!selectedClusterId || !modelId) return;
+      const targets = analyses.filter(
+        (a) => a.model_id === modelId && (a.analysis_type === 'md_vs_sample' || a.analysis_type === 'model_energy')
+      );
+      if (!targets.length) return;
+      const ok = window.confirm(`Delete ${targets.length} Sampling Explorer analyses for this Potts model?`);
+      if (!ok) return;
+      setAnalysesError(null);
+      try {
+        for (const analysis of targets) {
+          try {
+            await deleteClusterAnalysis(projectId, systemId, selectedClusterId, analysis.analysis_type, analysis.analysis_id);
+          } catch (err) {
+            const message = String(err?.message || '');
+            if (!/not found/i.test(message) && !/404/.test(message)) {
+              throw err;
+            }
+          }
+        }
+        if (selectedAnalysisModelId === modelId) setSelectedAnalysisModelId('');
+        await loadAnalyses();
+      } catch (err) {
+        setAnalysesError(err.message || 'Failed to delete analysis group.');
+      }
+    },
+    [analyses, loadAnalyses, projectId, selectedAnalysisModelId, selectedClusterId, systemId]
+  );
+
   useEffect(() => {
     const load = async () => {
       if (!infoSampleId) return;
@@ -683,15 +821,19 @@ export default function SamplingVizPage() {
   }, [selectedSampleId, sampleStatsCache, projectId, systemId, selectedClusterId]);
 
   const energyAnalysesForModel = useMemo(() => {
-    if (!selectedModelId) return [];
+    if (!selectedAnalysisModelId) return [];
     // Dedupe: repeated runs create multiple analysis entries per sample_id.
     // Analyses are already sorted newest-first by the backend, so keep the first per sample_id.
     const out = [];
     const seen = new Set();
     for (const a of modelEnergyAnalyses) {
-      if (a.model_id !== selectedModelId) continue;
-      if ((a.md_label_mode || 'assigned') !== mdLabelMode) continue;
-      if (Boolean(a.drop_invalid) !== Boolean(dropInvalid)) continue;
+      if (a.model_id !== selectedAnalysisModelId) continue;
+      const sampleType = String(a.sample_type || '').toLowerCase();
+      const isStateDerived = sampleType === 'state_pose' || sampleType === 'state_eval';
+      if (!isStateDerived) {
+        if ((a.md_label_mode || 'assigned') !== mdLabelMode) continue;
+        if (Boolean(a.drop_invalid) !== Boolean(dropInvalid)) continue;
+      }
       const sid = a.sample_id || '';
       if (!sid) continue;
       if (seen.has(sid)) continue;
@@ -699,7 +841,17 @@ export default function SamplingVizPage() {
       out.push(a);
     }
     return out;
-  }, [modelEnergyAnalyses, selectedModelId, mdLabelMode, dropInvalid]);
+  }, [modelEnergyAnalyses, selectedAnalysisModelId, mdLabelMode, dropInvalid]);
+
+  const baseEnergyAnalysesForModel = useMemo(() => {
+    if (!selectedAnalysisModelId) return [];
+    return modelEnergyAnalyses.filter(
+      (a) =>
+        a.model_id === selectedAnalysisModelId &&
+        String(a.sample_type || '').toLowerCase() !== 'state_pose' &&
+        String(a.sample_type || '').toLowerCase() !== 'state_eval'
+    );
+  }, [modelEnergyAnalyses, selectedAnalysisModelId]);
 
   const [energySeries, setEnergySeries] = useState([]);
   const [energyError, setEnergyError] = useState(null);
@@ -709,7 +861,7 @@ export default function SamplingVizPage() {
     const run = async () => {
       setEnergyError(null);
       setEnergySeries([]);
-      if (!selectedModelId) return;
+      if (!selectedAnalysisModelId) return;
       const metas = energyAnalysesForModel;
       if (!metas.length) return;
       setEnergyLoading(true);
@@ -724,7 +876,8 @@ export default function SamplingVizPage() {
           const sample = sampleEntries.find((s) => s.sample_id === meta.sample_id);
           series.push({
             sample_id: meta.sample_id,
-            label: sample?.name || meta.sample_id,
+            label: sample?.name || meta.sample_name || meta.sample_id,
+            kind: String(meta.sample_type || '').toLowerCase() === 'state_pose' ? 'state_pose' : 'sample',
             energies,
           });
         }
@@ -737,16 +890,21 @@ export default function SamplingVizPage() {
     };
     run();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedModelId, energyAnalysesForModel, loadAnalysisData]);
+  }, [selectedAnalysisModelId, energyAnalysesForModel, loadAnalysisData]);
 
   const energyPlot = useMemo(() => {
     if (!energySeries.length) return null;
+
+    const histogramSeries = energySeries.filter((s) => s.kind !== 'state_pose' && Array.isArray(s.energies) && s.energies.length > 1);
+    const poseSeries = energySeries.filter((s) => s.kind === 'state_pose' && Array.isArray(s.energies) && s.energies.length);
+    const allSeries = [...histogramSeries, ...poseSeries];
+    if (!allSeries.length) return null;
 
     // Use a shared xbins across traces so histograms align.
     let globalMin = Infinity;
     let globalMax = -Infinity;
     let minBinSize = Infinity;
-    for (const s of energySeries) {
+    for (const s of allSeries) {
       const arr = Array.isArray(s.energies) ? s.energies : [];
       if (!arr.length) continue;
       let localMin = Infinity;
@@ -779,18 +937,56 @@ export default function SamplingVizPage() {
       }
     }
 
+    const histogramTraces = histogramSeries.map((s, idx) => ({
+      x: s.energies,
+      type: 'histogram',
+      histnorm: 'probability',
+      name: s.label,
+      opacity: 0.55,
+      marker: { color: pickColor(idx) },
+      autobinx: false,
+      xbins: { start: globalMin, end: globalMax, size: minBinSize },
+      bingroup: 'energies',
+    }));
+
+    const poseShapes = poseSeries.map((s, idx) => {
+      const x = Number(s.energies[0]);
+      return {
+        type: 'line',
+        xref: 'x',
+        yref: 'paper',
+        x0: x,
+        x1: x,
+        y0: 0,
+        y1: 1,
+        line: {
+          color: pickColor(histogramSeries.length + idx),
+          width: 2,
+          dash: 'dot',
+        },
+      };
+    });
+    const poseAnnotations = poseSeries.map((s, idx) => ({
+      x: Number(s.energies[0]),
+      y: 1,
+      xref: 'x',
+      yref: 'paper',
+      xanchor: 'left',
+      yanchor: 'bottom',
+      text: s.label,
+      showarrow: false,
+      font: {
+        size: 10,
+        color: pickColor(histogramSeries.length + idx),
+      },
+      bgcolor: 'rgba(255,255,255,0.75)',
+      bordercolor: pickColor(histogramSeries.length + idx),
+      borderwidth: 1,
+      borderpad: 2,
+    }));
+
     return {
-      data: energySeries.map((s, idx) => ({
-        x: s.energies,
-        type: 'histogram',
-        histnorm: 'probability',
-        name: s.label,
-        opacity: 0.55,
-        marker: { color: pickColor(idx) },
-        autobinx: false,
-        xbins: { start: globalMin, end: globalMax, size: minBinSize },
-        bingroup: 'energies',
-      })),
+      data: histogramTraces,
       layout: {
         height: 260,
         margin: { l: 40, r: 10, t: 10, b: 40 },
@@ -800,6 +996,8 @@ export default function SamplingVizPage() {
         barmode: 'overlay',
         xaxis: { title: 'Energy', color: '#111827' },
         yaxis: { title: 'Probability', color: '#111827' },
+        shapes: poseShapes,
+        annotations: poseAnnotations,
       },
     };
   }, [energySeries]);
@@ -897,77 +1095,166 @@ export default function SamplingVizPage() {
               )}
             </div>
 
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="block text-xs text-gray-400">MD label mode</label>
-                <select
-                  value={mdLabelMode}
-                  onChange={(e) => setMdLabelMode(e.target.value)}
-                  className="w-full bg-gray-900 border border-gray-700 rounded-md px-2 py-2 text-white"
+            <p className="text-[11px] text-gray-500">Analysis mode: assigned labels only. Invalid SA frames are always dropped.</p>
+
+            <div className="space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-semibold text-gray-300">Analyses</p>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    await loadClusterInfo(selectedAnalysisModelId);
+                    await loadAnalyses();
+                  }}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md border border-gray-700 text-gray-200 text-[11px] hover:border-gray-500"
                 >
-                  <option value="assigned">Assigned</option>
-                  <option value="halo">Halo</option>
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Refresh
+                </button>
+              </div>
+              <div className="space-y-2 rounded-md border border-gray-800 bg-gray-950/40 p-2">
+                {!analysisGroups.length && !pendingAnalysisEntry && (
+                  <p className="text-[11px] text-gray-500">No Potts analyses yet.</p>
+                )}
+                {analysisGroups.map((group) => {
+                  const isSelected = group.modelId === selectedAnalysisModelId;
+                  const isPending = pendingAnalysisEntry?.modelId === group.modelId;
+                  const progress = isPending ? pendingAnalysisEntry.progress : null;
+                  const status = isPending ? pendingAnalysisEntry.status : null;
+                  return (
+                    <div
+                      key={group.modelId}
+                      className={`w-full rounded-md border px-3 py-2 ${
+                        isSelected
+                          ? 'border-cyan-500 bg-cyan-950/30'
+                          : 'border-gray-800 bg-gray-900/40 hover:border-gray-600'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setSelectedAnalysisModelId(group.modelId)}
+                          className="min-w-0 flex-1 text-left"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-sm text-white truncate">{group.modelName}</span>
+                            <span className="text-[10px] text-gray-500 whitespace-nowrap">
+                              {group.mdVsCount} compare · {group.energyCount} energy
+                            </span>
+                          </div>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteAnalysisGroup(group.modelId)}
+                          className="text-gray-400 hover:text-red-300"
+                          title="Delete this model analysis group"
+                          aria-label={`Delete analyses for ${group.modelName}`}
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
+                      {isPending && (
+                        <div className="mt-2 space-y-1">
+                          <div className="h-1.5 rounded bg-gray-800 overflow-hidden">
+                            <div
+                              className="h-full bg-cyan-500"
+                              style={{ width: `${Math.max(0, Math.min(100, Number(progress) || 0))}%` }}
+                            />
+                          </div>
+                          <p className="text-[10px] text-cyan-200">
+                            {status || 'running'} · {Math.max(0, Math.min(100, Number(progress) || 0))}%
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+                {!!pendingAnalysisEntry && !analysisGroups.some((g) => g.modelId === pendingAnalysisEntry.modelId) && (
+                  <div className="rounded-md border border-cyan-800 bg-cyan-950/20 px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-sm text-white truncate">{pendingAnalysisEntry.modelName}</span>
+                      <span className="text-[10px] text-cyan-200">running</span>
+                    </div>
+                    <div className="mt-2 h-1.5 rounded bg-gray-800 overflow-hidden">
+                      <div
+                        className="h-full bg-cyan-500"
+                        style={{ width: `${Math.max(0, Math.min(100, Number(pendingAnalysisEntry.progress) || 0))}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="space-y-2 rounded-md border border-gray-800 bg-gray-950/40 p-3">
+              <p className="text-xs font-semibold text-gray-300">Run new analysis</p>
+              <div className="space-y-1">
+                <label className="block text-xs text-gray-400">Potts model</label>
+                <select
+                  value={runAnalysisModelId}
+                  onChange={(e) => setRunAnalysisModelId(e.target.value)}
+                  disabled={!pottsModels.length}
+                  className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white disabled:opacity-60"
+                >
+                  {!pottsModels.length && <option value="">No models</option>}
+                  {pottsModels.map((m) => (
+                    <option key={m.model_id} value={m.model_id}>
+                      {m.name || m.model_id}
+                    </option>
+                  ))}
                 </select>
               </div>
-              <div className="flex items-end">
-                <label className="flex items-center gap-2 text-xs text-gray-300">
-                  <input
-                    type="checkbox"
-                    checked={keepInvalid}
-                    onChange={(e) => setKeepInvalid(e.target.checked)}
-                    className="h-4 w-4 rounded border-gray-500 bg-gray-900 text-cyan-500 focus:ring-cyan-500"
-                  />
-                  Keep invalid SA
-                </label>
-              </div>
-            </div>
-
-            <div className="space-y-1">
-              <label className="block text-xs text-gray-400">Potts model (edges + energies + sample filter)</label>
-              <select
-                value={selectedModelId}
-                onChange={(e) => setSelectedModelId(e.target.value)}
-                disabled={!pottsModels.length}
-                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white disabled:opacity-60"
-              >
-                {!pottsModels.length && <option value="">No models</option>}
-                {pottsModels.map((m) => (
-                  <option key={m.model_id} value={m.model_id}>
-                    {m.name || m.model_id}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div className="flex items-center gap-2">
               <button
                 type="button"
                 onClick={handleRunAnalysis}
-                className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-cyan-600 hover:bg-cyan-500 text-white text-sm"
+                disabled={!runAnalysisModelId}
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-cyan-600 hover:bg-cyan-500 text-white text-sm disabled:opacity-60 disabled:cursor-not-allowed"
               >
                 <Play className="h-4 w-4" />
                 Run analysis
               </button>
+            </div>
+
+            <div className="space-y-2 rounded-md border border-gray-800 bg-gray-950/40 p-3">
+              <p className="text-xs font-semibold text-gray-300">State energy</p>
+              <p className="text-[11px] text-gray-500">
+                Use a descriptor-ready state and place its Potts energy on the current histogram. If the state is not yet materialized as an assigned cluster sample, PHASE will evaluate it once and reuse that assignment.
+              </p>
+              <div className="space-y-1">
+                <label className="block text-xs text-gray-400">State</label>
+                <select
+                  value={selectedPoseStateId}
+                  onChange={(e) => setSelectedPoseStateId(e.target.value)}
+                  disabled={!poseEligibleStates.length}
+                  className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white disabled:opacity-60"
+                >
+                  {!poseEligibleStates.length && <option value="">No descriptor-ready states available</option>}
+                  {poseEligibleStates.map((state) => (
+                    <option key={state.state_id} value={state.state_id}>
+                      {state.name || state.state_id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {!selectedAnalysisModelId && (
+                <p className="text-[11px] text-amber-300">Select an analysis in the sidebar first.</p>
+              )}
+              {!!selectedAnalysisModelId && !baseEnergyAnalysesForModel.length && (
+                <p className="text-[11px] text-amber-300">
+                  Run the complete Potts analysis for this model first. The state energy is appended to that model context.
+                </p>
+              )}
               <button
                 type="button"
-                onClick={async () => {
-                  await loadClusterInfo(selectedModelId);
-                  await loadAnalyses();
-                }}
-                className="inline-flex items-center gap-2 px-3 py-2 rounded-md border border-gray-700 text-gray-200 text-sm hover:border-gray-500"
+                onClick={handleAppendStatePoseEnergy}
+                disabled={!selectedAnalysisModelId || !selectedPoseStateId || !baseEnergyAnalysesForModel.length}
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-md bg-gray-700 hover:bg-gray-600 text-white text-sm disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <RefreshCw className="h-4 w-4" />
-                Refresh
+                <Play className="h-4 w-4" />
+                Add energy
               </button>
             </div>
 
-            {analysisJob?.job_id && (
-              <div className="text-[11px] text-gray-300">
-                Job: <span className="text-gray-200">{analysisJob.job_id}</span>{' '}
-                {analysisJobStatus?.meta?.status ? `· ${analysisJobStatus.meta.status}` : ''}
-                {typeof analysisJobStatus?.meta?.progress === 'number' ? ` · ${analysisJobStatus.meta.progress}%` : ''}
-              </div>
-            )}
             {analysesError && <ErrorMessage message={analysesError} />}
           </div>
 
@@ -1185,8 +1472,8 @@ export default function SamplingVizPage() {
             {analysisJobStatus?.status === 'finished' && analysisSummary && (
               <div className="rounded-md border border-cyan-800 bg-cyan-950/20 p-3 text-[12px] text-cyan-100 space-y-1">
                 <div>
-                  Wrote {analysisSummary.comparisons_written ?? 0} MD-vs-sample analyses and {analysisSummary.energies_written ?? 0}{' '}
-                  energy analyses.
+                  Wrote {analysisSummary.comparisons_written ?? 0} MD-vs-sample analyses, {analysisSummary.energies_written ?? 0}{' '}
+                  energy analyses, and {analysisSummary.pose_energies_written ?? 0} single-pose energies.
                 </div>
                 {!!analysisSkippedSamples.length && (
                   <div className="text-cyan-200/90">
@@ -1308,11 +1595,11 @@ export default function SamplingVizPage() {
 
                   {!edgeMatrixHasValues && (
                     <p className="text-[11px] text-gray-600">
-                      {!selectedModelId
-                        ? 'Select a Potts model to compute edge metrics.'
+                      {!selectedAnalysisModelId
+                        ? 'Select an analysis in the sidebar to load edge metrics.'
                         : !edges.length
                           ? 'Selected Potts model has no edges.'
-                          : 'No edge JS available yet. Run analysis for this model.'}
+                          : 'No edge JS available yet for the selected analysis.'}
                     </p>
                   )}
                   {edgeMatrixHasValues && (
@@ -1362,7 +1649,7 @@ export default function SamplingVizPage() {
               <div>
                 <h2 className="text-sm font-semibold text-gray-200">Energies</h2>
                 <p className="text-[11px] text-gray-500">
-                  Energy distributions are computed on-demand for all samples under the selected model.
+                  Energy distributions are computed on-demand for all samples under the selected model. Single-PDB state poses are shown as vertical markers.
                 </p>
               </div>
               <div className="text-[11px] text-gray-500">
@@ -1370,15 +1657,14 @@ export default function SamplingVizPage() {
               </div>
             </div>
 
-            {!selectedModelId && (
+            {!selectedAnalysisModelId && (
               <div className="rounded-md border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200">
-                Select a Potts model to compute energies.
+                Select an analysis in the sidebar to load energies.
               </div>
             )}
-            {!!selectedModelId && !energyAnalysesForModel.length && (
+            {!!selectedAnalysisModelId && !energyAnalysesForModel.length && (
               <div className="rounded-md border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200">
-                No energy analyses found for this model/settings. Click <span className="font-semibold">Run analysis</span>{' '}
-                to compute them.
+                No energy analyses found for this analysis/settings. Run a new analysis for this Potts model.
               </div>
             )}
             {selectedSampleAllInvalid && (

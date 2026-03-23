@@ -76,7 +76,7 @@ export function StateCard({
 
       <div className="space-y-2">
         <div>
-          <label className="block text-sm text-gray-300 mb-1">Upload trajectory</label>
+          <label className="block text-sm text-gray-300 mb-1">Upload trajectory (optional)</label>
           <input
             type="file"
             onChange={(e) => setFile(e.target.files?.[0] || null)}
@@ -120,10 +120,10 @@ export function StateCard({
         </div>
         <button
           onClick={() => onUpload(state.state_id, file, sliceSpec, residueSelection, residShift)}
-          disabled={uploading || !file}
+          disabled={uploading || (!file && !state?.pdb_file)}
           className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-semibold py-2 rounded-md transition-colors disabled:opacity-50"
         >
-          {uploading ? 'Uploading...' : 'Upload & Build'}
+          {uploading ? 'Building...' : file ? 'Upload & Build' : 'Build'}
         </button>
       </div>
 

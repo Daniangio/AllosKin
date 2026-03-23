@@ -870,7 +870,7 @@ async def delete_cluster_analysis(
     cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
     analysis_dir = cluster_dirs["cluster_dir"] / "analyses" / kind / aid
     if not analysis_dir.exists() or not analysis_dir.is_dir():
-        raise HTTPException(status_code=404, detail="Analysis not found on disk.")
+        return {"status": "missing", "analysis_type": kind, "analysis_id": aid}
     try:
         shutil.rmtree(analysis_dir)
     except Exception as exc:

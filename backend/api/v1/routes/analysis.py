@@ -397,6 +397,29 @@ async def submit_potts_analysis_job(
     if md_label_mode not in {"assigned", "halo"}:
         raise HTTPException(status_code=400, detail="md_label_mode must be 'assigned' or 'halo'.")
 
+    pose_only = bool(payload.pose_only)
+    state_pose_ids = [str(v).strip() for v in (payload.state_pose_ids or []) if str(v).strip()]
+    if pose_only:
+        if not (payload.model_id or payload.model_path):
+            raise HTTPException(status_code=400, detail="pose_only requires model_id or model_path.")
+        if not state_pose_ids:
+            raise HTTPException(status_code=400, detail="pose_only requires at least one state_pose_id.")
+        missing_states = [
+            state_id for state_id in state_pose_ids if state_id not in (system_meta.states or {})
+        ]
+        if missing_states:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Unknown state ids for pose analysis: {', '.join(missing_states)}",
+            )
+        for state_id in state_pose_ids:
+            state = (system_meta.states or {}).get(state_id)
+            if not getattr(state, "pdb_file", None):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"State '{state_id}' has no stored PDB.",
+                )
+
     params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
     dataset_ref = {
         "project_id": payload.project_id,
@@ -644,7 +667,10 @@ async def submit_ligand_completion_job(
         raise HTTPException(status_code=500, detail=f"Job submission failed: {exc}") from exc
 
 
-@router.post("/submit/md_samples_refresh", summary="Recompute MD evaluation samples (md_eval) for all states in a cluster")
+@router.post(
+    "/submit/md_samples_refresh",
+    summary="Recompute MD evaluation samples (md_eval) for all or selected descriptor-ready states in a cluster",
+)
 async def submit_md_samples_refresh_job(
     payload: MdSamplesRefreshJobRequest,
     task_queue: Any = Depends(get_queue),
@@ -659,7 +685,28 @@ async def submit_md_samples_refresh_job(
 
     get_cluster_entry(system_meta, payload.cluster_id)
 
+    raw_state_ids = payload.state_ids or []
+    state_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for raw in raw_state_ids:
+        sid = str(raw or "").strip()
+        if not sid or sid in seen_ids:
+            continue
+        seen_ids.add(sid)
+        state_ids.append(sid)
+
+    descriptor_state_ids = {
+        str(sid)
+        for sid, state in (system_meta.states or {}).items()
+        if getattr(state, "descriptor_file", None)
+    }
+    invalid = [sid for sid in state_ids if sid not in descriptor_state_ids]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"State(s) missing descriptors: {', '.join(invalid)}")
+
     params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
+    if state_ids:
+        params["state_ids"] = state_ids
     dataset_ref = {
         "project_id": payload.project_id,
         "system_id": payload.system_id,

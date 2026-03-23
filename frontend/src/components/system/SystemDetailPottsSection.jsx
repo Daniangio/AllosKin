@@ -4,7 +4,7 @@ import ErrorMessage from '../common/ErrorMessage';
 import { AnalysisResultsList, InfoTooltip } from './SystemDetailWidgets';
 import SimulationAnalysisForm from '../analysis/SimulationAnalysisForm';
 import SimulationUploadForm from '../analysis/SimulationUploadForm';
-import { assignClusterStates, createLambdaPottsModel, fetchSampleStats } from '../../api/projects';
+import { createLambdaPottsModel, fetchSampleStats } from '../../api/projects';
 
 export default function SystemDetailPottsSection(props) {
   const {
@@ -87,6 +87,7 @@ export default function SystemDetailPottsSection(props) {
     handleUploadSimulationResults,
     samplingUploadBusy,
     enqueueSimulationJob,
+    enqueueMdSamplesRefreshJob,
     navigate,
     projectId,
     systemId,
@@ -1538,10 +1539,15 @@ export default function SystemDetailPottsSection(props) {
                       }
                       setAssignBusy(true);
                       try {
-                        await assignClusterStates(projectId, systemId, pottsFitClusterId, assignStateIds);
-                        if (typeof props.refreshSystem === 'function') {
-                          await props.refreshSystem();
+                        if (typeof enqueueMdSamplesRefreshJob !== 'function') {
+                          throw new Error('State assignment job submission is unavailable.');
                         }
+                        await enqueueMdSamplesRefreshJob({
+                          cluster_id: pottsFitClusterId,
+                          state_ids: assignStateIds,
+                          overwrite: true,
+                          cleanup: true,
+                        });
                         setSamplingOverlayOpen(false);
                       } catch (err) {
                         setAssignError(err.message || 'Failed to assign selected states.');
