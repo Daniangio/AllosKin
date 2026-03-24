@@ -126,6 +126,7 @@ if prompt_bool "Resume existing model fit? (y/N)" "N"; then
     echo "No model selected."
     exit 1
   fi
+  MODEL_NAME="$SELECTED_MODEL_NAME"
   RESUME_EXISTING="true"
 fi
 

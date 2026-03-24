@@ -8,6 +8,8 @@ import numpy as np
 os.environ.setdefault("PHASE_DATA_ROOT", "/tmp/phase-test-data")
 
 import backend.tasks as tasks
+from phase.services.project_store import ProjectStore
+import phase.scripts.potts_fit as potts_fit_script
 
 
 def test_run_potts_fit_job_uses_selected_md_samples_as_training_dataset(tmp_path, monkeypatch):
@@ -162,3 +164,62 @@ def test_run_potts_fit_job_uses_selected_md_samples_as_training_dataset(tmp_path
     assert saved_meta["data_npz"].endswith("fit_dataset.npz")
     assert saved_meta["fit_dataset_type"] == "selected_md_samples"
     assert saved_meta["fit_sample_ids"] == ["sample-a", "sample-b"]
+
+
+def test_potts_fit_resume_keeps_existing_model_name(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("PHASE_DATA_ROOT", str(data_root))
+
+    store = ProjectStore(base_dir=data_root / "projects")
+    store.create_project("Project", project_id="proj")
+    system = store.create_system("proj", name="System", system_id="sys")
+    system.metastable_clusters = [
+        {
+            "cluster_id": "cluster1",
+            "potts_models": [
+                {
+                    "model_id": "model-1",
+                    "name": "Original model name",
+                    "path": "clusters/cluster1/potts_models/model-1/model.npz",
+                }
+            ],
+        }
+    ]
+    store.save_system(system)
+
+    cluster_dirs = store.ensure_cluster_directories("proj", "sys", "cluster1")
+    cluster_npz = cluster_dirs["cluster_dir"] / "cluster.npz"
+    np.savez_compressed(cluster_npz, merged__labels_assigned=np.asarray([[0]], dtype=np.int32))
+
+    resume_dir = cluster_dirs["potts_models_dir"] / "model-1"
+    resume_dir.mkdir(parents=True, exist_ok=True)
+    resume_path = resume_dir / "model.npz"
+    resume_path.write_bytes(b"fake")
+
+    def fake_run_pipeline(args, parser=None):
+        return {"model_path": str(resume_path)}
+
+    monkeypatch.setattr(potts_fit_script.sim_main, "run_pipeline", fake_run_pipeline)
+
+    rc = potts_fit_script.main(
+        [
+            "--project-id",
+            "proj",
+            "--system-id",
+            "sys",
+            "--cluster-id",
+            "cluster1",
+            "--npz",
+            str(cluster_npz),
+            "--results-dir",
+            str(tmp_path / "results"),
+            "--fit",
+            "plm",
+            "--plm-resume-model",
+            "clusters/cluster1/potts_models/model-1/model.npz",
+        ]
+    )
+
+    assert rc == 0
+    meta = json.loads((resume_dir / "model_metadata.json").read_text(encoding="utf-8"))
+    assert meta["name"] == "Original model name"

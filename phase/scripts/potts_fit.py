@@ -138,11 +138,42 @@ def main(argv: list[str] | None = None) -> int:
             params.setdefault("fit_mode", "standard")
             params = _relativize_param_paths(params, system_dir)
             pre_model_meta_path = model_dir / "model_metadata.json"
+            display_name = args.model_name or None
+            if not display_name and args.plm_resume_model:
+                resume_path = Path(args.plm_resume_model)
+                if not resume_path.is_absolute():
+                    resume_path = store.resolve_path(project_id, system_id, str(args.plm_resume_model))
+                try:
+                    system_meta = store.get_system(project_id, system_id)
+                except FileNotFoundError:
+                    system_meta = None
+                if system_meta:
+                    entry = next(
+                        (c for c in (system_meta.metastable_clusters or []) if c.get("cluster_id") == cluster_id),
+                        None,
+                    )
+                    if isinstance(entry, dict):
+                        for model in entry.get("potts_models") or []:
+                            rel_model_path = model.get("path")
+                            if not rel_model_path:
+                                continue
+                            abs_model_path = store.resolve_path(project_id, system_id, rel_model_path)
+                            if abs_model_path.resolve() == resume_path.resolve():
+                                display_name = model.get("name") or display_name
+                                break
+                if not display_name:
+                    resume_meta_path = resume_path.parent / "model_metadata.json"
+                    if resume_meta_path.exists():
+                        try:
+                            resume_meta = json.loads(resume_meta_path.read_text(encoding="utf-8"))
+                            display_name = resume_meta.get("name") or display_name
+                        except Exception:
+                            pass
             _write_model_metadata(
                 model_dir=model_dir,
                 model_meta={
                     "model_id": model_id,
-                    "name": args.model_name or model_id,
+                    "name": display_name or model_id,
                     "path": rel_path,
                     "created_at": datetime.utcnow().isoformat(),
                     "source": args.model_source or "offline",
