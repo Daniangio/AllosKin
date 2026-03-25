@@ -1644,6 +1644,7 @@ def run_ligand_completion_local(
 
 _COMBINED_MODEL_CACHE: dict[tuple[str, ...], Any] = {}
 _GAUGED_MODEL_CACHE: dict[str, Any] = {}
+_POTTS_NN_WORKER_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _load_combined_model_cached(model_paths: Sequence[str]) -> Any:
@@ -1660,6 +1661,48 @@ def _load_gauged_model_cached(model_path: str) -> Any:
     if key not in _GAUGED_MODEL_CACHE:
         _GAUGED_MODEL_CACHE[key] = zero_sum_gauge_model(load_potts_model(key))
     return _GAUGED_MODEL_CACHE[key]
+
+
+def _get_potts_nn_worker_cache(prepared: dict[str, Any]) -> dict[str, Any]:
+    key = (str(prepared["prepared_path"]), str(prepared["model_path"]))
+    cached = _POTTS_NN_WORKER_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    model = _load_gauged_model_cached(str(prepared["model_path"]))
+    md_unique = np.ascontiguousarray(np.asarray(prepared["md_unique_sequences"], dtype=np.int32))
+    md_unique_t = np.ascontiguousarray(md_unique.T)
+    h = [np.asarray(v, dtype=float) for v in model.h]
+    edges = [(int(r), int(s)) for r, s in model.edges]
+    max_gap_h = np.asarray(prepared["max_gap_h"], dtype=float)
+    z_node = float(prepared["z_node"])
+    z_edge = float(prepared["z_edge"])
+    z_edge_per_residue = np.asarray(prepared["z_edge_per_residue"], dtype=float)
+
+    edge_mats = [np.asarray(model.J[(r, s)], dtype=float) for r, s in edges]
+    edge_r_idx = np.asarray([int(r) for r, _ in edges], dtype=np.int32)
+    edge_s_idx = np.asarray([int(s) for _, s in edges], dtype=np.int32)
+    md_edge_r = md_unique_t[edge_r_idx] if edge_r_idx.size else np.zeros((0, md_unique.shape[0]), dtype=np.int32)
+    md_edge_s = md_unique_t[edge_s_idx] if edge_s_idx.size else np.zeros((0, md_unique.shape[0]), dtype=np.int32)
+
+    cached = {
+        "model": model,
+        "h": h,
+        "edges": edges,
+        "max_gap_h": max_gap_h,
+        "z_node": z_node,
+        "z_edge": z_edge,
+        "z_edge_per_residue": z_edge_per_residue,
+        "md_unique": md_unique,
+        "md_unique_t": md_unique_t,
+        "edge_mats": edge_mats,
+        "edge_r_idx": edge_r_idx,
+        "edge_s_idx": edge_s_idx,
+        "md_edge_r": md_edge_r,
+        "md_edge_s": md_edge_s,
+    }
+    _POTTS_NN_WORKER_CACHE[key] = cached
+    return cached
 
 
 def run_sampling_chain_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2614,6 +2657,540 @@ def run_lambda_sweep_local(
     )
     workers_used = 1 if not payloads else max(1, min(max_workers, len(payloads)))
     return aggregate_lambda_sweep_batch(prepared, out_rows, workers_used=workers_used)
+
+
+def _resolve_cluster_sample_entry(
+    store: ProjectStore,
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    sample_id: str,
+) -> dict[str, Any]:
+    sample_id = str(sample_id or "").strip()
+    if not sample_id:
+        raise ValueError("sample_id is required.")
+    entries = store.list_samples(project_id, system_id, cluster_id)
+    entry = next((s for s in entries if isinstance(s, dict) and str(s.get("sample_id") or "") == sample_id), None)
+    if not isinstance(entry, dict):
+        raise FileNotFoundError(f"Sample not found on cluster: {sample_id}")
+    return entry
+
+
+def _resolve_cluster_sample_path(
+    store: ProjectStore,
+    project_id: str,
+    system_id: str,
+    cluster_dir: Path,
+    sample_entry: dict[str, Any],
+) -> Path:
+    paths = sample_entry.get("paths") or {}
+    rel = None
+    if isinstance(paths, dict):
+        rel = paths.get("summary_npz") or paths.get("path")
+    rel = rel or sample_entry.get("path")
+    if not rel:
+        raise FileNotFoundError(f"Sample entry '{sample_entry.get('sample_id')}' missing NPZ path.")
+    p = Path(str(rel))
+    if not p.is_absolute():
+        resolved = store.resolve_path(project_id, system_id, str(rel))
+        if resolved.exists():
+            p = resolved
+        else:
+            alt = cluster_dir / str(rel)
+            p = alt if alt.exists() else resolved
+    if not p.exists():
+        raise FileNotFoundError(f"Sample NPZ not found: {p}")
+    return p
+
+
+def _load_cluster_sample_labels(
+    store: ProjectStore,
+    *,
+    project_id: str,
+    system_id: str,
+    cluster_dir: Path,
+    sample_entry: dict[str, Any],
+    md_label_mode: str,
+    drop_invalid: bool,
+    is_md: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    sample = load_sample_npz(
+        _resolve_cluster_sample_path(store, project_id, system_id, cluster_dir, sample_entry)
+    )
+    labels = sample.labels_halo if is_md and str(md_label_mode or "assigned").lower() == "halo" and sample.labels_halo is not None else sample.labels
+    labels = np.asarray(labels, dtype=np.int32)
+    if labels.ndim != 2:
+        raise ValueError(f"Sample '{sample_entry.get('sample_id')}' labels must be 2D.")
+    keep = np.ones(labels.shape[0], dtype=bool)
+    if drop_invalid and sample.invalid_mask is not None:
+        invalid_mask = np.asarray(sample.invalid_mask, dtype=bool).reshape(-1)
+        if invalid_mask.shape[0] == labels.shape[0]:
+            keep &= ~invalid_mask
+    keep &= np.all(labels >= 0, axis=1)
+    labels = labels[keep]
+    original_indices = np.arange(int(keep.shape[0]), dtype=np.int64)[keep]
+    if sample.frame_indices is not None:
+        frame_indices_full = np.asarray(sample.frame_indices, dtype=np.int64).reshape(-1)
+        if frame_indices_full.shape[0] == keep.shape[0]:
+            frame_indices = frame_indices_full[keep]
+        else:
+            frame_indices = original_indices.copy()
+    else:
+        frame_indices = original_indices.copy()
+    return labels, original_indices, frame_indices
+
+
+def _unique_sequences_with_inverse(X: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[np.ndarray]]:
+    X = np.asarray(X, dtype=np.int32)
+    if X.ndim != 2:
+        raise ValueError("Expected a 2D label matrix.")
+    if X.shape[0] == 0:
+        n_res = int(X.shape[1]) if X.ndim == 2 else 0
+        return (
+            np.zeros((0, n_res), dtype=np.int32),
+            np.zeros((0,), dtype=np.int32),
+            np.zeros((0,), dtype=np.int64),
+            [],
+        )
+    unique, inv, counts = np.unique(X, axis=0, return_inverse=True, return_counts=True)
+    groups = [np.flatnonzero(inv == idx).astype(np.int64) for idx in range(int(unique.shape[0]))]
+    return unique.astype(np.int32), inv.astype(np.int32), counts.astype(np.int64), groups
+
+
+def _potts_nn_row_worker(payload: dict[str, Any]) -> dict[str, Any]:
+    prepared = pickle_load(Path(str(payload["prepared_path"])))
+    row = int(payload["row"])
+    eps = 1e-12
+
+    sample_unique = np.asarray(prepared["sample_unique_sequences"], dtype=np.int32)
+    if row < 0 or row >= sample_unique.shape[0]:
+        raise IndexError(f"Invalid sample unique row: {row}")
+    s = np.asarray(sample_unique[row], dtype=np.int32)
+
+    cache = _get_potts_nn_worker_cache(prepared)
+    h = cache["h"]
+    edges = cache["edges"]
+    max_gap_h = cache["max_gap_h"]
+    z_node = float(cache["z_node"])
+    z_edge = float(cache["z_edge"])
+    z_edge_per_residue = cache["z_edge_per_residue"]
+    beta_node = float(prepared["beta_node"])
+    beta_edge = float(prepared["beta_edge"])
+    normalize = bool(prepared["normalize"])
+    compute_per_residue = bool(prepared["compute_per_residue"])
+    top_k_candidates = prepared.get("top_k_candidates")
+    top_k_candidates = None if top_k_candidates in (None, "", 0) else int(top_k_candidates)
+    chunk_size = max(1, int(prepared.get("chunk_size") or 256))
+    md_unique = cache["md_unique"]
+    md_unique_t = cache["md_unique_t"]
+    edge_mats = cache["edge_mats"]
+    edge_r_idx = cache["edge_r_idx"]
+    edge_s_idx = cache["edge_s_idx"]
+    md_edge_r = cache["md_edge_r"]
+    md_edge_s = cache["md_edge_s"]
+
+    md_count = int(md_unique.shape[0])
+    node_raw_all = np.zeros(md_count, dtype=float)
+    for i in range(md_unique_t.shape[0]):
+        ref = int(s[i])
+        tv = md_unique_t[i]
+        vals = np.abs(h[i][tv] - h[i][ref])
+        if np.any(tv == ref):
+            vals = vals.copy()
+            vals[tv == ref] = 0.0
+        node_raw_all += vals
+
+    candidate_indices = np.arange(md_count, dtype=np.int64)
+    if top_k_candidates is not None and top_k_candidates > 0 and top_k_candidates < md_count:
+        node_rank = node_raw_all / (z_node + eps) if normalize else node_raw_all
+        candidate_indices = np.argsort(node_rank)[: int(top_k_candidates)].astype(np.int64)
+
+    best_idx = -1
+    best_global = float("inf")
+    best_node = float("inf")
+    best_edge = float("inf")
+    denom = beta_node + beta_edge
+
+    for start in range(0, int(candidate_indices.shape[0]), chunk_size):
+        cand_idx = candidate_indices[start : start + chunk_size]
+        node_raw = np.asarray(node_raw_all[cand_idx], dtype=float)
+        edge_raw = np.zeros(cand_idx.shape[0], dtype=float)
+        for edge_idx, (r, s_) in enumerate(edges):
+            tvr = md_edge_r[edge_idx, cand_idx]
+            tvs = md_edge_s[edge_idx, cand_idx]
+            mismatch = (tvr != int(s[r])) | (tvs != int(s[s_]))
+            if not np.any(mismatch):
+                continue
+            mat = edge_mats[edge_idx]
+            pair_ref = float(mat[int(s[r]), int(s[s_])])
+            edge_raw += np.abs(mat[tvr, tvs] - pair_ref) * mismatch
+        node_val = node_raw / (z_node + eps) if normalize else node_raw
+        edge_val = edge_raw / (z_edge + eps) if normalize else edge_raw
+        global_val = (beta_node * node_val + beta_edge * edge_val) / (denom + eps)
+        local_best = int(np.argmin(global_val))
+        if float(global_val[local_best]) < best_global:
+            best_idx = int(cand_idx[local_best])
+            best_global = float(global_val[local_best])
+            best_node = float(node_val[local_best])
+            best_edge = float(edge_val[local_best])
+
+    if best_idx < 0:
+        raise RuntimeError(f"Failed to resolve nearest-neighbor row for sample unique index {row}.")
+
+    residue_node = np.zeros_like(max_gap_h, dtype=float)
+    residue_edge = np.zeros_like(max_gap_h, dtype=float)
+    if compute_per_residue:
+        nn = np.asarray(md_unique[best_idx], dtype=np.int32)
+        for i in range(int(max_gap_h.shape[0])):
+            if int(s[i]) != int(nn[i]):
+                residue_node[i] = abs(float(h[i][int(nn[i])]) - float(h[i][int(s[i])]))
+        residue_node = residue_node / (max_gap_h + eps) if normalize else residue_node
+        for edge_idx, (r, s_) in enumerate(edges):
+            if int(s[r]) == int(nn[r]) and int(s[s_]) == int(nn[s_]):
+                continue
+            mat = edge_mats[edge_idx]
+            contrib = abs(float(mat[int(nn[r]), int(nn[s_])]) - float(mat[int(s[r]), int(s[s_])]))
+            residue_edge[r] += contrib
+            residue_edge[s_] += contrib
+        residue_edge = residue_edge / (z_edge_per_residue + eps) if normalize else residue_edge
+
+    return {
+        "row": row,
+        "nn_md_unique_idx": int(best_idx),
+        "nn_dist_global": float(best_global),
+        "nn_dist_node": float(best_node),
+        "nn_dist_edge": float(best_edge),
+        "nn_dist_residue_node": np.asarray(residue_node, dtype=float),
+        "nn_dist_residue_edge": np.asarray(residue_edge, dtype=float),
+    }
+
+
+def prepare_potts_nn_mapping_batch(
+    *,
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    model_id: str | None = None,
+    model_path: str | None = None,
+    sample_id: str,
+    md_sample_id: str,
+    md_label_mode: str = "assigned",
+    keep_invalid: bool = False,
+    use_unique: bool = True,
+    normalize: bool = True,
+    compute_per_residue: bool = True,
+    alpha: float = 0.75,
+    beta_node: float = 1.0,
+    beta_edge: float = 1.0,
+    top_k_candidates: int | None = None,
+    chunk_size: int = 256,
+    distance_thresholds: Sequence[float] | None = None,
+    n_workers: int | None = None,
+) -> dict[str, Any]:
+    if not (model_id or model_path):
+        raise ValueError("Provide model_id or model_path.")
+    if not sample_id or not md_sample_id:
+        raise ValueError("sample_id and md_sample_id are required.")
+    if float(beta_node) < 0.0 or float(beta_edge) < 0.0:
+        raise ValueError("beta_node and beta_edge must be non-negative.")
+    if float(beta_node) == 0.0 and float(beta_edge) == 0.0:
+        raise ValueError("At least one of beta_node or beta_edge must be > 0.")
+
+    data_root = Path(os.getenv("PHASE_DATA_ROOT", "/app/data"))
+    store = ProjectStore(base_dir=data_root / "projects")
+    cluster_dirs = store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    system_dir = cluster_dirs["system_dir"]
+    cluster_dir = cluster_dirs["cluster_dir"]
+    analyses_dir = cluster_dir / "analyses" / "potts_nn_mapping"
+    analyses_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_entry = _resolve_cluster_sample_entry(store, project_id, system_id, cluster_id, sample_id)
+    md_entry = _resolve_cluster_sample_entry(store, project_id, system_id, cluster_id, md_sample_id)
+    if str(md_entry.get("type") or "") != "md_eval":
+        raise ValueError("md_sample_id must reference an md_eval sample.")
+
+    resolved_model_id = str(model_id or "").strip()
+    resolved_model_path = None
+    if str(model_path or "").strip():
+        resolved_model_path = Path(str(model_path).strip())
+    resolved_model_name = resolved_model_id
+    if resolved_model_id and resolved_model_path is None:
+        models = store.list_potts_models(project_id, system_id, cluster_id)
+        entry = next((m for m in models if isinstance(m, dict) and str(m.get("model_id") or "") == resolved_model_id), None)
+        if not entry or not entry.get("path"):
+            raise FileNotFoundError(f"Potts model_id not found on this cluster: {resolved_model_id}")
+        resolved_model_name = str(entry.get("name") or resolved_model_id)
+        resolved_model_path = store.resolve_path(project_id, system_id, str(entry.get("path")))
+    elif resolved_model_path is not None:
+        if not resolved_model_path.is_absolute():
+            resolved_model_path = store.resolve_path(project_id, system_id, str(resolved_model_path))
+        resolved_model_name = resolved_model_name or resolved_model_path.stem
+    if resolved_model_path is None:
+        raise ValueError("Provide model_id or model_path.")
+    if not resolved_model_path.exists():
+        raise FileNotFoundError(f"Potts model NPZ not found: {resolved_model_path}")
+
+    sample_labels, sample_original_indices, sample_frame_indices = _load_cluster_sample_labels(
+        store,
+        project_id=project_id,
+        system_id=system_id,
+        cluster_dir=cluster_dir,
+        sample_entry=sample_entry,
+        md_label_mode=str(md_label_mode),
+        drop_invalid=bool(not keep_invalid),
+        is_md=False,
+    )
+    md_labels, md_original_indices, md_frame_indices = _load_cluster_sample_labels(
+        store,
+        project_id=project_id,
+        system_id=system_id,
+        cluster_dir=cluster_dir,
+        sample_entry=md_entry,
+        md_label_mode=str(md_label_mode),
+        drop_invalid=bool(not keep_invalid),
+        is_md=True,
+    )
+    if sample_labels.shape[0] == 0:
+        raise ValueError("Selected sample has no usable frames after filtering invalid/unassigned rows.")
+    if md_labels.shape[0] == 0:
+        raise ValueError("Selected MD sample has no usable frames after filtering invalid/unassigned rows.")
+    if sample_labels.shape[1] != md_labels.shape[1]:
+        raise ValueError("Sample and MD label matrices do not have the same number of residues.")
+
+    if bool(use_unique):
+        sample_unique, sample_inv, sample_counts, sample_groups = _unique_sequences_with_inverse(sample_labels)
+        md_unique, md_inv, md_counts, md_groups = _unique_sequences_with_inverse(md_labels)
+    else:
+        sample_unique = np.asarray(sample_labels, dtype=np.int32)
+        sample_inv = np.arange(sample_labels.shape[0], dtype=np.int32)
+        sample_counts = np.ones(sample_labels.shape[0], dtype=np.int64)
+        sample_groups = [np.asarray([i], dtype=np.int64) for i in range(sample_labels.shape[0])]
+        md_unique = np.asarray(md_labels, dtype=np.int32)
+        md_inv = np.arange(md_labels.shape[0], dtype=np.int32)
+        md_counts = np.ones(md_labels.shape[0], dtype=np.int64)
+        md_groups = [np.asarray([i], dtype=np.int64) for i in range(md_labels.shape[0])]
+
+    model = zero_sum_gauge_model(load_potts_model(str(resolved_model_path)))
+    max_gap_h = np.asarray([float(np.max(hr) - np.min(hr)) for hr in model.h], dtype=float)
+    edges = [(int(r), int(s_)) for r, s_ in model.edges]
+    max_gap_J = np.asarray([float(np.max(model.J[(r, s_)]) - np.min(model.J[(r, s_)])) for r, s_ in edges], dtype=float)
+    z_node = float(np.sum(max_gap_h))
+    z_edge = float(np.sum(max_gap_J))
+    z_edge_per_residue = np.zeros(len(model.h), dtype=float)
+    for edge_idx, (r, s_) in enumerate(edges):
+        z_edge_per_residue[int(r)] += float(max_gap_J[edge_idx])
+        z_edge_per_residue[int(s_)] += float(max_gap_J[edge_idx])
+
+    threshold_values = [float(v) for v in (distance_thresholds or [0.05, 0.1, 0.2])]
+    analysis_id = str(uuid.uuid4())
+    analysis_dir = analyses_dir / analysis_id
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_unique_rep_original_indices = np.asarray([int(sample_original_indices[group[0]]) for group in sample_groups], dtype=np.int64)
+    md_unique_rep_original_indices = np.asarray([int(md_original_indices[group[0]]) for group in md_groups], dtype=np.int64)
+    sample_unique_rep_frame_indices = np.asarray([int(sample_frame_indices[group[0]]) for group in sample_groups], dtype=np.int64)
+    md_unique_rep_frame_indices = np.asarray([int(md_frame_indices[group[0]]) for group in md_groups], dtype=np.int64)
+
+    prepared_path = orchestration_paths(analysis_dir)["prepared"]
+    payloads = [{"row": int(row), "prepared_path": str(prepared_path)} for row in range(int(sample_unique.shape[0]))]
+    requested_workers = int(n_workers) if n_workers is not None else max(1, len(payloads))
+    if requested_workers <= 0:
+        requested_workers = max(1, len(payloads))
+
+    prepared = {
+        "analysis_id": analysis_id,
+        "analysis_dir": str(analysis_dir),
+        "analysis_npz": str(analysis_dir / "analysis.npz"),
+        "analysis_metadata": str(analysis_dir / ANALYSIS_METADATA_FILENAME),
+        "project_id": str(project_id),
+        "system_id": str(system_id),
+        "cluster_id": str(cluster_id),
+        "system_dir": str(system_dir),
+        "model_id": resolved_model_id or None,
+        "model_name": resolved_model_name or None,
+        "model_path": str(resolved_model_path),
+        "sample_id": str(sample_entry.get("sample_id") or sample_id),
+        "sample_name": str(sample_entry.get("name") or sample_id),
+        "sample_type": str(sample_entry.get("type") or "sample"),
+        "md_sample_id": str(md_entry.get("sample_id") or md_sample_id),
+        "md_sample_name": str(md_entry.get("name") or md_sample_id),
+        "md_label_mode": str(md_label_mode or "assigned"),
+        "drop_invalid": bool(not keep_invalid),
+        "use_unique": bool(use_unique),
+        "normalize": bool(normalize),
+        "compute_per_residue": bool(compute_per_residue),
+        "alpha": float(alpha),
+        "beta_node": float(beta_node),
+        "beta_edge": float(beta_edge),
+        "top_k_candidates": None if top_k_candidates is None or int(top_k_candidates) <= 0 else int(top_k_candidates),
+        "chunk_size": int(max(1, chunk_size)),
+        "distance_thresholds": threshold_values,
+        "max_gap_h": np.asarray(max_gap_h, dtype=float),
+        "max_gap_J": np.asarray(max_gap_J, dtype=float),
+        "z_node": float(z_node),
+        "z_edge": float(z_edge),
+        "z_edge_per_residue": np.asarray(z_edge_per_residue, dtype=float),
+        "edges": np.asarray(edges, dtype=np.int32),
+        "sample_unique_sequences": np.asarray(sample_unique, dtype=np.int32),
+        "md_unique_sequences": np.asarray(md_unique, dtype=np.int32),
+        "sample_unique_counts": np.asarray(sample_counts, dtype=np.int64),
+        "md_unique_counts": np.asarray(md_counts, dtype=np.int64),
+        "sample_inv": np.asarray(sample_inv, dtype=np.int32),
+        "md_inv": np.asarray(md_inv, dtype=np.int32),
+        "sample_unique_rep_original_indices": np.asarray(sample_unique_rep_original_indices, dtype=np.int64),
+        "md_unique_rep_original_indices": np.asarray(md_unique_rep_original_indices, dtype=np.int64),
+        "sample_unique_rep_frame_indices": np.asarray(sample_unique_rep_frame_indices, dtype=np.int64),
+        "md_unique_rep_frame_indices": np.asarray(md_unique_rep_frame_indices, dtype=np.int64),
+        "payloads": payloads,
+        "requested_workers": int(requested_workers),
+        "prepared_path": str(prepared_path),
+    }
+    atomic_pickle_dump(prepared_path, prepared)
+    return prepared
+
+
+def aggregate_potts_nn_mapping_batch(
+    prepared: dict[str, Any],
+    out_rows: Sequence[dict[str, Any]],
+    *,
+    workers_used: int,
+) -> dict[str, Any]:
+    analysis_dir = Path(str(prepared["analysis_dir"]))
+    npz_path = Path(str(prepared["analysis_npz"]))
+    meta_path = Path(str(prepared["analysis_metadata"]))
+    system_dir = Path(str(prepared["system_dir"]))
+    sample_unique = np.asarray(prepared["sample_unique_sequences"], dtype=np.int32)
+    md_unique = np.asarray(prepared["md_unique_sequences"], dtype=np.int32)
+    sample_counts = np.asarray(prepared["sample_unique_counts"], dtype=np.int64)
+    sample_inv = np.asarray(prepared["sample_inv"], dtype=np.int32)
+    md_unique_rep_original_indices = np.asarray(prepared["md_unique_rep_original_indices"], dtype=np.int64)
+    md_unique_rep_frame_indices = np.asarray(prepared["md_unique_rep_frame_indices"], dtype=np.int64)
+    thresholds = np.asarray(prepared["distance_thresholds"], dtype=float)
+    alpha = float(prepared["alpha"])
+
+    rows_sorted = sorted(out_rows, key=lambda row: int(row["row"]))
+    nn_md_unique_idx = np.asarray([int(row["nn_md_unique_idx"]) for row in rows_sorted], dtype=np.int32)
+    nn_dist_global = np.asarray([float(row["nn_dist_global"]) for row in rows_sorted], dtype=float)
+    nn_dist_node = np.asarray([float(row["nn_dist_node"]) for row in rows_sorted], dtype=float)
+    nn_dist_edge = np.asarray([float(row["nn_dist_edge"]) for row in rows_sorted], dtype=float)
+    nn_dist_residue_node = np.asarray([np.asarray(row["nn_dist_residue_node"], dtype=float) for row in rows_sorted], dtype=float)
+    nn_dist_residue_edge = np.asarray([np.asarray(row["nn_dist_residue_edge"], dtype=float) for row in rows_sorted], dtype=float)
+    nn_dist_residue = (1.0 - alpha) * nn_dist_residue_node + alpha * nn_dist_residue_edge
+
+    weights = sample_counts.astype(float)
+    total_weight = float(np.sum(weights)) if weights.size else 1.0
+    threshold_coverage = np.asarray(
+        [float(np.sum(weights[nn_dist_global <= thr]) / total_weight) if total_weight > 0 else 0.0 for thr in thresholds.tolist()],
+        dtype=float,
+    )
+    per_residue_mean = np.average(nn_dist_residue, axis=0, weights=weights) if nn_dist_residue.size else np.zeros((0,), dtype=float)
+    per_residue_mean_node = np.average(nn_dist_residue_node, axis=0, weights=weights) if nn_dist_residue_node.size else np.zeros((0,), dtype=float)
+    per_residue_mean_edge = np.average(nn_dist_residue_edge, axis=0, weights=weights) if nn_dist_residue_edge.size else np.zeros((0,), dtype=float)
+    nn_md_rep_original_idx = md_unique_rep_original_indices[nn_md_unique_idx] if nn_md_unique_idx.size else np.zeros((0,), dtype=np.int64)
+    nn_md_rep_frame_idx = md_unique_rep_frame_indices[nn_md_unique_idx] if nn_md_unique_idx.size else np.zeros((0,), dtype=np.int64)
+
+    np.savez_compressed(
+        npz_path,
+        sample_unique_sequences=np.asarray(sample_unique, dtype=np.int32),
+        md_unique_sequences=np.asarray(md_unique, dtype=np.int32),
+        sample_unique_counts=np.asarray(sample_counts, dtype=np.int64),
+        md_unique_counts=np.asarray(prepared["md_unique_counts"], dtype=np.int64),
+        sample_inv=np.asarray(sample_inv, dtype=np.int32),
+        md_inv=np.asarray(prepared["md_inv"], dtype=np.int32),
+        sample_unique_rep_original_indices=np.asarray(prepared["sample_unique_rep_original_indices"], dtype=np.int64),
+        md_unique_rep_original_indices=np.asarray(md_unique_rep_original_indices, dtype=np.int64),
+        sample_unique_rep_frame_indices=np.asarray(prepared["sample_unique_rep_frame_indices"], dtype=np.int64),
+        md_unique_rep_frame_indices=np.asarray(md_unique_rep_frame_indices, dtype=np.int64),
+        nn_md_unique_idx=np.asarray(nn_md_unique_idx, dtype=np.int32),
+        nn_md_rep_original_idx=np.asarray(nn_md_rep_original_idx, dtype=np.int64),
+        nn_md_rep_frame_idx=np.asarray(nn_md_rep_frame_idx, dtype=np.int64),
+        nn_dist_global=np.asarray(nn_dist_global, dtype=float),
+        nn_dist_node=np.asarray(nn_dist_node, dtype=float),
+        nn_dist_edge=np.asarray(nn_dist_edge, dtype=float),
+        nn_dist_residue_node=np.asarray(nn_dist_residue_node, dtype=float),
+        nn_dist_residue_edge=np.asarray(nn_dist_residue_edge, dtype=float),
+        nn_dist_residue=np.asarray(nn_dist_residue, dtype=float),
+        threshold_values=np.asarray(thresholds, dtype=float),
+        threshold_coverage=np.asarray(threshold_coverage, dtype=float),
+        per_residue_mean=np.asarray(per_residue_mean, dtype=float),
+        per_residue_mean_node=np.asarray(per_residue_mean_node, dtype=float),
+        per_residue_mean_edge=np.asarray(per_residue_mean_edge, dtype=float),
+        max_gap_h=np.asarray(prepared["max_gap_h"], dtype=float),
+        max_gap_J=np.asarray(prepared["max_gap_J"], dtype=float),
+        edges=np.asarray(prepared["edges"], dtype=np.int32),
+        alpha=np.asarray([alpha], dtype=float),
+        beta_node=np.asarray([float(prepared["beta_node"])], dtype=float),
+        beta_edge=np.asarray([float(prepared["beta_edge"])], dtype=float),
+    )
+
+    summary = {
+        "n_sample_frames": int(np.asarray(prepared["sample_inv"]).shape[0]),
+        "n_md_frames": int(np.asarray(prepared["md_inv"]).shape[0]),
+        "n_sample_unique": int(sample_unique.shape[0]),
+        "n_md_unique": int(md_unique.shape[0]),
+        "distance_mean": float(np.average(nn_dist_global, weights=weights)) if nn_dist_global.size else None,
+        "distance_median": float(np.median(np.repeat(nn_dist_global, sample_counts.astype(int)))) if nn_dist_global.size and np.all(sample_counts < 10000) else float(np.median(nn_dist_global)) if nn_dist_global.size else None,
+        "distance_min": float(np.min(nn_dist_global)) if nn_dist_global.size else None,
+        "distance_max": float(np.max(nn_dist_global)) if nn_dist_global.size else None,
+        "threshold_coverage": {str(float(thr)): float(val) for thr, val in zip(thresholds.tolist(), threshold_coverage.tolist())},
+    }
+    meta = {
+        "analysis_id": str(prepared["analysis_id"]),
+        "analysis_type": "potts_nn_mapping",
+        "created_at": _utc_now(),
+        "project_id": str(prepared["project_id"]),
+        "system_id": str(prepared["system_id"]),
+        "cluster_id": str(prepared["cluster_id"]),
+        "model_id": prepared.get("model_id"),
+        "model_name": prepared.get("model_name"),
+        "sample_id": str(prepared["sample_id"]),
+        "sample_name": str(prepared["sample_name"]),
+        "sample_type": str(prepared["sample_type"]),
+        "md_sample_id": str(prepared["md_sample_id"]),
+        "md_sample_name": str(prepared["md_sample_name"]),
+        "md_label_mode": str(prepared["md_label_mode"]),
+        "drop_invalid": bool(prepared["drop_invalid"]),
+        "use_unique": bool(prepared["use_unique"]),
+        "normalize": bool(prepared["normalize"]),
+        "compute_per_residue": bool(prepared["compute_per_residue"]),
+        "alpha": float(prepared["alpha"]),
+        "beta_node": float(prepared["beta_node"]),
+        "beta_edge": float(prepared["beta_edge"]),
+        "top_k_candidates": prepared.get("top_k_candidates"),
+        "chunk_size": int(prepared["chunk_size"]),
+        "distance_thresholds": [float(v) for v in thresholds.tolist()],
+        "workers": int(max(1, workers_used)),
+        "paths": {"analysis_npz": _relativize(npz_path, system_dir)},
+        "summary": summary,
+    }
+    meta_path.write_text(json.dumps(_convert_nan_to_none(meta), indent=2), encoding="utf-8")
+    result = {
+        "metadata": _convert_nan_to_none(meta),
+        "analysis_id": str(prepared["analysis_id"]),
+        "analysis_dir": str(analysis_dir),
+        "analysis_npz": str(npz_path),
+    }
+    atomic_pickle_dump(orchestration_paths(analysis_dir)["aggregate"], result)
+    return result
+
+
+def run_potts_nn_mapping_local(
+    *,
+    progress_callback: ProgressCallback = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    prepared = prepare_potts_nn_mapping_batch(**kwargs)
+    payloads = prepared.get("payloads") or []
+    workers = max(1, int(kwargs.get("n_workers") or prepared.get("requested_workers") or 1))
+    out_rows = run_local_payload_batch(
+        payloads,
+        worker_fn=_potts_nn_row_worker,
+        max_workers=workers,
+        progress_callback=progress_callback,
+        progress_label="Running Potts nearest-neighbor mapping",
+    )
+    workers_used = 1 if not payloads else max(1, min(workers, len(payloads)))
+    return aggregate_potts_nn_mapping_batch(prepared, out_rows, workers_used=workers_used)
 
 
 def wait_for_batch_marker(

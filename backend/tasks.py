@@ -36,6 +36,7 @@ from phase.potts.orchestration import (
     aggregate_gibbs_relaxation_batch,
     aggregate_ligand_completion_batch,
     aggregate_lambda_sweep_batch,
+    aggregate_potts_nn_mapping_batch,
     aggregate_sampling_batch,
     load_partial_errors,
     load_partial_results,
@@ -44,10 +45,12 @@ from phase.potts.orchestration import (
     prepare_gibbs_relaxation_batch,
     prepare_ligand_completion_batch,
     prepare_lambda_sweep_batch,
+    prepare_potts_nn_mapping_batch,
     prepare_sampling_batch,
     run_local_payload_batch,
     run_lambda_sweep_payload,
     run_sampling_chain_payload,
+    _potts_nn_row_worker,
     write_partial_error,
     write_partial_result,
 )
@@ -1507,6 +1510,191 @@ def run_potts_analysis_job(
     return sanitized_payload
 
 
+def run_potts_nearest_neighbor_job(
+    job_uuid: str,
+    dataset_ref: Dict[str, str],
+    params: Dict[str, Any],
+):
+    job = get_current_job()
+    start_time = datetime.utcnow()
+    rq_job_id = job.id if job else f"potts-nn-mapping-{job_uuid}"
+
+    project_id = dataset_ref.get("project_id")
+    system_id = dataset_ref.get("system_id")
+    cluster_id = dataset_ref.get("cluster_id")
+    if not project_id or not system_id or not cluster_id:
+        raise ValueError("Potts NN mapping requires project_id/system_id/cluster_id.")
+
+    results_dirs = project_store.ensure_results_directories(project_id, system_id)
+    result_filepath = results_dirs["jobs_dir"] / f"{job_uuid}.json"
+    result_payload: Dict[str, Any] = {
+        "job_id": job_uuid,
+        "rq_job_id": rq_job_id,
+        "analysis_type": "potts_nn_mapping",
+        "status": "started",
+        "created_at": start_time.isoformat(),
+        "params": params,
+        "results": None,
+        "system_reference": {
+            "project_id": project_id,
+            "system_id": system_id,
+            "cluster_id": cluster_id,
+        },
+        "error": None,
+        "completed_at": None,
+    }
+
+    def save_progress(status_msg: str, progress: int):
+        if job:
+            job.meta["status"] = status_msg
+            job.meta["progress"] = progress
+            job.save_meta()
+        print(f"[PottsNNMapping {job_uuid}] {status_msg}")
+
+    def write_result_to_disk(payload: Dict[str, Any]):
+        try:
+            with open(result_filepath, "w") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as exc:
+            payload["status"] = "failed"
+            payload["error"] = f"Failed to save result file: {exc}"
+
+    try:
+        save_progress("Initializing...", 0)
+        write_result_to_disk(result_payload)
+
+        workers = params.get("workers")
+        workers_val = int(workers) if workers is not None else None
+        save_progress("Preparing nearest-neighbor mapping...", 10)
+        prepared = prepare_potts_nn_mapping_batch(
+            project_id=project_id,
+            system_id=system_id,
+            cluster_id=cluster_id,
+            model_id=str(params.get("model_id") or "").strip() or None,
+            model_path=str(params.get("model_path") or "").strip() or None,
+            sample_id=str(params.get("sample_id") or "").strip(),
+            md_sample_id=str(params.get("md_sample_id") or "").strip(),
+            md_label_mode=str(params.get("md_label_mode") or "assigned"),
+            keep_invalid=bool(params.get("keep_invalid", False)),
+            use_unique=bool(params.get("use_unique", True)),
+            normalize=bool(params.get("normalize", True)),
+            compute_per_residue=bool(params.get("compute_per_residue", True)),
+            alpha=float(params.get("alpha") or 0.75),
+            beta_node=float(params.get("beta_node") or 1.0),
+            beta_edge=float(params.get("beta_edge") or 1.0),
+            top_k_candidates=(int(params.get("top_k_candidates")) if params.get("top_k_candidates") not in (None, "", 0) else None),
+            chunk_size=int(params.get("chunk_size") or 256),
+            distance_thresholds=params.get("distance_thresholds") or [0.05, 0.1, 0.2],
+            n_workers=workers_val,
+        )
+        payloads = prepared.get("payloads") or []
+        analysis_id = str(prepared.get("analysis_id") or "")
+        analysis_dir = Path(str(prepared.get("analysis_dir") or "")).resolve()
+        redis_conn = getattr(job, "connection", None)
+        queue_name = getattr(job, "origin", "phase-jobs")
+        queue = Queue(queue_name, connection=redis_conn) if redis_conn is not None else None
+        available_queue_workers = _count_queue_workers(queue) if queue is not None else 0
+        distributed_parallelism = _distributed_batch_parallelism(
+            requested_workers=int(prepared.get("requested_workers", workers_val or 1)),
+            available_queue_workers=available_queue_workers,
+            n_payloads=len(payloads),
+        )
+
+        if distributed_parallelism > 1 and queue is not None:
+            keys = _potts_nn_mapping_batch_keys(analysis_id)
+            redis_conn.delete(keys["done"], keys["error"], keys["child_error"])
+            redis_conn.set(keys["remaining"], int(len(payloads)), ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["state"], "running", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            save_progress(
+                f"Dispatching {len(payloads)} nearest-neighbor tasks across {distributed_parallelism} queue workers...",
+                15,
+            )
+            for row in range(len(payloads)):
+                queue.enqueue(
+                    run_potts_nn_mapping_payload_job,
+                    args=(analysis_id, str(analysis_dir), int(row), int(distributed_parallelism)),
+                    job_timeout="8h",
+                    result_ttl=86400,
+                    job_id=f"potts-nn-mapping-task-{analysis_id}-{row:06d}",
+                )
+            while True:
+                done = _decode_redis_value(redis_conn.get(keys["done"]))
+                remaining_raw = _decode_redis_value(redis_conn.get(keys["remaining"]))
+                remaining = int(remaining_raw) if remaining_raw is not None else len(payloads)
+                state = _decode_redis_value(redis_conn.get(keys["state"])) or "running"
+                child_error = _decode_redis_value(redis_conn.get(keys["child_error"]))
+                if done:
+                    break
+                if remaining <= 0:
+                    save_progress("Aggregating distributed nearest-neighbor results...", 92)
+                else:
+                    completed = max(0, min(len(payloads), len(payloads) - remaining))
+                    pct = 15 + int(70 * (float(completed) / float(max(1, len(payloads)))))
+                    status = f"Running distributed nearest-neighbor mapping ({completed}/{len(payloads)} uniques)"
+                    if child_error:
+                        status = f"{status}; worker error recorded, waiting for aggregation"
+                    elif state and state != "running":
+                        status = f"{status}; state={state}"
+                    save_progress(status, pct)
+                time.sleep(1.0)
+            error = _decode_redis_value(redis_conn.get(keys["error"]))
+            if error:
+                raise RuntimeError(error)
+            out = pickle_load(orchestration_paths(analysis_dir)["aggregate"])
+        else:
+            save_progress("Running nearest-neighbor mapping locally...", 15)
+
+            def progress_cb(message: str, current: int, total: int):
+                if total <= 0:
+                    return
+                ratio = max(0.0, min(1.0, float(current) / float(total)))
+                save_progress(message, 15 + int(70 * ratio))
+
+            max_workers = max(1, int(prepared.get("requested_workers") or 1))
+            out_rows = run_local_payload_batch(
+                payloads,
+                worker_fn=_potts_nn_row_worker,
+                max_workers=max_workers,
+                progress_callback=progress_cb,
+                progress_label="Running Potts nearest-neighbor mapping",
+            )
+            out = aggregate_potts_nn_mapping_batch(
+                prepared,
+                out_rows,
+                workers_used=(1 if not payloads else max(1, min(max_workers, len(payloads)))),
+            )
+
+        meta = out.get("metadata") or {}
+        analysis_id = str(out.get("analysis_id") or meta.get("analysis_id") or "")
+        analysis_dir = Path(str(out.get("analysis_dir") or "")).resolve()
+        npz_path = Path(str(out.get("analysis_npz") or "")).resolve()
+        if not analysis_id or not analysis_dir.exists() or not npz_path.exists():
+            raise RuntimeError("potts_nn_mapping did not write analysis artifacts as expected.")
+
+        result_payload["status"] = "finished"
+        result_payload["results"] = {
+            "analysis_type": "potts_nn_mapping",
+            "analysis_id": analysis_id,
+            "analysis_dir": _relativize_path(analysis_dir),
+            "analysis_npz": _relativize_path(npz_path),
+            "summary": meta.get("summary") or {},
+        }
+    except Exception as exc:
+        print(f"[PottsNNMapping {job_uuid}] FAILED: {exc}")
+        traceback.print_exc()
+        result_payload["status"] = "failed"
+        result_payload["error"] = str(exc)
+        raise
+    finally:
+        save_progress("Saving final result", 95)
+        result_payload["completed_at"] = datetime.utcnow().isoformat()
+        sanitized_payload = _convert_nan_to_none(result_payload)
+        write_result_to_disk(sanitized_payload)
+
+    save_progress("Potts NN mapping completed", 100)
+    return sanitized_payload
+
+
 def run_md_samples_refresh_job(
     job_uuid: str,
     dataset_ref: Dict[str, str],
@@ -2889,6 +3077,84 @@ def run_lambda_sweep_aggregate_job(
             raise RuntimeError(f"Distributed lambda sweep worker failures: {summary}")
         out_rows = load_partial_results(analysis_dir_path, expected_rows=len(prepared.get("payloads") or []))
         result = aggregate_lambda_sweep_batch(prepared, out_rows, workers_used=max(1, int(workers_used)))
+        if redis_conn is not None:
+            redis_conn.delete(keys["error"])
+            redis_conn.set(keys["state"], "finished", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        return result
+    except Exception as exc:
+        if redis_conn is not None:
+            redis_conn.set(keys["error"], f"{type(exc).__name__}: {exc}", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["state"], "failed", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        raise
+
+
+def _potts_nn_mapping_batch_keys(analysis_id: str) -> Dict[str, str]:
+    return _analysis_batch_keys("potts_nn_mapping", analysis_id)
+
+
+def run_potts_nn_mapping_payload_job(
+    analysis_id: str,
+    analysis_dir: str,
+    row: int,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    queue_name = getattr(job, "origin", "phase-jobs")
+    keys = _potts_nn_mapping_batch_keys(str(analysis_id))
+    analysis_dir_path = Path(str(analysis_dir))
+    prepared = pickle_load(orchestration_paths(analysis_dir_path)["prepared"])
+    payloads = prepared.get("payloads") or []
+    row = int(row)
+    if row < 0 or row >= len(payloads):
+        raise IndexError(f"Invalid potts NN mapping row index: {row}")
+    try:
+        out = _potts_nn_row_worker(payloads[row])
+        write_partial_result(analysis_dir_path, row, out)
+    except Exception as exc:
+        write_partial_error(analysis_dir_path, row, f"{type(exc).__name__}: {exc}")
+        if redis_conn is not None and redis_conn.get(keys["child_error"]) is None:
+            redis_conn.set(
+                keys["child_error"],
+                f"row {row}: {type(exc).__name__}: {exc}",
+                ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS,
+            )
+        raise
+    finally:
+        if redis_conn is not None:
+            remaining = int(redis_conn.decr(keys["remaining"]))
+            if remaining <= 0:
+                redis_conn.set(keys["state"], "aggregating", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+                Queue(queue_name, connection=redis_conn).enqueue(
+                    run_potts_nn_mapping_aggregate_job,
+                    args=(str(analysis_id), str(analysis_dir_path), int(max(1, workers_used))),
+                    job_timeout="8h",
+                    result_ttl=86400,
+                    job_id=f"potts-nn-mapping-aggregate-{analysis_id}",
+                )
+
+
+def run_potts_nn_mapping_aggregate_job(
+    analysis_id: str,
+    analysis_dir: str,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    keys = _potts_nn_mapping_batch_keys(str(analysis_id))
+    analysis_dir_path = Path(str(analysis_dir))
+    try:
+        prepared = pickle_load(orchestration_paths(analysis_dir_path)["prepared"])
+        errors = load_partial_errors(analysis_dir_path)
+        if errors:
+            summary = "; ".join(f"row {err.get('row')}: {err.get('error')}" for err in errors[:3])
+            if len(errors) > 3:
+                summary = f"{summary}; ... ({len(errors)} worker failures total)"
+            raise RuntimeError(f"Distributed potts NN mapping worker failures: {summary}")
+        out_rows = load_partial_results(analysis_dir_path, expected_rows=len(prepared.get("payloads") or []))
+        result = aggregate_potts_nn_mapping_batch(prepared, out_rows, workers_used=max(1, int(workers_used)))
         if redis_conn is not None:
             redis_conn.delete(keys["error"])
             redis_conn.set(keys["state"], "finished", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)

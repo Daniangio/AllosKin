@@ -259,6 +259,28 @@ class LambdaSweepJobRequest(BaseModel):
     md_sample_id_2: Optional[str] = None
     md_sample_id_3: Optional[str] = None
 
+
+class PottsNearestNeighborJobRequest(BaseModel):
+    project_id: str
+    system_id: str
+    cluster_id: str
+    model_id: Optional[str] = None
+    model_path: Optional[str] = None
+    sample_id: str
+    md_sample_id: str
+    md_label_mode: Optional[str] = None  # assigned|halo
+    keep_invalid: Optional[bool] = None
+    use_unique: Optional[bool] = None
+    normalize: Optional[bool] = None
+    compute_per_residue: Optional[bool] = None
+    alpha: Optional[float] = None
+    beta_node: Optional[float] = None
+    beta_edge: Optional[float] = None
+    top_k_candidates: Optional[int] = None
+    chunk_size: Optional[int] = None
+    distance_thresholds: Optional[List[float]] = None
+    workers: Optional[int] = None
+
     series_id: Optional[str] = None
     series_label: Optional[str] = None
 

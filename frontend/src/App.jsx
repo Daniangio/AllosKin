@@ -18,6 +18,7 @@ import LambdaSweepPage from './pages/LambdaSweepPage';
 import GibbsRelaxationPage from './pages/GibbsRelaxationPage';
 import GibbsRelaxation3DPage from './pages/GibbsRelaxation3DPage';
 import LigandCompletionPage from './pages/LigandCompletionPage';
+import PottsNearestNeighborPage from './pages/PottsNearestNeighborPage';
 import MolstarDebugPage from './pages/MolstarDebugPage';
 import HealthPage from './pages/HealthPage';
 import JobStatusPage from './pages/JobStatusPage';
@@ -73,6 +74,10 @@ export default function App() {
           <Route
             path="/projects/:projectId/systems/:systemId/sampling/ligand_completion"
             element={<LigandCompletionPage />}
+          />
+          <Route
+            path="/projects/:projectId/systems/:systemId/sampling/potts_nn_mapping"
+            element={<PottsNearestNeighborPage />}
           />
           <Route path="/results" element={<ResultsPage />} />
           <Route path="/results/:jobId" element={<ResultDetailPage />} />

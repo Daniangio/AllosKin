@@ -28,6 +28,13 @@ export function submitPottsAnalysisJob(payload) {
   });
 }
 
+export function submitPottsNearestNeighborJob(payload) {
+  return requestJSON('/submit/potts_nn_mapping', {
+    method: 'POST',
+    body: payload,
+  });
+}
+
 export function submitMdSamplesRefreshJob(payload) {
   return requestJSON('/submit/md_samples_refresh', {
     method: 'POST',

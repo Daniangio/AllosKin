@@ -13,6 +13,7 @@ from backend.api.v1.schemas import (
     DeltaTransitionJobRequest,
     LambdaSweepJobRequest,
     MdSamplesRefreshJobRequest,
+    PottsNearestNeighborJobRequest,
     PottsAnalysisJobRequest,
     PottsFitJobRequest,
     SimulationJobRequest,
@@ -29,6 +30,7 @@ from backend.tasks import (
     run_lambda_sweep_job,
     run_md_samples_refresh_job,
     run_potts_analysis_job,
+    run_potts_nearest_neighbor_job,
     run_potts_fit_job,
     run_simulation_job,
 )
@@ -435,6 +437,68 @@ async def submit_potts_analysis_job(
             job_timeout="2h",
             result_ttl=86400,
             job_id=f"potts-analysis-{job_uuid}",
+        )
+        return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"Job submission failed: {exc}") from exc
+
+
+@router.post(
+    "/submit/potts_nn_mapping",
+    summary="Submit a Potts-weighted nearest-neighbor mapping analysis (samples to MD in cluster space)",
+)
+async def submit_potts_nearest_neighbor_job(
+    payload: PottsNearestNeighborJobRequest,
+    task_queue: Any = Depends(get_queue),
+):
+    try:
+        system_meta = project_store.get_system(payload.project_id, payload.system_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"System '{payload.system_id}' not found in project '{payload.project_id}'.",
+        )
+
+    cluster_entry = get_cluster_entry(system_meta, payload.cluster_id)
+    sample_entries = cluster_entry.get("samples") if isinstance(cluster_entry, dict) else []
+    sample_by_id = {
+        str(sample.get("sample_id") or "").strip(): sample
+        for sample in (sample_entries or [])
+        if isinstance(sample, dict) and sample.get("sample_id")
+    }
+    sample_id = str(payload.sample_id or "").strip()
+    md_sample_id = str(payload.md_sample_id or "").strip()
+    if not sample_id or not md_sample_id:
+        raise HTTPException(status_code=400, detail="sample_id and md_sample_id are required.")
+    if sample_id not in sample_by_id:
+        raise HTTPException(status_code=404, detail=f"Sample '{sample_id}' not found on cluster.")
+    if md_sample_id not in sample_by_id:
+        raise HTTPException(status_code=404, detail=f"MD sample '{md_sample_id}' not found on cluster.")
+    if str(sample_by_id[md_sample_id].get("type") or "").strip() != "md_eval":
+        raise HTTPException(status_code=400, detail="md_sample_id must reference an md_eval sample.")
+
+    md_label_mode = (payload.md_label_mode or "assigned").lower()
+    if md_label_mode not in {"assigned", "halo"}:
+        raise HTTPException(status_code=400, detail="md_label_mode must be 'assigned' or 'halo'.")
+
+    if not (payload.model_id or payload.model_path):
+        raise HTTPException(status_code=400, detail="Provide model_id or model_path.")
+
+    params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
+    dataset_ref = {
+        "project_id": payload.project_id,
+        "system_id": payload.system_id,
+        "cluster_id": payload.cluster_id,
+    }
+
+    try:
+        job_uuid = str(uuid.uuid4())
+        job = task_queue.enqueue(
+            run_potts_nearest_neighbor_job,
+            args=(job_uuid, dataset_ref, params),
+            job_timeout="8h",
+            result_ttl=86400,
+            job_id=f"potts-nn-mapping-{job_uuid}",
         )
         return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
     except Exception as exc:  # pragma: no cover

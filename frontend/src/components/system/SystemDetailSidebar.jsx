@@ -54,6 +54,14 @@ export default function SystemDetailSidebar({
         <Eye className="h-4 w-4" />
         Sampling explorer
       </button>
+      <button
+        type="button"
+        onClick={() => navigate(`/projects/${projectId}/systems/${systemId}/sampling/potts_nn_mapping${buildSamplingSuffix()}`)}
+        className="w-full text-xs px-3 py-2 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/40 inline-flex items-center justify-center gap-2"
+      >
+        <Eye className="h-4 w-4" />
+        Nearest-neighbour mapping
+      </button>
       <div className="grid grid-cols-2 gap-2">
         <button
           type="button"
@@ -113,9 +121,18 @@ export default function SystemDetailSidebar({
         <button
           type="button"
           onClick={() =>
+            navigate(`/projects/${projectId}/systems/${systemId}/sampling/potts_nn_mapping${buildSamplingSuffix()}`)
+          }
+          className="text-xs px-2 py-2 rounded-md border border-gray-700 text-gray-200 hover:bg-gray-700/40"
+        >
+          NN mapping
+        </button>
+        <button
+          type="button"
+          onClick={() =>
             navigate(`/projects/${projectId}/systems/${systemId}/sampling/gibbs_relaxation_3d${buildSamplingSuffix()}`)
           }
-          className="col-span-2 text-xs px-2 py-2 rounded-md border border-gray-700 text-gray-200 hover:bg-gray-700/40"
+          className="text-xs px-2 py-2 rounded-md border border-gray-700 text-gray-200 hover:bg-gray-700/40"
         >
           Gibbs relax 3D
         </button>
