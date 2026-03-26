@@ -109,7 +109,7 @@ if [ -z "$SAMPLE_ID" ]; then
   exit 1
 fi
 
-MD_LINES="$(printf "%s\n" "$SAMPLE_LINES" | awk -F'|' '$5=="md_eval"')"
+MD_LINES="$(printf "%s\n" "$SAMPLE_LINES" | awk -F'|' '$3=="md_eval"')"
 if [ -z "$(trim "$MD_LINES")" ]; then
   echo "No md_eval samples found in this cluster."
   exit 1
