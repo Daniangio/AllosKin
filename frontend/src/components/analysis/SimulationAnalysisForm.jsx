@@ -25,6 +25,7 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
   const [saInit, setSaInit] = useState('md');
   const [saInitMdFrame, setSaInitMdFrame] = useState('');
   const [saRestart, setSaRestart] = useState('independent');
+  const [saMdSampleId, setSaMdSampleId] = useState('');
   const [saMdStateIds, setSaMdStateIds] = useState('');
   const [penaltySafety, setPenaltySafety] = useState('8.0');
   const [repair, setRepair] = useState('none');
@@ -61,6 +62,10 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
       };
     });
   }, [selectedCluster]);
+  const mdSampleOptions = useMemo(
+    () => (selectedCluster?.samples || []).filter((sample) => String(sample?.type || '') === 'md_eval' && sample?.sample_id),
+    [selectedCluster]
+  );
 
   useEffect(() => {
     if (!clusterOptions.length) {
@@ -88,6 +93,16 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
       setPottsModelIds([modelOptions[0].value]);
     }
   }, [modelOptions, pottsModelIds]);
+
+  useEffect(() => {
+    if (!mdSampleOptions.length) {
+      setSaMdSampleId('');
+      return;
+    }
+    if (!saMdSampleId || !mdSampleOptions.some((sample) => sample.sample_id === saMdSampleId)) {
+      setSaMdSampleId(mdSampleOptions[0].sample_id || '');
+    }
+  }, [mdSampleOptions, saMdSampleId]);
 
   const parseBetaList = (raw) =>
     raw
@@ -137,6 +152,10 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
         if (rexBurnin !== '') payload.rex_burnin = Number(rexBurnin);
         if (rexThin !== '') payload.rex_thin = Number(rexThin);
       } else {
+        if (!saMdSampleId) {
+          throw new Error('Select an MD sample to use for SA warm-starts.');
+        }
+        payload.md_sample_id = saMdSampleId;
         if (saReads !== '') payload.sa_reads = Number(saReads);
         if (saChains !== '') payload.sa_chains = Number(saChains);
         if (saSweeps !== '') payload.sa_sweeps = Number(saSweeps);
@@ -396,6 +415,25 @@ export default function SimulationAnalysisForm({ clusterRuns, onSubmit }) {
 
       {samplingMethod === 'sa' && (
         <>
+          <div>
+            <label className="block text-sm text-gray-300 mb-1">SA warm-start MD sample</label>
+            <select
+              value={saMdSampleId}
+              onChange={(event) => setSaMdSampleId(event.target.value)}
+              disabled={!mdSampleOptions.length}
+              className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white focus:ring-cyan-500 disabled:opacity-60"
+            >
+              {mdSampleOptions.length === 0 && <option value="">No md_eval samples on this cluster</option>}
+              {mdSampleOptions.map((sample) => (
+                <option key={sample.sample_id} value={sample.sample_id}>
+                  {sample.name || sample.sample_id}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-gray-500 mt-1">
+              SA no longer uses <code>cluster.npz</code> as its MD warm-start pool. It uses this explicit <code>md_eval</code> sample.
+            </p>
+          </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <div>
               <label className="block text-sm text-gray-300 mb-1">SA reads</label>

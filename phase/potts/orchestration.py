@@ -1767,6 +1767,7 @@ def run_sampling_chain_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def prepare_sampling_batch(
     *,
     cluster_npz: str,
+    sa_md_sample_npz: str | None = None,
     results_dir: str | Path,
     model_npz: Sequence[str],
     sampling_method: str,
@@ -1802,6 +1803,7 @@ def prepare_sampling_batch(
     sa_init_md_frame: int = -1,
     sa_restart: str = "independent",
     sa_restart_topk: int = 200,
+    sa_md_sample_id: str = "",
     sa_md_state_ids: str = "",
     penalty_safety: float = 8.0,
     repair: str = "none",
@@ -1907,6 +1909,8 @@ def prepare_sampling_batch(
             requested_workers = max(1, min(max(1, n_chains), max(1, len(payloads))))
             progress_label = "Running replica-exchange chains"
     else:
+        if not str(sa_md_sample_npz or "").strip():
+            raise ValueError("SA sampling requires sa_md_sample_npz.")
         schedule_type = _normalize_sa_schedule_type(sa_schedule_type or "geometric")
         custom_schedule = _parse_sa_custom_schedule(sa_custom_beta_schedule)
         sweeps_per_beta = int(sa_num_sweeps_per_beta)
@@ -1953,7 +1957,7 @@ def prepare_sampling_batch(
                     "worker_kind": worker_kind,
                     "chain_index": int(idx),
                     "model_npz": list(model_paths),
-                    "cluster_npz": str(cluster_npz),
+                    "sa_md_sample_npz": str(sa_md_sample_npz or ""),
                     "beta": float(beta),
                     "penalty_safety": float(penalty_safety),
                     "sweeps": int(sa_sweeps),
@@ -1966,6 +1970,7 @@ def prepare_sampling_batch(
                     "sa_acceptance_criteria": str(acceptance),
                     "sa_init": str(sa_init),
                     "sa_init_md_frame": int(sa_init_md_frame),
+                    "sa_md_sample_id": str(sa_md_sample_id),
                     "sa_md_state_ids": str(sa_md_state_ids),
                     "repair": str(repair),
                     "sa_restart_topk": int(sa_restart_topk),
@@ -1987,6 +1992,8 @@ def prepare_sampling_batch(
         "sample_path": str(sample_path),
         "sampling_method": method,
         "gibbs_method": (gibbs_method or "single").strip().lower(),
+        "sa_md_sample_npz": str(sa_md_sample_npz or ""),
+        "sa_md_sample_id": str(sa_md_sample_id or ""),
         "n_residues": int(n_residues),
         "requested_workers": int(requested_workers),
         "progress_label": progress_label,

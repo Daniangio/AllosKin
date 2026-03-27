@@ -6,11 +6,9 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
-
-from phase.io.data import load_npz
 from phase.potts.potts_model import PottsModel, add_potts_models, load_potts_model
 from phase.potts.qubo import decode_onehot, encode_onehot, potts_to_qubo_onehot
-from phase.potts.sample_io import SAMPLE_NPZ_FILENAME, save_sample_npz
+from phase.potts.sample_io import SAMPLE_NPZ_FILENAME, load_sample_npz, save_sample_npz
 from phase.potts.sampling import (
     _ProgressCounter,
     gibbs_sample_potts,
@@ -229,6 +227,24 @@ def _filter_md_labels_for_states(
     return np.asarray(labels)[mask]
 
 
+def _load_sa_md_labels(payload: dict[str, object]) -> tuple[np.ndarray, np.ndarray | None]:
+    sample_path = str(payload.get("sa_md_sample_npz") or "").strip()
+    sample_id = str(payload.get("sa_md_sample_id") or "").strip()
+    if not sample_path:
+        raise ValueError("SA sampling requires sa_md_sample_npz.")
+    sample = load_sample_npz(sample_path)
+    labels = np.asarray(sample.labels, dtype=np.int32)
+    if labels.ndim != 2 or labels.shape[0] == 0:
+        ident = sample_id or sample_path
+        raise ValueError(f"Selected MD sample has no usable labels: {ident}")
+    frame_state_ids = (
+        np.asarray(sample.frame_state_ids, dtype=str)
+        if sample.frame_state_ids is not None and sample.frame_state_ids.shape[0] == labels.shape[0]
+        else None
+    )
+    return labels, frame_state_ids
+
+
 def _parse_str_list(raw: str) -> List[str]:
     parts = [p.strip() for p in str(raw or "").split(",") if p.strip()]
     return [str(p) for p in parts]
@@ -285,10 +301,9 @@ def _run_sa_independent_worker(payload: dict[str, object]) -> dict[str, object]:
     sa_init_md_frame = int(payload.get("sa_init_md_frame", -1))
     repair = str(payload.get("repair", "none"))
 
-    md_ds = load_npz(str(payload["cluster_npz"]), unassigned_policy="drop_frames", allow_missing_edges=True)  # type: ignore[arg-type]
-    md_labels = md_ds.labels
+    md_labels, md_frame_state_ids = _load_sa_md_labels(payload)
     md_state_ids = _parse_str_list(str(payload.get("sa_md_state_ids", "")))
-    md_labels = _filter_md_labels_for_states(md_labels, md_ds.frame_state_ids, state_ids=md_state_ids)
+    md_labels = _filter_md_labels_for_states(md_labels, md_frame_state_ids, state_ids=md_state_ids)
 
     qubo = potts_to_qubo_onehot(model, beta=beta, penalty_safety=penalty_safety)
     init_rng = np.random.default_rng(seed + 1000)
@@ -352,10 +367,9 @@ def _run_sa_chain_worker(payload: dict[str, object]) -> dict[str, object]:
     if sa_restart not in {"previous", "md"}:
         raise ValueError("--sa-restart must be one of: previous, md (for chain mode).")
 
-    md_ds = load_npz(str(payload["cluster_npz"]), unassigned_policy="drop_frames", allow_missing_edges=True)  # type: ignore[arg-type]
-    md_labels = md_ds.labels
+    md_labels, md_frame_state_ids = _load_sa_md_labels(payload)
     md_state_ids = _parse_str_list(str(payload.get("sa_md_state_ids", "")))
-    md_labels = _filter_md_labels_for_states(md_labels, md_ds.frame_state_ids, state_ids=md_state_ids)
+    md_labels = _filter_md_labels_for_states(md_labels, md_frame_state_ids, state_ids=md_state_ids)
 
     # Build QUBO and corresponding BQM once.
     qubo = potts_to_qubo_onehot(model, beta=beta, penalty_safety=penalty_safety)
@@ -466,6 +480,7 @@ def _run_sa_chain_worker(payload: dict[str, object]) -> dict[str, object]:
 def run_sampling(
     *,
     cluster_npz: str,
+    sa_md_sample_npz: str | None = None,
     results_dir: str | Path,
     model_npz: Sequence[str],
     sampling_method: str,
@@ -504,6 +519,7 @@ def run_sampling(
     sa_init_md_frame: int = -1,
     sa_restart: str = "independent",
     sa_restart_topk: int = 200,
+    sa_md_sample_id: str = "",
     sa_md_state_ids: str = "",
     penalty_safety: float = 8.0,
     repair: str = "none",
@@ -519,6 +535,7 @@ def run_sampling(
 
     out = run_sampling_local(
         cluster_npz=cluster_npz,
+        sa_md_sample_npz=sa_md_sample_npz,
         results_dir=results_dir,
         model_npz=model_npz,
         sampling_method=sampling_method,
@@ -554,6 +571,7 @@ def run_sampling(
         sa_init_md_frame=sa_init_md_frame,
         sa_restart=sa_restart,
         sa_restart_topk=sa_restart_topk,
+        sa_md_sample_id=sa_md_sample_id,
         sa_md_state_ids=sa_md_state_ids,
         penalty_safety=penalty_safety,
         repair=repair,

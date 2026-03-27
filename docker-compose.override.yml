@@ -1,0 +1,37 @@
+# This file is for LOCAL DEVELOPMENT only.
+# Use it explicitly with:
+#   docker compose -f docker-compose.yaml -f docker-compose.dev.yml up --build
+
+services:
+  backend:
+    command: uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000 --reload-dir /app/phase --reload-dir /app/backend
+    volumes:
+      - ./phase:/app/phase
+      - ./backend:/app/backend
+      - ${PHASE_DATA_ROOT:-./data}:/data/phase
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+      - HOST=0.0.0.0
+      - DANGEROUSLY_DISABLE_HOST_CHECK=true
+      - WDS_SOCKET_PORT=0
+
+  worker:
+    command: >
+      watchmedo auto-restart
+        --directory=/app/phase
+        --pattern="*.py"
+        --recursive
+        --
+        rq worker phase-jobs --url redis://redis:6379/0
+    volumes:
+      - ./phase:/app/phase
+      - ./backend:/app/backend
+      - ${PHASE_DATA_ROOT:-./data}:/data/phase

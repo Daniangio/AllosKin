@@ -1,9 +1,8 @@
 #
 # Dockerfile for the PHASE Frontend (React + Tailwind)
-# This is for PRODUCTION builds.
+# PRODUCTION build
 #
 
-# --- Stage 1: The "Builder" ---
 FROM node:18-alpine AS builder
 WORKDIR /app
 
@@ -11,13 +10,12 @@ COPY package.json ./
 COPY package-lock.json ./
 RUN npm install
 
-# Copy all source and config files
 COPY . .
 RUN npm run build
 
-# --- Stage 2: The "Final Server" ---
 FROM nginx:1.25-alpine
 ENV NGINX_ENTRYPOINT_WORKER_PROCESSES_AUTOTUNE=0
+
 COPY --from=builder /app/build /usr/share/nginx/html
 
 RUN printf '%s\n' \
@@ -32,7 +30,6 @@ RUN printf '%s\n' \
     '  include /etc/nginx/conf.d/*.conf;' \
     '}' > /etc/nginx/nginx.conf
 
-# Configure Nginx for a Single Page App (SPA)
 RUN echo "server { \
       listen 3000; \
       location /api/ { \
@@ -51,3 +48,4 @@ RUN echo "server { \
     }" > /etc/nginx/conf.d/default.conf
 
 EXPOSE 3000
+CMD ["nginx", "-g", "daemon off;"]

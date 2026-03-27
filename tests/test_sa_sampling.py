@@ -37,6 +37,7 @@ def test_prepare_sampling_batch_accepts_custom_sa_schedule(monkeypatch, tmp_path
 
     out = orchestration.prepare_sampling_batch(
         cluster_npz=str(tmp_path / "cluster.npz"),
+        sa_md_sample_npz=str(tmp_path / "md_sample.npz"),
         results_dir=tmp_path / "sample-out",
         model_npz=[str(tmp_path / "model.npz")],
         sampling_method="sa",
@@ -73,6 +74,7 @@ def test_prepare_sampling_batch_accepts_linear_range_schedule(monkeypatch, tmp_p
 
     out = orchestration.prepare_sampling_batch(
         cluster_npz=str(tmp_path / "cluster.npz"),
+        sa_md_sample_npz=str(tmp_path / "md_sample.npz"),
         results_dir=tmp_path / "sample-out",
         model_npz=[str(tmp_path / "model.npz")],
         sampling_method="sa",
@@ -105,6 +107,7 @@ def test_prepare_sampling_batch_uses_stronger_default_penalty_safety(monkeypatch
 
     out = orchestration.prepare_sampling_batch(
         cluster_npz=str(tmp_path / "cluster.npz"),
+        sa_md_sample_npz=str(tmp_path / "md_sample.npz"),
         results_dir=tmp_path / "sample-out",
         model_npz=[str(tmp_path / "model.npz")],
         sampling_method="sa",
@@ -127,6 +130,7 @@ def test_prepare_sampling_batch_defaults_to_independent_sa_restart(monkeypatch, 
 
     out = orchestration.prepare_sampling_batch(
         cluster_npz=str(tmp_path / "cluster.npz"),
+        sa_md_sample_npz=str(tmp_path / "md_sample.npz"),
         results_dir=tmp_path / "sample-out",
         model_npz=[str(tmp_path / "model.npz")],
         sampling_method="sa",

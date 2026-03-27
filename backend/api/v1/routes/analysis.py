@@ -122,6 +122,21 @@ async def submit_simulation_job(
     if sampling_method not in {"gibbs", "sa"}:
         raise HTTPException(status_code=400, detail="sampling_method must be 'gibbs' or 'sa'.")
 
+    if sampling_method == "sa":
+        md_sample_id = str(payload.md_sample_id or "").strip()
+        if not md_sample_id:
+            raise HTTPException(status_code=400, detail="SA sampling requires md_sample_id.")
+        cluster_entry = get_cluster_entry(system_meta, payload.cluster_id)
+        sample_by_id = {
+            str(sample.get("sample_id") or "").strip(): sample
+            for sample in (cluster_entry.get("samples") or [])
+            if isinstance(sample, dict) and str(sample.get("sample_id") or "").strip()
+        }
+        if md_sample_id not in sample_by_id:
+            raise HTTPException(status_code=404, detail=f"MD sample '{md_sample_id}' not found on cluster.")
+        if str(sample_by_id[md_sample_id].get("type") or "").strip() != "md_eval":
+            raise HTTPException(status_code=400, detail="md_sample_id must reference an md_eval sample.")
+
     rex_betas = payload.rex_betas
     if isinstance(rex_betas, str) and not rex_betas.strip():
         rex_betas = None

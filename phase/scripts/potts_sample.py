@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from phase.potts.sampling_run import run_sampling
 from phase.scripts.potts_utils import persist_sample
+from phase.services.project_store import ProjectStore
 
 
 def _differs_from_default(parser, key: str, value: object) -> bool:
@@ -46,6 +48,7 @@ def _filter_sampling_params(args: object, parser) -> dict:
             }
     else:
         allow |= {
+            "md_sample_id",
             "sa_reads",
             "sa_chains",
             "sa_sweeps",
@@ -151,8 +154,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project-id", default="")
     parser.add_argument("--system-id", default="")
     parser.add_argument("--cluster-id", default="")
+    parser.add_argument("--root", default="", help="Offline data root containing projects/.")
     parser.add_argument("--sample-id", default="")
     parser.add_argument("--sample-name", default="")
+    parser.add_argument("--md-sample-id", default="", help="md_eval sample id used as the SA warm-start pool.")
     args = parser.parse_args(argv)
     last_progress = {"message": None, "pct": -1}
 
@@ -166,9 +171,49 @@ def main(argv: list[str] | None = None) -> int:
         last_progress["pct"] = pct
         print(f"[sampling] {message} ({pct}%)")
 
+    sa_md_sample_npz = ""
+    if str(args.sampling_method) == "sa":
+        md_sample_id = str(args.md_sample_id or "").strip()
+        if not md_sample_id:
+            raise SystemExit("--md-sample-id is required for SA sampling.")
+        project_id = str(args.project_id or "").strip()
+        system_id = str(args.system_id or "").strip()
+        cluster_id = str(args.cluster_id or "").strip()
+        if not (project_id and system_id and cluster_id):
+            raise SystemExit("--project-id, --system-id, and --cluster-id are required to resolve --md-sample-id.")
+        root = Path(args.root) if str(args.root or "").strip() else Path(os.environ.get("PHASE_DATA_ROOT", ""))
+        if not str(root).strip():
+            raise SystemExit("--root or PHASE_DATA_ROOT is required to resolve --md-sample-id.")
+        store = ProjectStore(base_dir=root / "projects")
+        system_meta = store.get_system(project_id, system_id)
+        entry = next((c for c in (system_meta.metastable_clusters or []) if c.get("cluster_id") == cluster_id), None)
+        if not entry:
+            raise SystemExit(f"Cluster not found: {cluster_id}")
+        sample_entry = next(
+            (
+                s for s in (entry.get("samples") or [])
+                if isinstance(s, dict) and str(s.get("sample_id") or "").strip() == md_sample_id
+            ),
+            None,
+        )
+        if not sample_entry:
+            raise SystemExit(f"MD sample not found on cluster: {md_sample_id}")
+        if str(sample_entry.get("type") or "").strip() != "md_eval":
+            raise SystemExit(f"Selected sample is not md_eval: {md_sample_id}")
+        rel = ((sample_entry.get("paths") or {}).get("summary_npz") or sample_entry.get("path"))
+        if not rel:
+            raise SystemExit(f"MD sample NPZ path missing: {md_sample_id}")
+        sample_path = Path(str(rel))
+        if not sample_path.is_absolute():
+            sample_path = store.resolve_path(project_id, system_id, str(rel))
+        if not sample_path.exists():
+            raise SystemExit(f"MD sample NPZ missing on disk: {sample_path}")
+        sa_md_sample_npz = str(sample_path)
+
     try:
         results = run_sampling(
             cluster_npz=str(args.npz),
+            sa_md_sample_npz=sa_md_sample_npz,
             results_dir=str(args.results_dir),
             model_npz=getattr(args, "model_npz", []) or [],
             sampling_method=str(args.sampling_method),
@@ -203,6 +248,7 @@ def main(argv: list[str] | None = None) -> int:
             sa_init=str(args.sa_init),
             sa_init_md_frame=int(args.sa_init_md_frame),
             sa_restart=str(args.sa_restart),
+            sa_md_sample_id=str(args.md_sample_id),
             sa_md_state_ids=str(args.sa_md_state_ids),
             penalty_safety=float(args.penalty_safety),
             repair=str(args.repair),

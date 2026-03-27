@@ -849,6 +849,38 @@ def run_simulation_job(
 
         effective_beta = float(beta_override) if beta_override is not None else float(sim_params.get("beta", 1.0))
         effective_seed = int(sim_params.get("seed", 0) or 0)
+        sa_md_sample_id = str(sim_params.get("md_sample_id") or "").strip()
+        sa_md_sample_path = None
+        if sampling_method == "sa":
+            if not sa_md_sample_id:
+                raise ValueError("SA sampling requires md_sample_id.")
+            samples = entry.get("samples") if isinstance(entry, dict) else None
+            sample_entry = None
+            if isinstance(samples, list):
+                sample_entry = next(
+                    (
+                        s for s in samples
+                        if isinstance(s, dict)
+                        and str(s.get("sample_id") or "").strip() == sa_md_sample_id
+                    ),
+                    None,
+                )
+            if not sample_entry:
+                raise FileNotFoundError(f"Start MD sample not found: {sa_md_sample_id}")
+            if str(sample_entry.get("type") or "").strip() != "md_eval":
+                raise ValueError(f"Start sample must be an md_eval sample: {sa_md_sample_id}")
+            sample_rel = (
+                (sample_entry.get("paths") or {}).get("summary_npz")
+                or sample_entry.get("path")
+            )
+            if not sample_rel:
+                raise FileNotFoundError(f"MD sample NPZ path missing: {sa_md_sample_id}")
+            sample_path = Path(str(sample_rel))
+            if not sample_path.is_absolute():
+                sample_path = project_store.resolve_path(project_id, system_id, str(sample_rel))
+            if not sample_path.exists():
+                raise FileNotFoundError(f"MD sample NPZ missing on disk: {sample_path}")
+            sa_md_sample_path = str(sample_path)
 
         # Backwards-compatible support for older UIs that sent one SA range in sa_beta_schedules.
         if sampling_method == "sa":
@@ -876,6 +908,7 @@ def run_simulation_job(
 
         prepared = prepare_sampling_batch(
             cluster_npz=str(cluster_path),
+            sa_md_sample_npz=sa_md_sample_path,
             results_dir=results_dir,
             model_npz=[str(p) for p in model_paths],
             sampling_method=str(sampling_method),
@@ -911,6 +944,7 @@ def run_simulation_job(
             sa_init_md_frame=int(sim_params.get("sa_init_md_frame") or -1),
             sa_restart=raw_sa_restart,
             sa_restart_topk=int(sim_params.get("sa_restart_topk") or 200),
+            sa_md_sample_id=sa_md_sample_id,
             sa_md_state_ids=str(sim_params.get("sa_md_state_ids") or ""),
             penalty_safety=float(sim_params.get("penalty_safety") or 8.0),
             repair=str(sim_params.get("repair") or "none"),

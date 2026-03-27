@@ -47,6 +47,17 @@ trim() {
   printf "%s" "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
 }
 
+sample_id_from_row() {
+  local row="$1"
+  local p
+  p="$(printf "%s" "$row" | awk -F'|' '{print $4}')"
+  p="$(trim "$p")"
+  if [ -z "$p" ]; then
+    return 1
+  fi
+  basename "$(dirname "$p")"
+}
+
 OFFLINE_ROOT=""
 OFFLINE_PROJECT_ID=""
 OFFLINE_SYSTEM_ID=""
@@ -211,6 +222,19 @@ if [ "$SAMPLING_METHOD" = "gibbs" ]; then
     REX_CHAINS="$(prompt "REX chain count (runs in parallel, total rounds split)" "1")"
   fi
 else
+  SAMPLE_LINES="$(_offline_list list-sampling --project-id "$OFFLINE_PROJECT_ID" --system-id "$OFFLINE_SYSTEM_ID" || true)"
+  SAMPLE_LINES="$(printf "%s\n" "$SAMPLE_LINES" | awk -F'|' -v cid="$CLUSTER_ID" '$1==cid')"
+  MD_LINES="$(printf "%s\n" "$SAMPLE_LINES" | awk -F'|' '$3=="md_eval"')"
+  if [ -z "$(trim "$MD_LINES")" ]; then
+    echo "No md_eval samples found in this cluster."
+    exit 1
+  fi
+  MD_ROW="$(offline_choose_one "Select MD sample for SA warm-starts:" "$MD_LINES")"
+  MD_SAMPLE_ID="$(sample_id_from_row "$MD_ROW" || true)"
+  if [ -z "$MD_SAMPLE_ID" ]; then
+    echo "Failed to resolve MD sample id."
+    exit 1
+  fi
   SA_READS="$(prompt "SA reads" "2000")"
   SA_CHAINS="$(prompt "SA chain count (parallel independent chains)" "1")"
   SA_SWEEPS="$(prompt "SA sweeps" "2000")"
@@ -315,6 +339,7 @@ fi
 
 if [ "$SAMPLING_METHOD" = "sa" ]; then
   CMD+=(
+    --root "$OFFLINE_ROOT"
     --sa-reads "$SA_READS"
     --sa-chains "$SA_CHAINS"
     --sa-sweeps "$SA_SWEEPS"
@@ -323,6 +348,7 @@ if [ "$SAMPLING_METHOD" = "sa" ]; then
     --sa-acceptance-criteria "$SA_ACCEPTANCE_CRITERIA"
     --sa-init "$SA_INIT"
     --sa-restart "$SA_RESTART"
+    --md-sample-id "$MD_SAMPLE_ID"
     --penalty-safety "$PENALTY_SAFETY"
     --repair "$REPAIR"
   )
