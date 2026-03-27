@@ -36,6 +36,7 @@ def _filter_fit_params(args: object) -> dict:
         "plm_lr_schedule",
         "plm_l2",
         "plm_batch_size",
+        "plm_grad_accum_steps",
         "plm_progress_every",
         "plm_lambda",
     }

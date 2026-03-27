@@ -84,6 +84,7 @@ class SimulationJobRequest(BaseModel):
     plm_lr_schedule: Optional[str] = None
     plm_l2: Optional[float] = None
     plm_batch_size: Optional[int] = None
+    plm_grad_accum_steps: Optional[int] = None
     plm_progress_every: Optional[int] = None
     plm_device: Optional[str] = None
     plm_init: Optional[str] = None
@@ -113,6 +114,7 @@ class PottsFitJobRequest(BaseModel):
     delta_lr_min: Optional[float] = None
     delta_lr_schedule: Optional[str] = None
     delta_batch_size: Optional[int] = None
+    delta_grad_accum_steps: Optional[int] = None
     delta_seed: Optional[int] = None
     delta_device: Optional[str] = None
     delta_l2: Optional[float] = None
@@ -127,6 +129,7 @@ class PottsFitJobRequest(BaseModel):
     plm_lr_schedule: Optional[str] = None
     plm_l2: Optional[float] = None
     plm_batch_size: Optional[int] = None
+    plm_grad_accum_steps: Optional[int] = None
     plm_progress_every: Optional[int] = None
     plm_device: Optional[str] = None
 

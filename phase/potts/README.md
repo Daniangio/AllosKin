@@ -116,6 +116,31 @@ python main.py \
 * `--plm-init-model`: Potts model NPZ used when `--plm-init=model`
 * `--plm-resume-model`: resume PLM from a saved model (uses stored best loss if available)
 * `--plm-val-frac`: fraction of frames reserved for validation during PLM
+* `--plm-grad-accum-steps`: number of micro-batches accumulated before each PLM optimizer step
+* `--plm-l2`: L2 penalty on effective PLM parameters
+* `--plm-lambda`: group-Frobenius shrinkage on coupling blocks
+
+PLM details:
+
+* PHASE fits a single symmetric sparse-edge Potts model directly by pseudolikelihood.
+* When zero-sum gauge is enabled, training uses differentiable projected views in the forward pass and export path.
+* Saved models are exported in zero-sum gauge; the optimizer-owned tensors are not mutated in place after each step.
+* Effective PLM batch size is `plm_batch_size * plm_grad_accum_steps`.
+
+### Delta Potts fit
+
+The delta fitter keeps a base model fixed and learns only `Δh` and `ΔJ`.
+
+* `--delta-l2`: L2 penalty on projected delta parameters
+* `--delta-group-h`: group-L2 shrinkage on residue field vectors
+* `--delta-group-j`: group-Frobenius shrinkage on edge coupling blocks
+* `--grad-accum-steps`: number of micro-batches accumulated before each delta optimizer step
+
+Delta details:
+
+* Logits are built from `base + delta`.
+* When gauge fixing is enabled, penalties are applied to projected `Δh` and `ΔJ`, not raw tensors.
+* This keeps delta magnitudes interpretable as minimal rewiring rather than gauge artifacts.
 
 ### Local fitting
 

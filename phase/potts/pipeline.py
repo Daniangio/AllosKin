@@ -1119,6 +1119,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--plm-l2", type=float, default=1e-5)
     ap.add_argument("--plm-lambda", type=float, default=1e-3)
     ap.add_argument("--plm-batch-size", type=int, default=512)
+    ap.add_argument("--plm-grad-accum-steps", type=int, default=1)
     ap.add_argument("--plm-progress-every", type=int, default=10)
     ap.add_argument(
         "--plm-device",
@@ -1620,6 +1621,7 @@ def run_pipeline(
                     lr_schedule=args.plm_lr_schedule,
                     epochs=args.plm_epochs,
                     batch_size=args.plm_batch_size,
+                    grad_accum_steps=args.plm_grad_accum_steps,
                     seed=args.seed,
                     verbose=not show_batch_progress,
                     init_from_pmi=init_from_pmi,
@@ -2205,6 +2207,7 @@ def run_pipeline(
         K,
         edges,
         batch_size=args.plm_batch_size,
+        grad_accum_steps=args.plm_grad_accum_steps,
     )
 
     beta_eff_grid_result = None

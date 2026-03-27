@@ -216,6 +216,76 @@ def fit_potts_pmi(
     return PottsModel(h=h, J=J, edges=list(edges))
 
 
+def _torch_project_zero_sum_sparse(
+    h_tensors: Sequence["torch.Tensor"],
+    J_tensors: Dict[Tuple[int, int], "torch.Tensor"],
+    edges: Sequence[Tuple[int, int]],
+) -> tuple[List["torch.Tensor"], Dict[Tuple[int, int], "torch.Tensor"]]:
+    """
+    Return differentiable zero-sum-gauge views without mutating optimizer-owned tensors.
+    """
+    import torch
+
+    N = len(h_tensors)
+    h_add = [torch.zeros_like(h_tensors[r]) for r in range(N)]
+    J_proj: Dict[Tuple[int, int], "torch.Tensor"] = {}
+    norm_edges = sorted((min(int(r), int(s)), max(int(r), int(s))) for r, s in edges if int(r) != int(s))
+    for r, s in norm_edges:
+        M = J_tensors[(r, s)]
+        row_mean = M.mean(dim=1, keepdim=True)
+        col_mean = M.mean(dim=0, keepdim=True)
+        overall = M.mean()
+        h_add[r] = h_add[r] + row_mean[:, 0]
+        h_add[s] = h_add[s] + col_mean[0, :]
+        J_proj[(r, s)] = M - row_mean - col_mean + overall
+    h_proj = []
+    for r in range(N):
+        hr = h_tensors[r] + h_add[r]
+        h_proj.append(hr - hr.mean())
+    return h_proj, J_proj
+
+
+def _export_potts_model_from_logits_tensors(
+    h_tensors: Sequence["torch.Tensor"],
+    J_tensors: Dict[Tuple[int, int], "torch.Tensor"],
+    edges: Sequence[Tuple[int, int]],
+    *,
+    zero_sum_gauge: bool,
+) -> PottsModel:
+    import torch
+
+    with torch.no_grad():
+        if zero_sum_gauge:
+            h_use, J_use = _torch_project_zero_sum_sparse(h_tensors, J_tensors, edges)
+        else:
+            h_use = [h for h in h_tensors]
+            J_use = {edge: J_tensors[edge] for edge in edges}
+        h = [(-hp).detach().cpu().numpy().astype(float) for hp in h_use]
+        J = {edge: (-J_use[edge]).detach().cpu().numpy().astype(float) for edge in edges}
+    return PottsModel(h=h, J=J, edges=list(edges))
+
+
+def _build_residue_incoming(
+    edges: Sequence[Tuple[int, int]],
+) -> List[List[Tuple[int, int, Tuple[int, int], bool]]]:
+    if not edges:
+        return []
+    N = max(max(int(r), int(s)) for r, s in edges) + 1
+    incoming: List[List[Tuple[int, int, Tuple[int, int], bool]]] = [[] for _ in range(N)]
+    for r, s in edges:
+        rr, ss = min(int(r), int(s)), max(int(r), int(s))
+        edge = (rr, ss)
+        incoming[rr].append((rr, ss, edge, True))
+        incoming[ss].append((rr, ss, edge, False))
+    return incoming
+
+
+def _group_l2_norm(t: "torch.Tensor", eps: float = 1e-12) -> "torch.Tensor":
+    import torch
+
+    return torch.sqrt(torch.sum(t * t) + eps)
+
+
 
 def fit_potts_pseudolikelihood_torch(
     labels: np.ndarray,
@@ -245,6 +315,7 @@ def fit_potts_pseudolikelihood_torch(
     progress_every: int = 10,
     batch_progress_callback: "callable | None" = None,
     device: str | None = None,
+    grad_accum_steps: int = 1,
 ) -> PottsModel:
     """
     True symmetric Potts fit by minimizing negative pseudolikelihood:
@@ -266,17 +337,19 @@ def fit_potts_pseudolikelihood_torch(
     T, N = labels.shape
     K = list(map(int, K))
     edges = sorted((min(r, s), max(r, s)) for r, s in edges if r != s)
+    grad_accum_steps = int(grad_accum_steps)
+    if grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be >= 1.")
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     torch_device = torch.device(device)
     if verbose:
         print(f"[plm] using device={torch_device}")
 
-    # adjacency lists by residue
-    neigh = [[] for _ in range(N)]
-    for r, s in edges:
-        neigh[r].append(s)
-        neigh[s].append(r)
+    incoming = _build_residue_incoming(edges)
+    if len(incoming) < N:
+        incoming.extend([[] for _ in range(N - len(incoming))])
+    edge_keys = {edge: f"{edge[0]}_{edge[1]}" for edge in edges}
 
     # Optional initialization from PMI heuristic
     pmi_model: PottsModel | None = init_model
@@ -306,7 +379,8 @@ def fit_potts_pseudolikelihood_torch(
             raise ValueError("val_labels must match shape (T_val, N).")
         X_val = torch.tensor(val_labels, dtype=torch.long, device=torch_device)
 
-    opt = torch.optim.Adam(list(h_params) + list(J_params.values()), lr=lr, weight_decay=l2)
+    opt_weight_decay = 0.0 if zero_sum_gauge else float(l2)
+    opt = torch.optim.Adam(list(h_params) + list(J_params.values()), lr=lr, weight_decay=opt_weight_decay)
     schedule = lr_schedule.lower() if lr_schedule else "none"
     scheduler = None
     if schedule == "cosine":
@@ -314,71 +388,61 @@ def fit_potts_pseudolikelihood_torch(
     elif schedule != "none":
         raise ValueError(f"Unknown lr_schedule={lr_schedule!r}")
 
-    def _logits_for_residue(x_batch: "torch.Tensor", r: int) -> "torch.Tensor":
-        # returns logits shape (B, K_r)
+    def _parameter_views() -> tuple[List["torch.Tensor"], Dict[Tuple[int, int], "torch.Tensor"]]:
+        h_raw = list(h_params)
+        J_raw = {edge: J_params[edge_keys[edge]] for edge in edges}
+        if zero_sum_gauge:
+            return _torch_project_zero_sum_sparse(h_raw, J_raw, edges)
+        return h_raw, J_raw
+
+    def _logits_for_residue(
+        x_batch: "torch.Tensor",
+        r: int,
+        h_view: Sequence["torch.Tensor"],
+        J_view: Dict[Tuple[int, int], "torch.Tensor"],
+    ) -> "torch.Tensor":
         B = x_batch.shape[0]
-        logits = h_params[r].unsqueeze(0).expand(B, -1)  # (B, K_r)
-
-        for s in neigh[r]:
-            rr, ss = (r, s) if r < s else (s, r)
-            key = f"{rr}_{ss}"
-            Jmat = J_params[key]
-            xs = x_batch[:, s]  # (B,)
-
-            if r < s:
-                # add J_rs[:, x_s]
-                logits = logits + Jmat[:, xs].T
-            else:
-                # stored J_sr with shape (K_s,K_r)?? No: we stored (rr,ss)=(s,r) so Jmat is (K_s,K_r).
-                # Need contribution as J_sr[x_s, :] which is (B,K_r)
-                logits = logits + Jmat[xs, :]
+        logits = h_view[r].unsqueeze(0).expand(B, -1)
+        for rr, ss, edge, r_is_first in incoming[r]:
+            Jmat = J_view[edge]
+            xs = x_batch[:, ss if r_is_first else rr]
+            logits = logits + (Jmat[:, xs].T if r_is_first else Jmat[xs, :])
         return logits
 
     loss_fn = torch.nn.CrossEntropyLoss()
 
-    eps = 1e-12
-
-    def _fro_norm(mat: "torch.Tensor") -> "torch.Tensor":
-        # Frobenius norm (smooth at 0)
-        return torch.sqrt(torch.sum(mat * mat) + eps)
-
-    @torch.no_grad()
-    def _apply_zero_sum_gauge_():
-        """
-        Put (h, J) into a standard zero-sum gauge while preserving the model distribution
-        (up to additive constants). Works on the PARAMS USED IN LOGITS (h_params, J_params).
-
-        For each edge (r,s) with matrix M (K_r x K_s):
-            row_mean[a] = mean_b M[a,b]
-            col_mean[b] = mean_a M[a,b]
-            overall = mean_{a,b} M[a,b]
-        We set:
-            M <- M - row_mean - col_mean + overall
-            h_r <- h_r + row_mean
-            h_s <- h_s + col_mean
-        Then finally center h_r to zero-mean (optional gauge fixing on fields).
-        """
-        # First, fix each coupling block and push row/col means into fields
-        for (r, s) in edges:
-            key = f"{r}_{s}"
-            M = J_params[key]                    # shape (K_r, K_s)
-
-            row_mean = M.mean(dim=1, keepdim=True)  # (K_r, 1)
-            col_mean = M.mean(dim=0, keepdim=True)  # (1, K_s)
-            overall  = M.mean()                      # scalar
-
-            # push means into the corresponding fields (preserves energies up to constants)
-            h_params[r].add_(row_mean.squeeze(1))
-            h_params[s].add_(col_mean.squeeze(0))
-
-            # double-center coupling
-            M.sub_(row_mean)
-            M.sub_(col_mean)
-            M.add_(overall)
-
-        # Then center fields to zero mean per site (pure gauge; adds constants)
+    def _data_loss_from_views(
+        xb: "torch.Tensor",
+        h_view: Sequence["torch.Tensor"],
+        J_view: Dict[Tuple[int, int], "torch.Tensor"],
+    ) -> "torch.Tensor":
+        loss = torch.tensor(0.0, device=torch_device)
         for r in range(N):
-            h_params[r].sub_(h_params[r].mean())
+            logits = _logits_for_residue(xb, r, h_view, J_view)
+            y = xb[:, r]
+            loss = loss + loss_fn(logits, y)
+        return loss
+
+    def _data_loss_for_batch(xb: "torch.Tensor") -> "torch.Tensor":
+        h_view, J_view = _parameter_views()
+        return _data_loss_from_views(xb, h_view, J_view)
+
+    def _loss_for_batch(xb: "torch.Tensor") -> "torch.Tensor":
+        h_view, J_view = _parameter_views()
+        loss = _data_loss_from_views(xb, h_view, J_view)
+        if zero_sum_gauge and l2 > 0:
+            reg_l2 = torch.tensor(0.0, device=torch_device)
+            for hr in h_view:
+                reg_l2 = reg_l2 + torch.sum(hr * hr)
+            for edge in edges:
+                reg_l2 = reg_l2 + torch.sum(J_view[edge] * J_view[edge])
+            loss = loss + l2 * reg_l2
+        if lambda_J_block > 0:
+            reg = torch.tensor(0.0, device=torch_device)
+            for edge in edges:
+                reg = reg + _group_l2_norm(J_view[edge])
+            loss = loss + lambda_J_block * reg
+        return loss
 
     idx = np.arange(T)
     progress_every = max(1, int(progress_every))
@@ -391,11 +455,7 @@ def fit_potts_pseudolikelihood_torch(
             n_eval = X_eval.shape[0]
             for start in range(0, n_eval, batch_size):
                 xb = X_eval[start:start + batch_size]
-                loss = 0.0
-                for r in range(N):
-                    logits = _logits_for_residue(xb, r)
-                    y = xb[:, r]
-                    loss = loss + loss_fn(logits, y)
+                loss = _data_loss_for_batch(xb)
                 total += float(loss.item()) * xb.shape[0]
                 nobs += xb.shape[0]
         return total / max(1, nobs)
@@ -416,12 +476,13 @@ def fit_potts_pseudolikelihood_torch(
     last_val_loss = None
 
     def _export_model() -> PottsModel:
-        h = [(-hp).detach().cpu().numpy().astype(float) for hp in h_params]
-        J: Dict[Tuple[int, int], np.ndarray] = {}
-        for r, s in edges:
-            key = f"{r}_{s}"
-            J[(r, s)] = -J_params[key].detach().cpu().numpy().astype(float)
-        return PottsModel(h=h, J=J, edges=list(edges))
+        raw_J = {edge: J_params[edge_keys[edge]] for edge in edges}
+        return _export_potts_model_from_logits_tensors(
+            list(h_params),
+            raw_J,
+            edges,
+            zero_sum_gauge=zero_sum_gauge,
+        )
 
     def _maybe_save_best(ep: int, train_loss: float, val_loss: Optional[float]) -> None:
         nonlocal best_metric, best_loss, best_val_loss, best_epoch
@@ -468,32 +529,19 @@ def fit_potts_pseudolikelihood_torch(
         rng.shuffle(idx)
         total = 0.0
         nobs = 0
+        opt.zero_grad()
+        micro_step = 0
 
         for start in range(0, T, batch_size):
             bidx = idx[start:start + batch_size]
             xb = X[bidx]  # (B,N)
-            opt.zero_grad()
-
-            loss = 0.0
-            # sum over residues (pseudolikelihood)
-            for r in range(N):
-                logits = _logits_for_residue(xb, r)  # (B,K_r)
-                y = xb[:, r]
-                loss = loss + loss_fn(logits, y)
-            
-            # block regularization per edge (group-lasso style over coupling matrices)
-            if lambda_J_block > 0:
-                reg = torch.tensor(0.0, device=torch_device)
-                for key in J_params:
-                    reg = reg + _fro_norm(J_params[key])
-                loss = loss + lambda_J_block * reg
-
-            loss.backward()
-
-            opt.step()
-
-            if zero_sum_gauge:
-                _apply_zero_sum_gauge_()
+            loss = _loss_for_batch(xb)
+            (loss / grad_accum_steps).backward()
+            micro_step += 1
+            if micro_step >= grad_accum_steps or start + batch_size >= T:
+                opt.step()
+                opt.zero_grad()
+                micro_step = 0
 
             total += float(loss.item()) * len(bidx)
             nobs += len(bidx)
@@ -511,9 +559,6 @@ def fit_potts_pseudolikelihood_torch(
             print(f"[plm] epoch {ep:4d}/{epochs}  avg_loss={avg_loss:.6f}")
         if progress_callback and (ep == 1 or ep == epochs or ep % progress_every == 0):
             progress_callback(ep, epochs, float(avg_loss))
-        if zero_sum_gauge:
-            # Keep a consistent gauge at epoch boundaries so checkpointed parameters are comparable.
-            _apply_zero_sum_gauge_()
         _maybe_save_best(ep, float(avg_loss), val_loss)
         if scheduler is not None:
             scheduler.step()
@@ -603,6 +648,7 @@ def fit_potts_delta_pseudolikelihood_torch(
     progress_every: int = 10,
     batch_progress_callback: "callable | None" = None,
     device: str | None = None,
+    grad_accum_steps: int = 1,
 ) -> PottsModel:
     """
     Fit a sparse delta Potts model (Δh, ΔJ) on top of a frozen base model using pseudolikelihood.
@@ -621,6 +667,9 @@ def fit_potts_delta_pseudolikelihood_torch(
     T, N = labels.shape
     if N != len(base_model.h):
         raise ValueError("Labels shape does not match base Potts model size.")
+    grad_accum_steps = int(grad_accum_steps)
+    if grad_accum_steps < 1:
+        raise ValueError("grad_accum_steps must be >= 1.")
 
     edges = sorted((min(r, s), max(r, s)) for r, s in base_model.edges if r != s)
     if device is None:
@@ -636,17 +685,16 @@ def fit_potts_delta_pseudolikelihood_torch(
         if init_edges != edges:
             raise ValueError("Init delta model edges do not match base model.")
 
-    neigh = [[] for _ in range(N)]
-    for r, s in edges:
-        neigh[r].append(s)
-        neigh[s].append(r)
+    incoming = _build_residue_incoming(edges)
+    if len(incoming) < N:
+        incoming.extend([[] for _ in range(N - len(incoming))])
+    edge_keys = {edge: f"{edge[0]}_{edge[1]}" for edge in edges}
 
     torch.manual_seed(seed)
     base_h = [torch.tensor(-base_model.h[r], dtype=torch.float32, device=torch_device) for r in range(N)]
-    base_J: Dict[str, "torch.Tensor"] = {}
+    base_J: Dict[Tuple[int, int], "torch.Tensor"] = {}
     for r, s in edges:
-        key = f"{r}_{s}"
-        base_J[key] = torch.tensor(-base_model.J[(r, s)], dtype=torch.float32, device=torch_device)
+        base_J[(r, s)] = torch.tensor(-base_model.J[(r, s)], dtype=torch.float32, device=torch_device)
 
     delta_h = torch.nn.ParameterList([
         torch.nn.Parameter(torch.tensor(
@@ -658,7 +706,7 @@ def fit_potts_delta_pseudolikelihood_torch(
     ])
     delta_J = torch.nn.ParameterDict()
     for r, s in edges:
-        key = f"{r}_{s}"
+        key = edge_keys[(r, s)]
         init_val = np.zeros(base_model.J[(r, s)].shape)
         if init_model is not None:
             init_val = -init_model.coupling(r, s)
@@ -677,43 +725,25 @@ def fit_potts_delta_pseudolikelihood_torch(
     elif schedule != "none":
         raise ValueError(f"Unknown lr_schedule={lr_schedule!r}")
 
-    @torch.no_grad()
-    def _apply_zero_sum_gauge_() -> None:
-        """
-        Enforce zero-sum gauge on DELTA parameters (delta_h, delta_J).
-
-        This is important before comparing Δh/ΔJ across delta fits: without a fixed gauge, large apparent
-        differences can be pure gauge artifacts.
-        """
-        for (r, s) in edges:
-            key = f"{r}_{s}"
-            M = delta_J[key]  # (K_r, K_s) in logits-space
-
-            row_mean = M.mean(dim=1, keepdim=True)  # (K_r, 1)
-            col_mean = M.mean(dim=0, keepdim=True)  # (1, K_s)
-            overall = M.mean()
-
-            delta_h[r].add_(row_mean.squeeze(1))
-            delta_h[s].add_(col_mean.squeeze(0))
-
-            M.sub_(row_mean)
-            M.sub_(col_mean)
-            M.add_(overall)
-
-        for r in range(N):
-            delta_h[r].sub_(delta_h[r].mean())
+    def _delta_views() -> tuple[List["torch.Tensor"], Dict[Tuple[int, int], "torch.Tensor"]]:
+        h_raw = list(delta_h)
+        J_raw = {edge: delta_J[edge_keys[edge]] for edge in edges}
+        if zero_sum_gauge:
+            return _torch_project_zero_sum_sparse(h_raw, J_raw, edges)
+        return h_raw, J_raw
 
     best_loss = float("inf") if start_best_loss is None else float(start_best_loss)
     best_epoch = None
     last_loss = None
 
     def _export_model() -> PottsModel:
-        h = [(-hp).detach().cpu().numpy().astype(float) for hp in delta_h]
-        J: Dict[Tuple[int, int], np.ndarray] = {}
-        for r, s in edges:
-            key = f"{r}_{s}"
-            J[(r, s)] = -delta_J[key].detach().cpu().numpy().astype(float)
-        return PottsModel(h=h, J=J, edges=list(edges))
+        raw_J = {edge: delta_J[edge_keys[edge]] for edge in edges}
+        return _export_potts_model_from_logits_tensors(
+            list(delta_h),
+            raw_J,
+            edges,
+            zero_sum_gauge=zero_sum_gauge,
+        )
 
     def _maybe_save_best(ep: int, train_loss: float) -> None:
         nonlocal best_loss, best_epoch
@@ -744,22 +774,57 @@ def fit_potts_delta_pseudolikelihood_torch(
                 float(train_loss),
             )
 
-    def _logits_for_residue(x_batch: "torch.Tensor", r: int) -> "torch.Tensor":
+    def _logits_for_residue(
+        x_batch: "torch.Tensor",
+        r: int,
+        h_view: Sequence["torch.Tensor"],
+        J_view: Dict[Tuple[int, int], "torch.Tensor"],
+    ) -> "torch.Tensor":
         B = x_batch.shape[0]
-        logits = (base_h[r] + delta_h[r]).unsqueeze(0).expand(B, -1)
-        for s in neigh[r]:
-            rr, ss = (r, s) if r < s else (s, r)
-            key = f"{rr}_{ss}"
-            Jmat = base_J[key] + delta_J[key]
-            xs = x_batch[:, s]
-            if r < s:
-                logits = logits + Jmat[:, xs].T
-            else:
-                logits = logits + Jmat[xs, :]
+        logits = (base_h[r] + h_view[r]).unsqueeze(0).expand(B, -1)
+        for rr, ss, edge, r_is_first in incoming[r]:
+            Jmat = base_J[edge] + J_view[edge]
+            xs = x_batch[:, ss if r_is_first else rr]
+            logits = logits + (Jmat[:, xs].T if r_is_first else Jmat[xs, :])
         return logits
 
-    def _group_norm(t: "torch.Tensor") -> "torch.Tensor":
-        return torch.sqrt(torch.sum(t * t) + 1e-12)
+    def _data_loss_from_views(
+        xb: "torch.Tensor",
+        delta_h_view: Sequence["torch.Tensor"],
+        delta_J_view: Dict[Tuple[int, int], "torch.Tensor"],
+    ) -> "torch.Tensor":
+        loss = torch.tensor(0.0, device=torch_device)
+        for r in range(N):
+            logits = _logits_for_residue(xb, r, delta_h_view, delta_J_view)
+            y = xb[:, r]
+            loss = loss + loss_fn(logits, y)
+        return loss
+
+    def _data_loss_for_batch(xb: "torch.Tensor") -> "torch.Tensor":
+        delta_h_view, delta_J_view = _delta_views()
+        return _data_loss_from_views(xb, delta_h_view, delta_J_view)
+
+    def _loss_for_batch(xb: "torch.Tensor") -> "torch.Tensor":
+        delta_h_view, delta_J_view = _delta_views()
+        loss = _data_loss_from_views(xb, delta_h_view, delta_J_view)
+        if l2 > 0:
+            l2_sum = torch.tensor(0.0, device=torch_device)
+            for r in range(N):
+                l2_sum = l2_sum + torch.sum(delta_h_view[r] ** 2)
+            for edge in edges:
+                l2_sum = l2_sum + torch.sum(delta_J_view[edge] ** 2)
+            loss = loss + l2 * l2_sum
+        if lambda_h > 0:
+            gh = torch.tensor(0.0, device=torch_device)
+            for r in range(N):
+                gh = gh + _group_l2_norm(delta_h_view[r])
+            loss = loss + lambda_h * gh
+        if lambda_J > 0:
+            gJ = torch.tensor(0.0, device=torch_device)
+            for edge in edges:
+                gJ = gJ + _group_l2_norm(delta_J_view[edge])
+            loss = loss + lambda_J * gJ
+        return loss
 
     idx = np.arange(T)
     progress_every = max(1, int(progress_every))
@@ -772,11 +837,7 @@ def fit_potts_delta_pseudolikelihood_torch(
             for start in range(0, T, batch_size):
                 bidx = idx[start:start + batch_size]
                 xb = X[bidx]
-                loss = 0.0
-                for r in range(N):
-                    logits = _logits_for_residue(xb, r)
-                    y = xb[:, r]
-                    loss = loss + loss_fn(logits, y)
+                loss = _data_loss_for_batch(xb)
                 total += float(loss.item()) * len(bidx)
                 nobs += len(bidx)
         return total / max(1, nobs)
@@ -789,39 +850,18 @@ def fit_potts_delta_pseudolikelihood_torch(
         rng.shuffle(idx)
         total = 0.0
         nobs = 0
+        opt.zero_grad()
+        micro_step = 0
         for start in range(0, T, batch_size):
             bidx = idx[start:start + batch_size]
             xb = X[bidx]
-            opt.zero_grad()
-
-            loss = 0.0
-            for r in range(N):
-                logits = _logits_for_residue(xb, r)
-                y = xb[:, r]
-                loss = loss + loss_fn(logits, y)
-
-            if l2 > 0:
-                l2_sum = torch.tensor(0.0, device=torch_device)
-                for r in range(N):
-                    l2_sum = l2_sum + torch.sum(delta_h[r] ** 2)
-                for key in delta_J:
-                    l2_sum = l2_sum + torch.sum(delta_J[key] ** 2)
-                loss = loss + l2 * l2_sum
-
-            if lambda_h > 0:
-                gh = torch.tensor(0.0, device=torch_device)
-                for r in range(N):
-                    gh = gh + _group_norm(delta_h[r])
-                loss = loss + lambda_h * gh
-
-            if lambda_J > 0:
-                gJ = torch.tensor(0.0, device=torch_device)
-                for key in delta_J:
-                    gJ = gJ + _group_norm(delta_J[key])
-                loss = loss + lambda_J * gJ
-
-            loss.backward()
-            opt.step()
+            loss = _loss_for_batch(xb)
+            (loss / grad_accum_steps).backward()
+            micro_step += 1
+            if micro_step >= grad_accum_steps or start + batch_size >= T:
+                opt.step()
+                opt.zero_grad()
+                micro_step = 0
 
             total += float(loss.item()) * len(bidx)
             nobs += len(bidx)
@@ -835,8 +875,6 @@ def fit_potts_delta_pseudolikelihood_torch(
             print(f"[plm-delta] epoch {ep:4d}/{epochs}  avg_loss={avg_loss:.6f}")
         if progress_callback and (ep == 1 or ep == epochs or ep % progress_every == 0):
             progress_callback(ep, epochs, float(avg_loss))
-        if zero_sum_gauge:
-            _apply_zero_sum_gauge_()
         _maybe_save_best(ep, float(avg_loss))
         if scheduler is not None:
             scheduler.step()

@@ -40,6 +40,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--lr-min", type=float, default=1e-3)
     ap.add_argument("--lr-schedule", type=str, default="cosine", choices=["cosine", "none"])
     ap.add_argument("--batch-size", type=int, default=512)
+    ap.add_argument("--grad-accum-steps", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", type=str, default="auto")
 
@@ -184,6 +185,7 @@ def main(argv: list[str] | None = None) -> int:
             "lr_min": args.lr_min,
             "lr_schedule": args.lr_schedule,
             "batch_size": args.batch_size,
+            "grad_accum_steps": args.grad_accum_steps,
             "seed": args.seed,
             "delta_l2": args.delta_l2,
             "delta_group_h": args.delta_group_h,
@@ -214,6 +216,7 @@ def main(argv: list[str] | None = None) -> int:
             lr_schedule=args.lr_schedule,
             epochs=args.epochs,
             batch_size=args.batch_size,
+            grad_accum_steps=args.grad_accum_steps,
             seed=args.seed,
             device=device,
             init_model=resume_model,
@@ -254,6 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             lr_schedule=args.lr_schedule,
             epochs=args.epochs,
             batch_size=args.batch_size,
+            grad_accum_steps=args.grad_accum_steps,
             seed=args.seed,
             device=device,
             best_model_path=str(active_delta_path),
@@ -282,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
             lr_schedule=args.lr_schedule,
             epochs=args.epochs,
             batch_size=args.batch_size,
+            grad_accum_steps=args.grad_accum_steps,
             seed=args.seed,
             device=device,
             best_model_path=str(inactive_delta_path),

@@ -1034,6 +1034,7 @@ export default function SystemDetailPottsSection(props) {
                         { key: 'plm_lr_min', label: 'PLM lr min', placeholder: '1e-4' },
                         { key: 'plm_l2', label: 'PLM L2', placeholder: '1e-5' },
                         { key: 'plm_batch_size', label: 'Batch size', placeholder: '512' },
+                        { key: 'plm_grad_accum_steps', label: 'Grad accum steps', placeholder: '1' },
                         { key: 'plm_progress_every', label: 'Progress every', placeholder: '10' },
                       ].map((field) => (
                         <label key={field.key} className="space-y-1">
@@ -1168,6 +1169,7 @@ export default function SystemDetailPottsSection(props) {
                         { key: 'delta_lr', label: 'Learning rate', placeholder: '1e-3' },
                         { key: 'delta_lr_min', label: 'LR min', placeholder: '1e-3' },
                         { key: 'delta_batch_size', label: 'Batch size', placeholder: '512' },
+                        { key: 'delta_grad_accum_steps', label: 'Grad accum steps', placeholder: '1' },
                         { key: 'delta_seed', label: 'Random seed', placeholder: '0' },
                         { key: 'delta_l2', label: 'Delta L2', placeholder: '0.0' },
                         { key: 'delta_group_h', label: 'Group sparsity (fields)', placeholder: '0.0' },

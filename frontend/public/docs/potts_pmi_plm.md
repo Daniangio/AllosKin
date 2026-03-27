@@ -35,8 +35,32 @@ The PLM fit in `phase/potts/potts_model.py` is a symmetric global fit:
    - Sample mini-batches of frames.
    - For each residue r, compute logits_r for the batch.
    - Apply log-softmax and accumulate cross-entropy against the true labels.
-   - Add L2 regularization on h and J.
-4) Use a cosine or fixed learning-rate schedule, with optional progress logging.
+   - Add regularization on the effective parameters.
+4) If zero-sum gauge is enabled, the forward pass uses differentiable projected views of `h` and `J` rather than mutating parameters in place after each optimizer step.
+5) Use a cosine or fixed learning-rate schedule, with optional progress logging and optional gradient accumulation.
 
 This approach avoids the "fit each residue separately then symmetrize" pattern,
 and directly optimizes a single set of symmetric couplings.
+
+## Gauge-consistent fitting
+
+PHASE now keeps two concepts separate:
+
+- raw optimizer-owned tensors
+- projected zero-sum-gauge views used for forward, regularization, and export
+
+This matters because in-place gauge projection after `optimizer.step()` can corrupt Adam state. The current implementation avoids that.
+
+For delta fits, this is even more important:
+- sparsity penalties are applied to the projected `Δh` and `ΔJ`
+- otherwise the magnitude of the learned rewiring would depend on arbitrary gauge choice
+
+## Gradient accumulation
+
+PLM and delta-PLM both support gradient accumulation.
+
+If:
+- `batch_size = B`
+- `grad_accum_steps = G`
+
+then each optimizer step sees an effective batch size of `B * G`, while still loading only `B` frames at a time in memory.

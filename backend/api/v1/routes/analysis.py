@@ -1099,6 +1099,7 @@ async def submit_potts_fit_job(
         for name, value in {
             "plm_epochs": payload.plm_epochs,
             "plm_batch_size": payload.plm_batch_size,
+            "plm_grad_accum_steps": payload.plm_grad_accum_steps,
             "plm_progress_every": payload.plm_progress_every,
         }.items():
             if value is not None and int(value) < 1:
@@ -1138,6 +1139,7 @@ async def submit_potts_fit_job(
         for name, value in {
             "delta_epochs": payload.delta_epochs,
             "delta_batch_size": payload.delta_batch_size,
+            "delta_grad_accum_steps": payload.delta_grad_accum_steps,
         }.items():
             if value is not None and int(value) < 1:
                 raise HTTPException(status_code=400, detail=f"{name} must be >= 1.")
