@@ -12,13 +12,18 @@ from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
+from phase.io.data import load_npz
 from phase.potts.analysis_run import (
     ANALYSIS_METADATA_FILENAME,
     _completion_cost_from_curve,
     _convert_nan_to_none,
     _delta_js_row_node_edge_values,
     _ensure_analysis_dir,
+    _purge_matching_sampling_analyses,
+    _resolve_model_for_analysis,
     compute_lambda_sweep_analysis,
+    compute_md_vs_sample_metrics,
+    compute_sample_energies,
     _gibbs_relax_worker,
     _normalize_js_filter_rules,
     _normalized_auc,
@@ -34,6 +39,8 @@ from phase.services.project_store import ProjectStore
 
 
 ProgressCallback = Optional[Callable[[str, int, int], None]]
+_POTTS_ANALYSIS_SAMPLE_CACHE: dict[tuple[str, bool, str, bool], dict[str, Any]] = {}
+_POTTS_ANALYSIS_MODEL_CACHE: dict[str, Any] = {}
 
 
 def atomic_pickle_dump(path: Path, payload: Any) -> None:
@@ -158,6 +165,526 @@ def run_local_payload_batch(
     if any(v is None for v in out_rows):
         raise RuntimeError("Missing worker output while executing local payload batch.")
     return [row for row in out_rows if row is not None]
+
+
+def _resolve_analysis_sample_npz_path(
+    *,
+    store: ProjectStore,
+    project_id: str,
+    system_id: str,
+    cluster_dir: Path,
+    sample_entry: dict[str, Any],
+) -> Path | None:
+    paths = sample_entry.get("paths") or {}
+    rel = None
+    if isinstance(paths, dict):
+        rel = paths.get("summary_npz") or paths.get("path")
+    rel = rel or sample_entry.get("path")
+    if not rel:
+        return None
+    npz_path = Path(str(rel))
+    if npz_path.is_absolute():
+        return npz_path
+    resolved = store.resolve_path(project_id, system_id, str(rel))
+    if resolved.exists():
+        return resolved
+    alt = cluster_dir / str(rel)
+    return alt if alt.exists() else resolved
+
+
+def _load_potts_analysis_labels(
+    npz_path: str | Path | None,
+    *,
+    md_mode: bool,
+    md_label_mode: str,
+    drop_invalid: bool,
+) -> dict[str, Any]:
+    if npz_path is None or not str(npz_path).strip():
+        return {
+            "labels": np.zeros((0, 0), dtype=int),
+            "reason": "missing_path",
+            "info": {"n_frames_total": 0, "n_frames_used": 0, "invalid_count": 0},
+        }
+    path = Path(str(npz_path)).resolve()
+    mode = (md_label_mode or "assigned").strip().lower()
+    cache_key = (str(path), bool(md_mode), mode, bool(drop_invalid))
+    cached = _POTTS_ANALYSIS_SAMPLE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        sample_npz = load_sample_npz(path)
+    except Exception as exc:
+        result = {
+            "labels": np.zeros((0, 0), dtype=int),
+            "reason": "load_failed",
+            "info": {
+                "n_frames_total": 0,
+                "n_frames_used": 0,
+                "invalid_count": 0,
+                "error": str(exc),
+            },
+        }
+        _POTTS_ANALYSIS_SAMPLE_CACHE[cache_key] = result
+        return result
+    if md_mode and mode in {"halo", "labels_halo"} and sample_npz.labels_halo is not None:
+        labels = np.asarray(sample_npz.labels_halo, dtype=int)
+    else:
+        labels = np.asarray(sample_npz.labels, dtype=int)
+    n_frames_total = int(labels.shape[0]) if labels.ndim == 2 else 0
+    invalid_count = int(np.count_nonzero(sample_npz.invalid_mask)) if sample_npz.invalid_mask is not None else 0
+    reason = None
+    if bool(drop_invalid) and sample_npz.invalid_mask is not None:
+        keep = ~np.asarray(sample_npz.invalid_mask, dtype=bool)
+        if keep.shape[0] == labels.shape[0]:
+            labels = labels[keep]
+            if labels.shape[0] == 0 and n_frames_total > 0:
+                reason = "all_frames_invalid"
+    if labels.size == 0 and reason is None:
+        reason = "empty_labels"
+    result = {
+        "labels": np.asarray(labels, dtype=int),
+        "reason": reason,
+        "info": {
+            "n_frames_total": n_frames_total,
+            "n_frames_used": int(labels.shape[0]) if labels.ndim == 2 else 0,
+            "invalid_count": invalid_count,
+        },
+    }
+    _POTTS_ANALYSIS_SAMPLE_CACHE[cache_key] = result
+    return result
+
+
+def _load_potts_analysis_model(model_path: str | Path) -> Any:
+    key = str(Path(str(model_path)).resolve())
+    cached = _POTTS_ANALYSIS_MODEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+    model = load_potts_model(key)
+    _POTTS_ANALYSIS_MODEL_CACHE[key] = model
+    return model
+
+
+def _skip_record_from_sample(sample_entry: dict[str, Any], *, stage: str, reason: str, info: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "sample_id": str(sample_entry.get("sample_id") or ""),
+        "sample_name": sample_entry.get("name"),
+        "sample_type": sample_entry.get("type"),
+        "sample_method": sample_entry.get("method"),
+        "stage": stage,
+        "reason": str(reason or "empty_labels"),
+    }
+    payload.update(info or {})
+    return payload
+
+
+def prepare_potts_analysis_batch(
+    *,
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    model_ref: str | None = None,
+    md_label_mode: str = "assigned",
+    drop_invalid: bool = True,
+    n_workers: int | None = None,
+    analysis_id: str | None = None,
+) -> dict[str, Any]:
+    data_root = Path(os.getenv("PHASE_DATA_ROOT", "/app/data"))
+    store = ProjectStore(base_dir=data_root / "projects")
+    cluster_dirs = store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    system_dir = cluster_dirs["system_dir"]
+    cluster_dir = cluster_dirs["cluster_dir"]
+    cluster_path = cluster_dir / "cluster.npz"
+    if not cluster_path.exists():
+        raise FileNotFoundError(f"Cluster NPZ not found: {cluster_path}")
+
+    ds = load_npz(str(cluster_path), unassigned_policy="drop_frames", allow_missing_edges=True)
+    K = [int(v) for v in np.asarray(ds.cluster_counts, dtype=int).tolist()]
+    cluster_edges = list(ds.edges or [])
+
+    samples = store.list_samples(project_id, system_id, cluster_id)
+    md_samples = [s for s in samples if str(s.get("type") or "").strip().lower() == "md_eval"]
+    other_samples = [s for s in samples if str(s.get("type") or "").strip().lower() != "md_eval"]
+
+    model = None
+    model_id = None
+    model_name = None
+    model_path = None
+    if model_ref:
+        model, model_id, model_name, model_path = _resolve_model_for_analysis(
+            store=store,
+            project_id=project_id,
+            system_id=system_id,
+            cluster_id=cluster_id,
+            model_ref=str(model_ref),
+        )
+
+    if model is not None:
+        edges_for_metrics = list(model.edges or [])
+    else:
+        edges_for_metrics = list(cluster_edges or [])
+    edges_for_metrics = sorted(
+        {
+            (min(int(r), int(s)), max(int(r), int(s)))
+            for r, s in edges_for_metrics
+            if int(r) != int(s)
+        }
+    )
+
+    comparisons_root = _ensure_analysis_dir(cluster_dir, "md_vs_sample")
+    energies_root = _ensure_analysis_dir(cluster_dir, "model_energy")
+    _purge_matching_sampling_analyses(
+        comparisons_root,
+        model_id=model_id,
+        model_name=model_name,
+        md_label_mode=md_label_mode,
+        drop_invalid=bool(drop_invalid),
+    )
+    _purge_matching_sampling_analyses(
+        energies_root,
+        model_id=model_id,
+        model_name=model_name,
+        md_label_mode=md_label_mode,
+        drop_invalid=bool(drop_invalid),
+    )
+
+    payloads: list[dict[str, Any]] = []
+    for md_entry in md_samples:
+        md_npz_path = _resolve_analysis_sample_npz_path(
+            store=store,
+            project_id=project_id,
+            system_id=system_id,
+            cluster_dir=cluster_dir,
+            sample_entry=md_entry,
+        )
+        md_payload = {
+            "sample_id": str(md_entry.get("sample_id") or ""),
+            "name": md_entry.get("name"),
+            "type": md_entry.get("type"),
+            "method": md_entry.get("method"),
+            "npz_path": str(md_npz_path or ""),
+        }
+        for sample_entry in other_samples:
+            sample_npz_path = _resolve_analysis_sample_npz_path(
+                store=store,
+                project_id=project_id,
+                system_id=system_id,
+                cluster_dir=cluster_dir,
+                sample_entry=sample_entry,
+            )
+            payloads.append(
+                {
+                    "kind": "md_vs_sample",
+                    "md_sample": md_payload,
+                    "sample": {
+                        "sample_id": str(sample_entry.get("sample_id") or ""),
+                        "name": sample_entry.get("name"),
+                        "type": sample_entry.get("type"),
+                        "method": sample_entry.get("method"),
+                        "npz_path": str(sample_npz_path or ""),
+                    },
+                    "K": list(K),
+                    "edges": [tuple(map(int, edge)) for edge in edges_for_metrics],
+                    "md_label_mode": str(md_label_mode or "assigned"),
+                    "drop_invalid": bool(drop_invalid),
+                }
+            )
+
+    if model_path is not None:
+        for sample_entry in samples:
+            sample_npz_path = _resolve_analysis_sample_npz_path(
+                store=store,
+                project_id=project_id,
+                system_id=system_id,
+                cluster_dir=cluster_dir,
+                sample_entry=sample_entry,
+            )
+            payloads.append(
+                {
+                    "kind": "model_energy",
+                    "sample": {
+                        "sample_id": str(sample_entry.get("sample_id") or ""),
+                        "name": sample_entry.get("name"),
+                        "type": sample_entry.get("type"),
+                        "method": sample_entry.get("method"),
+                        "npz_path": str(sample_npz_path or ""),
+                    },
+                    "model_path": str(Path(model_path).resolve()),
+                    "md_mode": str(sample_entry.get("type") or "").strip().lower() == "md_eval",
+                    "md_label_mode": str(md_label_mode or "assigned"),
+                    "drop_invalid": bool(drop_invalid),
+                }
+            )
+
+    analysis_id = str(analysis_id or uuid.uuid4())
+    batch_dir = cluster_dir / "_orchestration" / "potts_analysis" / analysis_id
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    requested_workers = int(n_workers) if n_workers is not None else 0
+    prepared = {
+        "analysis_id": analysis_id,
+        "analysis_dir": str(batch_dir),
+        "cluster_dir": str(cluster_dir),
+        "system_dir": str(system_dir),
+        "comparisons_root": str(comparisons_root),
+        "energies_root": str(energies_root),
+        "project_id": project_id,
+        "system_id": system_id,
+        "cluster_id": cluster_id,
+        "model_id": model_id,
+        "model_name": model_name,
+        "model_path": str(Path(model_path).resolve()) if model_path is not None else None,
+        "md_label_mode": str(md_label_mode or "assigned"),
+        "drop_invalid": bool(drop_invalid),
+        "edges_for_metrics": [tuple(map(int, edge)) for edge in edges_for_metrics],
+        "md_samples": len(md_samples),
+        "other_samples": len(other_samples),
+        "payloads": payloads,
+        "requested_workers": requested_workers,
+    }
+    atomic_pickle_dump(orchestration_paths(batch_dir)["prepared"], prepared)
+    return prepared
+
+
+def _potts_analysis_payload_worker(payload: dict[str, Any]) -> dict[str, Any]:
+    kind = str(payload.get("kind") or "").strip().lower()
+    md_label_mode = str(payload.get("md_label_mode") or "assigned")
+    drop_invalid = bool(payload.get("drop_invalid", True))
+    if kind == "md_vs_sample":
+        md_sample = payload.get("md_sample") or {}
+        sample = payload.get("sample") or {}
+        md_loaded = _load_potts_analysis_labels(
+            md_sample.get("npz_path"),
+            md_mode=True,
+            md_label_mode=md_label_mode,
+            drop_invalid=drop_invalid,
+        )
+        X_md = np.asarray(md_loaded["labels"], dtype=int)
+        if X_md.size == 0:
+            return {
+                "kind": "md_vs_sample",
+                "skip": _skip_record_from_sample(
+                    md_sample,
+                    stage="md_vs_sample",
+                    reason=str(md_loaded.get("reason") or "empty_labels"),
+                    info=dict(md_loaded.get("info") or {}),
+                ),
+            }
+        sample_loaded = _load_potts_analysis_labels(
+            sample.get("npz_path"),
+            md_mode=False,
+            md_label_mode=md_label_mode,
+            drop_invalid=drop_invalid,
+        )
+        X_sample = np.asarray(sample_loaded["labels"], dtype=int)
+        if X_sample.size == 0:
+            return {
+                "kind": "md_vs_sample",
+                "skip": _skip_record_from_sample(
+                    sample,
+                    stage="md_vs_sample",
+                    reason=str(sample_loaded.get("reason") or "empty_labels"),
+                    info=dict(sample_loaded.get("info") or {}),
+                ),
+            }
+        metrics = compute_md_vs_sample_metrics(
+            X_md,
+            X_sample,
+            K=[int(v) for v in (payload.get("K") or [])],
+            edges=[tuple(map(int, edge)) for edge in (payload.get("edges") or [])],
+        )
+        return {
+            "kind": "md_vs_sample",
+            "md_sample": md_sample,
+            "sample": sample,
+            "node_js": np.asarray(metrics["node_js"], dtype=float),
+            "edge_js": np.asarray(metrics["edge_js"], dtype=float),
+            "summary": {
+                "node_js_mean": float(metrics["node_js_mean"]),
+                "node_js_median": float(metrics["node_js_median"]),
+                "node_js_max": float(metrics["node_js_max"]),
+                "edge_js_mean": float(metrics["edge_js_mean"]),
+                "edge_js_median": float(metrics["edge_js_median"]),
+                "edge_js_max": float(metrics["edge_js_max"]),
+                "combined_distance": float(metrics["combined_distance"]),
+                "md_count": int(X_md.shape[0]),
+                "sample_count": int(X_sample.shape[0]),
+            },
+        }
+    if kind == "model_energy":
+        sample = payload.get("sample") or {}
+        loaded = _load_potts_analysis_labels(
+            sample.get("npz_path"),
+            md_mode=bool(payload.get("md_mode", False)),
+            md_label_mode=md_label_mode,
+            drop_invalid=drop_invalid,
+        )
+        X = np.asarray(loaded["labels"], dtype=int)
+        if X.size == 0:
+            return {
+                "kind": "model_energy",
+                "skip": _skip_record_from_sample(
+                    sample,
+                    stage="model_energy",
+                    reason=str(loaded.get("reason") or "empty_labels"),
+                    info=dict(loaded.get("info") or {}),
+                ),
+            }
+        model = _load_potts_analysis_model(str(payload.get("model_path") or ""))
+        energy_payload = compute_sample_energies(model, X)
+        return {
+            "kind": "model_energy",
+            "sample": sample,
+            "energies": np.asarray(energy_payload["energies"], dtype=float),
+            "summary": {
+                "energy_mean": float(energy_payload["energy_mean"]),
+                "energy_median": float(energy_payload["energy_median"]),
+                "energy_min": float(energy_payload["energy_min"]),
+                "energy_max": float(energy_payload["energy_max"]),
+                "count": int(X.shape[0]),
+            },
+        }
+    raise ValueError(f"Unsupported Potts analysis payload kind: {kind}")
+
+
+def aggregate_potts_analysis_batch(
+    prepared: dict[str, Any],
+    out_rows: Sequence[dict[str, Any]],
+    *,
+    workers_used: int,
+) -> dict[str, Any]:
+    cluster_dir = Path(str(prepared["cluster_dir"]))
+    system_dir = Path(str(prepared["system_dir"]))
+    comparisons_root = Path(str(prepared["comparisons_root"]))
+    energies_root = Path(str(prepared["energies_root"]))
+    model_id = prepared.get("model_id")
+    model_name = prepared.get("model_name")
+    md_label_mode = str(prepared.get("md_label_mode") or "assigned")
+    drop_invalid = bool(prepared.get("drop_invalid", True))
+    edges_for_metrics = [tuple(map(int, edge)) for edge in (prepared.get("edges_for_metrics") or [])]
+
+    written_comparisons: list[dict[str, Any]] = []
+    written_energies: list[dict[str, Any]] = []
+    skipped_samples: list[dict[str, Any]] = []
+    skipped_seen: set[tuple[str, str, str]] = set()
+
+    for row in out_rows:
+        skip_entry = row.get("skip") if isinstance(row, dict) else None
+        if skip_entry:
+            sample_id = str(skip_entry.get("sample_id") or "")
+            seen_key = (sample_id, str(skip_entry.get("stage") or ""), str(skip_entry.get("reason") or ""))
+            if seen_key not in skipped_seen:
+                skipped_seen.add(seen_key)
+                skipped_samples.append(skip_entry)
+            continue
+        kind = str(row.get("kind") or "").strip().lower()
+        if kind == "md_vs_sample":
+            analysis_id = str(uuid.uuid4())
+            analysis_dir = comparisons_root / analysis_id
+            analysis_dir.mkdir(parents=True, exist_ok=True)
+            npz_path = analysis_dir / "analysis.npz"
+            np.savez_compressed(
+                npz_path,
+                node_js=np.asarray(row.get("node_js"), dtype=float),
+                edge_js=np.asarray(row.get("edge_js"), dtype=float),
+                edges=np.asarray(edges_for_metrics, dtype=int),
+            )
+            md_sample = row.get("md_sample") or {}
+            sample = row.get("sample") or {}
+            meta = {
+                "analysis_id": analysis_id,
+                "analysis_type": "md_vs_sample",
+                "created_at": _utc_now(),
+                "project_id": prepared["project_id"],
+                "system_id": prepared["system_id"],
+                "cluster_id": prepared["cluster_id"],
+                "md_sample_id": md_sample.get("sample_id"),
+                "md_sample_name": md_sample.get("name"),
+                "sample_id": sample.get("sample_id"),
+                "sample_name": sample.get("name"),
+                "sample_type": sample.get("type"),
+                "sample_method": sample.get("method"),
+                "model_id": model_id,
+                "model_name": model_name,
+                "drop_invalid": bool(drop_invalid),
+                "md_label_mode": md_label_mode,
+                "paths": {
+                    "analysis_npz": _relativize(npz_path, system_dir),
+                },
+                "summary": row.get("summary") or {},
+            }
+            (analysis_dir / ANALYSIS_METADATA_FILENAME).write_text(json.dumps(_convert_nan_to_none(meta), indent=2), encoding="utf-8")
+            written_comparisons.append(meta)
+        elif kind == "model_energy":
+            analysis_id = str(uuid.uuid4())
+            analysis_dir = energies_root / analysis_id
+            analysis_dir.mkdir(parents=True, exist_ok=True)
+            npz_path = analysis_dir / "analysis.npz"
+            np.savez_compressed(npz_path, energies=np.asarray(row.get("energies"), dtype=float))
+            sample = row.get("sample") or {}
+            meta = {
+                "analysis_id": analysis_id,
+                "analysis_type": "model_energy",
+                "created_at": _utc_now(),
+                "project_id": prepared["project_id"],
+                "system_id": prepared["system_id"],
+                "cluster_id": prepared["cluster_id"],
+                "model_id": model_id,
+                "model_name": model_name,
+                "sample_id": sample.get("sample_id"),
+                "sample_name": sample.get("name"),
+                "sample_type": sample.get("type"),
+                "sample_method": sample.get("method"),
+                "drop_invalid": bool(drop_invalid),
+                "md_label_mode": md_label_mode,
+                "paths": {
+                    "analysis_npz": _relativize(npz_path, system_dir),
+                },
+                "summary": row.get("summary") or {},
+            }
+            (analysis_dir / ANALYSIS_METADATA_FILENAME).write_text(json.dumps(_convert_nan_to_none(meta), indent=2), encoding="utf-8")
+            written_energies.append(meta)
+
+    summary = {
+        "cluster_id": prepared["cluster_id"],
+        "md_samples": int(prepared.get("md_samples") or 0),
+        "other_samples": int(prepared.get("other_samples") or 0),
+        "comparisons_written": len(written_comparisons),
+        "energies_written": len(written_energies),
+        "model_id": model_id,
+        "model_name": model_name,
+        "skipped_samples": skipped_samples,
+        "workers_used": int(max(1, workers_used)),
+    }
+    result = {
+        "analysis_id": str(prepared["analysis_id"]),
+        "analysis_dir": str(Path(str(prepared["analysis_dir"])).resolve()),
+        "analyses_root": str((cluster_dir / "analyses").resolve()),
+        "metadata": summary,
+    }
+    atomic_pickle_dump(orchestration_paths(Path(str(prepared["analysis_dir"])))["aggregate"], result)
+    return result
+
+
+def run_potts_analysis_local(
+    *,
+    progress_callback: ProgressCallback = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    prepared = prepare_potts_analysis_batch(**kwargs)
+    payloads = prepared.get("payloads") or []
+    requested = int(kwargs.get("n_workers") or prepared.get("requested_workers") or 0)
+    if requested > 0:
+        workers = requested
+    else:
+        workers = max(1, min(int(os.cpu_count() or 1), max(1, len(payloads))))
+    out_rows = run_local_payload_batch(
+        payloads,
+        worker_fn=_potts_analysis_payload_worker,
+        max_workers=workers,
+        progress_callback=progress_callback,
+        progress_label="Running Sampling Explorer analysis",
+    )
+    workers_used = 1 if not payloads else max(1, min(workers, len(payloads)))
+    return aggregate_potts_analysis_batch(prepared, out_rows, workers_used=workers_used)
 
 
 def prepare_gibbs_relaxation_batch(

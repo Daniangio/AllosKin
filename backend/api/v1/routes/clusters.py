@@ -29,7 +29,7 @@ from phase.workflows.clustering import (
     evaluate_state_with_models,
 )
 from phase.workflows.backmapping import build_backmapping_npz
-from backend.tasks import run_cluster_job, run_backmapping_job
+from backend.tasks import run_backmapping_job, run_cluster_job, run_sample_backmapping_job
 from phase.potts.potts_model import interpolate_potts_models, load_potts_model, save_potts_model, zero_sum_gauge_model
 
 
@@ -1637,6 +1637,103 @@ async def upload_backmapping_npz(
                 pass
 
     return FileResponse(out_path, filename=out_path.name, media_type="application/octet-stream")
+
+
+@router.get(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/samples/{sample_id}/backmapping_dataset",
+    summary="Download a per-sample backmapping dataset NPZ",
+)
+async def download_sample_backmapping_dataset(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    sample_id: str,
+):
+    try:
+        sample_meta = project_store.get_sample_entry(project_id, system_id, cluster_id, sample_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    dataset_meta = dict(sample_meta.get("backmapping_dataset") or {})
+    rel_path = str(dataset_meta.get("path") or "").strip()
+    if not rel_path:
+        raise HTTPException(status_code=404, detail="Backmapping dataset not found for this sample.")
+    abs_path = Path(rel_path)
+    if not abs_path.is_absolute():
+        abs_path = project_store.resolve_path(project_id, system_id, rel_path)
+    if not abs_path.exists():
+        raise HTTPException(status_code=404, detail="Backmapping dataset file is missing on disk.")
+    filename = f"{sample_meta.get('name') or sample_id}_backmapping_dataset.npz"
+    return FileResponse(abs_path, filename=filename, media_type="application/octet-stream")
+
+
+@router.post(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/samples/{sample_id}/backmapping_dataset/job",
+    summary="Upload a trajectory and queue per-sample backmapping dataset generation",
+)
+async def queue_sample_backmapping_dataset_job(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    sample_id: str,
+    trajectory: UploadFile = File(...),
+    task_queue: Any = Depends(get_queue),
+):
+    try:
+        sample_meta = project_store.get_sample_entry(project_id, system_id, cluster_id, sample_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if str(sample_meta.get("type") or "") != "md_eval":
+        raise HTTPException(status_code=400, detail="Backmapping dataset is only supported for md_eval samples.")
+    if not str(sample_meta.get("state_id") or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Backmapping dataset currently requires an md_eval sample tied to a single state.",
+        )
+
+    sample_dir = project_store._sample_dir(project_id, system_id, cluster_id, sample_id)
+    upload_root = sample_dir / "backmapping_uploads" / str(uuid.uuid4())
+    upload_root.mkdir(parents=True, exist_ok=True)
+    filename = trajectory.filename or "trajectory.xtc"
+    upload_path = upload_root / filename
+    await stream_upload(trajectory, upload_path)
+
+    job_uuid = str(uuid.uuid4())
+    try:
+        job = task_queue.enqueue(
+            run_sample_backmapping_job,
+            args=(
+                job_uuid,
+                project_id,
+                system_id,
+                cluster_id,
+                sample_id,
+                str(upload_path),
+            ),
+            job_timeout="4h",
+            result_ttl=86400,
+            job_id=f"sample-backmapping-{job_uuid}",
+        )
+    except Exception as exc:
+        try:
+            upload_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Job submission failed: {exc}") from exc
+
+    dataset_meta = dict(sample_meta.get("backmapping_dataset") or {})
+    dataset_meta.update(
+        {
+            "status": "queued",
+            "job_id": job.id,
+            "updated_at": datetime.utcnow().isoformat(),
+            "source_trajectory_name": filename,
+            "error": None,
+        }
+    )
+    sample_meta["backmapping_dataset"] = dataset_meta
+    project_store.save_sample_entry(project_id, system_id, cluster_id, sample_id, sample_meta)
+    return {"status": "queued", "job_id": job.id, "cluster_id": cluster_id, "sample_id": sample_id}
 
 
 @router.post(

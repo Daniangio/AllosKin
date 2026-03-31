@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Tuple
 
 import numpy as np
 import MDAnalysis as mda
 from MDAnalysis.lib.distances import calc_dihedrals
 
+from phase.features.extraction import DIHEDRAL_KEYS, FeatureExtractor
 from phase.services.project_store import ProjectStore
 
 
@@ -177,6 +178,205 @@ def _compute_dihedrals_for_frame(positions: np.ndarray, idxs: np.ndarray) -> np.
     c = positions[idxs[:, 2]]
     d = positions[idxs[:, 3]]
     return calc_dihedrals(a, b, c, d)
+
+
+def _build_named_dihedral_indices(
+    residues: mda.core.groups.ResidueGroup,
+    residue_index_map: Dict[int, int],
+) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
+    extractor = FeatureExtractor()
+    selections = extractor._build_dihedral_selections(residues)
+    out: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+    for name in DIHEDRAL_KEYS:
+        idx_rows: List[Tuple[int, int, int, int]] = []
+        residue_rows: List[int] = []
+        for residue, atom_group in zip(residues, selections.get(name) or []):
+            if atom_group is None:
+                continue
+            try:
+                atom_count = int(atom_group.n_atoms)
+            except Exception:
+                continue
+            if atom_count != 4:
+                continue
+            residue_col = residue_index_map.get(int(residue.resid))
+            if residue_col is None:
+                continue
+            idx_rows.append(tuple(int(atom.index) for atom in atom_group))
+            residue_rows.append(int(residue_col))
+        out[name] = (
+            np.asarray(idx_rows, dtype=int) if idx_rows else np.zeros((0, 4), dtype=int),
+            np.asarray(residue_rows, dtype=int) if residue_rows else np.zeros((0,), dtype=int),
+        )
+    return out
+
+
+def _load_cluster_label_metadata(cluster_path: Path) -> tuple[np.ndarray, np.ndarray]:
+    with np.load(cluster_path, allow_pickle=True) as cluster_npz:
+        residue_keys = np.asarray(cluster_npz["residue_keys"]).astype(str)
+        if "cluster_counts" in cluster_npz:
+            cluster_counts = np.asarray(cluster_npz["cluster_counts"], dtype=np.int32)
+        else:
+            cluster_counts = np.asarray(cluster_npz["merged__cluster_counts"], dtype=np.int32)
+    return residue_keys, cluster_counts
+
+
+def build_sample_backmapping_dataset(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    sample_id: str,
+    trajectory_path: Path,
+    output_path: Path,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> Dict[str, Any]:
+    store = ProjectStore()
+    system = store.get_system(project_id, system_id)
+    sample = store.get_sample_entry(project_id, system_id, cluster_id, sample_id)
+    if str(sample.get("type") or "") != "md_eval":
+        raise ValueError("Backmapping dataset is only supported for md_eval samples.")
+    state_id = str(sample.get("state_id") or "").strip()
+    if not state_id:
+        raise ValueError("Backmapping dataset currently requires an md_eval sample tied to a single state.")
+    state = system.states.get(state_id)
+    if not state:
+        raise ValueError(f"State '{state_id}' referenced by sample '{sample_id}' is missing.")
+    if not state.pdb_file:
+        raise ValueError(f"State '{state_id}' is missing its PDB file.")
+
+    cluster_dir = store.ensure_cluster_directories(project_id, system_id, cluster_id)["cluster_dir"]
+    cluster_path = cluster_dir / "cluster.npz"
+    if not cluster_path.exists():
+        raise FileNotFoundError(f"Cluster NPZ not found for cluster '{cluster_id}'.")
+    residue_keys, cluster_counts = _load_cluster_label_metadata(cluster_path)
+
+    raw_sample_npz_path = str(sample.get("path") or (sample.get("paths") or {}).get("summary_npz") or "").strip()
+    if not raw_sample_npz_path:
+        raise FileNotFoundError(f"Sample '{sample_id}' is missing its NPZ path.")
+    sample_npz_path = Path(raw_sample_npz_path)
+    if not sample_npz_path.is_absolute():
+        sample_npz_path = store.resolve_path(project_id, system_id, str(sample_npz_path))
+    if not sample_npz_path.exists():
+        raise FileNotFoundError(f"Sample NPZ is missing on disk: {sample_npz_path}")
+
+    with np.load(sample_npz_path, allow_pickle=True) as sample_npz:
+        labels = np.asarray(sample_npz["labels"], dtype=np.int32)
+        frame_indices = np.asarray(sample_npz["frame_indices"], dtype=np.int64)
+        frame_state_ids = (
+            np.asarray(sample_npz["frame_state_ids"]).astype(str)
+            if "frame_state_ids" in sample_npz
+            else np.full(labels.shape[0], state_id, dtype=str)
+        )
+
+    if labels.ndim != 2:
+        raise ValueError("Sample labels must have shape (n_frames, n_residues).")
+    if labels.shape[1] != residue_keys.shape[0]:
+        raise ValueError(
+            f"Sample residue count mismatch: expected {residue_keys.shape[0]}, got {labels.shape[1]}."
+        )
+    if frame_indices.shape[0] != labels.shape[0]:
+        raise ValueError("Sample frame_indices length does not match label rows.")
+    normalized_frame_state_ids = np.asarray([str(v) for v in frame_state_ids.tolist()], dtype=object)
+    unique_frame_ids = {str(v) for v in normalized_frame_state_ids.tolist()}
+    if unique_frame_ids == {state_id[:1]}:
+        normalized_frame_state_ids = np.asarray([state_id] * int(labels.shape[0]), dtype=object)
+        unique_frame_ids = {state_id}
+    if unique_frame_ids != {state_id}:
+        raise ValueError(
+            f"Backmapping dataset only supports samples with frames from one state; found frame_state_ids={sorted(unique_frame_ids)!r} for state_id={state_id!r}."
+        )
+    frame_state_ids = np.asarray([state_id] * int(labels.shape[0]), dtype=f"U{max(1, len(state_id))}")
+
+    pdb_path = store.resolve_path(project_id, system_id, str(state.pdb_file))
+    if not pdb_path.exists():
+        raise FileNotFoundError(f"PDB file missing on disk: {pdb_path}")
+    if not trajectory_path.exists():
+        raise FileNotFoundError(f"Uploaded trajectory is missing on disk: {trajectory_path}")
+
+    selection = _resolve_selection(state.residue_selection)
+    universe = mda.Universe(str(pdb_path), str(trajectory_path))
+    atoms = universe.select_atoms(selection)
+    if atoms.n_atoms == 0:
+        raise ValueError(f"Selection '{selection}' yielded no atoms for state '{state_id}'.")
+
+    residue_index_map = _build_residue_index_map([str(key) for key in residue_keys.tolist()])
+    atom_residue_index = np.full(atoms.n_atoms, -1, dtype=np.int32)
+    atom_resids = np.asarray([int(atom.resid) for atom in atoms], dtype=np.int32)
+    atom_names = np.asarray([str(atom.name) for atom in atoms], dtype=str)
+    for idx_atom, atom in enumerate(atoms):
+        mapped = residue_index_map.get(int(atom.resid))
+        if mapped is not None:
+            atom_residue_index[idx_atom] = int(mapped)
+
+    n_rows, n_residues = labels.shape
+    coordinates = np.zeros((n_rows, atoms.n_atoms, 3), dtype=np.float32)
+    dihedrals = np.full((n_rows, n_residues, len(DIHEDRAL_KEYS)), np.nan, dtype=np.float32)
+
+    dihedral_indices = _build_named_dihedral_indices(atoms.residues, residue_index_map)
+
+    frame_to_rows: Dict[int, List[int]] = {}
+    for row_idx, frame_idx in enumerate(frame_indices.tolist()):
+        frame_to_rows.setdefault(int(frame_idx), []).append(int(row_idx))
+
+    total_rows = int(n_rows)
+    processed_rows = 0
+    seen_rows: set[int] = set()
+    for ts in universe.trajectory:
+        frame_idx = int(ts.frame)
+        rows = frame_to_rows.get(frame_idx)
+        if not rows:
+            continue
+        positions = universe.atoms.positions.astype(np.float32)
+        selected_positions = atoms.positions.astype(np.float32)
+        angle_values = {
+            name: _compute_dihedrals_for_frame(positions, idxs)
+            for name, (idxs, _) in dihedral_indices.items()
+        }
+        for row_idx in rows:
+            coordinates[row_idx] = selected_positions
+            for dim_idx, name in enumerate(DIHEDRAL_KEYS):
+                _, residue_rows = dihedral_indices[name]
+                values = angle_values[name]
+                if residue_rows.size and values.size:
+                    dihedrals[row_idx, residue_rows, dim_idx] = values.astype(np.float32)
+            seen_rows.add(int(row_idx))
+        processed_rows += len(rows)
+        if progress_callback:
+            progress_callback(processed_rows, total_rows)
+
+    if len(seen_rows) != total_rows:
+        missing = sorted(set(range(total_rows)) - seen_rows)
+        raise ValueError(
+            f"Trajectory does not provide all requested sample frames. Missing frame rows: {missing[:10]}"
+            + ("..." if len(missing) > 10 else "")
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "trajectory": coordinates,
+        "atom_resids": atom_resids,
+        "atom_names": atom_names,
+        "atom_residue_index": atom_residue_index,
+        "residue_keys": residue_keys,
+        "residue_cluster_ids": labels,
+        "residue_cluster_counts": cluster_counts,
+        "frame_indices": frame_indices,
+        "frame_state_ids": frame_state_ids,
+        "state_id": np.asarray(state_id, dtype=str),
+        "sample_id": np.asarray(sample_id, dtype=str),
+        "dihedrals": dihedrals,
+        "dihedral_keys": np.asarray(DIHEDRAL_KEYS, dtype=str),
+    }
+    np.savez_compressed(output_path, **payload)
+    return {
+        "path": str(output_path),
+        "n_frames": int(coordinates.shape[0]),
+        "n_atoms": int(coordinates.shape[1]),
+        "n_residues": int(labels.shape[1]),
+        "dihedral_keys": list(DIHEDRAL_KEYS),
+        "sample_id": str(sample_id),
+        "state_id": str(state_id),
+    }
 
 
 def build_backmapping_npz(

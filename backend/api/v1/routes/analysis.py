@@ -413,6 +413,8 @@ async def submit_potts_analysis_job(
     md_label_mode = (payload.md_label_mode or "assigned").lower()
     if md_label_mode not in {"assigned", "halo"}:
         raise HTTPException(status_code=400, detail="md_label_mode must be 'assigned' or 'halo'.")
+    if payload.workers is not None and int(payload.workers) < 0:
+        raise HTTPException(status_code=400, detail="workers must be >= 0.")
 
     pose_only = bool(payload.pose_only)
     state_pose_ids = [str(v).strip() for v in (payload.state_pose_ids or []) if str(v).strip()]

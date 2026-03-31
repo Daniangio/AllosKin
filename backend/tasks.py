@@ -22,7 +22,6 @@ from phase.potts.pipeline import parse_args as parse_simulation_args
 from phase.potts.pipeline import run_pipeline as run_simulation_pipeline
 from phase.potts.sampling_run import run_sampling
 from phase.potts.analysis_run import (
-    analyze_cluster_samples,
     append_state_pose_energies,
     compute_delta_transition_analysis,
     upsert_delta_commitment_analysis,
@@ -36,6 +35,7 @@ from phase.potts.orchestration import (
     aggregate_gibbs_relaxation_batch,
     aggregate_ligand_completion_batch,
     aggregate_lambda_sweep_batch,
+    aggregate_potts_analysis_batch,
     aggregate_potts_nn_mapping_batch,
     aggregate_sampling_batch,
     load_partial_errors,
@@ -45,11 +45,13 @@ from phase.potts.orchestration import (
     prepare_gibbs_relaxation_batch,
     prepare_ligand_completion_batch,
     prepare_lambda_sweep_batch,
+    prepare_potts_analysis_batch,
     prepare_potts_nn_mapping_batch,
     prepare_sampling_batch,
     run_local_payload_batch,
     run_lambda_sweep_payload,
     run_sampling_chain_payload,
+    _potts_analysis_payload_worker,
     _potts_nn_row_worker,
     write_partial_error,
     write_partial_result,
@@ -69,7 +71,7 @@ from phase.workflows.clustering import (
     evaluate_state_with_models,
     build_cluster_output_path,
 )
-from phase.workflows.backmapping import build_backmapping_npz
+from phase.workflows.backmapping import build_backmapping_npz, build_sample_backmapping_dataset
 from backend.services.project_store import ProjectStore
 
 # Define the persistent data root (aligned with PHASE_DATA_ROOT).
@@ -1510,14 +1512,101 @@ def run_potts_analysis_job(
                 progress_callback=save_progress,
             )
         else:
-            summary = analyze_cluster_samples(
+            workers = params.get("workers")
+            workers_val = int(workers) if workers not in (None, "") else None
+            save_progress("Preparing Sampling Explorer analysis...", 10)
+            prepared = prepare_potts_analysis_batch(
                 project_id=project_id,
                 system_id=system_id,
                 cluster_id=cluster_id,
                 model_ref=model_ref,
                 md_label_mode=md_label_mode,
                 drop_invalid=not keep_invalid,
+                n_workers=workers_val,
             )
+            payloads = prepared.get("payloads") or []
+            analysis_id = str(prepared.get("analysis_id") or "")
+            analysis_dir = Path(str(prepared.get("analysis_dir") or "")).resolve()
+            redis_conn = getattr(job, "connection", None)
+            queue_name = getattr(job, "origin", "phase-jobs")
+            queue = Queue(queue_name, connection=redis_conn) if redis_conn is not None else None
+            available_queue_workers = _count_queue_workers(queue) if queue is not None else 0
+            distributed_parallelism = _distributed_batch_parallelism(
+                requested_workers=int(prepared.get("requested_workers", workers_val or 0)),
+                available_queue_workers=available_queue_workers,
+                n_payloads=len(payloads),
+            )
+
+            if distributed_parallelism > 1 and queue is not None:
+                keys = _potts_analysis_batch_keys(analysis_id)
+                redis_conn.delete(keys["done"], keys["error"], keys["child_error"])
+                redis_conn.set(keys["remaining"], int(len(payloads)), ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+                redis_conn.set(keys["state"], "running", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+                save_progress(
+                    f"Dispatching {len(payloads)} Sampling Explorer tasks across {distributed_parallelism} queue workers...",
+                    15,
+                )
+                for row in range(len(payloads)):
+                    queue.enqueue(
+                        run_potts_analysis_payload_job,
+                        args=(analysis_id, str(analysis_dir), int(row), int(distributed_parallelism)),
+                        job_timeout="8h",
+                        result_ttl=86400,
+                        job_id=f"potts-analysis-task-{analysis_id}-{row:06d}",
+                    )
+                while True:
+                    done = _decode_redis_value(redis_conn.get(keys["done"]))
+                    remaining_raw = _decode_redis_value(redis_conn.get(keys["remaining"]))
+                    remaining = int(remaining_raw) if remaining_raw is not None else len(payloads)
+                    state = _decode_redis_value(redis_conn.get(keys["state"])) or "running"
+                    child_error = _decode_redis_value(redis_conn.get(keys["child_error"]))
+                    if done:
+                        break
+                    if remaining <= 0:
+                        save_progress("Aggregating distributed Sampling Explorer results...", 92)
+                    else:
+                        completed = max(0, min(len(payloads), len(payloads) - remaining))
+                        pct = 15 + int(70 * (float(completed) / float(max(1, len(payloads)))))
+                        status = f"Running distributed Sampling Explorer analysis ({completed}/{len(payloads)} tasks)"
+                        if child_error:
+                            status = f"{status}; worker error recorded, waiting for aggregation"
+                        elif state and state != "running":
+                            status = f"{status}; state={state}"
+                        save_progress(status, pct)
+                    time.sleep(1.0)
+                error = _decode_redis_value(redis_conn.get(keys["error"]))
+                if error:
+                    raise RuntimeError(error)
+                out = pickle_load(orchestration_paths(analysis_dir)["aggregate"])
+            else:
+                save_progress("Running Sampling Explorer analysis locally...", 15)
+
+                def progress_cb(message: str, current: int, total: int):
+                    if total <= 0:
+                        return
+                    ratio = max(0.0, min(1.0, float(current) / float(total)))
+                    save_progress(message, 15 + int(70 * ratio))
+
+                requested_workers = int(prepared.get("requested_workers") or 0)
+                if requested_workers > 0:
+                    max_workers = requested_workers
+                else:
+                    max_workers = max(1, min(int(os.cpu_count() or 1), max(1, len(payloads))))
+                if job is not None:
+                    max_workers = 1
+                out_rows = run_local_payload_batch(
+                    payloads,
+                    worker_fn=_potts_analysis_payload_worker,
+                    max_workers=max_workers,
+                    progress_callback=progress_cb,
+                    progress_label="Running Sampling Explorer analysis",
+                )
+                out = aggregate_potts_analysis_batch(
+                    prepared,
+                    out_rows,
+                    workers_used=(1 if not payloads else max(1, min(max_workers, len(payloads)))),
+                )
+            summary = out.get("metadata") or {}
 
         cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
         analyses_dir = cluster_dirs["cluster_dir"] / "analyses"
@@ -3050,6 +3139,84 @@ def _lambda_sweep_batch_keys(analysis_id: str) -> Dict[str, str]:
     return _analysis_batch_keys("lambda_sweep", analysis_id)
 
 
+def _potts_analysis_batch_keys(analysis_id: str) -> Dict[str, str]:
+    return _analysis_batch_keys("potts_analysis", analysis_id)
+
+
+def run_potts_analysis_payload_job(
+    analysis_id: str,
+    analysis_dir: str,
+    row: int,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    queue_name = getattr(job, "origin", "phase-jobs")
+    keys = _potts_analysis_batch_keys(str(analysis_id))
+    analysis_dir_path = Path(str(analysis_dir))
+    prepared = pickle_load(orchestration_paths(analysis_dir_path)["prepared"])
+    payloads = prepared.get("payloads") or []
+    row = int(row)
+    if row < 0 or row >= len(payloads):
+        raise IndexError(f"Invalid Potts analysis row index: {row}")
+    try:
+        out = _potts_analysis_payload_worker(payloads[row])
+        write_partial_result(analysis_dir_path, row, out)
+    except Exception as exc:
+        write_partial_error(analysis_dir_path, row, f"{type(exc).__name__}: {exc}")
+        if redis_conn is not None and redis_conn.get(keys["child_error"]) is None:
+            redis_conn.set(
+                keys["child_error"],
+                f"row {row}: {type(exc).__name__}: {exc}",
+                ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS,
+            )
+        raise
+    finally:
+        if redis_conn is not None:
+            remaining = int(redis_conn.decr(keys["remaining"]))
+            if remaining <= 0:
+                redis_conn.set(keys["state"], "aggregating", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+                Queue(queue_name, connection=redis_conn).enqueue(
+                    run_potts_analysis_aggregate_job,
+                    args=(str(analysis_id), str(analysis_dir_path), int(max(1, workers_used))),
+                    job_timeout="8h",
+                    result_ttl=86400,
+                    job_id=f"potts-analysis-aggregate-{analysis_id}",
+                )
+
+
+def run_potts_analysis_aggregate_job(
+    analysis_id: str,
+    analysis_dir: str,
+    workers_used: int,
+):
+    job = get_current_job()
+    redis_conn = getattr(job, "connection", None)
+    keys = _potts_analysis_batch_keys(str(analysis_id))
+    analysis_dir_path = Path(str(analysis_dir))
+    try:
+        prepared = pickle_load(orchestration_paths(analysis_dir_path)["prepared"])
+        errors = load_partial_errors(analysis_dir_path)
+        if errors:
+            summary = "; ".join(f"row {err.get('row')}: {err.get('error')}" for err in errors[:3])
+            if len(errors) > 3:
+                summary = f"{summary}; ... ({len(errors)} worker failures total)"
+            raise RuntimeError(f"Distributed Potts analysis worker failures: {summary}")
+        out_rows = load_partial_results(analysis_dir_path, expected_rows=len(prepared.get("payloads") or []))
+        result = aggregate_potts_analysis_batch(prepared, out_rows, workers_used=max(1, int(workers_used)))
+        if redis_conn is not None:
+            redis_conn.delete(keys["error"])
+            redis_conn.set(keys["state"], "finished", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        return result
+    except Exception as exc:
+        if redis_conn is not None:
+            redis_conn.set(keys["error"], f"{type(exc).__name__}: {exc}", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["state"], "failed", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+            redis_conn.set(keys["done"], "1", ex=_LIGAND_COMPLETION_BATCH_TTL_SECONDS)
+        raise
+
+
 def run_lambda_sweep_payload_job(
     analysis_id: str,
     analysis_dir: str,
@@ -4063,6 +4230,112 @@ def run_backmapping_job(job_uuid: str, project_id: str, system_id: str, cluster_
         "completed_at": datetime.utcnow().isoformat(),
         "started_at": start_time.isoformat(),
     }
+
+
+def run_sample_backmapping_job(
+    job_uuid: str,
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    sample_id: str,
+    trajectory_path: str,
+) -> Dict[str, Any]:
+    job = get_current_job()
+    started_at = datetime.utcnow().isoformat()
+    rq_job_id = job.id if job else f"sample-backmapping-{job_uuid}"
+
+    def save_progress(status_msg: str, progress: int):
+        if job:
+            job.meta["status"] = status_msg
+            job.meta["progress"] = progress
+            job.save_meta()
+        print(f"[SampleBackmapping {job_uuid}] {status_msg}")
+
+    sample_meta = project_store.get_sample_entry(project_id, system_id, cluster_id, sample_id)
+    existing = dict(sample_meta.get("backmapping_dataset") or {})
+    temp_traj_path = Path(trajectory_path)
+    if not temp_traj_path.is_absolute():
+        temp_traj_path = project_store.resolve_path(project_id, system_id, str(trajectory_path))
+    sample_dir = project_store._sample_dir(project_id, system_id, cluster_id, sample_id)
+    system_dir = project_store.ensure_directories(project_id, system_id)["system_dir"]
+    out_path = sample_dir / "backmapping_dataset.npz"
+    relative_out = str(out_path.relative_to(system_dir))
+
+    def persist(status: str, **extra: Any) -> None:
+        payload = {
+            **existing,
+            "status": status,
+            "job_id": rq_job_id,
+            "updated_at": datetime.utcnow().isoformat(),
+            "path": existing.get("path") or relative_out,
+            **extra,
+        }
+        sample_meta["backmapping_dataset"] = payload
+        project_store.save_sample_entry(project_id, system_id, cluster_id, sample_id, sample_meta)
+
+    save_progress("Initializing...", 0)
+    persist("running", started_at=started_at, error=None)
+
+    def progress_callback(current: int, total: int):
+        if not total:
+            return
+        ratio = max(0.0, min(1.0, current / float(total)))
+        progress = 5 + int(ratio * 90)
+        save_progress("Building backmapping dataset...", min(progress, 95))
+        persist("running", progress=min(progress, 95))
+
+    try:
+        summary = build_sample_backmapping_dataset(
+            project_id=project_id,
+            system_id=system_id,
+            cluster_id=cluster_id,
+            sample_id=sample_id,
+            trajectory_path=temp_traj_path,
+            output_path=out_path,
+            progress_callback=progress_callback,
+        )
+        completed_at = datetime.utcnow().isoformat()
+        persist(
+            "finished",
+            progress=100,
+            path=relative_out,
+            source_trajectory_name=temp_traj_path.name,
+            started_at=started_at,
+            completed_at=completed_at,
+            n_frames=int(summary.get("n_frames") or 0),
+            n_atoms=int(summary.get("n_atoms") or 0),
+            n_residues=int(summary.get("n_residues") or 0),
+            dihedral_keys=list(summary.get("dihedral_keys") or []),
+            error=None,
+        )
+        save_progress("Completed", 100)
+        return {
+            "job_id": rq_job_id,
+            "status": "finished",
+            "project_id": project_id,
+            "system_id": system_id,
+            "cluster_id": cluster_id,
+            "sample_id": sample_id,
+            "path": relative_out,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            **summary,
+        }
+    except Exception as exc:
+        persist("failed", progress=100, error=str(exc))
+        save_progress(f"Failed: {exc}", 100)
+        raise
+    finally:
+        try:
+            temp_traj_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            parent = temp_traj_path.parent
+            if parent != sample_dir and parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+        except Exception:
+            pass
 
 
 def run_cluster_job(

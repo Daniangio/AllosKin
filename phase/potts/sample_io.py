@@ -10,6 +10,15 @@ import numpy as np
 SAMPLE_NPZ_FILENAME = "sample.npz"
 
 
+def _as_string_array(values: np.ndarray | list[str] | tuple[str, ...]) -> np.ndarray:
+    arr = np.asarray(values)
+    if arr.size == 0:
+        return np.asarray([], dtype="U1")
+    flat = [str(v) for v in arr.reshape(-1).tolist()]
+    max_len = max(1, max(len(v) for v in flat))
+    return np.asarray(flat, dtype=f"U{max_len}").reshape(arr.shape)
+
+
 @dataclass(frozen=True)
 class SampleNPZ:
     """
@@ -60,7 +69,7 @@ def save_sample_npz(
     if frame_indices is not None:
         payload["frame_indices"] = np.asarray(frame_indices, dtype=np.int64)
     if frame_state_ids is not None:
-        payload["frame_state_ids"] = np.asarray(frame_state_ids, dtype=str)
+        payload["frame_state_ids"] = _as_string_array(frame_state_ids)
     if extra:
         payload.update(extra)
     path.parent.mkdir(parents=True, exist_ok=True)

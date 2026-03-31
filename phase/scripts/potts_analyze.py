@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 
 from phase.potts.analysis_run import analyze_cluster_samples, append_state_pose_energies
-from phase.services.project_store import ProjectStore
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -20,6 +19,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--md-label-mode", default="assigned", choices=["assigned", "halo"])
     ap.add_argument("--keep-invalid", action="store_true", help="Do not drop invalid SA samples (invalid_mask rows).")
+    ap.add_argument("--workers", type=int, default=0, help="Parallel workers for local analysis (0=auto).")
+    ap.add_argument("--progress", action="store_true", help="Show progress while running local analysis.")
     ap.add_argument("--pose-only", action="store_true", help="Append single-PDB state energies under an existing model-energy analysis context.")
     ap.add_argument("--state-pose-id", action="append", default=[], help="State id to evaluate as a single PDB pose. Repeatable.")
     args = ap.parse_args(argv)
@@ -56,6 +57,12 @@ def main(argv: list[str] | None = None) -> int:
             state_ids=args.state_pose_id,
         )
     else:
+        progress_cb = None
+        if args.progress:
+            def progress_cb(message: str, current: int, total: int):
+                total_i = max(1, int(total))
+                print(f"[{int(current)}/{total_i}] {message}")
+
         summary = analyze_cluster_samples(
             project_id=args.project_id,
             system_id=args.system_id,
@@ -63,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
             model_ref=model_ref,
             md_label_mode=args.md_label_mode,
             drop_invalid=not bool(args.keep_invalid),
+            n_workers=(int(args.workers) if int(args.workers) > 0 else None),
+            progress_callback=progress_cb,
         )
     print(summary)
     return 0

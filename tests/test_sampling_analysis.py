@@ -1,17 +1,60 @@
 import json
 import os
+import pickle
 from pathlib import Path
 
 import numpy as np
 
 os.environ.setdefault("PHASE_DATA_ROOT", "/tmp/phase-test-data")
 
+from backend import tasks
 from backend.tasks import run_md_samples_refresh_job
 from phase.potts.analysis_run import analyze_cluster_samples, append_state_pose_energies
 from phase.potts.potts_model import PottsModel, save_potts_model
 from phase.potts.sample_io import save_sample_npz
 from phase.services.project_store import DescriptorState, ProjectStore
 from phase.workflows.clustering import _predict_cluster_adp
+
+
+class _FakeJob:
+    def __init__(self, connection=None, origin="phase-jobs", job_id="rq-test-job"):
+        self.connection = connection
+        self.origin = origin
+        self.id = job_id
+        self.meta = {}
+
+    def save_meta(self):
+        return None
+
+
+class _FakeRedis:
+    def __init__(self):
+        self._store = {}
+
+    def get(self, key):
+        return self._store.get(str(key))
+
+    def set(self, key, value, ex=None):
+        self._store[str(key)] = str(value)
+        return True
+
+    def delete(self, *keys):
+        for key in keys:
+            self._store.pop(str(key), None)
+        return True
+
+    def decr(self, key):
+        current = int(self._store.get(str(key), "0"))
+        current -= 1
+        self._store[str(key)] = str(current)
+        return current
+
+
+def _write_prepared_pickle(prepared):
+    paths = tasks.orchestration_paths(Path(prepared["analysis_dir"]))
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    with open(paths["prepared"], "wb") as fh:
+        pickle.dump(prepared, fh, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 def _write_sample(system_dir: Path, cluster_id: str, sample_id: str, meta: dict, *, labels: np.ndarray, invalid_mask=None):
@@ -389,3 +432,161 @@ def test_run_md_samples_refresh_job_filters_selected_states(monkeypatch, tmp_pat
     assert out["status"] == "finished"
     assert out["results"]["states"] == 1
     assert out["results"]["requested_state_ids"] == ["state2"]
+
+
+def test_analyze_cluster_samples_supports_parallel_local_workers(monkeypatch, tmp_path):
+    data_root = tmp_path / "data"
+    system_dir = data_root / "projects" / "proj" / "systems" / "sys"
+    cluster_id = "cluster1"
+    cluster_dir = system_dir / "clusters" / cluster_id
+    cluster_dir.mkdir(parents=True, exist_ok=True)
+
+    np.savez_compressed(
+        cluster_dir / "cluster.npz",
+        residue_keys=np.asarray(["res_1", "res_2"], dtype=str),
+        merged__labels_assigned=np.asarray([[0, 0], [1, 1]], dtype=np.int32),
+        cluster_counts=np.asarray([2, 2], dtype=np.int32),
+        edges=np.asarray([[0, 1]], dtype=np.int32),
+    )
+    _write_sample(
+        system_dir,
+        cluster_id,
+        "md1",
+        {"name": "MD 1", "type": "md_eval", "method": "md_eval"},
+        labels=np.asarray([[0, 0], [1, 1]], dtype=np.int32),
+    )
+    _write_sample(
+        system_dir,
+        cluster_id,
+        "sa1",
+        {"name": "SA 1", "type": "potts_sampling", "method": "sa"},
+        labels=np.asarray([[0, 0], [0, 1], [1, 1]], dtype=np.int32),
+    )
+
+    model_dir = cluster_dir / "potts_models" / "model1"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_path = model_dir / "model.npz"
+    save_potts_model(
+        PottsModel(
+            h=[np.asarray([0.0, 1.0], dtype=float), np.asarray([0.0, -1.0], dtype=float)],
+            J={(0, 1): np.zeros((2, 2), dtype=float)},
+            edges=[(0, 1)],
+        ),
+        model_path,
+    )
+
+    monkeypatch.setenv("PHASE_DATA_ROOT", str(data_root))
+    out = analyze_cluster_samples(
+        project_id="proj",
+        system_id="sys",
+        cluster_id=cluster_id,
+        model_ref=str(model_path),
+        md_label_mode="assigned",
+        drop_invalid=True,
+        n_workers=2,
+    )
+
+    assert out["comparisons_written"] == 1
+    assert out["energies_written"] == 2
+    assert out["workers_used"] == 2
+
+
+def test_run_potts_analysis_job_uses_distributed_rq_workers(tmp_path, monkeypatch):
+    redis_conn = _FakeRedis()
+    fake_job = _FakeJob(connection=redis_conn)
+    jobs_dir = tmp_path / "results" / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    analysis_dir = tmp_path / "analysis-distributed"
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+
+    prepared = {
+        "analysis_id": "dist-analysis",
+        "analysis_dir": str(analysis_dir),
+        "cluster_dir": str(tmp_path / "cluster"),
+        "system_dir": str(tmp_path / "system"),
+        "comparisons_root": str(tmp_path / "cluster" / "analyses" / "md_vs_sample"),
+        "energies_root": str(tmp_path / "cluster" / "analyses" / "model_energy"),
+        "project_id": "proj",
+        "system_id": "sys",
+        "cluster_id": "cluster",
+        "model_id": "model-1",
+        "model_name": "Model 1",
+        "md_label_mode": "assigned",
+        "drop_invalid": True,
+        "md_samples": 1,
+        "other_samples": 1,
+        "edges_for_metrics": [(0, 1)],
+        "payloads": [
+            {"kind": "md_vs_sample"},
+            {"kind": "model_energy"},
+        ],
+        "requested_workers": 0,
+    }
+
+    enqueued = []
+
+    class _FakeQueue:
+        def __init__(self, name, connection):
+            self.name = name
+            self.connection = connection
+
+        def enqueue(self, func, args=(), **kwargs):
+            enqueued.append((func.__name__, args, kwargs))
+            func(*args)
+            return type("FakeEnqueuedJob", (), {"id": kwargs.get("job_id", "fake-job")})()
+
+    def _fake_prepare(**kwargs):
+        _write_prepared_pickle(prepared)
+        return prepared
+
+    def _fake_worker(payload):
+        if payload.get("kind") == "md_vs_sample":
+            return {
+                "kind": "md_vs_sample",
+                "md_sample": {"sample_id": "md1", "name": "MD 1"},
+                "sample": {"sample_id": "sa1", "name": "SA 1", "type": "potts_sampling", "method": "sa"},
+                "node_js": np.asarray([0.1, 0.2], dtype=float),
+                "edge_js": np.asarray([0.3], dtype=float),
+                "summary": {"combined_distance": 0.2, "md_count": 2, "sample_count": 3},
+            }
+        return {
+            "kind": "model_energy",
+            "sample": {"sample_id": "sa1", "name": "SA 1", "type": "potts_sampling", "method": "sa"},
+            "energies": np.asarray([1.0, 2.0], dtype=float),
+            "summary": {"energy_mean": 1.5, "count": 2},
+        }
+
+    def _fake_aggregate(prepared_obj, out_rows, workers_used):
+        result = {
+            "analysis_id": prepared_obj["analysis_id"],
+            "analysis_dir": prepared_obj["analysis_dir"],
+            "metadata": {
+                "comparisons_written": 1,
+                "energies_written": 1,
+                "workers_used": workers_used,
+                "skipped_samples": [],
+            },
+        }
+        with open(tasks.orchestration_paths(Path(prepared_obj["analysis_dir"]))["aggregate"], "wb") as fh:
+            pickle.dump(result, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        return result
+
+    monkeypatch.setattr(tasks, "get_current_job", lambda: fake_job)
+    monkeypatch.setattr(tasks.project_store, "ensure_results_directories", lambda *args, **kwargs: {"jobs_dir": jobs_dir})
+    monkeypatch.setattr(tasks.project_store, "get_system", lambda *args, **kwargs: type("S", (), {"metastable_clusters": [{"cluster_id": "cluster"}]})())
+    monkeypatch.setattr(tasks, "prepare_potts_analysis_batch", _fake_prepare)
+    monkeypatch.setattr(tasks, "_potts_analysis_payload_worker", _fake_worker)
+    monkeypatch.setattr(tasks, "aggregate_potts_analysis_batch", _fake_aggregate)
+    monkeypatch.setattr(tasks, "_count_queue_workers", lambda queue: 3)
+    monkeypatch.setattr(tasks, "Queue", _FakeQueue)
+
+    out = tasks.run_potts_analysis_job(
+        "job-dist",
+        {"project_id": "proj", "system_id": "sys", "cluster_id": "cluster"},
+        {"model_id": "model-1", "workers": 0},
+    )
+
+    assert out["status"] == "finished"
+    assert out["results"]["summary"]["comparisons_written"] == 1
+    assert any(name == "run_potts_analysis_payload_job" for name, _args, _kwargs in enqueued)
+    assert any(name == "run_potts_analysis_aggregate_job" for name, _args, _kwargs in enqueued)

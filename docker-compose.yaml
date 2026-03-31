@@ -14,8 +14,20 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - PHASE_DATA_ROOT=/data/phase
       - TMPDIR=/data/phase/tmp
+      - MPLCONFIGDIR=/tmp/matplotlib
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/projects', timeout=5)"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     depends_on:
-      - redis
+      redis:
+        condition: service_started
 
   frontend:
     build:
@@ -24,7 +36,8 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
   worker:
     build:
@@ -39,8 +52,10 @@ services:
       - PYTHONUNBUFFERED=1
       - PHASE_DATA_ROOT=/data/phase
       - TMPDIR=/data/phase/tmp
+      - MPLCONFIGDIR=/tmp/matplotlib
     depends_on:
-      - redis
+      redis:
+        condition: service_started
 
   redis:
     image: redis:7-alpine

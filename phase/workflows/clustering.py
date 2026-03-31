@@ -21,7 +21,7 @@ from dadapy import Data
 
 from phase.io.descriptors import load_descriptor_npz
 from phase.services.project_store import DescriptorState, ProjectStore, SystemMetadata
-from phase.potts.sample_io import SAMPLE_NPZ_FILENAME, save_sample_npz
+from phase.potts.sample_io import SAMPLE_NPZ_FILENAME, save_sample_npz, _as_string_array
 
 
 def _slug(value: str) -> str:
@@ -1008,7 +1008,7 @@ def assign_cluster_labels_to_states(
             labels=labels_primary,
             labels_halo=labels_halo,
             frame_indices=frame_indices,
-            frame_state_ids=np.full(frame_indices.shape[0], str(state_id), dtype=str),
+            frame_state_ids=_as_string_array([str(state_id)] * int(frame_indices.shape[0])),
         )
         system_dir = cluster_path.parent.parent.parent
         try:
@@ -1280,7 +1280,7 @@ def evaluate_state_with_models(
         labels=labels_assigned,
         labels_halo=labels_halo,
         frame_indices=frame_indices,
-        frame_state_ids=np.full(frame_indices.shape[0], str(state_id), dtype=str),
+        frame_state_ids=_as_string_array([str(state_id)] * int(frame_indices.shape[0])),
     )
     try:
         rel = str(out_path.relative_to(cluster_dirs["system_dir"]))

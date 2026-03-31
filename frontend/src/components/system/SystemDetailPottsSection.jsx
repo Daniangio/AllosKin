@@ -36,11 +36,10 @@ export default function SystemDetailPottsSection(props) {
     pottsModelName,
     setPottsModelName,
     handleDownloadSavedCluster,
-    handleBackmappingAction,
-    backmappingJobStatus,
-    backmappingProgressById,
+    handleDownloadSampleBackmapping,
+    handleSubmitSampleBackmappingDataset,
+    sampleBackmappingJobStatus,
     handleDeleteSavedCluster,
-    handleUploadBackmappingTrajectories,
     pottsFitMethod,
     setPottsFitMethod,
     pottsFitContactMode,
@@ -96,10 +95,12 @@ export default function SystemDetailPottsSection(props) {
 
   const [fitOverlayOpen, setFitOverlayOpen] = useState(false);
   const [samplingOverlayOpen, setSamplingOverlayOpen] = useState(false);
-  const [backmappingUploadOpen, setBackmappingUploadOpen] = useState(false);
-  const [backmappingUploadError, setBackmappingUploadError] = useState(null);
-  const [backmappingUploadBusy, setBackmappingUploadBusy] = useState(false);
-  const [backmappingFiles, setBackmappingFiles] = useState({});
+  const [sampleBackmappingOpen, setSampleBackmappingOpen] = useState(false);
+  const [sampleBackmappingSampleId, setSampleBackmappingSampleId] = useState('');
+  const [sampleBackmappingFile, setSampleBackmappingFile] = useState(null);
+  const [sampleBackmappingError, setSampleBackmappingError] = useState(null);
+  const [sampleBackmappingBusy, setSampleBackmappingBusy] = useState(false);
+  const [sampleBackmappingUploadProgress, setSampleBackmappingUploadProgress] = useState(null);
   const [renameEditingId, setRenameEditingId] = useState(null);
   const [infoSampleId, setInfoSampleId] = useState(null);
   const [lambdaCreateBusy, setLambdaCreateBusy] = useState(false);
@@ -115,8 +116,6 @@ export default function SystemDetailPottsSection(props) {
   const clusterLabel =
     selectedClusterName || selectedCluster?.name || selectedCluster?.cluster_id || '';
   const clusterFileName = selectedCluster?.path?.split('/').pop();
-  const backmappingJob = pottsFitClusterId ? backmappingJobStatus?.[pottsFitClusterId] : null;
-  const backmappingProgress = pottsFitClusterId ? backmappingProgressById?.[pottsFitClusterId] : null;
   const analysisStateOptions = useMemo(() => {
     const options = [];
     (states || []).forEach((state) => {
@@ -155,6 +154,23 @@ export default function SystemDetailPottsSection(props) {
   );
   const [infoSampleStats, setInfoSampleStats] = useState(null);
   const [infoSampleStatsError, setInfoSampleStatsError] = useState(null);
+  const sampleBackmappingStatusById = useMemo(() => {
+    const statusMap = {};
+    mdSamples.forEach((sample) => {
+      const persisted = sample?.backmapping_dataset || {};
+      const transient = sampleBackmappingJobStatus?.[sample.sample_id] || {};
+      statusMap[sample.sample_id] = {
+        ...persisted,
+        ...transient,
+        status: transient.status || persisted.status || (persisted.path ? 'finished' : ''),
+      };
+    });
+    return statusMap;
+  }, [mdSamples, sampleBackmappingJobStatus]);
+  const selectedBackmappingSample = useMemo(
+    () => mdSamples.find((sample) => sample.sample_id === sampleBackmappingSampleId) || null,
+    [mdSamples, sampleBackmappingSampleId]
+  );
 
   useEffect(() => {
     const load = async () => {
@@ -285,17 +301,6 @@ export default function SystemDetailPottsSection(props) {
                 </button>
                 <button
                   type="button"
-                  onClick={() => {
-                    setBackmappingUploadError(null);
-                    setBackmappingUploadOpen(true);
-                  }}
-                  className="inline-flex items-center gap-2 text-xs px-3 py-2 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60"
-                >
-                  <UploadCloud className="h-4 w-4" />
-                  Backmapping NPZ
-                </button>
-                <button
-                  type="button"
                   onClick={() => handleDeleteSavedCluster(pottsFitClusterId)}
                   className="inline-flex items-center gap-2 text-xs px-3 py-2 rounded-md border border-red-500/40 text-red-200 hover:bg-red-500/10"
                 >
@@ -303,20 +308,6 @@ export default function SystemDetailPottsSection(props) {
                   Delete cluster
                 </button>
               </div>
-              {backmappingProgress !== null && backmappingProgress !== undefined && (
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between text-[11px] text-gray-500">
-                    <span>Backmapping progress</span>
-                    <span>{backmappingProgress}%</span>
-                  </div>
-                  <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-cyan-500 transition-all duration-300"
-                      style={{ width: `${backmappingProgress || 0}%` }}
-                    />
-                  </div>
-                </div>
-              )}
               {pottsFitResults.length > 0 && (
                 <div className="border-t border-gray-800 pt-3 space-y-2">
                   <h4 className="text-xs font-semibold text-gray-300">Recent fit jobs</h4>
@@ -505,12 +496,33 @@ export default function SystemDetailPottsSection(props) {
                     const label = meta
                       ? `${meta.name || meta.default_name || meta.metastable_id} (${stateName})`
                       : stateName;
+                    const backmapping = sampleBackmappingStatusById[sample.sample_id] || {};
+                    const backmappingStatus = backmapping.status || '';
+                    const canBuildBackmapping = Boolean(sample.state_id);
+                    const isBackmappingActive = backmapping.job_id && !['finished', 'failed'].includes(backmappingStatus);
+                    const backmappingStatusLabel = backmapping.path
+                      ? backmappingStatus === 'failed'
+                        ? 'dataset ready; last rebuild failed'
+                        : isBackmappingActive
+                          ? `dataset ${backmappingStatus}`
+                          : 'dataset ready'
+                      : backmappingStatus
+                        ? `dataset ${backmappingStatus}`
+                        : 'no dataset';
                     return (
                       <div
                         key={sample.sample_id || sample.path}
                         className="flex items-center justify-between gap-2 rounded-md border border-gray-800 bg-gray-950/50 px-2 py-1"
                       >
-                        <span className="text-[11px] text-gray-300 truncate">{label}</span>
+                        <div className="min-w-0">
+                          <p className="text-[11px] text-gray-300 truncate">{label}</p>
+                          <p className="text-[10px] text-gray-500 truncate">
+                            {backmappingStatusLabel}
+                            {isBackmappingActive && backmapping.meta?.progress !== undefined
+                              ? ` • ${backmapping.meta.progress}%`
+                              : ''}
+                          </p>
+                        </div>
                         <div className="flex items-center gap-2">
                           <button
                             type="button"
@@ -534,6 +546,38 @@ export default function SystemDetailPottsSection(props) {
                               aria-label={`View ${label} in Descriptor Explorer`}
                             >
                               <Eye className="h-4 w-4" />
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setSampleBackmappingSampleId(sample.sample_id || '');
+                              setSampleBackmappingFile(null);
+                              setSampleBackmappingError(null);
+                              setSampleBackmappingUploadProgress(null);
+                              setSampleBackmappingOpen(true);
+                            }}
+                            className={`${
+                              canBuildBackmapping ? 'text-gray-400 hover:text-cyan-300' : 'text-gray-700 cursor-not-allowed'
+                            }`}
+                            aria-label={`Build backmapping dataset for ${label}`}
+                            disabled={!canBuildBackmapping}
+                            title={
+                              canBuildBackmapping
+                                ? 'Build or rebuild backmapping dataset'
+                                : 'Backmapping dataset currently requires a state-based MD sample'
+                            }
+                          >
+                            <UploadCloud className="h-4 w-4" />
+                          </button>
+                          {backmapping.path && (
+                            <button
+                              type="button"
+                              onClick={() => handleDownloadSampleBackmapping(pottsFitClusterId, sample)}
+                              className="text-gray-400 hover:text-cyan-300"
+                              aria-label={`Download backmapping dataset for ${label}`}
+                            >
+                              <Download className="h-4 w-4" />
                             </button>
                           )}
                         </div>
@@ -1569,88 +1613,142 @@ export default function SystemDetailPottsSection(props) {
         </div>
       )}
 
-      {backmappingUploadOpen && (
+      {sampleBackmappingOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-          <div className="w-full max-w-3xl bg-gray-900 border border-gray-700 rounded-lg p-4 space-y-4">
+          <div className="w-full max-w-2xl bg-gray-900 border border-gray-700 rounded-lg p-4 space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <h3 className="text-lg font-semibold text-white">Upload trajectories for backmapping</h3>
+                <h3 className="text-lg font-semibold text-white">Build backmapping dataset</h3>
                 <p className="text-xs text-gray-500">
-                  Upload trajectories again to build a backmapping NPZ without storing them.
+                  Upload the trajectory corresponding to this MD sample. The dataset is saved on the sample and can be downloaded later.
                 </p>
               </div>
               <button
                 type="button"
-                onClick={() => setBackmappingUploadOpen(false)}
+                onClick={() => setSampleBackmappingOpen(false)}
                 className="text-gray-400 hover:text-gray-200"
                 aria-label="Close"
               >
                 <X className="h-5 w-5" />
               </button>
             </div>
-            <div className="space-y-2">
-              {states.map((state) => (
-                <div key={state.state_id} className="flex items-center gap-3">
-                  <div className="w-40 text-xs text-gray-300">{state.name || state.state_id}</div>
+            {!selectedBackmappingSample && (
+              <p className="text-sm text-gray-400">Sample not found.</p>
+            )}
+            {selectedBackmappingSample && (
+              <>
+                <div className="rounded-md border border-gray-800 bg-gray-950/50 p-3 space-y-1 text-xs text-gray-300">
+                  <p>
+                    <span className="text-gray-500">Sample:</span> {selectedBackmappingSample.name || selectedBackmappingSample.sample_id}
+                  </p>
+                  <p>
+                    <span className="text-gray-500">State:</span>{' '}
+                    {states.find((state) => state.state_id === selectedBackmappingSample.state_id)?.name ||
+                      selectedBackmappingSample.state_id ||
+                      'Unavailable'}
+                  </p>
+                  <p>
+                    <span className="text-gray-500">Status:</span>{' '}
+                    {selectedBackmappingSample.backmapping_dataset?.status ||
+                      (selectedBackmappingSample.backmapping_dataset?.path ? 'finished' : 'not built')}
+                  </p>
+                  {selectedBackmappingSample.backmapping_dataset?.path && (
+                    <p>
+                      <span className="text-gray-500">Cached dataset:</span>{' '}
+                      {selectedBackmappingSample.backmapping_dataset.n_frames || '?'} frames,{' '}
+                      {selectedBackmappingSample.backmapping_dataset.n_atoms || '?'} atoms,{' '}
+                      {selectedBackmappingSample.backmapping_dataset.n_residues || '?'} residues
+                    </p>
+                  )}
+                </div>
+                <div className="space-y-2">
+                  <label className="block text-xs text-gray-400">Trajectory file</label>
                   <input
                     type="file"
-                    accept=".xtc,.trr,.dcd,.nc,.h5,.hdf5"
-                    onChange={(event) =>
-                      setBackmappingFiles((prev) => ({
-                        ...prev,
-                        [state.state_id]: event.target.files?.[0] || null,
-                      }))
-                    }
-                    className="flex-1 text-xs text-gray-200"
+                    accept=".xtc,.trr,.dcd,.nc,.h5,.hdf5,.pdb"
+                    onChange={(event) => setSampleBackmappingFile(event.target.files?.[0] || null)}
+                    className="w-full text-xs text-gray-200"
                   />
+                  {sampleBackmappingUploadProgress !== null && sampleBackmappingUploadProgress !== undefined && (
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between text-[11px] text-gray-500">
+                        <span>Upload progress</span>
+                        <span>{sampleBackmappingUploadProgress}%</span>
+                      </div>
+                      <div className="h-2 bg-gray-800 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-cyan-500 transition-all duration-300"
+                          style={{ width: `${sampleBackmappingUploadProgress || 0}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
-              ))}
-            </div>
-            {backmappingUploadError && <ErrorMessage message={backmappingUploadError} />}
-            <div className="flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setBackmappingUploadOpen(false)}
-                className="text-xs px-3 py-2 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60"
-                disabled={backmappingUploadBusy}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={async () => {
-                  setBackmappingUploadError(null);
-                  if (!pottsFitClusterId) {
-                    setBackmappingUploadError('Select a cluster first.');
-                    return;
-                  }
-                  const files = Object.entries(backmappingFiles)
-                    .filter(([, file]) => Boolean(file))
-                    .reduce((acc, [key, file]) => {
-                      acc[key] = file;
-                      return acc;
-                    }, {});
-                  if (!Object.keys(files).length) {
-                    setBackmappingUploadError('Upload at least one trajectory.');
-                    return;
-                  }
-                  try {
-                    setBackmappingUploadBusy(true);
-                    await handleUploadBackmappingTrajectories(pottsFitClusterId, files);
-                    setBackmappingUploadOpen(false);
-                    setBackmappingFiles({});
-                  } catch (err) {
-                    setBackmappingUploadError(err.message || 'Failed to build backmapping NPZ.');
-                  } finally {
-                    setBackmappingUploadBusy(false);
-                  }
-                }}
-                className="text-xs px-3 py-2 rounded-md border border-cyan-500 text-cyan-200 hover:bg-cyan-500/10 disabled:opacity-60"
-                disabled={backmappingUploadBusy}
-              >
-                {backmappingUploadBusy ? 'Building…' : 'Build backmapping NPZ'}
-              </button>
-            </div>
+                {sampleBackmappingError && <ErrorMessage message={sampleBackmappingError} />}
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-[11px] text-gray-500">
+                    {selectedBackmappingSample.backmapping_dataset?.path
+                      ? 'A new run overwrites the stored dataset if it completes successfully.'
+                      : 'The dataset will be stored on this sample and exposed as a download action.'}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {selectedBackmappingSample.backmapping_dataset?.path && (
+                      <button
+                        type="button"
+                        onClick={() => handleDownloadSampleBackmapping(pottsFitClusterId, selectedBackmappingSample)}
+                        className="text-xs px-3 py-2 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60"
+                      >
+                        Download current
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setSampleBackmappingOpen(false)}
+                      className="text-xs px-3 py-2 rounded-md border border-gray-600 text-gray-200 hover:bg-gray-700/60"
+                      disabled={sampleBackmappingBusy}
+                    >
+                      Close
+                    </button>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setSampleBackmappingError(null);
+                        if (!pottsFitClusterId || !selectedBackmappingSample?.sample_id) {
+                          setSampleBackmappingError('Select a cluster sample first.');
+                          return;
+                        }
+                        if (!sampleBackmappingFile) {
+                          setSampleBackmappingError('Upload a trajectory file.');
+                          return;
+                        }
+                        try {
+                          setSampleBackmappingBusy(true);
+                          await handleSubmitSampleBackmappingDataset(
+                            pottsFitClusterId,
+                            selectedBackmappingSample.sample_id,
+                            sampleBackmappingFile,
+                            {
+                              onUploadProgress: (percent) => setSampleBackmappingUploadProgress(percent),
+                            }
+                          );
+                          setSampleBackmappingOpen(false);
+                          setSampleBackmappingFile(null);
+                          setSampleBackmappingUploadProgress(null);
+                        } catch (err) {
+                          setSampleBackmappingError(err.message || 'Failed to submit backmapping dataset job.');
+                        } finally {
+                          setSampleBackmappingBusy(false);
+                        }
+                      }}
+                      className="text-xs px-3 py-2 rounded-md border border-cyan-500 text-cyan-200 hover:bg-cyan-500/10 disabled:opacity-60"
+                      disabled={sampleBackmappingBusy}
+                    >
+                      {sampleBackmappingBusy ? 'Submitting…' : 'Build dataset'}
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

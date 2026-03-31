@@ -440,6 +440,9 @@ class ProjectStore:
     def _sample_metadata_path(self, project_id: str, system_id: str, cluster_id: str, sample_id: str) -> Path:
         return self._cluster_dir(project_id, system_id, cluster_id) / "samples" / sample_id / SAMPLE_METADATA_FILENAME
 
+    def _sample_dir(self, project_id: str, system_id: str, cluster_id: str, sample_id: str) -> Path:
+        return self._cluster_dir(project_id, system_id, cluster_id) / "samples" / sample_id
+
     def _states_metadata_path(self, project_id: str, system_id: str) -> Path:
         return self._system_dir(project_id, system_id) / STATES_METADATA_FILENAME
 
@@ -575,6 +578,43 @@ class ProjectStore:
                         meta["path"] = str(npz_files[0])
             entries.append(meta)
         return entries
+
+    def get_sample_entry(self, project_id: str, system_id: str, cluster_id: str, sample_id: str) -> Dict[str, Any]:
+        meta_path = self._sample_metadata_path(project_id, system_id, cluster_id, sample_id)
+        if not meta_path.exists():
+            raise FileNotFoundError(
+                f"Sample '{sample_id}' not found in cluster '{cluster_id}' for system '{system_id}'."
+            )
+        payload = _read_json(meta_path)
+        payload["sample_id"] = str(payload.get("sample_id") or sample_id)
+        return payload
+
+    def save_sample_entry(
+        self,
+        project_id: str,
+        system_id: str,
+        cluster_id: str,
+        sample_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        sample_dir = self._sample_dir(project_id, system_id, cluster_id, sample_id)
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        sample_payload = dict(payload or {})
+        sample_payload["sample_id"] = str(sample_payload.get("sample_id") or sample_id)
+        _write_json(self._sample_metadata_path(project_id, system_id, cluster_id, sample_id), sample_payload)
+        return sample_payload
+
+    def update_sample_entry(
+        self,
+        project_id: str,
+        system_id: str,
+        cluster_id: str,
+        sample_id: str,
+        updates: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        sample_meta = self.get_sample_entry(project_id, system_id, cluster_id, sample_id)
+        sample_meta.update(dict(updates or {}))
+        return self.save_sample_entry(project_id, system_id, cluster_id, sample_id, sample_meta)
 
     def _hydrate_system(self, system_meta: SystemMetadata) -> None:
         state_sidecar = self._load_states_metadata(system_meta.project_id, system_meta.system_id)

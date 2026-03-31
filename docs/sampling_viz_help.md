@@ -49,7 +49,34 @@ Interpretation:
 - Different samples can have different energy ranges.
 - If a Potts sampler is working “as intended”, Potts-generated samples often sit in a similar energy band as the MD ensembles the model was trained to represent (but this is not guaranteed).
 
-## Label Modes / Invalid Mask
+## Running The Analysis
 
-- **MD label mode**: “assigned” vs “halo” controls which MD labels are compared.
-- **Keep invalid SA**: if disabled, frames marked invalid by SA constraints are excluded from comparisons/plots.
+The Sampling Explorer analysis has two work-unit types:
+
+- one work unit for each **MD vs non-MD sample pair**
+- one work unit for each **sample energy evaluation** under the selected Potts model
+
+So if a cluster has `M` MD samples and `S` non-MD samples:
+
+- comparisons: `M * S`
+- energy evaluations: `M + S` if a Potts model is selected
+
+On the webserver this is now intrinsically parallelizable:
+
+- if enough RQ workers are available, the job fans out automatically
+- otherwise it falls back to local serial execution inside the parent worker
+
+From `phase_console`, the same analysis is available as:
+
+- `Sampling Explorer analysis`
+
+Console parameters:
+
+- **Potts model**: optional. If omitted, only MD-vs-sample JS analyses are written.
+- **MD label mode**: `assigned` or `halo` for MD ensembles.
+- **Keep invalid SA rows**: if off, rows flagged by `invalid_mask` are dropped before comparison and energy evaluation.
+- **Workers**: local multiprocessing fan-out. `0` means auto.
+
+## Practical Limitation
+
+This job can create many small tasks. That is correct for the current design, but if a cluster has many MD samples and many generated samples, queue overhead can become noticeable.

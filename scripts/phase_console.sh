@@ -236,7 +236,7 @@ cluster_menu() {
     echo "System: ${OFFLINE_SYSTEM_NAME:-$OFFLINE_SYSTEM_ID} (${OFFLINE_SYSTEM_ID})"
     echo "Cluster: ${OFFLINE_CLUSTER_NAME:-$OFFLINE_CLUSTER_ID} (${OFFLINE_CLUSTER_ID})"
     echo ""
-    ACTION_LINES=$'list-models|List Potts models\nlist-samples|List sampling runs\nfit|Fit Potts model\nfit-delta|Fit delta Potts model\nlambda-model|Create lambda model\nsample|Run sampling\nlambda-sweep|Lambda sweep sampling\ngibbs-relax|Gibbs relaxation analysis\nligand-completion|Ligand completion analysis\ndelta-js|Delta JS analysis\npotts-nn|Potts NN mapping analysis\npatch-cluster|Patch cluster residues\nrefresh-md|Recompute MD samples\nassign-md|Assign selected macro states\nback|Back to systems'
+    ACTION_LINES=$'list-models|List Potts models\nlist-samples|List sampling runs\nfit|Fit Potts model\nfit-delta|Fit delta Potts model\nlambda-model|Create lambda model\nsample|Run sampling\nsampling-analysis|Sampling Explorer analysis\nlambda-sweep|Lambda sweep sampling\ngibbs-relax|Gibbs relaxation analysis\nligand-completion|Ligand completion analysis\ndelta-js|Delta JS analysis\npotts-nn|Potts NN mapping analysis\nbackmapping-dataset|Build backmapping dataset\npatch-cluster|Patch cluster residues\nrefresh-md|Recompute MD samples\nassign-md|Assign selected macro states\nback|Back to systems'
     ACTION_ROW="$(offline_choose_one "Cluster actions:" "$ACTION_LINES")"
     ACTION="$(printf "%s" "$ACTION_ROW" | awk -F'|' '{print $1}')"
     case "$ACTION" in
@@ -291,6 +291,15 @@ cluster_menu() {
           --cluster-id "$OFFLINE_CLUSTER_ID" \
           --npz "$OFFLINE_CLUSTER_PATH"
         ;;
+      sampling-analysis)
+        ensure_env || return 0
+        "${ROOT_DIR}/scripts/potts_analyze.sh" \
+          --root "$OFFLINE_ROOT" \
+          --project-id "$OFFLINE_PROJECT_ID" \
+          --system-id "$OFFLINE_SYSTEM_ID" \
+          --cluster-id "$OFFLINE_CLUSTER_ID"
+        pause
+        ;;
       lambda-sweep)
         ensure_env || return 0
         "${ROOT_DIR}/scripts/potts_lambda_sweep.sh" \
@@ -330,6 +339,15 @@ cluster_menu() {
       potts-nn)
         ensure_env || return 0
         "${ROOT_DIR}/scripts/potts_nn_mapping.sh" \
+          --root "$OFFLINE_ROOT" \
+          --project-id "$OFFLINE_PROJECT_ID" \
+          --system-id "$OFFLINE_SYSTEM_ID" \
+          --cluster-id "$OFFLINE_CLUSTER_ID"
+        pause
+        ;;
+      backmapping-dataset)
+        ensure_env || return 0
+        "${ROOT_DIR}/scripts/backmapping_dataset.sh" \
           --root "$OFFLINE_ROOT" \
           --project-id "$OFFLINE_PROJECT_ID" \
           --system-id "$OFFLINE_SYSTEM_ID" \

@@ -29,15 +29,14 @@ import {
   submitMetastableClusterJob,
   uploadMetastableClusterNp,
   downloadSavedCluster,
-  downloadBackmappingCluster,
-  submitBackmappingClusterJob,
-  uploadBackmappingTrajectories,
+  downloadSampleBackmappingDataset,
   downloadPottsModel,
   uploadPottsModel,
   renamePottsModel,
   deletePottsModel,
   deleteSavedCluster,
   deleteSamplingSample,
+  submitSampleBackmappingDatasetJob,
 } from '../api/projects';
 import {
   fetchResults,
@@ -91,8 +90,7 @@ export default function SystemDetailPage() {
   const [uploadClusterError, setUploadClusterError] = useState(null);
   const [uploadClusterLoading, setUploadClusterLoading] = useState(false);
   const [clusterJobStatus, setClusterJobStatus] = useState({});
-  const [backmappingDownloadProgress, setBackmappingDownloadProgress] = useState({});
-  const [backmappingJobStatus, setBackmappingJobStatus] = useState({});
+  const [sampleBackmappingJobStatus, setSampleBackmappingJobStatus] = useState({});
   const [maxClusterFrames, setMaxClusterFrames] = useState(0);
   const [densityZMode, setDensityZMode] = useState('manual');
   const [densityZValue, setDensityZValue] = useState(3.0);
@@ -247,7 +245,7 @@ export default function SystemDetailPage() {
     if (!pottsFitBaseModelId || !pottsModels.some((model) => model.model_id === pottsFitBaseModelId)) {
       setPottsFitBaseModelId(pottsModels[0].model_id);
     }
-  }, [pottsFitStartMode, pottsModels, pottsFitBaseModelId]);
+  }, [pottsFitStartMode, pottsFitMethod, pottsModels, pottsFitBaseModelId]);
   const selectedClusterName = useMemo(() => {
     if (!pottsFitClusterId) return null;
     return clusterNameById.get(pottsFitClusterId) || pottsFitClusterId;
@@ -433,30 +431,57 @@ export default function SystemDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeClusterJobs]);
 
-  const activeBackmappingJobs = useMemo(
-    () =>
-      Object.entries(backmappingJobStatus)
-        .map(([clusterId, status]) => ({ clusterId, ...status }))
-        .filter((job) => job.job_id && !['finished', 'failed'].includes(job.status)),
-    [backmappingJobStatus]
-  );
+  const activeSampleBackmappingJobs = useMemo(() => {
+    const jobs = new Map();
+    (clusterRuns || []).forEach((cluster) => {
+      (cluster?.samples || []).forEach((sample) => {
+        const dataset = sample?.backmapping_dataset || {};
+        if (!sample?.sample_id || !dataset?.job_id) return;
+        jobs.set(sample.sample_id, {
+          sampleId: sample.sample_id,
+          clusterId: cluster.cluster_id,
+          job_id: dataset.job_id,
+          status: dataset.status || 'queued',
+        });
+      });
+    });
+    Object.entries(sampleBackmappingJobStatus || {}).forEach(([sampleId, status]) => {
+      if (!status?.job_id) return;
+      const prev = jobs.get(sampleId) || {};
+      jobs.set(sampleId, {
+        ...prev,
+        sampleId,
+        clusterId: prev.clusterId || null,
+        ...status,
+      });
+    });
+    return Array.from(jobs.values()).filter((job) => job.job_id && !['finished', 'failed'].includes(job.status));
+  }, [clusterRuns, sampleBackmappingJobStatus]);
 
   useEffect(() => {
-    if (!activeBackmappingJobs.length) return;
+    if (!activeSampleBackmappingJobs.length) return;
     let cancelled = false;
     const poll = async () => {
       const updates = {};
-      for (const job of activeBackmappingJobs) {
+      let shouldRefresh = false;
+      for (const job of activeSampleBackmappingJobs) {
         if (!job.job_id) continue;
         try {
           const status = await fetchJobStatus(job.job_id);
-          updates[job.clusterId] = status;
+          updates[job.sampleId] = status;
+          if (status.status === 'finished' || status.status === 'failed') {
+            shouldRefresh = true;
+          }
         } catch (err) {
-          updates[job.clusterId] = { status: 'failed', result: { error: err.message } };
+          updates[job.sampleId] = { status: 'failed', result: { error: err.message } };
+          shouldRefresh = true;
         }
       }
       if (!cancelled && Object.keys(updates).length) {
-        setBackmappingJobStatus((prev) => ({ ...prev, ...updates }));
+        setSampleBackmappingJobStatus((prev) => ({ ...prev, ...updates }));
+      }
+      if (!cancelled && shouldRefresh) {
+        await refreshSystem();
       }
     };
     poll();
@@ -465,7 +490,8 @@ export default function SystemDetailPage() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [activeBackmappingJobs]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSampleBackmappingJobs]);
 
   const openDoc = (nextDocId = 'metastable_states') => {
     setDocId(nextDocId);
@@ -1139,67 +1165,50 @@ export default function SystemDetailPage() {
     }
   };
 
-  const handleDownloadBackmappingCluster = async (clusterId, filename) => {
+  const handleDownloadSampleBackmapping = async (clusterId, sample, filename) => {
     setClusterError(null);
     try {
-      setBackmappingDownloadProgress((prev) => ({ ...prev, [clusterId]: 0 }));
-      const blob = await downloadBackmappingCluster(projectId, systemId, clusterId, {
-        onProgress: (percent) =>
-          setBackmappingDownloadProgress((prev) => ({ ...prev, [clusterId]: percent })),
-      });
+      const blob = await downloadSampleBackmappingDataset(projectId, systemId, clusterId, sample.sample_id);
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = filename || `backmapping_${clusterId}.npz`;
+      link.download = filename || `${sample.name || sample.sample_id}_backmapping_dataset.npz`;
       document.body.appendChild(link);
       link.click();
       link.remove();
       URL.revokeObjectURL(url);
     } catch (err) {
       setClusterError(err.message);
-    } finally {
-      setBackmappingDownloadProgress((prev) => ({ ...prev, [clusterId]: null }));
     }
   };
 
-  const handleBackmappingAction = async (clusterId, filename) => {
-    const job = backmappingJobStatus[clusterId];
-    if (job?.status === 'finished') {
-      await handleDownloadBackmappingCluster(clusterId, filename);
-      return;
-    }
-    if (job?.status && job.status !== 'failed') return;
-    setClusterError(null);
-    try {
-      const response = await submitBackmappingClusterJob(projectId, systemId, clusterId);
-      if (response?.job_id) {
-        setBackmappingJobStatus((prev) => ({
-          ...prev,
-          [clusterId]: { status: 'queued', job_id: response.job_id, meta: { progress: 0 } },
-        }));
-      }
-    } catch (err) {
-      setClusterError(err.message);
-    }
-  };
-
-  const handleUploadBackmappingTrajectories = async (clusterId, filesByState) => {
-    const stateIds = Object.keys(filesByState || {}).filter((key) => filesByState[key]);
-    if (!stateIds.length) {
-      throw new Error('Select at least one trajectory to upload.');
+  const handleSubmitSampleBackmappingDataset = async (
+    clusterId,
+    sampleId,
+    trajectoryFile,
+    options = {}
+  ) => {
+    if (!trajectoryFile) {
+      throw new Error('Upload a trajectory file first.');
     }
     const payload = new FormData();
-    payload.append('state_ids', stateIds.join(','));
-    stateIds.forEach((stateId) => payload.append('trajectories', filesByState[stateId]));
-    const blob = await uploadBackmappingTrajectories(projectId, systemId, clusterId, payload);
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `backmapping_${clusterId}.npz`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
+    payload.append('trajectory', trajectoryFile);
+    const response = await submitSampleBackmappingDatasetJob(
+      projectId,
+      systemId,
+      clusterId,
+      sampleId,
+      payload,
+      options
+    );
+    if (response?.job_id) {
+      setSampleBackmappingJobStatus((prev) => ({
+        ...prev,
+        [sampleId]: { status: 'queued', job_id: response.job_id, meta: { progress: 0 } },
+      }));
+      await refreshSystem();
+    }
+    return response;
   };
 
   const handleDownloadPottsModel = async (clusterId, modelId, filename) => {
@@ -1445,11 +1454,10 @@ export default function SystemDetailPage() {
               pottsModelName={pottsModelName}
               setPottsModelName={setPottsModelName}
               handleDownloadSavedCluster={handleDownloadSavedCluster}
-              handleBackmappingAction={handleBackmappingAction}
-              backmappingJobStatus={backmappingJobStatus}
-              backmappingProgressById={backmappingDownloadProgress}
+              handleDownloadSampleBackmapping={handleDownloadSampleBackmapping}
+              handleSubmitSampleBackmappingDataset={handleSubmitSampleBackmappingDataset}
+              sampleBackmappingJobStatus={sampleBackmappingJobStatus}
               handleDeleteSavedCluster={handleDeleteSavedCluster}
-              handleUploadBackmappingTrajectories={handleUploadBackmappingTrajectories}
               pottsFitMethod={pottsFitMethod}
               setPottsFitMethod={setPottsFitMethod}
               pottsFitContactMode={pottsFitContactMode}

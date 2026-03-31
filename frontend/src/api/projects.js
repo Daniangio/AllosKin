@@ -229,6 +229,74 @@ export function deleteSamplingSample(projectId, systemId, clusterId, sampleId) {
   );
 }
 
+export function downloadSampleBackmappingDataset(projectId, systemId, clusterId, sampleId) {
+  return requestBlob(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/samples/${sampleId}/backmapping_dataset`
+  );
+}
+
+export function submitSampleBackmappingDatasetJob(
+  projectId,
+  systemId,
+  clusterId,
+  sampleId,
+  payload,
+  options = {}
+) {
+  const { onUploadProgress } = options;
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(
+      'POST',
+      `${API_BASE}/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/samples/${sampleId}/backmapping_dataset/job`
+    );
+    xhr.responseType = 'json';
+
+    if (xhr.upload && typeof onUploadProgress === 'function') {
+      xhr.upload.addEventListener('loadstart', () => onUploadProgress(0));
+      xhr.upload.addEventListener('progress', (event) => {
+        if (!event.lengthComputable) return;
+        const percent = Math.round((event.loaded / event.total) * 100);
+        onUploadProgress(Math.min(100, percent));
+      });
+      xhr.upload.addEventListener('loadend', () => onUploadProgress(100));
+    }
+
+    const parseResponseJSON = () => {
+      if (xhr.response !== null && xhr.response !== undefined) {
+        return xhr.response;
+      }
+      try {
+        return xhr.responseText ? JSON.parse(xhr.responseText) : null;
+      } catch (err) {
+        return null;
+      }
+    };
+
+    xhr.onreadystatechange = () => {
+      if (xhr.readyState !== XMLHttpRequest.DONE) return;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(parseResponseJSON());
+      } else {
+        const response = parseResponseJSON() || {};
+        const message =
+          response.detail ||
+          response.error ||
+          (typeof response === 'string' ? response : '') ||
+          xhr.statusText ||
+          'Failed to submit backmapping dataset job.';
+        reject(new Error(message));
+      }
+    };
+
+    xhr.onerror = () => {
+      reject(new Error('Network error while submitting backmapping dataset job.'));
+    };
+
+    xhr.send(payload);
+  });
+}
+
 export function assignClusterStates(projectId, systemId, clusterId, stateIds = []) {
   return requestJSON(
     `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/assign_states`,
