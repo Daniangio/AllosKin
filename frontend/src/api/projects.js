@@ -167,9 +167,14 @@ export function discardClusterPatch(projectId, systemId, clusterId, patchId) {
   );
 }
 
-export function fetchClusterAnalysisData(projectId, systemId, clusterId, analysisType, analysisId) {
+export function fetchClusterAnalysisData(projectId, systemId, clusterId, analysisType, analysisId, options = {}) {
+  const params = new URLSearchParams();
+  if (options?.maxRows != null && Number(options.maxRows) > 0) params.set('max_rows', String(Number(options.maxRows)));
+  if (options?.sampleSeed != null) params.set('sample_seed', String(Number(options.sampleSeed)));
+  if (options?.summaryOnly) params.set('summary_only', '1');
+  const q = params.toString();
   return requestJSON(
-    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/analyses/${analysisType}/${analysisId}/data`
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/analyses/${analysisType}/${analysisId}/data${q ? `?${q}` : ''}`
   );
 }
 

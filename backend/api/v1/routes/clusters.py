@@ -813,6 +813,9 @@ async def get_cluster_analysis_data(
     cluster_id: str,
     analysis_type: str,
     analysis_id: str,
+    max_rows: int | None = None,
+    sample_seed: int = 0,
+    summary_only: bool = False,
 ):
     try:
         project_store.get_system(project_id, system_id)
@@ -831,11 +834,88 @@ async def get_cluster_analysis_data(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to read analysis metadata: {exc}") from exc
 
+    def _compact_potts_nn_payload(payload_np: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        keep_keys = {
+            'analysis_format_version',
+            'residue_keys',
+            'residue_display_labels',
+            'edges',
+            'per_residue_mean', 'per_residue_std', 'per_residue_median', 'per_residue_q25', 'per_residue_q75',
+            'per_residue_node_mean', 'per_residue_node_std', 'per_residue_node_median', 'per_residue_node_q25', 'per_residue_node_q75',
+            'per_residue_edge_mean', 'per_residue_edge_std', 'per_residue_edge_median', 'per_residue_edge_q25', 'per_residue_edge_q75',
+            'per_edge_mean', 'per_edge_std', 'per_edge_median', 'per_edge_q25', 'per_edge_q75',
+        }
+        return {key: np.asarray(value) for key, value in payload_np.items() if key in keep_keys}
+
+    def _downsample_potts_nn_payload(payload_np: dict[str, np.ndarray], *, row_limit: int, seed: int) -> dict[str, np.ndarray]:
+        nn_dist_global = np.asarray(payload_np.get("nn_dist_global", np.asarray([], dtype=float)))
+        row_count = int(nn_dist_global.shape[0]) if nn_dist_global.ndim == 1 else 0
+        if row_limit <= 0 or row_count <= row_limit:
+            payload_np["sampled_unique_row_indices"] = np.arange(row_count, dtype=np.int32)
+            payload_np["sampled_unique_row_count"] = np.asarray([row_count], dtype=np.int32)
+            payload_np["original_unique_row_count"] = np.asarray([row_count], dtype=np.int32)
+            payload_np["downsampled"] = np.asarray([0], dtype=np.int32)
+            return payload_np
+
+        rng = np.random.default_rng(int(seed))
+        keep_rows = np.sort(rng.choice(row_count, size=int(row_limit), replace=False).astype(np.int32))
+        row_keys = {
+            "sample_unique_sequences",
+            "sample_unique_counts",
+            "sample_unique_rep_original_indices",
+            "sample_unique_rep_frame_indices",
+            "nn_md_unique_idx",
+            "nn_md_rep_original_idx",
+            "nn_md_rep_frame_idx",
+            "nn_dist_global",
+            "nn_dist_node",
+            "nn_dist_edge",
+            "nn_dist_residue_node",
+            "nn_dist_residue_edge",
+            "nn_dist_residue",
+            "nn_dist_edge_per_edge",
+        }
+        out = dict(payload_np)
+        for key in row_keys:
+            if key not in out:
+                continue
+            arr = np.asarray(out[key])
+            if arr.ndim >= 1 and int(arr.shape[0]) == row_count:
+                out[key] = np.asarray(arr[keep_rows], dtype=arr.dtype)
+
+        if "nn_md_unique_idx" in out and "md_unique_sequences" in out:
+            md_idx = np.asarray(out["nn_md_unique_idx"], dtype=np.int32)
+            used_md = np.unique(md_idx)
+            md_map = {int(old): new for new, old in enumerate(used_md.tolist())}
+            out["nn_md_unique_idx"] = np.asarray([md_map[int(v)] for v in md_idx.tolist()], dtype=np.int32)
+            for key in {"md_unique_sequences", "md_unique_counts", "md_unique_rep_original_indices", "md_unique_rep_frame_indices"}:
+                if key not in out:
+                    continue
+                arr = np.asarray(out[key])
+                if arr.ndim >= 1 and arr.shape[0] >= used_md.shape[0]:
+                    out[key] = np.asarray(arr[used_md], dtype=arr.dtype)
+
+        if "sample_inv" in out:
+            out.pop("sample_inv", None)
+        if "md_inv" in out:
+            out.pop("md_inv", None)
+
+        out["sampled_unique_row_indices"] = np.asarray(keep_rows, dtype=np.int32)
+        out["sampled_unique_row_count"] = np.asarray([int(keep_rows.shape[0])], dtype=np.int32)
+        out["original_unique_row_count"] = np.asarray([row_count], dtype=np.int32)
+        out["downsampled"] = np.asarray([1], dtype=np.int32)
+        return out
+
     try:
         with np.load(npz_path, allow_pickle=False) as data:
+            payload_np: dict[str, np.ndarray] = {key: np.asarray(data[key]) for key in data.files}
+            if str(analysis_type or "").strip().lower() == "potts_nn_mapping":
+                if bool(summary_only):
+                    payload_np = _compact_potts_nn_payload(payload_np)
+                elif max_rows is not None:
+                    payload_np = _downsample_potts_nn_payload(payload_np, row_limit=int(max_rows), seed=int(sample_seed))
             payload: dict[str, Any] = {}
-            for key in data.files:
-                value = data[key]
+            for key, value in payload_np.items():
                 if isinstance(value, np.ndarray):
                     payload[key] = value.tolist()
                 else:

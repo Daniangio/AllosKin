@@ -120,6 +120,15 @@ This is the residue-level average mismatch across the full sample ensemble.
 
 Large values mean that residue consistently contributes to why the sample differs from the MD reference.
 
+Newer analyses also persist compact spread summaries:
+
+- `std`
+- `median`
+- `q25`
+- `q75`
+
+These are used by the dedicated **Potts NN Mismatch Graph** page.
+
 ## Selected unique sample
 
 This panel focuses on one unique sample row.

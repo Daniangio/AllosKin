@@ -51,6 +51,7 @@ export default function PottsNearestNeighborPage() {
   const [chunkSize, setChunkSize] = useState(256);
   const [workers, setWorkers] = useState(0);
   const [distanceThresholds, setDistanceThresholds] = useState('0.05,0.1,0.2');
+  const [rowCap, setRowCap] = useState('1500');
 
   const [analyses, setAnalyses] = useState([]);
   const [analysesLoading, setAnalysesLoading] = useState(false);
@@ -172,12 +173,24 @@ export default function PottsNearestNeighborPage() {
     loadAnalyses();
   }, [selectedClusterId, loadAnalyses]);
 
+  useEffect(() => {
+    cacheRef.current = {};
+    inFlightRef.current = {};
+    setAnalysisData(null);
+    setAnalysisDataError(null);
+    setSelectedUniqueIndex('0');
+  }, [rowCap]);
+
   const loadAnalysisData = useCallback(async (analysisId) => {
     if (!analysisId || !selectedClusterId) return null;
-    const key = `${selectedClusterId}:${analysisId}`;
+    const maxRows = Number(rowCap) > 0 ? Number(rowCap) : null;
+    const key = `${selectedClusterId}:${analysisId}:${maxRows ?? 'all'}`;
     if (Object.prototype.hasOwnProperty.call(cacheRef.current, key)) return cacheRef.current[key];
     if (inFlightRef.current[key]) return inFlightRef.current[key];
-    const promise = fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'potts_nn_mapping', analysisId)
+    const promise = fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'potts_nn_mapping', analysisId, {
+      maxRows,
+      sampleSeed: 0,
+    })
       .then((payload) => {
         cacheRef.current = { ...cacheRef.current, [key]: payload };
         delete inFlightRef.current[key];
@@ -189,7 +202,7 @@ export default function PottsNearestNeighborPage() {
       });
     inFlightRef.current[key] = promise;
     return promise;
-  }, [projectId, systemId, selectedClusterId]);
+  }, [projectId, rowCap, selectedClusterId, systemId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -514,6 +527,13 @@ export default function PottsNearestNeighborPage() {
         <div className="flex items-center gap-2">
           <button
             type="button"
+            onClick={() => navigate(`/projects/${projectId}/systems/${systemId}/sampling/potts_nn_mapping_graph${selectedClusterId ? `?cluster_id=${encodeURIComponent(selectedClusterId)}` : ''}`)}
+            className="inline-flex items-center gap-2 text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:bg-gray-700/40"
+          >
+            Graph view
+          </button>
+          <button
+            type="button"
             onClick={() => setHelpOpen(true)}
             className="inline-flex items-center gap-2 text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:bg-gray-700/40"
           >
@@ -597,6 +617,18 @@ export default function PottsNearestNeighborPage() {
             Distance thresholds
             <input value={distanceThresholds} onChange={(e) => setDistanceThresholds(e.target.value)} className="mt-1 w-full rounded-md bg-gray-950 border border-gray-700 px-3 py-2 text-sm text-white" />
           </label>
+          <label className="block text-sm text-gray-300">
+            Max unique rows to load
+            <select value={rowCap} onChange={(e) => setRowCap(e.target.value)} className="mt-1 w-full rounded-md bg-gray-950 border border-gray-700 px-3 py-2 text-sm text-white">
+              <option value="500">500</option>
+              <option value="1000">1000</option>
+              <option value="1500">1500</option>
+              <option value="3000">3000</option>
+              <option value="5000">5000</option>
+              <option value="0">All</option>
+            </select>
+            <p className="mt-1 text-xs text-gray-500">Applies server-side random downsampling to row-wise NN payloads. Aggregate summaries stay exact.</p>
+          </label>
           <button
             type="button"
             onClick={handleRun}
@@ -667,6 +699,14 @@ export default function PottsNearestNeighborPage() {
                 <div className="rounded-lg border border-gray-800 bg-gray-900/70 p-4"><p className="text-xs text-gray-500 uppercase tracking-[0.2em]">Unique MD rows</p><p className="mt-2 text-2xl text-white font-semibold">{analysisData?.metadata?.summary?.n_md_unique ?? analysisData?.data?.md_unique_sequences?.length ?? 0}</p></div>
                 <div className="rounded-lg border border-gray-800 bg-gray-900/70 p-4"><p className="text-xs text-gray-500 uppercase tracking-[0.2em]">Mean distance</p><p className="mt-2 text-2xl text-white font-semibold">{Number(analysisData?.metadata?.summary?.distance_mean ?? 0).toFixed(3)}</p></div>
                 <div className="rounded-lg border border-gray-800 bg-gray-900/70 p-4"><p className="text-xs text-gray-500 uppercase tracking-[0.2em]">Distance max</p><p className="mt-2 text-2xl text-white font-semibold">{Number(analysisData?.metadata?.summary?.distance_max ?? 0).toFixed(3)}</p></div>
+              </div>
+
+              <div className="rounded-lg border border-gray-800 bg-gray-900/70 p-4 text-sm text-gray-300">
+                {Number(analysisData?.data?.downsampled?.[0] || 0) > 0 ? (
+                  <span>Loaded {Number(analysisData?.data?.sampled_unique_row_count?.[0] || analysisData?.data?.sample_unique_sequences?.length || 0)} of {Number(analysisData?.data?.original_unique_row_count?.[0] || analysisData?.metadata?.summary?.n_sample_unique || 0)} unique rows using server-side random sampling.</span>
+                ) : (
+                  <span>Loaded full analysis payload: {Number(analysisData?.data?.sampled_unique_row_count?.[0] || analysisData?.data?.sample_unique_sequences?.length || 0)} unique rows.</span>
+                )}
               </div>
 
               {histogram && (

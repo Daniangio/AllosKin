@@ -43,6 +43,88 @@ _POTTS_ANALYSIS_SAMPLE_CACHE: dict[tuple[str, bool, str, bool], dict[str, Any]] 
 _POTTS_ANALYSIS_MODEL_CACHE: dict[str, Any] = {}
 
 
+def _derive_residue_display_labels(
+    *,
+    store: ProjectStore,
+    project_id: str,
+    system_id: str,
+    cluster_dir: Path,
+    residue_keys: Sequence[str],
+) -> list[str]:
+    labels = [str(v) for v in residue_keys]
+    if not labels:
+        return labels
+
+    residue_mapping: dict[str, str] = {}
+    selected_state_ids: list[str] = []
+    cluster_npz_path = cluster_dir / "cluster.npz"
+    if cluster_npz_path.exists():
+        try:
+            with np.load(cluster_npz_path, allow_pickle=True) as cluster_npz:
+                raw_meta = cluster_npz.get("metadata_json")
+                if raw_meta is not None:
+                    meta_json = raw_meta.item() if isinstance(raw_meta, np.ndarray) else raw_meta
+                    if isinstance(meta_json, bytes):
+                        meta_json = meta_json.decode("utf-8", errors="ignore")
+                    meta = json.loads(str(meta_json)) if meta_json else {}
+                    if isinstance(meta, dict):
+                        residue_mapping = {str(k): str(v) for k, v in (meta.get("residue_mapping") or {}).items()}
+                        selected_state_ids = [str(v) for v in (meta.get("selected_state_ids") or meta.get("selected_metastable_ids") or [])]
+        except Exception:
+            residue_mapping = {}
+            selected_state_ids = []
+
+    try:
+        system_meta = store.get_system(project_id, system_id)
+    except Exception:
+        return labels
+
+    state_pdb: Path | None = None
+    candidate_state_ids = [sid for sid in selected_state_ids if sid in (system_meta.states or {})]
+    if not candidate_state_ids:
+        candidate_state_ids = [str(sid) for sid, st in (system_meta.states or {}).items() if getattr(st, "pdb_file", None)]
+    for state_id in candidate_state_ids:
+        state = (system_meta.states or {}).get(state_id)
+        if state is None:
+            continue
+        if not residue_mapping and getattr(state, "residue_mapping", None):
+            residue_mapping = {str(k): str(v) for k, v in (state.residue_mapping or {}).items()}
+        pdb_rel = getattr(state, "pdb_file", None)
+        if pdb_rel:
+            candidate = store.resolve_path(project_id, system_id, str(pdb_rel))
+            if candidate.exists():
+                state_pdb = candidate
+                break
+    if state_pdb is None:
+        return labels
+
+    try:
+        import MDAnalysis as mda  # type: ignore
+        u = mda.Universe(str(state_pdb))
+        resname_map = {int(res.resid): str(res.resname).strip() for res in u.residues}
+    except Exception:
+        return labels
+
+    out: list[str] = []
+    for key in labels:
+        selection = str(residue_mapping.get(key) or key)
+        resid_val: int | None = None
+        match = re.search(r"(?:resid|resnum)\s+(-?\d+)", selection)
+        if match:
+            resid_val = int(match.group(1))
+        else:
+            tail = re.search(r"(\d+)$", key)
+            if tail:
+                resid_val = int(tail.group(1))
+        if resid_val is not None and resid_val in resname_map:
+            out.append(f"{resname_map[resid_val]}{resid_val}")
+        elif resid_val is not None:
+            out.append(f"res{resid_val}")
+        else:
+            out.append(key)
+    return out
+
+
 def atomic_pickle_dump(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}")
@@ -2202,6 +2284,7 @@ def _get_potts_nn_worker_cache(prepared: dict[str, Any]) -> dict[str, Any]:
     h = [np.asarray(v, dtype=float) for v in model.h]
     edges = [(int(r), int(s)) for r, s in model.edges]
     max_gap_h = np.asarray(prepared["max_gap_h"], dtype=float)
+    max_gap_J = np.asarray(prepared["max_gap_J"], dtype=float)
     z_node = float(prepared["z_node"])
     z_edge = float(prepared["z_edge"])
     z_edge_per_residue = np.asarray(prepared["z_edge_per_residue"], dtype=float)
@@ -2217,6 +2300,7 @@ def _get_potts_nn_worker_cache(prepared: dict[str, Any]) -> dict[str, Any]:
         "h": h,
         "edges": edges,
         "max_gap_h": max_gap_h,
+        "max_gap_J": max_gap_J,
         "z_node": z_node,
         "z_edge": z_edge,
         "z_edge_per_residue": z_edge_per_residue,
@@ -3305,6 +3389,7 @@ def _potts_nn_row_worker(payload: dict[str, Any]) -> dict[str, Any]:
     h = cache["h"]
     edges = cache["edges"]
     max_gap_h = cache["max_gap_h"]
+    max_gap_J = cache["max_gap_J"]
     z_node = float(cache["z_node"])
     z_edge = float(cache["z_edge"])
     z_edge_per_residue = cache["z_edge_per_residue"]
@@ -3373,6 +3458,7 @@ def _potts_nn_row_worker(payload: dict[str, Any]) -> dict[str, Any]:
 
     residue_node = np.zeros_like(max_gap_h, dtype=float)
     residue_edge = np.zeros_like(max_gap_h, dtype=float)
+    per_edge = np.zeros(len(edges), dtype=float)
     if compute_per_residue:
         nn = np.asarray(md_unique[best_idx], dtype=np.int32)
         for i in range(int(max_gap_h.shape[0])):
@@ -3384,9 +3470,18 @@ def _potts_nn_row_worker(payload: dict[str, Any]) -> dict[str, Any]:
                 continue
             mat = edge_mats[edge_idx]
             contrib = abs(float(mat[int(nn[r]), int(nn[s_])]) - float(mat[int(s[r]), int(s[s_])]))
+            per_edge[edge_idx] = contrib / (float(max_gap_J[edge_idx]) + eps) if normalize else contrib
             residue_edge[r] += contrib
             residue_edge[s_] += contrib
         residue_edge = residue_edge / (z_edge_per_residue + eps) if normalize else residue_edge
+    else:
+        nn = np.asarray(md_unique[best_idx], dtype=np.int32)
+        for edge_idx, (r, s_) in enumerate(edges):
+            if int(s[r]) == int(nn[r]) and int(s[s_]) == int(nn[s_]):
+                continue
+            mat = edge_mats[edge_idx]
+            contrib = abs(float(mat[int(nn[r]), int(nn[s_])]) - float(mat[int(s[r]), int(s[s_])]))
+            per_edge[edge_idx] = contrib / (float(max_gap_J[edge_idx]) + eps) if normalize else contrib
 
     return {
         "row": row,
@@ -3396,6 +3491,7 @@ def _potts_nn_row_worker(payload: dict[str, Any]) -> dict[str, Any]:
         "nn_dist_edge": float(best_edge),
         "nn_dist_residue_node": np.asarray(residue_node, dtype=float),
         "nn_dist_residue_edge": np.asarray(residue_edge, dtype=float),
+        "nn_dist_edge_per_edge": np.asarray(per_edge, dtype=float),
     }
 
 
@@ -3491,6 +3587,28 @@ def prepare_potts_nn_mapping_batch(
     if sample_labels.shape[1] != md_labels.shape[1]:
         raise ValueError("Sample and MD label matrices do not have the same number of residues.")
 
+    residue_keys: list[str]
+    cluster_npz_path = cluster_dir / "cluster.npz"
+    if cluster_npz_path.exists():
+        try:
+            with np.load(cluster_npz_path, allow_pickle=True) as cluster_npz:
+                residue_keys = [str(v) for v in np.asarray(cluster_npz["residue_keys"], dtype=str).tolist()] if "residue_keys" in cluster_npz else []
+        except Exception:
+            residue_keys = []
+    else:
+        residue_keys = []
+    if len(residue_keys) != int(sample_labels.shape[1]):
+        residue_keys = [f"res_{idx + 1}" for idx in range(int(sample_labels.shape[1]))]
+    residue_display_labels = _derive_residue_display_labels(
+        store=store,
+        project_id=project_id,
+        system_id=system_id,
+        cluster_dir=cluster_dir,
+        residue_keys=residue_keys,
+    )
+    if len(residue_display_labels) != len(residue_keys):
+        residue_display_labels = [str(v) for v in residue_keys]
+
     if bool(use_unique):
         sample_unique, sample_inv, sample_counts, sample_groups = _unique_sequences_with_inverse(sample_labels)
         md_unique, md_inv, md_counts, md_groups = _unique_sequences_with_inverse(md_labels)
@@ -3561,6 +3679,8 @@ def prepare_potts_nn_mapping_batch(
         "distance_thresholds": threshold_values,
         "max_gap_h": np.asarray(max_gap_h, dtype=float),
         "max_gap_J": np.asarray(max_gap_J, dtype=float),
+        "residue_keys": np.asarray(residue_keys, dtype=str),
+        "residue_display_labels": np.asarray(residue_display_labels, dtype=str),
         "z_node": float(z_node),
         "z_edge": float(z_edge),
         "z_edge_per_residue": np.asarray(z_edge_per_residue, dtype=float),
@@ -3589,6 +3709,57 @@ def aggregate_potts_nn_mapping_batch(
     *,
     workers_used: int,
 ) -> dict[str, Any]:
+    def _weighted_stats_matrix(matrix: np.ndarray, weights_in: np.ndarray) -> dict[str, np.ndarray]:
+        arr = np.asarray(matrix, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] == 0:
+            width = int(arr.shape[1]) if arr.ndim == 2 else 0
+            zeros = np.zeros((width,), dtype=float)
+            return {
+                "mean": zeros.copy(),
+                "std": zeros.copy(),
+                "median": zeros.copy(),
+                "q25": zeros.copy(),
+                "q75": zeros.copy(),
+            }
+        weights_local = np.asarray(weights_in, dtype=float).reshape(-1)
+        if weights_local.shape[0] != arr.shape[0]:
+            raise ValueError("weights length mismatch while aggregating Potts NN mapping stats.")
+        weights_local = np.where(np.isfinite(weights_local) & (weights_local > 0), weights_local, 0.0)
+        total_weight = float(np.sum(weights_local))
+        if total_weight <= 0.0:
+            zeros = np.zeros((arr.shape[1],), dtype=float)
+            return {
+                "mean": zeros.copy(),
+                "std": zeros.copy(),
+                "median": zeros.copy(),
+                "q25": zeros.copy(),
+                "q75": zeros.copy(),
+            }
+        mean = np.average(arr, axis=0, weights=weights_local)
+        var = np.average((arr - mean[None, :]) ** 2, axis=0, weights=weights_local)
+        std = np.sqrt(np.maximum(var, 0.0))
+        order = np.argsort(arr, axis=0)
+        sorted_arr = np.take_along_axis(arr, order, axis=0)
+        weight_matrix = np.broadcast_to(weights_local[:, None], arr.shape)
+        sorted_weights = np.take_along_axis(weight_matrix, order, axis=0)
+        cumsum = np.cumsum(sorted_weights, axis=0)
+        totals = cumsum[-1]
+        col_index = np.arange(arr.shape[1], dtype=int)
+
+        def _pick_quantile(q: float) -> np.ndarray:
+            target = np.asarray(totals * float(q), dtype=float)
+            hits = cumsum >= target[None, :]
+            idx = np.argmax(hits, axis=0)
+            return np.asarray(sorted_arr[idx, col_index], dtype=float)
+
+        return {
+            "mean": np.asarray(mean, dtype=float),
+            "std": np.asarray(std, dtype=float),
+            "median": _pick_quantile(0.5),
+            "q25": _pick_quantile(0.25),
+            "q75": _pick_quantile(0.75),
+        }
+
     analysis_dir = Path(str(prepared["analysis_dir"]))
     npz_path = Path(str(prepared["analysis_npz"]))
     meta_path = Path(str(prepared["analysis_metadata"]))
@@ -3609,6 +3780,7 @@ def aggregate_potts_nn_mapping_batch(
     nn_dist_edge = np.asarray([float(row["nn_dist_edge"]) for row in rows_sorted], dtype=float)
     nn_dist_residue_node = np.asarray([np.asarray(row["nn_dist_residue_node"], dtype=float) for row in rows_sorted], dtype=float)
     nn_dist_residue_edge = np.asarray([np.asarray(row["nn_dist_residue_edge"], dtype=float) for row in rows_sorted], dtype=float)
+    nn_dist_edge_per_edge = np.asarray([np.asarray(row["nn_dist_edge_per_edge"], dtype=float) for row in rows_sorted], dtype=float)
     nn_dist_residue = (1.0 - alpha) * nn_dist_residue_node + alpha * nn_dist_residue_edge
 
     weights = sample_counts.astype(float)
@@ -3617,14 +3789,21 @@ def aggregate_potts_nn_mapping_batch(
         [float(np.sum(weights[nn_dist_global <= thr]) / total_weight) if total_weight > 0 else 0.0 for thr in thresholds.tolist()],
         dtype=float,
     )
-    per_residue_mean = np.average(nn_dist_residue, axis=0, weights=weights) if nn_dist_residue.size else np.zeros((0,), dtype=float)
-    per_residue_mean_node = np.average(nn_dist_residue_node, axis=0, weights=weights) if nn_dist_residue_node.size else np.zeros((0,), dtype=float)
-    per_residue_mean_edge = np.average(nn_dist_residue_edge, axis=0, weights=weights) if nn_dist_residue_edge.size else np.zeros((0,), dtype=float)
+    residue_stats = _weighted_stats_matrix(nn_dist_residue, weights)
+    residue_node_stats = _weighted_stats_matrix(nn_dist_residue_node, weights)
+    residue_edge_stats = _weighted_stats_matrix(nn_dist_residue_edge, weights)
+    edge_stats = _weighted_stats_matrix(nn_dist_edge_per_edge, weights)
+    per_residue_mean = residue_stats["mean"]
+    per_residue_mean_node = residue_node_stats["mean"]
+    per_residue_mean_edge = residue_edge_stats["mean"]
     nn_md_rep_original_idx = md_unique_rep_original_indices[nn_md_unique_idx] if nn_md_unique_idx.size else np.zeros((0,), dtype=np.int64)
     nn_md_rep_frame_idx = md_unique_rep_frame_indices[nn_md_unique_idx] if nn_md_unique_idx.size else np.zeros((0,), dtype=np.int64)
 
     np.savez_compressed(
         npz_path,
+        analysis_format_version=np.asarray([2], dtype=np.int32),
+        residue_keys=np.asarray(prepared["residue_keys"], dtype=str),
+        residue_display_labels=np.asarray(prepared.get("residue_display_labels", prepared["residue_keys"]), dtype=str),
         sample_unique_sequences=np.asarray(sample_unique, dtype=np.int32),
         md_unique_sequences=np.asarray(md_unique, dtype=np.int32),
         sample_unique_counts=np.asarray(sample_counts, dtype=np.int64),
@@ -3643,12 +3822,30 @@ def aggregate_potts_nn_mapping_batch(
         nn_dist_edge=np.asarray(nn_dist_edge, dtype=float),
         nn_dist_residue_node=np.asarray(nn_dist_residue_node, dtype=float),
         nn_dist_residue_edge=np.asarray(nn_dist_residue_edge, dtype=float),
+        nn_dist_edge_per_edge=np.asarray(nn_dist_edge_per_edge, dtype=float),
         nn_dist_residue=np.asarray(nn_dist_residue, dtype=float),
         threshold_values=np.asarray(thresholds, dtype=float),
         threshold_coverage=np.asarray(threshold_coverage, dtype=float),
         per_residue_mean=np.asarray(per_residue_mean, dtype=float),
+        per_residue_std=np.asarray(residue_stats["std"], dtype=float),
+        per_residue_median=np.asarray(residue_stats["median"], dtype=float),
+        per_residue_q25=np.asarray(residue_stats["q25"], dtype=float),
+        per_residue_q75=np.asarray(residue_stats["q75"], dtype=float),
         per_residue_mean_node=np.asarray(per_residue_mean_node, dtype=float),
+        per_residue_std_node=np.asarray(residue_node_stats["std"], dtype=float),
+        per_residue_median_node=np.asarray(residue_node_stats["median"], dtype=float),
+        per_residue_q25_node=np.asarray(residue_node_stats["q25"], dtype=float),
+        per_residue_q75_node=np.asarray(residue_node_stats["q75"], dtype=float),
         per_residue_mean_edge=np.asarray(per_residue_mean_edge, dtype=float),
+        per_residue_std_edge=np.asarray(residue_edge_stats["std"], dtype=float),
+        per_residue_median_edge=np.asarray(residue_edge_stats["median"], dtype=float),
+        per_residue_q25_edge=np.asarray(residue_edge_stats["q25"], dtype=float),
+        per_residue_q75_edge=np.asarray(residue_edge_stats["q75"], dtype=float),
+        per_edge_mean=np.asarray(edge_stats["mean"], dtype=float),
+        per_edge_std=np.asarray(edge_stats["std"], dtype=float),
+        per_edge_median=np.asarray(edge_stats["median"], dtype=float),
+        per_edge_q25=np.asarray(edge_stats["q25"], dtype=float),
+        per_edge_q75=np.asarray(edge_stats["q75"], dtype=float),
         max_gap_h=np.asarray(prepared["max_gap_h"], dtype=float),
         max_gap_J=np.asarray(prepared["max_gap_J"], dtype=float),
         edges=np.asarray(prepared["edges"], dtype=np.int32),
@@ -3667,6 +3864,7 @@ def aggregate_potts_nn_mapping_batch(
         "distance_min": float(np.min(nn_dist_global)) if nn_dist_global.size else None,
         "distance_max": float(np.max(nn_dist_global)) if nn_dist_global.size else None,
         "threshold_coverage": {str(float(thr)): float(val) for thr, val in zip(thresholds.tolist(), threshold_coverage.tolist())},
+        "analysis_format_version": 2,
     }
     meta = {
         "analysis_id": str(prepared["analysis_id"]),
@@ -3693,6 +3891,7 @@ def aggregate_potts_nn_mapping_batch(
         "top_k_candidates": prepared.get("top_k_candidates"),
         "chunk_size": int(prepared["chunk_size"]),
         "distance_thresholds": [float(v) for v in thresholds.tolist()],
+        "analysis_format_version": 2,
         "workers": int(max(1, workers_used)),
         "paths": {"analysis_npz": _relativize(npz_path, system_dir)},
         "summary": summary,
