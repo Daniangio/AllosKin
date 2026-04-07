@@ -82,6 +82,7 @@ export default function DescriptorVizPage() {
   const [helpOpen, setHelpOpen] = useState(false);
 
   const [selectedStates, setSelectedStates] = useState([]);
+  const [appliedStates, setAppliedStates] = useState([]);
   const [selectedMetastableIds, setSelectedMetastableIds] = useState([]);
   const [residueFilter, setResidueFilter] = useState('');
   const [selectedResidue, setSelectedResidue] = useState('');
@@ -164,7 +165,9 @@ export default function DescriptorVizPage() {
         setSystem(data);
         const descriptorStates = Object.values(data.states || {}).filter((s) => s.descriptor_file);
         if (descriptorStates.length) {
-          setSelectedStates((prev) => (prev.length ? prev : descriptorStates.map((s) => s.state_id)));
+          const firstStateId = descriptorStates[0].state_id;
+          setSelectedStates((prev) => (prev.length ? prev : [firstStateId]));
+          setAppliedStates((prev) => (prev.length ? prev : [firstStateId]));
         }
       } catch (err) {
         setError(err.message);
@@ -257,7 +260,7 @@ export default function DescriptorVizPage() {
     (key) => {
       if (residueLabelCache[key]) return residueLabelCache[key];
       const metasInOrder = [
-        ...selectedStates.map((stateId) => metaByState[stateId]).filter(Boolean),
+        ...appliedStates.map((stateId) => metaByState[stateId]).filter(Boolean),
         ...Object.values(metaByState),
       ];
 
@@ -275,7 +278,7 @@ export default function DescriptorVizPage() {
 
       return key;
     },
-    [metaByState, residueLabelCache, selectedStates]
+    [appliedStates, metaByState, residueLabelCache]
   );
 
   const filteredResidues = useMemo(() => {
@@ -500,10 +503,10 @@ export default function DescriptorVizPage() {
   // Preload residue labels/resnames so the list keeps informative names even before a residue is loaded
   useEffect(() => {
     const bootstrapLabels = async () => {
-      if (!selectedStates.length) return;
+      if (!appliedStates.length) return;
       const requestId = ++bootstrapLabelsRequestIdRef.current;
       try {
-        const stateId = selectedStates[0];
+        const stateId = appliedStates[0];
         const data = await fetchStateDescriptors(projectId, systemId, stateId, { max_points: 10 });
         if (requestId !== bootstrapLabelsRequestIdRef.current) return;
         const labels = data.residue_labels || {};
@@ -531,11 +534,11 @@ export default function DescriptorVizPage() {
     };
     bootstrapLabels();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, systemId, selectedStates, sortResidues]);
+  }, [appliedStates, projectId, systemId, sortResidues]);
 
   const loadAngles = useCallback(async () => {
     const requestId = ++loadAnglesRequestIdRef.current;
-    if (!selectedStates.length) {
+    if (!appliedStates.length) {
       setAnglesByState({});
       setMetaByState({});
       setClusterLegend([]);
@@ -564,7 +567,7 @@ export default function DescriptorVizPage() {
       }
 
       const responses = await Promise.all(
-        selectedStates.map(async (stateId) => {
+        appliedStates.map(async (stateId) => {
           const data = await fetchStateDescriptors(projectId, systemId, stateId, qs);
           return { stateId, data };
         })
@@ -718,13 +721,13 @@ export default function DescriptorVizPage() {
     selectedMetastableIds,
     selectedClusterId,
     selectedResidue,
-    selectedStates,
+    appliedStates,
     sortResidues,
     systemId,
   ]);
 
   useEffect(() => {
-    if (selectedStates.length) {
+    if (appliedStates.length) {
       loadAngles();
     } else {
       setAnglesByState({});
@@ -732,7 +735,7 @@ export default function DescriptorVizPage() {
       setSelectedResidue('');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedStates, selectedClusterId, selectedResidue, clusterLabelMode, selectedClusterVariantId, selectedMetastableIds]);
+  }, [appliedStates, selectedClusterId, selectedResidue, clusterLabelMode, selectedClusterVariantId, selectedMetastableIds]);
 
   useEffect(() => {
     if (!patchResiduesInput && selectedResidue) {
@@ -1024,14 +1027,23 @@ export default function DescriptorVizPage() {
 
   const stateSummaries = useMemo(
     () =>
-      selectedStates.map((stateId) => ({
+      appliedStates.map((stateId) => ({
         stateId,
         name: stateName(stateId),
         frames: metaByState[stateId]?.n_frames,
         stride: metaByState[stateId]?.sample_stride,
       })),
-    [metaByState, selectedStates, stateName]
+    [appliedStates, metaByState, stateName]
   );
+
+  const hasPendingStateSelection = useMemo(() => {
+    if (selectedStates.length !== appliedStates.length) return true;
+    return selectedStates.some((stateId, idx) => stateId !== appliedStates[idx]);
+  }, [appliedStates, selectedStates]);
+
+  const handleRefreshData = useCallback(() => {
+    setAppliedStates([...selectedStates]);
+  }, [selectedStates]);
 
   if (loadingSystem) return <Loader message="Loading system..." />;
   if (error) return <ErrorMessage message={error} />;
@@ -1069,7 +1081,10 @@ export default function DescriptorVizPage() {
           </button>
           <div className="text-xs text-gray-400 text-right space-y-0.5">
             <div>
-              States: {selectedStates.length ? stateSummaries.map((s) => s.name).join(', ') : '—'}
+              Loaded states: {appliedStates.length ? stateSummaries.map((s) => s.name).join(', ') : '—'}
+            </div>
+            <div>
+              Selected states: {selectedStates.length ? selectedStates.map((stateId) => stateName(stateId)).join(', ') : '—'}
             </div>
             <div>
               Metastable: {selectedMetastableIds.length ? selectedMetastableIds.length : 'All'}
@@ -1107,12 +1122,17 @@ export default function DescriptorVizPage() {
               />
             </div>
             <button
-              onClick={loadAngles}
+              onClick={handleRefreshData}
               disabled={loadingAngles || !selectedStates.length}
               className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-semibold py-2 rounded-md disabled:opacity-50"
             >
               {loadingAngles ? 'Loading…' : 'Refresh data'}
             </button>
+            {hasPendingStateSelection && (
+              <p className="text-[11px] text-amber-300">
+                State selection changed. Click `Refresh data` to apply it.
+              </p>
+            )}
             <div>
               <div className="flex items-center justify-between mb-2">
                 <p className="text-xs text-gray-400">Macro states</p>

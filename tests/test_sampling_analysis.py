@@ -8,6 +8,7 @@ import numpy as np
 os.environ.setdefault("PHASE_DATA_ROOT", "/tmp/phase-test-data")
 
 from backend import tasks
+from backend.api.v1.analysis_payloads import downsample_model_energy_payload
 from backend.tasks import run_md_samples_refresh_job
 from phase.potts.analysis_run import analyze_cluster_samples, append_state_pose_energies
 from phase.potts.potts_model import PottsModel, save_potts_model
@@ -590,3 +591,17 @@ def test_run_potts_analysis_job_uses_distributed_rq_workers(tmp_path, monkeypatc
     assert out["results"]["summary"]["comparisons_written"] == 1
     assert any(name == "run_potts_analysis_payload_job" for name, _args, _kwargs in enqueued)
     assert any(name == "run_potts_analysis_aggregate_job" for name, _args, _kwargs in enqueued)
+
+
+def test_downsample_model_energy_payload_limits_rows_and_is_reproducible():
+    payload = {"energies": np.arange(100, dtype=float)}
+    out_a = downsample_model_energy_payload(payload, row_limit=15, seed=7)
+    out_b = downsample_model_energy_payload(payload, row_limit=15, seed=7)
+
+    assert np.asarray(out_a["energies"]).shape == (15,)
+    assert np.asarray(out_a["sampled_row_indices"]).shape == (15,)
+    assert np.array_equal(np.asarray(out_a["energies"]), np.asarray(out_b["energies"]))
+    assert np.array_equal(np.asarray(out_a["sampled_row_indices"]), np.asarray(out_b["sampled_row_indices"]))
+    assert int(np.asarray(out_a["sampled_row_count"]).ravel()[0]) == 15
+    assert int(np.asarray(out_a["original_row_count"]).ravel()[0]) == 100
+    assert int(np.asarray(out_a["downsampled"]).ravel()[0]) == 1

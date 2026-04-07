@@ -161,6 +161,7 @@ export default function PottsNearestNeighborGraphPage() {
   const [alpha, setAlpha] = useState(0.75);
   const [topEdges, setTopEdges] = useState(250);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [hoveredGraphItem, setHoveredGraphItem] = useState(null);
 
   useEffect(() => {
     const loadSystem = async () => {
@@ -651,7 +652,7 @@ export default function PottsNearestNeighborGraphPage() {
                 <div className="mb-3 flex items-center justify-between gap-2">
                   <div>
                     <h2 className="text-sm font-semibold text-white">Mismatch graph</h2>
-                    <p className="text-xs text-gray-400">Red nodes encode residue-level mismatch. Green edges encode edge-level mismatch in Edge view only. Combined view hides edges and folds edge-attributed mismatch into node color using α.</p>
+                    <p className="text-xs text-gray-400">Red nodes encode residue-level mismatch. Green edges encode edge-level mismatch in Edge view only. Combined view hides edges and folds edge-attributed mismatch into node color using α. Labels are available in the hover panel, not drawn on the graph.</p>
                   </div>
                 </div>
                 {graphModel ? (
@@ -667,28 +668,52 @@ export default function PottsNearestNeighborGraphPage() {
                           stroke={edge.color}
                           strokeWidth={edge.width}
                           opacity={edge.opacity}
+                          onMouseEnter={() => setHoveredGraphItem({
+                            type: 'edge',
+                            label: edge.label,
+                            title: edge.title,
+                            value: edge.value,
+                          })}
+                          onMouseLeave={() => setHoveredGraphItem((prev) => (prev?.type === 'edge' && prev?.label === edge.label ? null : prev))}
                         >
                           <title>{edge.title}</title>
                         </line>
                       ))}
-                      {graphModel.showEdges && graphModel.edges.length <= 40 ? graphModel.edges.map((edge) => (
-                        <text key={`edge-label-${edge.idx}`} x={edge.labelX} y={edge.labelY} textAnchor="middle" fontSize="10" fill="rgba(226,232,240,0.75)">
-                          {edge.label}
-                        </text>
-                      )) : null}
                       {graphModel.nodes.map((node) => (
                         <g key={`node-${node.idx}`}>
-                          <circle cx={node.x} cy={node.y} r={node.radius} fill={node.color} stroke="rgba(17,24,39,0.95)" strokeWidth="1.5">
+                          <circle
+                            cx={node.x}
+                            cy={node.y}
+                            r={node.radius}
+                            fill={node.color}
+                            stroke="rgba(17,24,39,0.95)"
+                            strokeWidth="1.5"
+                            onMouseEnter={() => setHoveredGraphItem({
+                              type: 'node',
+                              label: node.key,
+                              title: node.title,
+                              value: node.value,
+                            })}
+                            onMouseLeave={() => setHoveredGraphItem((prev) => (prev?.type === 'node' && prev?.label === node.key ? null : prev))}
+                          >
                             <title>{node.title}</title>
                           </circle>
-                          <text x={node.labelX} y={node.labelY} textAnchor={node.labelAnchor} fontSize="11" fill="rgba(229,231,235,0.95)">
-                            {node.key}
-                          </text>
                         </g>
                       ))}
                     </svg>
                   </div>
                 ) : null}
+                <div className="mt-3 rounded-md border border-gray-800 bg-gray-950/60 p-3 text-xs text-gray-300 min-h-[72px]">
+                  <div className="font-semibold text-white mb-1">Hover info</div>
+                  {hoveredGraphItem ? (
+                    <div className="space-y-1">
+                      <div className="text-white">{hoveredGraphItem.label}</div>
+                      <div className="whitespace-pre-line text-gray-300">{hoveredGraphItem.title}</div>
+                    </div>
+                  ) : (
+                    <div className="text-gray-500">Hover a node or edge in the graph to inspect its identity and mismatch values.</div>
+                  )}
+                </div>
                 <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3 text-xs text-gray-300">
                   <div className="rounded-md border border-gray-800 bg-gray-950/60 p-3">
                     <div className="font-semibold text-white mb-1">Main graph meaning</div>
@@ -696,7 +721,7 @@ export default function PottsNearestNeighborGraphPage() {
                   </div>
                   <div className="rounded-md border border-gray-800 bg-gray-950/60 p-3">
                     <div className="font-semibold text-white mb-1">Labels</div>
-                    <div>Node labels are residue keys. Edge labels are shown on the graph when few edges are displayed, and always in the edge ranking plot below.</div>
+                    <div>Residue and edge names are shown in the hover info panel and in the ranking plots below, not directly on the graph.</div>
                   </div>
                   <div className="rounded-md border border-gray-800 bg-gray-950/60 p-3">
                     <div className="font-semibold text-white mb-1">Color scale</div>
@@ -718,9 +743,9 @@ export default function PottsNearestNeighborGraphPage() {
                     {residueRows.slice(0, 20).map((row) => (
                       <div key={row.key} className="grid grid-cols-[minmax(0,1fr),90px,90px,90px] gap-3 text-xs text-gray-300">
                         <span className="text-white">{row.key}</span>
-                        <span>shown {row.value.toFixed(3)}</span>
-                        <span>node {row.nodeOnly.toFixed(3)}</span>
-                        <span>edge {row.edgeAttributed.toFixed(3)}</span>
+                        <span>shown {row.value.toFixed(4)}</span>
+                        <span>node {row.nodeOnly.toFixed(4)}</span>
+                        <span>edge {row.edgeAttributed.toFixed(4)}</span>
                       </div>
                     ))}
                   </div>
@@ -740,7 +765,7 @@ export default function PottsNearestNeighborGraphPage() {
                     {edgeRows.slice(0, 20).map((row) => (
                       <div key={row.label} className="grid grid-cols-[minmax(0,1fr),90px] gap-3 text-xs text-gray-300">
                         <span className="text-white">{row.label}</span>
-                        <span>{row.value.toFixed(3)}</span>
+                        <span>{row.value.toFixed(4)}</span>
                       </div>
                     ))}
                   </div>

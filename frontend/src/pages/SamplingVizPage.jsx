@@ -204,6 +204,7 @@ export default function SamplingVizPage() {
   const [selectedAnalysisModelId, setSelectedAnalysisModelId] = useState('');
   const [runAnalysisModelId, setRunAnalysisModelId] = useState('');
   const [selectedPoseStateId, setSelectedPoseStateId] = useState('');
+  const [energyLoadLimit, setEnergyLoadLimit] = useState(1500);
 
   const [selectedMdSampleId, setSelectedMdSampleId] = useState('');
   const [selectedSampleId, setSelectedSampleId] = useState('');
@@ -532,16 +533,19 @@ export default function SamplingVizPage() {
   }, [mdVsSampleAnalyses, selectedMdSampleId, selectedSampleId, selectedAnalysisModelId, mdLabelMode, dropInvalid]);
 
   const loadAnalysisData = useCallback(
-    async (analysisType, analysisId) => {
+    async (analysisType, analysisId, options = {}) => {
       if (!analysisType || !analysisId) return null;
-      const cacheKey = `${analysisType}:${analysisId}`;
+      const maxRowsKey = options?.maxRows != null ? `:maxRows=${Number(options.maxRows)}` : '';
+      const summaryOnlyKey = options?.summaryOnly ? ':summaryOnly=1' : '';
+      const sampleSeedKey = options?.sampleSeed != null ? `:seed=${Number(options.sampleSeed)}` : '';
+      const cacheKey = `${analysisType}:${analysisId}${maxRowsKey}${summaryOnlyKey}${sampleSeedKey}`;
       const cached = analysisDataCacheRef.current;
       if (Object.prototype.hasOwnProperty.call(cached, cacheKey)) return cached[cacheKey];
 
       const inflight = analysisDataInFlightRef.current;
       if (inflight[cacheKey]) return inflight[cacheKey];
 
-      const p = fetchClusterAnalysisData(projectId, systemId, selectedClusterId, analysisType, analysisId)
+      const p = fetchClusterAnalysisData(projectId, systemId, selectedClusterId, analysisType, analysisId, options)
         .then((payload) => {
           analysisDataCacheRef.current = { ...analysisDataCacheRef.current, [cacheKey]: payload };
           setAnalysisDataCache((prev) => ({ ...prev, [cacheKey]: payload }));
@@ -870,7 +874,10 @@ export default function SamplingVizPage() {
         // Load energies for all samples (MD + Potts) that have an analysis for this model.
         for (let idx = 0; idx < metas.length; idx += 1) {
           const meta = metas[idx];
-          const payload = await loadAnalysisData('model_energy', meta.analysis_id);
+          const payload = await loadAnalysisData('model_energy', meta.analysis_id, {
+            maxRows: energyLoadLimit > 0 ? energyLoadLimit : undefined,
+            sampleSeed: 0,
+          });
           const energies = payload?.data?.energies || [];
           if (!Array.isArray(energies) || !energies.length) continue;
           const sample = sampleEntries.find((s) => s.sample_id === meta.sample_id);
@@ -890,7 +897,7 @@ export default function SamplingVizPage() {
     };
     run();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedAnalysisModelId, energyAnalysesForModel, loadAnalysisData]);
+  }, [selectedAnalysisModelId, energyAnalysesForModel, energyLoadLimit, loadAnalysisData]);
 
   const energyPlot = useMemo(() => {
     if (!energySeries.length) return null;
@@ -1220,6 +1227,32 @@ export default function SamplingVizPage() {
                 <Play className="h-4 w-4" />
                 Run analysis
               </button>
+            </div>
+
+            <div className="space-y-2 rounded-md border border-gray-800 bg-gray-950/40 p-3">
+              <p className="text-xs font-semibold text-gray-300">Load limits</p>
+              <div className="space-y-1">
+                <label className="block text-xs text-gray-400">Max energy points per sample</label>
+                <select
+                  value={String(energyLoadLimit)}
+                  onChange={(e) => {
+                    const next = Number(e.target.value);
+                    setEnergyLoadLimit(Number.isFinite(next) ? next : 1500);
+                  }}
+                  className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
+                >
+                  <option value="500">500</option>
+                  <option value="1000">1000</option>
+                  <option value="1500">1500</option>
+                  <option value="3000">3000</option>
+                  <option value="5000">5000</option>
+                  <option value="0">All</option>
+                </select>
+              </div>
+              <p className="text-[11px] text-gray-500">
+                Energy histograms can require large payloads because each analysis stores one energy per frame. By default, the page loads a
+                random server-side subset of 1500 energies per sample.
+              </p>
             </div>
 
             <div className="space-y-2 rounded-md border border-gray-800 bg-gray-950/40 p-3">

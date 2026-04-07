@@ -49,6 +49,12 @@ Interpretation:
 - Different samples can have different energy ranges.
 - If a Potts sampler is working “as intended”, Potts-generated samples often sit in a similar energy band as the MD ensembles the model was trained to represent (but this is not guaranteed).
 
+Because each stored `model_energy` analysis contains one energy per frame, this panel can become heavy when many long trajectories are present. The web UI therefore supports a server-side load cap:
+
+- **Max energy points per sample**: loads at most a random subset of that many energies per sample.
+- Default: `1500`
+- Use `All` only when you really need the full histograms.
+
 ## Running The Analysis
 
 The Sampling Explorer analysis has two work-unit types:
