@@ -12,6 +12,8 @@ This dataset is built per `md_eval` sample.
 - `residue_cluster_counts`: `(n_residues,)` number of clusters available for each residue
 - `dihedrals`: `(n_frames, n_residues, n_dihedrals)` raw dihedral values in radians
 - `dihedral_keys`: names of the dihedral dimensions, currently `phi`, `psi`, `omega`, `chi1`, `chi2`
+- `dihedral_atom_indices`: `(n_residues, n_dihedrals, 4)` local atom indices into the saved `trajectory` atom axis for the 4 atoms defining each dihedral; missing dihedrals are encoded as `-1`
+- `dihedral_mask`: `(n_residues, n_dihedrals)` boolean mask telling which residue/dihedral combinations are actually defined
 - `residue_keys`: cluster residue keys in the same order as `residue_cluster_ids`
 - `frame_indices`: original frame indices used from the uploaded trajectory
 - `frame_state_ids`: source state id for each kept frame
@@ -44,3 +46,8 @@ The script asks for:
 - trajectory path
 
 It writes `backmapping_dataset.npz` into the selected sample folder and updates that sample's metadata.
+
+Notes:
+
+- The indices refer to the local atom order of `trajectory[frame, atom, xyz]`, not global MDAnalysis atom indices.
+- `dihedral_atom_indices` are frame-invariant for a fixed atom selection, so they are stored once per residue/dihedral pair.

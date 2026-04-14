@@ -211,6 +211,25 @@ def _build_named_dihedral_indices(
     return out
 
 
+def _build_dense_dihedral_atom_indices(
+    dihedral_indices: Dict[str, Tuple[np.ndarray, np.ndarray]],
+    *,
+    n_residues: int,
+    atom_index_to_local: Dict[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    dense = np.full((n_residues, len(DIHEDRAL_KEYS), 4), -1, dtype=np.int32)
+    mask = np.zeros((n_residues, len(DIHEDRAL_KEYS)), dtype=bool)
+    for dim_idx, name in enumerate(DIHEDRAL_KEYS):
+        idxs, residue_rows = dihedral_indices.get(name, (np.zeros((0, 4), dtype=int), np.zeros((0,), dtype=int)))
+        if idxs.size == 0 or residue_rows.size == 0:
+            continue
+        for row_atoms, residue_row in zip(np.asarray(idxs, dtype=int), np.asarray(residue_rows, dtype=int)):
+            local = [atom_index_to_local.get(int(atom_idx), -1) for atom_idx in np.asarray(row_atoms, dtype=int).tolist()]
+            dense[int(residue_row), dim_idx, :] = np.asarray(local, dtype=np.int32)
+            mask[int(residue_row), dim_idx] = all(v >= 0 for v in local)
+    return dense, mask
+
+
 def _load_cluster_label_metadata(cluster_path: Path) -> tuple[np.ndarray, np.ndarray]:
     with np.load(cluster_path, allow_pickle=True) as cluster_npz:
         residue_keys = np.asarray(cluster_npz["residue_keys"]).astype(str)
@@ -303,6 +322,7 @@ def build_sample_backmapping_dataset(
     atom_residue_index = np.full(atoms.n_atoms, -1, dtype=np.int32)
     atom_resids = np.asarray([int(atom.resid) for atom in atoms], dtype=np.int32)
     atom_names = np.asarray([str(atom.name) for atom in atoms], dtype=str)
+    atom_index_to_local = {int(atom.index): int(idx_atom) for idx_atom, atom in enumerate(atoms)}
     for idx_atom, atom in enumerate(atoms):
         mapped = residue_index_map.get(int(atom.resid))
         if mapped is not None:
@@ -313,6 +333,11 @@ def build_sample_backmapping_dataset(
     dihedrals = np.full((n_rows, n_residues, len(DIHEDRAL_KEYS)), np.nan, dtype=np.float32)
 
     dihedral_indices = _build_named_dihedral_indices(atoms.residues, residue_index_map)
+    dihedral_atom_indices, dihedral_mask = _build_dense_dihedral_atom_indices(
+        dihedral_indices,
+        n_residues=n_residues,
+        atom_index_to_local=atom_index_to_local,
+    )
 
     frame_to_rows: Dict[int, List[int]] = {}
     for row_idx, frame_idx in enumerate(frame_indices.tolist()):
@@ -366,6 +391,8 @@ def build_sample_backmapping_dataset(
         "sample_id": np.asarray(sample_id, dtype=str),
         "dihedrals": dihedrals,
         "dihedral_keys": np.asarray(DIHEDRAL_KEYS, dtype=str),
+        "dihedral_atom_indices": dihedral_atom_indices,
+        "dihedral_mask": dihedral_mask,
     }
     np.savez_compressed(output_path, **payload)
     return {

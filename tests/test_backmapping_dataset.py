@@ -122,6 +122,14 @@ def test_build_sample_backmapping_dataset_writes_expected_arrays(monkeypatch, tm
         assert np.array_equal(data["residue_cluster_counts"], np.asarray([2, 3], dtype=np.int32))
         assert data["dihedrals"].shape == (2, 2, 5)
         assert np.array_equal(data["dihedral_keys"].astype(str), np.asarray(["phi", "psi", "omega", "chi1", "chi2"]))
+        assert data["dihedral_atom_indices"].shape == (2, 5, 4)
+        assert data["dihedral_mask"].shape == (2, 5)
+        # ALA residue 1 has psi available in this minimal toy structure.
+        assert np.array_equal(data["dihedral_atom_indices"][0, 1], np.asarray([0, 1, 2, 4], dtype=np.int32))
+        assert bool(data["dihedral_mask"][0, 1]) is True
+        # Missing dihedrals are encoded with -1 atom indices.
+        assert np.array_equal(data["dihedral_atom_indices"][1, 3], np.asarray([-1, -1, -1, -1], dtype=np.int32))
+        assert bool(data["dihedral_mask"][1, 3]) is False
 
 
 def test_build_sample_backmapping_dataset_accepts_legacy_truncated_frame_state_ids(monkeypatch, tmp_path):

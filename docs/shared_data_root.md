@@ -68,6 +68,24 @@ This writes:
 ```bash
 PHASE_UID=<your uid>
 PHASE_GID=<your gid>
+PHASE_DATA_ROOT=<your exported PHASE_DATA_ROOT>   # if set
+```
+
+If `PHASE_DATA_ROOT` is not exported when you run `./scripts/compose_env.sh`, the compose file falls back to `./data`.
+That fallback is only safe if the repository checkout itself is writable by the current user.
+On shared machines this is often false, and the backend will fail on startup with:
+
+```text
+PermissionError: [Errno 13] Permission denied: '/data/phase/projects'
+```
+
+So the correct sequence is always:
+
+```bash
+export PHASE_DATA_ROOT=/scratch/$USER/phase-data
+mkdir -p "$PHASE_DATA_ROOT"
+./scripts/compose_env.sh
+docker compose up --build
 ```
 
 3. Start the stack:

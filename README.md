@@ -121,9 +121,17 @@ This writes:
 ```bash
 PHASE_UID=<your uid>
 PHASE_GID=<your gid>
+PHASE_DATA_ROOT=<your exported PHASE_DATA_ROOT>   # if set
 ```
 
 The compose file uses these values so `backend` and `worker` write files as your host user, not as `root`.
+
+Important:
+
+- export `PHASE_DATA_ROOT` **before** running `./scripts/compose_env.sh`
+- otherwise Compose falls back to `./data`
+- if the repository checkout is owned by another user, `./data` may be unwritable and Docker will fail at runtime with:
+  - `PermissionError: [Errno 13] Permission denied: '/data/phase/projects'`
 
 ### 3. Start the web stack
 
