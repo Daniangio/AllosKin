@@ -69,6 +69,9 @@ This writes:
 PHASE_UID=<your uid>
 PHASE_GID=<your gid>
 PHASE_DATA_ROOT=<your exported PHASE_DATA_ROOT>   # if set
+PHASE_FRONTEND_PORT=<optional host frontend port>
+PHASE_BACKEND_PORT=<optional host backend port>
+PHASE_REDIS_PORT=<optional host redis port>
 ```
 
 If `PHASE_DATA_ROOT` is not exported when you run `./scripts/compose_env.sh`, the compose file falls back to `./data`.

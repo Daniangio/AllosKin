@@ -7,13 +7,16 @@ ENV_FILE="${ROOT_DIR}/.env"
 UID_VAL="$(id -u)"
 GID_VAL="$(id -g)"
 DATA_ROOT_VAL="${PHASE_DATA_ROOT:-}"
+BACKEND_PORT_VAL="${PHASE_BACKEND_PORT:-}"
+FRONTEND_PORT_VAL="${PHASE_FRONTEND_PORT:-}"
+REDIS_PORT_VAL="${PHASE_REDIS_PORT:-}"
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
 
 if [ -f "$ENV_FILE" ]; then
   # Remove previous values (keep any other compose env vars intact).
-  grep -v -E '^(PHASE_UID|PHASE_GID|PHASE_DATA_ROOT)=' "$ENV_FILE" > "$tmp" || true
+  grep -v -E '^(PHASE_UID|PHASE_GID|PHASE_DATA_ROOT|PHASE_BACKEND_PORT|PHASE_FRONTEND_PORT|PHASE_REDIS_PORT)=' "$ENV_FILE" > "$tmp" || true
 else
   : > "$tmp"
 fi
@@ -23,6 +26,15 @@ fi
   echo "PHASE_GID=${GID_VAL}"
   if [ -n "$DATA_ROOT_VAL" ]; then
     echo "PHASE_DATA_ROOT=${DATA_ROOT_VAL}"
+  fi
+  if [ -n "$BACKEND_PORT_VAL" ]; then
+    echo "PHASE_BACKEND_PORT=${BACKEND_PORT_VAL}"
+  fi
+  if [ -n "$FRONTEND_PORT_VAL" ]; then
+    echo "PHASE_FRONTEND_PORT=${FRONTEND_PORT_VAL}"
+  fi
+  if [ -n "$REDIS_PORT_VAL" ]; then
+    echo "PHASE_REDIS_PORT=${REDIS_PORT_VAL}"
   fi
 } >> "$tmp"
 
@@ -36,4 +48,19 @@ if [ -n "$DATA_ROOT_VAL" ]; then
   echo "  PHASE_DATA_ROOT=${DATA_ROOT_VAL}"
 else
   echo "  PHASE_DATA_ROOT not exported; docker-compose will fall back to ./data"
+fi
+if [ -n "$FRONTEND_PORT_VAL" ]; then
+  echo "  PHASE_FRONTEND_PORT=${FRONTEND_PORT_VAL}"
+else
+  echo "  PHASE_FRONTEND_PORT not exported; docker-compose will use 18080"
+fi
+if [ -n "$BACKEND_PORT_VAL" ]; then
+  echo "  PHASE_BACKEND_PORT=${BACKEND_PORT_VAL}"
+else
+  echo "  PHASE_BACKEND_PORT not exported; docker-compose will use 18000"
+fi
+if [ -n "$REDIS_PORT_VAL" ]; then
+  echo "  PHASE_REDIS_PORT=${REDIS_PORT_VAL}"
+else
+  echo "  PHASE_REDIS_PORT not exported; docker-compose will use 16380"
 fi

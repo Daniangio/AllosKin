@@ -5,7 +5,7 @@ services:
       dockerfile: Dockerfile
     user: "${PHASE_UID:-1000}:${PHASE_GID:-1000}"
     ports:
-      - "8000:8000"
+      - "${PHASE_BACKEND_PORT:-18000}:8000"
     volumes:
       # Persist application data only
       - ${PHASE_DATA_ROOT:-./data}:/data/phase
@@ -34,7 +34,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "${PHASE_FRONTEND_PORT:-18080}:3000"
     depends_on:
       backend:
         condition: service_healthy
@@ -60,4 +60,4 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6380:6379"
+      - "${PHASE_REDIS_PORT:-16380}:6379"

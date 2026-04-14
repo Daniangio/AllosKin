@@ -122,6 +122,9 @@ This writes:
 PHASE_UID=<your uid>
 PHASE_GID=<your gid>
 PHASE_DATA_ROOT=<your exported PHASE_DATA_ROOT>   # if set
+PHASE_FRONTEND_PORT=<optional host frontend port>
+PHASE_BACKEND_PORT=<optional host backend port>
+PHASE_REDIS_PORT=<optional host redis port>
 ```
 
 The compose file uses these values so `backend` and `worker` write files as your host user, not as `root`.
@@ -198,7 +201,22 @@ docker compose -f docker-compose.yaml -f docker-compose.gpu.yaml up -d
 
 The web UI is then available at:
 
-- `http://localhost:3000`
+- `http://localhost:18080`
+
+Default host ports are intentionally non-standard to avoid clashing with other local Docker web stacks:
+
+- frontend: `18080`
+- backend API: `18000`
+- redis: `16380`
+
+You can override them by exporting:
+
+```bash
+export PHASE_FRONTEND_PORT=28080
+export PHASE_BACKEND_PORT=28000
+export PHASE_REDIS_PORT=26380
+./scripts/compose_env.sh
+```
 
 ### Development stack
 
@@ -292,8 +310,8 @@ docker compose up --build
 If you want Docker containers to use host GPUs for Potts fitting, see `docs/docker_gpu.md`.
 
 Services:
-- Backend API: `http://localhost:8000` (OpenAPI docs at `/docs`)
-- Frontend: `http://localhost:3000`
+- Backend API: `http://localhost:18000` (OpenAPI docs at `/docs`)
+- Frontend: `http://localhost:18080`
 
 Data is stored under the Docker volume mapped to `PHASE_DATA_ROOT` inside the container (default in compose: `/data/phase`).
 
