@@ -210,6 +210,19 @@ class DeltaCommitmentJobRequest(BaseModel):
     energy_bins: Optional[int] = None
 
 
+class EndpointFrustrationJobRequest(BaseModel):
+    project_id: str
+    system_id: str
+    cluster_id: str
+    model_a_id: str
+    model_b_id: str
+    sample_ids: List[str]
+    md_label_mode: Optional[str] = None  # assigned|halo
+    keep_invalid: Optional[bool] = None
+    top_k_edges: Optional[int] = None
+    workers: Optional[int] = None
+
+
 class DeltaJsJobRequest(BaseModel):
     """
     Incremental delta-JS A/B/Other analysis for a fixed (model A, model B) pair.

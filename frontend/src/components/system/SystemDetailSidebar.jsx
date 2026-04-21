@@ -76,7 +76,7 @@ export default function SystemDetailSidebar({
           onClick={() => navigate(`/projects/${projectId}/systems/${systemId}/sampling/delta_eval${buildSamplingSuffix()}`)}
           className="text-xs px-2 py-2 rounded-md border border-gray-700 text-gray-200 hover:bg-gray-700/40"
         >
-          Delta eval
+          Endpoint analysis
         </button>
         <button
           type="button"
@@ -85,7 +85,7 @@ export default function SystemDetailSidebar({
           }
           className="text-xs px-2 py-2 rounded-md border border-gray-700 text-gray-200 hover:bg-gray-700/40"
         >
-          Delta 3D
+          Endpoint 3D
         </button>
         <button
           type="button"

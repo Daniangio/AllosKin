@@ -63,6 +63,13 @@ export function submitDeltaCommitmentJob(payload) {
   });
 }
 
+export function submitEndpointFrustrationJob(payload) {
+  return requestJSON('/submit/endpoint_frustration', {
+    method: 'POST',
+    body: payload,
+  });
+}
+
 export function submitDeltaJsJob(payload) {
   return requestJSON('/submit/delta_js', {
     method: 'POST',

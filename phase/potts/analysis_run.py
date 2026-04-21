@@ -2250,6 +2250,805 @@ def compute_delta_transition_analysis(
     }
 
 
+def _robust_center_scale(values: np.ndarray, *, eps: float = 1e-9) -> tuple[float, float]:
+    arr = np.asarray(values, dtype=float).ravel()
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 0.0, 1.0
+    center = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - center)))
+    scale = 1.4826 * mad
+    if not np.isfinite(scale) or scale <= eps:
+        scale = float(np.std(arr))
+    if not np.isfinite(scale) or scale <= eps:
+        scale = 1.0
+    return center, scale
+
+
+def _residue_neighbors_with_self(n_residues: int, edges: Sequence[tuple[int, int]]) -> list[np.ndarray]:
+    neighbors: list[set[int]] = [set([i]) for i in range(int(n_residues))]
+    for raw_r, raw_s in edges:
+        r = int(raw_r)
+        s = int(raw_s)
+        if r < 0 or s < 0 or r >= int(n_residues) or s >= int(n_residues) or r == s:
+            continue
+        neighbors[r].add(s)
+        neighbors[s].add(r)
+    return [np.asarray(sorted(ids), dtype=int) for ids in neighbors]
+
+
+def _selected_edge_neighbor_lists(selected_edges: Sequence[tuple[int, int]]) -> list[np.ndarray]:
+    incident: list[list[int]] = [[] for _ in range(len(selected_edges))]
+    residue_to_cols: dict[int, list[int]] = {}
+    for col, (raw_r, raw_s) in enumerate(selected_edges):
+        r = int(raw_r)
+        s = int(raw_s)
+        residue_to_cols.setdefault(r, []).append(col)
+        residue_to_cols.setdefault(s, []).append(col)
+    for col, (raw_r, raw_s) in enumerate(selected_edges):
+        r = int(raw_r)
+        s = int(raw_s)
+        linked = set([col])
+        linked.update(residue_to_cols.get(r, []))
+        linked.update(residue_to_cols.get(s, []))
+        incident[col] = sorted(linked)
+    return [np.asarray(cols, dtype=int) for cols in incident]
+
+
+def _compute_local_node_energies(X: np.ndarray, model: PottsModel, edges: Sequence[tuple[int, int]]) -> np.ndarray:
+    labels = np.asarray(X, dtype=int)
+    t_count, n_residues = labels.shape
+    out = np.zeros((t_count, n_residues), dtype=np.float32)
+    for ridx in range(n_residues):
+        out[:, ridx] = np.asarray(model.h[ridx], dtype=float)[labels[:, ridx]].astype(np.float32, copy=False)
+    for raw_r, raw_s in edges:
+        r = int(raw_r)
+        s = int(raw_s)
+        vals = np.asarray(model.coupling(r, s), dtype=float)[labels[:, r], labels[:, s]].astype(np.float32, copy=False)
+        out[:, r] += 0.5 * vals
+        out[:, s] += 0.5 * vals
+    return out
+
+
+def _compute_selected_edge_energies(
+    X: np.ndarray,
+    model: PottsModel,
+    selected_edges: Sequence[tuple[int, int]],
+) -> np.ndarray:
+    labels = np.asarray(X, dtype=int)
+    t_count = labels.shape[0]
+    edge_count = len(selected_edges)
+    out = np.zeros((t_count, edge_count), dtype=np.float32)
+    for col, (raw_r, raw_s) in enumerate(selected_edges):
+        r = int(raw_r)
+        s = int(raw_s)
+        out[:, col] = np.asarray(model.coupling(r, s), dtype=float)[labels[:, r], labels[:, s]].astype(
+            np.float32, copy=False
+        )
+    return out
+
+
+def _compute_residue_frustration_raw(local_energies: np.ndarray, neighbors_with_self: Sequence[np.ndarray]) -> np.ndarray:
+    local = np.asarray(local_energies, dtype=np.float32)
+    if local.ndim != 2:
+        raise ValueError("local_energies must be 2D.")
+    t_count, n_residues = local.shape
+    out = np.zeros((t_count, n_residues), dtype=np.float32)
+    for ridx in range(n_residues):
+        cols = neighbors_with_self[ridx] if ridx < len(neighbors_with_self) else np.asarray([ridx], dtype=int)
+        if not isinstance(cols, np.ndarray) or cols.size == 0:
+            cols = np.asarray([ridx], dtype=int)
+        baseline = np.mean(local[:, cols], axis=1, dtype=np.float32)
+        out[:, ridx] = np.abs(local[:, ridx] - baseline)
+    return out
+
+
+def _compute_edge_frustration_raw(edge_energies: np.ndarray, edge_neighbors: Sequence[np.ndarray]) -> np.ndarray:
+    edge_vals = np.asarray(edge_energies, dtype=np.float32)
+    if edge_vals.ndim != 2:
+        raise ValueError("edge_energies must be 2D.")
+    if edge_vals.shape[1] == 0:
+        return np.zeros_like(edge_vals, dtype=np.float32)
+    frame_mean = np.mean(edge_vals, axis=1, dtype=np.float32)
+    out = np.zeros_like(edge_vals, dtype=np.float32)
+    for col in range(edge_vals.shape[1]):
+        cols = edge_neighbors[col] if col < len(edge_neighbors) else np.asarray([col], dtype=int)
+        if not isinstance(cols, np.ndarray) or cols.size <= 1:
+            baseline = frame_mean
+        else:
+            baseline = np.mean(edge_vals[:, cols], axis=1, dtype=np.float32)
+        out[:, col] = np.abs(edge_vals[:, col] - baseline)
+    return out
+
+
+def _run_endpoint_frustration_batch(
+    payloads: Sequence[dict[str, Any]],
+    *,
+    max_workers: int = 1,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+    progress_label: str = "Computing endpoint frustration",
+) -> list[dict[str, Any]]:
+    n_payloads = int(len(payloads))
+    if n_payloads <= 0:
+        return []
+    workers = max(1, int(max_workers))
+    out_rows: list[dict[str, Any] | None] = [None] * n_payloads
+    if progress_callback:
+        progress_callback(progress_label, 0, n_payloads)
+    if workers <= 1:
+        for row, payload in enumerate(payloads):
+            out_rows[row] = _endpoint_frustration_sample_worker(payload)
+            if progress_callback:
+                progress_callback(progress_label, row + 1, n_payloads)
+    else:
+        workers = min(workers, n_payloads)
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_endpoint_frustration_sample_worker, payloads[row]): row for row in range(n_payloads)}
+            done = 0
+            for future in as_completed(futures):
+                row = futures[future]
+                out_rows[row] = future.result()
+                done += 1
+                if progress_callback:
+                    progress_callback(progress_label, done, n_payloads)
+    if any(v is None for v in out_rows):
+        raise RuntimeError("Missing worker output while computing endpoint frustration batch.")
+    return [row for row in out_rows if row is not None]
+
+
+def _endpoint_resolve_model(
+    *,
+    store: ProjectStore,
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    system_dir: Path,
+    ref: str,
+) -> tuple[PottsModel, str | None, str, Path, str]:
+    model_id = None
+    model_name = None
+    model_path = Path(str(ref))
+    if not model_path.suffix:
+        model_id = str(ref)
+        models = store.list_potts_models(project_id, system_id, cluster_id)
+        entry = next((m for m in models if m.get("model_id") == model_id), None)
+        if not entry or not entry.get("path"):
+            raise FileNotFoundError(f"Potts model_id not found on this system: {model_id}")
+        model_name = str(entry.get("name") or model_id)
+        model_path = store.resolve_path(project_id, system_id, str(entry.get("path")))
+    else:
+        if not model_path.is_absolute():
+            model_path = store.resolve_path(project_id, system_id, str(model_path))
+        model_name = model_path.stem
+    if not model_path.exists():
+        raise FileNotFoundError(f"Potts model NPZ not found: {model_path}")
+    return (
+        zero_sum_gauge_model(load_potts_model(str(model_path))),
+        model_id,
+        str(model_name),
+        model_path,
+        _relativize(model_path, system_dir),
+    )
+
+
+def _endpoint_resolve_sample_path(
+    *,
+    store: ProjectStore,
+    project_id: str,
+    system_id: str,
+    cluster_dir: Path,
+    entry: dict[str, Any],
+) -> Path:
+    paths = entry.get("paths") or {}
+    rel = None
+    if isinstance(paths, dict):
+        rel = paths.get("summary_npz") or paths.get("path")
+    rel = rel or entry.get("path")
+    if not rel:
+        raise FileNotFoundError("Sample entry missing path.")
+    p = Path(str(rel))
+    if not p.is_absolute():
+        resolved = store.resolve_path(project_id, system_id, str(rel))
+        if not resolved.exists():
+            alt = cluster_dir / str(rel)
+            p = alt if alt.exists() else resolved
+        else:
+            p = resolved
+    return p
+
+
+def _endpoint_load_labels(
+    *,
+    sample_path: Path,
+    md_label_mode: str,
+    drop_invalid: bool,
+) -> tuple[np.ndarray, int]:
+    s = load_sample_npz(sample_path)
+    X = s.labels
+    invalid_count = 0
+    if md_label_mode in {"halo", "labels_halo"} and s.labels_halo is not None:
+        X = s.labels_halo
+    if drop_invalid and s.invalid_mask is not None:
+        invalid_mask = np.asarray(s.invalid_mask, dtype=bool)
+        invalid_count = int(np.count_nonzero(invalid_mask))
+        keep = ~invalid_mask
+        if keep.shape[0] == X.shape[0]:
+            X = X[keep]
+    return np.asarray(X, dtype=int), invalid_count
+
+
+def _endpoint_frustration_sample_worker(payload: dict[str, Any]) -> dict[str, Any]:
+    project_id = str(payload["project_id"])
+    system_id = str(payload["system_id"])
+    cluster_id = str(payload["cluster_id"])
+    model_a_path = Path(str(payload["model_a_path"]))
+    model_b_path = Path(str(payload["model_b_path"]))
+    sample_id = str(payload["sample_id"])
+    sample_label = str(payload.get("sample_label") or sample_id)
+    sample_type = str(payload.get("sample_type") or "sample")
+    sample_path = Path(str(payload["sample_path"]))
+    md_label_mode = str(payload.get("md_label_mode") or "assigned").strip().lower()
+    drop_invalid = bool(payload.get("drop_invalid", True))
+    selected_edges = [tuple(int(v) for v in edge) for edge in list(payload.get("selected_edges") or [])]
+    top_edge_indices = np.asarray(payload.get("top_edge_indices", []), dtype=np.int32)
+
+    store = ProjectStore(base_dir=Path(os.getenv("PHASE_DATA_ROOT", "/app/data")) / "projects")
+    cluster_dirs = store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    model_a, _, _, _, _ = _endpoint_resolve_model(
+        store=store,
+        project_id=project_id,
+        system_id=system_id,
+        cluster_id=cluster_id,
+        system_dir=cluster_dirs["system_dir"],
+        ref=str(model_a_path),
+    )
+    model_b, _, _, _, _ = _endpoint_resolve_model(
+        store=store,
+        project_id=project_id,
+        system_id=system_id,
+        cluster_id=cluster_id,
+        system_dir=cluster_dirs["system_dir"],
+        ref=str(model_b_path),
+    )
+
+    n_residues = int(len(model_a.h))
+    k_list = [int(k) for k in model_a.K_list()]
+    k_max = int(max(k_list)) if k_list else 0
+    edges_a = {(min(int(r), int(s)), max(int(r), int(s))) for r, s in (model_a.edges or []) if int(r) != int(s)}
+    edges_b = {(min(int(r), int(s)), max(int(r), int(s))) for r, s in (model_b.edges or []) if int(r) != int(s)}
+    edges = sorted(edges_a & edges_b)
+    residue_neighbors = _residue_neighbors_with_self(n_residues, edges)
+    edge_neighbors = _selected_edge_neighbor_lists(selected_edges)
+
+    dh_list: list[np.ndarray] = []
+    for ridx in range(n_residues):
+        a = np.asarray(model_a.h[ridx], dtype=float).ravel()
+        b = np.asarray(model_b.h[ridx], dtype=float).ravel()
+        if a.shape != b.shape:
+            raise ValueError(f"Model alphabets do not match at residue {ridx}: {a.shape} vs {b.shape}")
+        dh_list.append(a - b)
+
+    dJ: dict[tuple[int, int], np.ndarray] = {}
+    for edge in selected_edges:
+        dJ[edge] = np.asarray(model_a.coupling(*edge), dtype=float) - np.asarray(model_b.coupling(*edge), dtype=float)
+
+    labels, invalid_count = _endpoint_load_labels(
+        sample_path=sample_path,
+        md_label_mode=md_label_mode,
+        drop_invalid=drop_invalid,
+    )
+    if labels.ndim != 2 or labels.size == 0:
+        raise ValueError(f"Sample labels are empty: {sample_id}")
+    if int(labels.shape[1]) != n_residues:
+        raise ValueError(
+            f"Sample labels do not match model size for {sample_id}: got N={labels.shape[1]}, expected {n_residues}"
+        )
+    if np.min(labels) < 0:
+        raise ValueError(
+            f"Sample contains negative labels for {sample_id}. "
+            "Use md_label_mode='assigned' or remap unassigned labels before analysis."
+        )
+    for ridx in range(n_residues):
+        ki = int(k_list[ridx])
+        if ki <= 0:
+            continue
+        mx = int(np.max(labels[:, ridx])) if labels.shape[0] else -1
+        if mx >= ki:
+            raise ValueError(
+                f"Sample labels out of range for {sample_id} at residue {ridx}: max={mx}, expected in [0,{ki-1}]"
+            )
+
+    n_frames = int(labels.shape[0])
+    p_node_row = np.zeros((n_residues, k_max), dtype=np.float32)
+    q_residue_row = np.zeros((n_residues,), dtype=np.float32)
+    for ridx in range(n_residues):
+        ki = int(k_list[ridx])
+        counts = np.bincount(np.asarray(labels[:, ridx], dtype=int), minlength=ki).astype(np.float32, copy=False)
+        p = counts / float(n_frames) if n_frames > 0 else np.zeros((ki,), dtype=np.float32)
+        p_node_row[ridx, :ki] = p
+        mask = (np.asarray(dh_list[ridx], dtype=float) < 0).astype(np.float32, copy=False)
+        q_residue_row[ridx] = float(np.sum(p * mask)) if p.size else np.nan
+
+    q_edge_row = np.zeros((len(selected_edges),), dtype=np.float32)
+    for col, edge in enumerate(selected_edges):
+        r, s = edge
+        vals = dJ[edge][labels[:, r], labels[:, s]]
+        q_edge_row[col] = float(np.mean(vals < 0)) if vals.size else np.nan
+
+    local_node_a = _compute_local_node_energies(labels, model_a, edges)
+    local_node_b = _compute_local_node_energies(labels, model_b, edges)
+    raw_node_a = _compute_residue_frustration_raw(local_node_a, residue_neighbors)
+    raw_node_b = _compute_residue_frustration_raw(local_node_b, residue_neighbors)
+    node_center_a, node_scale_a = _robust_center_scale(raw_node_a)
+    node_center_b, node_scale_b = _robust_center_scale(raw_node_b)
+    node_a_z = (raw_node_a - float(node_center_a)) / float(node_scale_a)
+    node_b_z = (raw_node_b - float(node_center_b)) / float(node_scale_b)
+    node_sym = 0.5 * (node_a_z + node_b_z)
+    node_pol = node_a_z - node_b_z
+    global_node_sym_series = np.mean(node_sym, axis=1, dtype=np.float32)
+    global_node_pol_series = np.mean(node_pol, axis=1, dtype=np.float32)
+
+    edge_a = _compute_selected_edge_energies(labels, model_a, selected_edges)
+    edge_b = _compute_selected_edge_energies(labels, model_b, selected_edges)
+    raw_edge_a = _compute_edge_frustration_raw(edge_a, edge_neighbors)
+    raw_edge_b = _compute_edge_frustration_raw(edge_b, edge_neighbors)
+    edge_center_a, edge_scale_a = _robust_center_scale(raw_edge_a)
+    edge_center_b, edge_scale_b = _robust_center_scale(raw_edge_b)
+    edge_a_z = (raw_edge_a - float(edge_center_a)) / float(edge_scale_a) if selected_edges else raw_edge_a
+    edge_b_z = (raw_edge_b - float(edge_center_b)) / float(edge_scale_b) if selected_edges else raw_edge_b
+    edge_sym = 0.5 * (edge_a_z + edge_b_z)
+    edge_pol = edge_a_z - edge_b_z
+    global_edge_sym_series = (
+        np.mean(edge_sym, axis=1, dtype=np.float32) if selected_edges else np.zeros((n_frames,), dtype=np.float32)
+    )
+    global_edge_pol_series = (
+        np.mean(edge_pol, axis=1, dtype=np.float32) if selected_edges else np.zeros((n_frames,), dtype=np.float32)
+    )
+
+    if selected_edges:
+        edge_sym_mean = np.mean(edge_sym, axis=0, dtype=np.float32).astype(np.float32, copy=False)
+        edge_sym_std = np.std(edge_sym, axis=0, dtype=np.float32).astype(np.float32, copy=False)
+        edge_sym_median = np.median(edge_sym, axis=0).astype(np.float32, copy=False)
+        edge_pol_mean = np.mean(edge_pol, axis=0, dtype=np.float32).astype(np.float32, copy=False)
+        edge_pol_std = np.std(edge_pol, axis=0, dtype=np.float32).astype(np.float32, copy=False)
+        edge_pol_median = np.median(edge_pol, axis=0).astype(np.float32, copy=False)
+        global_edge_sym_mean = float(np.mean(global_edge_sym_series)) if global_edge_sym_series.size else np.nan
+        global_edge_sym_std = float(np.std(global_edge_sym_series)) if global_edge_sym_series.size else np.nan
+        global_edge_pol_mean = float(np.mean(global_edge_pol_series)) if global_edge_pol_series.size else np.nan
+        global_edge_pol_std = float(np.std(global_edge_pol_series)) if global_edge_pol_series.size else np.nan
+    else:
+        edge_sym_mean = np.zeros((0,), dtype=np.float32)
+        edge_sym_std = np.zeros((0,), dtype=np.float32)
+        edge_sym_median = np.zeros((0,), dtype=np.float32)
+        edge_pol_mean = np.zeros((0,), dtype=np.float32)
+        edge_pol_std = np.zeros((0,), dtype=np.float32)
+        edge_pol_median = np.zeros((0,), dtype=np.float32)
+        global_edge_sym_mean = 0.0
+        global_edge_sym_std = 0.0
+        global_edge_pol_mean = 0.0
+        global_edge_pol_std = 0.0
+
+    return {
+        "sample_id": sample_id,
+        "sample_label": sample_label,
+        "sample_type": sample_type,
+        "frame_count": n_frames,
+        "invalid_count": int(invalid_count),
+        "top_edge_indices": np.asarray(top_edge_indices, dtype=np.int32),
+        "p_node": np.asarray(p_node_row, dtype=np.float32),
+        "q_residue_all": np.asarray(q_residue_row, dtype=np.float32),
+        "q_edge": np.asarray(q_edge_row, dtype=np.float32),
+        "frustration_node_sym_mean": np.mean(node_sym, axis=0, dtype=np.float32).astype(np.float32, copy=False),
+        "frustration_node_sym_std": np.std(node_sym, axis=0, dtype=np.float32).astype(np.float32, copy=False),
+        "frustration_node_sym_median": np.median(node_sym, axis=0).astype(np.float32, copy=False),
+        "frustration_node_pol_mean": np.mean(node_pol, axis=0, dtype=np.float32).astype(np.float32, copy=False),
+        "frustration_node_pol_std": np.std(node_pol, axis=0, dtype=np.float32).astype(np.float32, copy=False),
+        "frustration_node_pol_median": np.median(node_pol, axis=0).astype(np.float32, copy=False),
+        "frustration_edge_sym_mean": np.asarray(edge_sym_mean, dtype=np.float32),
+        "frustration_edge_sym_std": np.asarray(edge_sym_std, dtype=np.float32),
+        "frustration_edge_sym_median": np.asarray(edge_sym_median, dtype=np.float32),
+        "frustration_edge_pol_mean": np.asarray(edge_pol_mean, dtype=np.float32),
+        "frustration_edge_pol_std": np.asarray(edge_pol_std, dtype=np.float32),
+        "frustration_edge_pol_median": np.asarray(edge_pol_median, dtype=np.float32),
+        "node_norm_center_a": float(node_center_a),
+        "node_norm_scale_a": float(node_scale_a),
+        "node_norm_center_b": float(node_center_b),
+        "node_norm_scale_b": float(node_scale_b),
+        "edge_norm_center_a": float(edge_center_a),
+        "edge_norm_scale_a": float(edge_scale_a),
+        "edge_norm_center_b": float(edge_center_b),
+        "edge_norm_scale_b": float(edge_scale_b),
+        "global_node_sym_mean": float(np.mean(global_node_sym_series)) if global_node_sym_series.size else np.nan,
+        "global_node_sym_std": float(np.std(global_node_sym_series)) if global_node_sym_series.size else np.nan,
+        "global_node_pol_mean": float(np.mean(global_node_pol_series)) if global_node_pol_series.size else np.nan,
+        "global_node_pol_std": float(np.std(global_node_pol_series)) if global_node_pol_series.size else np.nan,
+        "global_edge_sym_mean": global_edge_sym_mean,
+        "global_edge_sym_std": global_edge_sym_std,
+        "global_edge_pol_mean": global_edge_pol_mean,
+        "global_edge_pol_std": global_edge_pol_std,
+        "framewise": {
+            "frustration_node_sym_framewise": np.asarray(node_sym, dtype=np.float32),
+            "frustration_node_pol_framewise": np.asarray(node_pol, dtype=np.float32),
+            "frustration_edge_sym_framewise": np.asarray(edge_sym, dtype=np.float32),
+            "frustration_edge_pol_framewise": np.asarray(edge_pol, dtype=np.float32),
+            "global_node_sym_framewise": np.asarray(global_node_sym_series, dtype=np.float32),
+            "global_node_pol_framewise": np.asarray(global_node_pol_series, dtype=np.float32),
+            "global_edge_sym_framewise": np.asarray(global_edge_sym_series, dtype=np.float32),
+            "global_edge_pol_framewise": np.asarray(global_edge_pol_series, dtype=np.float32),
+            "frame_count": np.asarray([n_frames], dtype=np.int32),
+            "selected_edge_indices": np.asarray(top_edge_indices, dtype=np.int32),
+        },
+    }
+
+
+def upsert_endpoint_frustration_analysis(
+    *,
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    model_a_ref: str,
+    model_b_ref: str,
+    sample_ids: Sequence[str],
+    md_label_mode: str = "assigned",
+    drop_invalid: bool = True,
+    top_k_edges: int = 2000,
+    n_workers: int | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> dict[str, Any]:
+    """
+    Store interpretable endpoint-local analysis for a fixed (A,B) model pair.
+
+    Main artifact (`analysis.npz`) contains compact per-sample summaries used by the UI:
+      - node/edge commitment
+      - node/edge frustration summaries (mean/std/median; symmetric + polarity channels)
+      - robust normalization parameters used for frustration scaling
+
+    Per-sample framewise frustration arrays are written under:
+      clusters/<cluster_id>/analyses/endpoint_frustration/<analysis_id>/samples/<sample_id>.npz
+    """
+    md_label_mode = (md_label_mode or "assigned").strip().lower()
+    if md_label_mode not in {"assigned", "halo"}:
+        raise ValueError("md_label_mode must be 'assigned' or 'halo'.")
+    top_k_edges = int(top_k_edges)
+    if top_k_edges < 1:
+        raise ValueError("top_k_edges must be >= 1.")
+
+    data_root = Path(os.getenv("PHASE_DATA_ROOT", "/app/data"))
+    store = ProjectStore(base_dir=data_root / "projects")
+    cluster_dirs = store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    system_dir = cluster_dirs["system_dir"]
+    cluster_dir = cluster_dirs["cluster_dir"]
+
+    model_a, model_a_id, model_a_name, model_a_path_abs, model_a_path = _endpoint_resolve_model(
+        store=store,
+        project_id=project_id,
+        system_id=system_id,
+        cluster_id=cluster_id,
+        system_dir=system_dir,
+        ref=model_a_ref,
+    )
+    model_b, model_b_id, model_b_name, model_b_path_abs, model_b_path = _endpoint_resolve_model(
+        store=store,
+        project_id=project_id,
+        system_id=system_id,
+        cluster_id=cluster_id,
+        system_dir=system_dir,
+        ref=model_b_ref,
+    )
+    if model_a_id and model_b_id and model_a_id == model_b_id:
+        raise ValueError("Select two different models.")
+    if len(model_a.h) != len(model_b.h):
+        raise ValueError("Model sizes do not match.")
+    n_residues = int(len(model_a.h))
+    if n_residues <= 0:
+        raise ValueError("Invalid Potts model size.")
+    k_list = [int(k) for k in model_a.K_list()]
+    k_max = int(max(k_list)) if k_list else 0
+    if k_max <= 0:
+        raise ValueError("Invalid Potts alphabet size.")
+
+    edges_a = {(min(int(r), int(s)), max(int(r), int(s))) for r, s in (model_a.edges or []) if int(r) != int(s)}
+    edges_b = {(min(int(r), int(s)), max(int(r), int(s))) for r, s in (model_b.edges or []) if int(r) != int(s)}
+    edges = sorted(edges_a & edges_b)
+
+    dh_list: list[np.ndarray] = []
+    for ridx in range(n_residues):
+        a = np.asarray(model_a.h[ridx], dtype=float).ravel()
+        b = np.asarray(model_b.h[ridx], dtype=float).ravel()
+        if a.shape != b.shape:
+            raise ValueError(f"Model alphabets do not match at residue {ridx}: {a.shape} vs {b.shape}")
+        dh_list.append(a - b)
+    dh = np.zeros((n_residues, k_max), dtype=np.float32)
+    for ridx in range(n_residues):
+        ki = int(dh_list[ridx].shape[0])
+        if ki > 0:
+            dh[ridx, :ki] = np.asarray(dh_list[ridx], dtype=np.float32)
+
+    dJ: dict[tuple[int, int], np.ndarray] = {}
+    for edge in edges:
+        dJ[edge] = np.asarray(model_a.coupling(*edge), dtype=float) - np.asarray(model_b.coupling(*edge), dtype=float)
+
+    d_residue = np.zeros((n_residues,), dtype=np.float32)
+    for ridx in range(n_residues):
+        d_residue[ridx] = float(np.linalg.norm(np.asarray(dh_list[ridx], dtype=float).ravel(), ord=2))
+    d_edge = np.zeros((len(edges),), dtype=np.float32)
+    for eidx, edge in enumerate(edges):
+        d_edge[eidx] = float(np.linalg.norm(np.asarray(dJ[edge], dtype=float).ravel(), ord=2))
+
+    top_k_e = min(top_k_edges, len(edges))
+    top_edge_indices = np.argsort(d_edge)[::-1][:top_k_e].astype(int) if top_k_e > 0 else np.zeros((0,), dtype=int)
+    selected_edges = [edges[int(eidx)] for eidx in top_edge_indices.tolist()]
+
+    key = json.dumps(
+        {
+            "analysis_type": "endpoint_frustration",
+            "model_a_id": model_a_id or model_a_path,
+            "model_b_id": model_b_id or model_b_path,
+            "md_label_mode": md_label_mode,
+            "drop_invalid": bool(drop_invalid),
+            "top_k_edges": int(top_k_e),
+        },
+        sort_keys=True,
+    )
+    analysis_id = str(uuid.uuid5(uuid.NAMESPACE_URL, key))
+    analyses_root = _ensure_analysis_dir(cluster_dir, "endpoint_frustration")
+    analysis_dir = analyses_root / analysis_id
+    analysis_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = analysis_dir / "analysis.npz"
+    meta_path = analysis_dir / ANALYSIS_METADATA_FILENAME
+    framewise_root = analysis_dir / "samples"
+    framewise_root.mkdir(parents=True, exist_ok=True)
+
+    existing_sample_ids: list[str] = []
+    if npz_path.exists():
+        try:
+            with np.load(npz_path, allow_pickle=False) as data:
+                if "sample_ids" in data:
+                    existing_sample_ids = [str(x) for x in np.asarray(data["sample_ids"], dtype=str).tolist()]
+        except Exception:
+            existing_sample_ids = []
+
+    requested = [str(s).strip() for s in sample_ids if str(s).strip()]
+    seen: set[str] = set()
+    merged: list[str] = []
+    for sid in existing_sample_ids + requested:
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        merged.append(sid)
+    if not merged:
+        raise ValueError("No samples selected.")
+
+    samples = store.list_samples(project_id, system_id, cluster_id)
+    sample_by_id: dict[str, dict[str, Any]] = {str(s.get("sample_id")): s for s in samples if s.get("sample_id")}
+
+    sample_labels: list[str] = []
+    sample_types: list[str] = []
+    sample_frame_counts = np.zeros((len(merged),), dtype=np.int32)
+    sample_invalid_counts = np.zeros((len(merged),), dtype=np.int32)
+    q_residue_all = np.zeros((len(merged), n_residues), dtype=np.float32)
+    p_node = np.zeros((len(merged), n_residues, k_max), dtype=np.float32)
+    q_edge = np.zeros((len(merged), top_k_e), dtype=np.float32)
+    frustration_node_sym_mean = np.zeros((len(merged), n_residues), dtype=np.float32)
+    frustration_node_sym_std = np.zeros((len(merged), n_residues), dtype=np.float32)
+    frustration_node_sym_median = np.zeros((len(merged), n_residues), dtype=np.float32)
+    frustration_node_pol_mean = np.zeros((len(merged), n_residues), dtype=np.float32)
+    frustration_node_pol_std = np.zeros((len(merged), n_residues), dtype=np.float32)
+    frustration_node_pol_median = np.zeros((len(merged), n_residues), dtype=np.float32)
+    frustration_edge_sym_mean = np.zeros((len(merged), top_k_e), dtype=np.float32)
+    frustration_edge_sym_std = np.zeros((len(merged), top_k_e), dtype=np.float32)
+    frustration_edge_sym_median = np.zeros((len(merged), top_k_e), dtype=np.float32)
+    frustration_edge_pol_mean = np.zeros((len(merged), top_k_e), dtype=np.float32)
+    frustration_edge_pol_std = np.zeros((len(merged), top_k_e), dtype=np.float32)
+    frustration_edge_pol_median = np.zeros((len(merged), top_k_e), dtype=np.float32)
+    node_norm_center_a = np.zeros((len(merged),), dtype=np.float32)
+    node_norm_scale_a = np.ones((len(merged),), dtype=np.float32)
+    node_norm_center_b = np.zeros((len(merged),), dtype=np.float32)
+    node_norm_scale_b = np.ones((len(merged),), dtype=np.float32)
+    edge_norm_center_a = np.zeros((len(merged),), dtype=np.float32)
+    edge_norm_scale_a = np.ones((len(merged),), dtype=np.float32)
+    edge_norm_center_b = np.zeros((len(merged),), dtype=np.float32)
+    edge_norm_scale_b = np.ones((len(merged),), dtype=np.float32)
+    global_node_sym_mean = np.zeros((len(merged),), dtype=np.float32)
+    global_node_sym_std = np.zeros((len(merged),), dtype=np.float32)
+    global_node_pol_mean = np.zeros((len(merged),), dtype=np.float32)
+    global_node_pol_std = np.zeros((len(merged),), dtype=np.float32)
+    global_edge_sym_mean = np.zeros((len(merged),), dtype=np.float32)
+    global_edge_sym_std = np.zeros((len(merged),), dtype=np.float32)
+    global_edge_pol_mean = np.zeros((len(merged),), dtype=np.float32)
+    global_edge_pol_std = np.zeros((len(merged),), dtype=np.float32)
+    payloads: list[dict[str, Any]] = []
+    for sid in merged:
+        entry = sample_by_id.get(sid)
+        if not entry:
+            raise FileNotFoundError(f"Sample not found on this cluster: {sid}")
+        payloads.append(
+            {
+                "project_id": project_id,
+                "system_id": system_id,
+                "cluster_id": cluster_id,
+                "model_a_path": str(model_a_path_abs),
+                "model_b_path": str(model_b_path_abs),
+                "sample_id": sid,
+                "sample_label": str(entry.get("name") or sid),
+                "sample_type": str(entry.get("type") or "sample"),
+                "sample_path": str(
+                    _endpoint_resolve_sample_path(
+                        store=store,
+                        project_id=project_id,
+                        system_id=system_id,
+                        cluster_dir=cluster_dir,
+                        entry=entry,
+                    )
+                ),
+                "md_label_mode": md_label_mode,
+                "drop_invalid": bool(drop_invalid),
+                "selected_edges": [list(edge) for edge in selected_edges],
+                "top_edge_indices": np.asarray(top_edge_indices, dtype=np.int32).tolist(),
+            }
+        )
+
+    if n_workers is None or int(n_workers) <= 0:
+        workers_used = max(1, min(int(os.cpu_count() or 1), max(1, len(payloads))))
+    else:
+        workers_used = max(1, min(int(n_workers), max(1, len(payloads))))
+
+    out_rows = _run_endpoint_frustration_batch(
+        payloads,
+        max_workers=workers_used,
+        progress_callback=progress_callback,
+        progress_label="Computing endpoint frustration",
+    )
+
+    for row, out_row in enumerate(out_rows):
+        sid = str(out_row["sample_id"])
+        sample_labels.append(str(out_row["sample_label"]))
+        sample_types.append(str(out_row["sample_type"]))
+        sample_frame_counts[row] = int(out_row["frame_count"])
+        sample_invalid_counts[row] = int(out_row["invalid_count"])
+        p_node[row] = np.asarray(out_row["p_node"], dtype=np.float32)
+        q_residue_all[row] = np.asarray(out_row["q_residue_all"], dtype=np.float32)
+        q_edge[row] = np.asarray(out_row["q_edge"], dtype=np.float32)
+        frustration_node_sym_mean[row] = np.asarray(out_row["frustration_node_sym_mean"], dtype=np.float32)
+        frustration_node_sym_std[row] = np.asarray(out_row["frustration_node_sym_std"], dtype=np.float32)
+        frustration_node_sym_median[row] = np.asarray(out_row["frustration_node_sym_median"], dtype=np.float32)
+        frustration_node_pol_mean[row] = np.asarray(out_row["frustration_node_pol_mean"], dtype=np.float32)
+        frustration_node_pol_std[row] = np.asarray(out_row["frustration_node_pol_std"], dtype=np.float32)
+        frustration_node_pol_median[row] = np.asarray(out_row["frustration_node_pol_median"], dtype=np.float32)
+        frustration_edge_sym_mean[row] = np.asarray(out_row["frustration_edge_sym_mean"], dtype=np.float32)
+        frustration_edge_sym_std[row] = np.asarray(out_row["frustration_edge_sym_std"], dtype=np.float32)
+        frustration_edge_sym_median[row] = np.asarray(out_row["frustration_edge_sym_median"], dtype=np.float32)
+        frustration_edge_pol_mean[row] = np.asarray(out_row["frustration_edge_pol_mean"], dtype=np.float32)
+        frustration_edge_pol_std[row] = np.asarray(out_row["frustration_edge_pol_std"], dtype=np.float32)
+        frustration_edge_pol_median[row] = np.asarray(out_row["frustration_edge_pol_median"], dtype=np.float32)
+        node_norm_center_a[row] = float(out_row["node_norm_center_a"])
+        node_norm_scale_a[row] = float(out_row["node_norm_scale_a"])
+        node_norm_center_b[row] = float(out_row["node_norm_center_b"])
+        node_norm_scale_b[row] = float(out_row["node_norm_scale_b"])
+        edge_norm_center_a[row] = float(out_row["edge_norm_center_a"])
+        edge_norm_scale_a[row] = float(out_row["edge_norm_scale_a"])
+        edge_norm_center_b[row] = float(out_row["edge_norm_center_b"])
+        edge_norm_scale_b[row] = float(out_row["edge_norm_scale_b"])
+        global_node_sym_mean[row] = float(out_row["global_node_sym_mean"])
+        global_node_sym_std[row] = float(out_row["global_node_sym_std"])
+        global_node_pol_mean[row] = float(out_row["global_node_pol_mean"])
+        global_node_pol_std[row] = float(out_row["global_node_pol_std"])
+        global_edge_sym_mean[row] = float(out_row["global_edge_sym_mean"])
+        global_edge_sym_std[row] = float(out_row["global_edge_sym_std"])
+        global_edge_pol_mean[row] = float(out_row["global_edge_pol_mean"])
+        global_edge_pol_std[row] = float(out_row["global_edge_pol_std"])
+
+        framewise_npz = framewise_root / f"{sid}.npz"
+        np.savez_compressed(framewise_npz, **out_row["framewise"])
+
+    for old in framewise_root.glob("*.npz"):
+        if old.stem not in seen:
+            try:
+                old.unlink()
+            except Exception:
+                pass
+
+    np.savez_compressed(
+        npz_path,
+        analysis_format_version=np.asarray([1], dtype=np.int32),
+        edges=np.asarray(edges, dtype=np.int32),
+        D_residue=np.asarray(d_residue, dtype=np.float32),
+        D_edge=np.asarray(d_edge, dtype=np.float32),
+        top_edge_indices=np.asarray(top_edge_indices, dtype=np.int32),
+        sample_ids=np.asarray(merged, dtype=str),
+        sample_labels=np.asarray(sample_labels, dtype=str),
+        sample_types=np.asarray(sample_types, dtype=str),
+        sample_frame_counts=np.asarray(sample_frame_counts, dtype=np.int32),
+        sample_invalid_counts=np.asarray(sample_invalid_counts, dtype=np.int32),
+        K_list=np.asarray(k_list, dtype=np.int32),
+        dh=np.asarray(dh, dtype=np.float32),
+        p_node=np.asarray(p_node, dtype=np.float32),
+        q_residue_all=np.asarray(q_residue_all, dtype=np.float32),
+        q_edge=np.asarray(q_edge, dtype=np.float32),
+        frustration_node_sym_mean=np.asarray(frustration_node_sym_mean, dtype=np.float32),
+        frustration_node_sym_std=np.asarray(frustration_node_sym_std, dtype=np.float32),
+        frustration_node_sym_median=np.asarray(frustration_node_sym_median, dtype=np.float32),
+        frustration_node_pol_mean=np.asarray(frustration_node_pol_mean, dtype=np.float32),
+        frustration_node_pol_std=np.asarray(frustration_node_pol_std, dtype=np.float32),
+        frustration_node_pol_median=np.asarray(frustration_node_pol_median, dtype=np.float32),
+        frustration_edge_sym_mean=np.asarray(frustration_edge_sym_mean, dtype=np.float32),
+        frustration_edge_sym_std=np.asarray(frustration_edge_sym_std, dtype=np.float32),
+        frustration_edge_sym_median=np.asarray(frustration_edge_sym_median, dtype=np.float32),
+        frustration_edge_pol_mean=np.asarray(frustration_edge_pol_mean, dtype=np.float32),
+        frustration_edge_pol_std=np.asarray(frustration_edge_pol_std, dtype=np.float32),
+        frustration_edge_pol_median=np.asarray(frustration_edge_pol_median, dtype=np.float32),
+        node_norm_center_a=np.asarray(node_norm_center_a, dtype=np.float32),
+        node_norm_scale_a=np.asarray(node_norm_scale_a, dtype=np.float32),
+        node_norm_center_b=np.asarray(node_norm_center_b, dtype=np.float32),
+        node_norm_scale_b=np.asarray(node_norm_scale_b, dtype=np.float32),
+        edge_norm_center_a=np.asarray(edge_norm_center_a, dtype=np.float32),
+        edge_norm_scale_a=np.asarray(edge_norm_scale_a, dtype=np.float32),
+        edge_norm_center_b=np.asarray(edge_norm_center_b, dtype=np.float32),
+        edge_norm_scale_b=np.asarray(edge_norm_scale_b, dtype=np.float32),
+        global_node_sym_mean=np.asarray(global_node_sym_mean, dtype=np.float32),
+        global_node_sym_std=np.asarray(global_node_sym_std, dtype=np.float32),
+        global_node_pol_mean=np.asarray(global_node_pol_mean, dtype=np.float32),
+        global_node_pol_std=np.asarray(global_node_pol_std, dtype=np.float32),
+        global_edge_sym_mean=np.asarray(global_edge_sym_mean, dtype=np.float32),
+        global_edge_sym_std=np.asarray(global_edge_sym_std, dtype=np.float32),
+        global_edge_pol_mean=np.asarray(global_edge_pol_mean, dtype=np.float32),
+        global_edge_pol_std=np.asarray(global_edge_pol_std, dtype=np.float32),
+    )
+
+    now = _utc_now()
+    created_at = now
+    if meta_path.exists():
+        try:
+            old = json.loads(meta_path.read_text(encoding="utf-8"))
+            created_at = str(old.get("created_at") or created_at)
+        except Exception:
+            created_at = now
+
+    residue_rank = np.argsort(d_residue)[::-1][: min(10, n_residues)].astype(int).tolist()
+    frustration_rank = np.argsort(np.nanmean(frustration_node_sym_mean, axis=0))[::-1][: min(10, n_residues)].astype(int).tolist()
+    meta = {
+        "analysis_id": analysis_id,
+        "analysis_type": "endpoint_frustration",
+        "analysis_format_version": 1,
+        "created_at": created_at,
+        "updated_at": now,
+        "project_id": project_id,
+        "system_id": system_id,
+        "cluster_id": cluster_id,
+        "model_a_id": model_a_id,
+        "model_a_name": model_a_name,
+        "model_a_path": model_a_path,
+        "model_b_id": model_b_id,
+        "model_b_name": model_b_name,
+        "model_b_path": model_b_path,
+        "md_label_mode": md_label_mode,
+        "drop_invalid": bool(drop_invalid),
+        "top_k_edges": int(top_k_e),
+        "workers_used": int(workers_used),
+        "paths": {
+            "analysis_npz": str(npz_path.relative_to(system_dir)),
+            "sample_framewise_dir": str(framewise_root.relative_to(system_dir)),
+        },
+        "summary": {
+            "n_residues": int(n_residues),
+            "n_edges": int(len(edges)),
+            "n_selected_edges": int(top_k_e),
+            "n_samples": int(len(merged)),
+            "workers_used": int(workers_used),
+            "sample_ids": merged,
+            "top_residues_by_commitment_weight": [
+                {"residue_index": int(idx), "score": float(d_residue[int(idx)])} for idx in residue_rank
+            ],
+            "top_residues_by_mean_frustration": [
+                {"residue_index": int(idx), "score": float(np.nanmean(frustration_node_sym_mean[:, int(idx)]))}
+                for idx in frustration_rank
+            ],
+        },
+    }
+    meta_path.write_text(json.dumps(_convert_nan_to_none(meta), indent=2), encoding="utf-8")
+    return {"metadata": _convert_nan_to_none(meta), "analysis_npz": str(npz_path), "analysis_dir": str(analysis_dir)}
+
+
 def upsert_delta_commitment_analysis(
     *,
     project_id: str,

@@ -9,6 +9,7 @@ from backend.api.v1.schemas import (
     LigandCompletionJobRequest,
     DeltaEvalJobRequest,
     DeltaCommitmentJobRequest,
+    EndpointFrustrationJobRequest,
     DeltaJsJobRequest,
     DeltaTransitionJobRequest,
     LambdaSweepJobRequest,
@@ -25,6 +26,7 @@ from backend.tasks import (
     run_analysis_job,
     run_delta_eval_job,
     run_delta_commitment_job,
+    run_endpoint_frustration_job,
     run_delta_js_job,
     run_delta_transition_job,
     run_lambda_sweep_job,
@@ -962,6 +964,62 @@ async def submit_delta_commitment_job(
             job_timeout="2h",
             result_ttl=86400,
             job_id=f"delta-commitment-{job_uuid}",
+        )
+        return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
+    except Exception as exc:  # pragma: no cover
+        raise HTTPException(status_code=500, detail=f"Job submission failed: {exc}") from exc
+
+
+@router.post(
+    "/submit/endpoint_frustration",
+    summary="Submit an endpoint-local frustration analysis for a fixed (model A, model B) pair.",
+)
+async def submit_endpoint_frustration_job(
+    payload: EndpointFrustrationJobRequest,
+    task_queue: Any = Depends(get_queue),
+):
+    try:
+        system_meta = project_store.get_system(payload.project_id, payload.system_id)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"System '{payload.system_id}' not found in project '{payload.project_id}'.",
+        )
+
+    get_cluster_entry(system_meta, payload.cluster_id)
+
+    md_label_mode = (payload.md_label_mode or "assigned").lower()
+    if md_label_mode not in {"assigned", "halo"}:
+        raise HTTPException(status_code=400, detail="md_label_mode must be 'assigned' or 'halo'.")
+    if not payload.sample_ids or not isinstance(payload.sample_ids, list):
+        raise HTTPException(status_code=400, detail="sample_ids must be a non-empty list.")
+
+    model_a_id = str(payload.model_a_id or "").strip()
+    model_b_id = str(payload.model_b_id or "").strip()
+    if not model_a_id or not model_b_id:
+        raise HTTPException(status_code=400, detail="model_a_id and model_b_id are required.")
+    if model_a_id == model_b_id:
+        raise HTTPException(status_code=400, detail="model_a_id and model_b_id must be different.")
+    if payload.top_k_edges is not None and int(payload.top_k_edges) < 1:
+        raise HTTPException(status_code=400, detail="top_k_edges must be >= 1.")
+    if payload.workers is not None and int(payload.workers) < 0:
+        raise HTTPException(status_code=400, detail="workers must be >= 0.")
+
+    params = payload.dict(exclude_none=True, exclude={"project_id", "system_id", "cluster_id"})
+    dataset_ref = {
+        "project_id": payload.project_id,
+        "system_id": payload.system_id,
+        "cluster_id": payload.cluster_id,
+    }
+
+    try:
+        job_uuid = str(uuid.uuid4())
+        job = task_queue.enqueue(
+            run_endpoint_frustration_job,
+            args=(job_uuid, dataset_ref, params),
+            job_timeout="2h",
+            result_ttl=86400,
+            job_id=f"endpoint-frustration-{job_uuid}",
         )
         return {"status": "queued", "job_id": job.id, "analysis_uuid": job_uuid}
     except Exception as exc:  # pragma: no cover

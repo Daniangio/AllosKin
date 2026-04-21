@@ -333,6 +333,8 @@ export default function DeltaCommitment3DPage() {
 
   const [commitmentRowIndex, setCommitmentRowIndex] = useState(0);
   const [commitmentMode, setCommitmentMode] = useState('prob'); // prob | centered | mu_sigmoid
+  const [colorMetric, setColorMetric] = useState('commitment'); // commitment | frustration
+  const [frustrationChannel, setFrustrationChannel] = useState('sym'); // sym | pol
   const [referenceSampleIds, setReferenceSampleIds] = useState([]); // used for centered mode
   const [edgeSmoothEnabled, setEdgeSmoothEnabled] = useState(false);
   const [edgeSmoothStrength, setEdgeSmoothStrength] = useState(0.75); // 0..1
@@ -356,6 +358,8 @@ export default function DeltaCommitment3DPage() {
   const hoverRef = useRef({
     residueIdMode: 'auth',
     commitmentMode: 'prob',
+    colorMetric: 'commitment',
+    frustrationChannel: 'sym',
     sampleLabel: '',
     authToQ: new Map(),
     labelSeqToQ: [],
@@ -452,7 +456,7 @@ export default function DeltaCommitment3DPage() {
     if (!selectedClusterId) return;
     setAnalysesError(null);
     try {
-      const data = await fetchClusterAnalyses(projectId, systemId, selectedClusterId, { analysisType: 'delta_commitment' });
+      const data = await fetchClusterAnalyses(projectId, systemId, selectedClusterId, { analysisType: 'endpoint_frustration' });
       setAnalyses(Array.isArray(data?.analyses) ? data.analyses : []);
     } catch (err) {
       setAnalysesError(err.message || 'Failed to load analyses.');
@@ -664,7 +668,7 @@ export default function DeltaCommitment3DPage() {
       setAnalysisDataLoading(true);
       try {
         await clearOverpaint();
-        const payload = await fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'delta_commitment', selectedCommitmentMeta.analysis_id);
+        const payload = await fetchClusterAnalysisData(projectId, systemId, selectedClusterId, 'endpoint_frustration', selectedCommitmentMeta.analysis_id);
         setAnalysisData(payload);
       } catch (err) {
         setAnalysisDataError(err.message || 'Failed to load analysis.');
@@ -731,10 +735,26 @@ export default function DeltaCommitment3DPage() {
     () => (Array.isArray(analysisData?.data?.q_residue_all) ? analysisData.data.q_residue_all : []),
     [analysisData]
   );
+  const frustrationNodeSymMean = useMemo(
+    () => (Array.isArray(analysisData?.data?.frustration_node_sym_mean) ? analysisData.data.frustration_node_sym_mean : []),
+    [analysisData]
+  );
+  const frustrationNodePolMean = useMemo(
+    () => (Array.isArray(analysisData?.data?.frustration_node_pol_mean) ? analysisData.data.frustration_node_pol_mean : []),
+    [analysisData]
+  );
   const dhTable = useMemo(() => (Array.isArray(analysisData?.data?.dh) ? analysisData.data.dh : null), [analysisData]);
   const pNode = useMemo(() => (Array.isArray(analysisData?.data?.p_node) ? analysisData.data.p_node : null), [analysisData]);
   const kList = useMemo(() => (Array.isArray(analysisData?.data?.K_list) ? analysisData.data.K_list.map((v) => Number(v)) : null), [analysisData]);
   const qEdgeMatrix = useMemo(() => (Array.isArray(analysisData?.data?.q_edge) ? analysisData.data.q_edge : null), [analysisData]);
+  const frustrationEdgeSymMean = useMemo(
+    () => (Array.isArray(analysisData?.data?.frustration_edge_sym_mean) ? analysisData.data.frustration_edge_sym_mean : null),
+    [analysisData]
+  );
+  const frustrationEdgePolMean = useMemo(
+    () => (Array.isArray(analysisData?.data?.frustration_edge_pol_mean) ? analysisData.data.frustration_edge_pol_mean : null),
+    [analysisData]
+  );
   const edgesAll = useMemo(() => (Array.isArray(analysisData?.data?.edges) ? analysisData.data.edges : []), [analysisData]);
   const topEdgeIndices = useMemo(
     () => (Array.isArray(analysisData?.data?.top_edge_indices) ? analysisData.data.top_edge_indices : []),
@@ -856,6 +876,24 @@ export default function DeltaCommitment3DPage() {
   }, [commitmentMode, dhTable, pNode, referenceSampleIds, commitmentSampleIds, kList]);
 
   const qRowValues = useMemo(() => {
+    if (colorMetric === 'frustration') {
+      const matrix = frustrationChannel === 'pol' ? frustrationNodePolMean : frustrationNodeSymMean;
+      if (!Array.isArray(matrix) || !matrix.length) return null;
+      const row = matrix[commitmentRowIndex];
+      if (!Array.isArray(row) || !row.length) return null;
+      const base = row.map((v) => Number(v));
+      if (frustrationChannel === 'pol') {
+        const finite = base.filter((v) => Number.isFinite(v));
+        const maxAbs = finite.length ? Math.max(...finite.map((v) => Math.abs(v))) : 1;
+        const scale = maxAbs > 1e-9 ? maxAbs : 1;
+        return base.map((v) => (Number.isFinite(v) ? 0.5 + 0.5 * clamp(v / scale, -1, 1) : NaN));
+      }
+      const finite = base.filter((v) => Number.isFinite(v));
+      const maxVal = finite.length ? Math.max(...finite) : 1;
+      const scale = maxVal > 1e-9 ? maxVal : 1;
+      return base.map((v) => (Number.isFinite(v) ? 0.5 + 0.5 * clamp(v / scale, 0, 1) : NaN));
+    }
+
     if (!Array.isArray(commitmentMatrix) || !commitmentMatrix.length) return null;
     const row = commitmentMatrix[commitmentRowIndex];
     if (!Array.isArray(row) || !row.length) return null;
@@ -928,7 +966,20 @@ export default function DeltaCommitment3DPage() {
     }
 
     return null;
-  }, [commitmentMatrix, commitmentRowIndex, commitmentMode, dhTable, pNode, centeredCalib, residueLabels, kList]);
+  }, [
+    colorMetric,
+    frustrationChannel,
+    frustrationNodePolMean,
+    frustrationNodeSymMean,
+    commitmentMatrix,
+    commitmentRowIndex,
+    commitmentMode,
+    dhTable,
+    pNode,
+    centeredCalib,
+    residueLabels,
+    kList,
+  ]);
 
   const centeredEdgeRefIdxs = useMemo(() => {
     if (commitmentMode !== 'centered') return [];
@@ -939,6 +990,22 @@ export default function DeltaCommitment3DPage() {
   }, [commitmentMode, referenceSampleIds, commitmentSampleIds]);
 
   const qEdgeRowValues = useMemo(() => {
+    if (colorMetric === 'frustration') {
+      const matrix = frustrationChannel === 'pol' ? frustrationEdgePolMean : frustrationEdgeSymMean;
+      if (!matrix || !Array.isArray(matrix[commitmentRowIndex])) return null;
+      const row = matrix[commitmentRowIndex].map((v) => Number(v));
+      if (frustrationChannel === 'pol') {
+        const finite = row.filter((v) => Number.isFinite(v));
+        const maxAbs = finite.length ? Math.max(...finite.map((v) => Math.abs(v))) : 1;
+        const scale = maxAbs > 1e-9 ? maxAbs : 1;
+        return row.map((v) => (Number.isFinite(v) ? 0.5 + 0.5 * clamp(v / scale, -1, 1) : NaN));
+      }
+      const finite = row.filter((v) => Number.isFinite(v));
+      const maxVal = finite.length ? Math.max(...finite) : 1;
+      const scale = maxVal > 1e-9 ? maxVal : 1;
+      return row.map((v) => (Number.isFinite(v) ? 0.5 + 0.5 * clamp(v / scale, 0, 1) : NaN));
+    }
+
     if (!qEdgeMatrix || !Array.isArray(qEdgeMatrix[commitmentRowIndex])) return null;
     const row = qEdgeMatrix[commitmentRowIndex].map((v) => Number(v));
     if (commitmentMode !== 'centered') return row;
@@ -962,7 +1029,16 @@ export default function DeltaCommitment3DPage() {
       out[col] = n > 0 ? (before + 0.5 * at) / n : v;
     }
     return out;
-  }, [qEdgeMatrix, commitmentRowIndex, commitmentMode, centeredEdgeRefIdxs]);
+  }, [
+    colorMetric,
+    frustrationChannel,
+    frustrationEdgePolMean,
+    frustrationEdgeSymMean,
+    qEdgeMatrix,
+    commitmentRowIndex,
+    commitmentMode,
+    centeredEdgeRefIdxs,
+  ]);
 
   useEffect(() => {
     setSelectedResidueIndex((prev) => {
@@ -1132,7 +1208,7 @@ export default function DeltaCommitment3DPage() {
     return map;
   }, [coloringPayload]);
 
-  // Register a Mol* hover label provider to show the per-residue commitment being visualized.
+  // Register a Mol* hover label provider to show the current residue value being visualized.
   useEffect(() => {
     const plugin = pluginRef.current;
     if (viewerStatus !== 'ready' || !plugin) return;
@@ -1157,10 +1233,13 @@ export default function DeltaCommitment3DPage() {
           if (idx >= 0 && idx < h.labelSeqToQ.length) q = h.labelSeqToQ[idx];
         }
 
-        if (!Number.isFinite(q)) return `Commitment q: n/a`;
+        if (!Number.isFinite(q)) return `Displayed value: n/a`;
         const mode = h.commitmentMode || 'prob';
+        const metric = h.colorMetric || 'commitment';
         const sample = h.sampleLabel ? ` · ${h.sampleLabel}` : '';
-        return `Commitment q: ${q.toFixed(3)} · mode: ${mode}${sample}`;
+        return metric === 'commitment'
+          ? `Commitment color value: ${q.toFixed(3)} · mode: ${mode}${sample}`
+          : `Frustration color value: ${q.toFixed(3)} · channel: ${h.frustrationChannel || 'sym'}${sample}`;
       },
       group: (label) => `phase-commitment:${label}`,
     };
@@ -1192,11 +1271,13 @@ export default function DeltaCommitment3DPage() {
     hoverRef.current = {
       residueIdMode,
       commitmentMode,
+      colorMetric,
+      frustrationChannel,
       sampleLabel: commitmentLabels?.[commitmentRowIndex] ? String(commitmentLabels[commitmentRowIndex]) : '',
       authToQ,
       labelSeqToQ,
     };
-  }, [coloringPayload, residueIdMode, commitmentMode, commitmentLabels, commitmentRowIndex]);
+  }, [coloringPayload, residueIdMode, commitmentMode, colorMetric, frustrationChannel, commitmentLabels, commitmentRowIndex]);
 
   // Allow residue selection directly from 3D clicks.
   useEffect(() => {
@@ -1650,7 +1731,7 @@ export default function DeltaCommitment3DPage() {
     return map;
   }, [residueProfile]);
 
-  if (loadingSystem) return <Loader message="Loading 3D commitment viewer..." />;
+  if (loadingSystem) return <Loader message="Loading 3D endpoint viewer..." />;
   if (systemError) return <ErrorMessage message={systemError} />;
 
   const missing = Boolean(
@@ -1664,8 +1745,8 @@ export default function DeltaCommitment3DPage() {
     <div className="space-y-4">
       <HelpDrawer
         open={helpOpen}
-        title="Delta Commitment (3D): How To Read It"
-        docPath="/docs/delta_commitment_3d_help.md"
+        title="Endpoint Analysis (3D): How To Read It"
+        docPath="/docs/endpoint_frustration_3d.md"
         onClose={() => setHelpOpen(false)}
       />
 
@@ -1676,12 +1757,12 @@ export default function DeltaCommitment3DPage() {
             onClick={() => navigate(`/projects/${projectId}/systems/${systemId}/sampling/delta_eval`)}
             className="text-cyan-400 hover:text-cyan-300 text-sm"
           >
-            ← Back to Delta Potts Evaluation
+            ← Back to endpoint analysis
           </button>
-          <h1 className="text-2xl font-semibold text-white">Delta Commitment (3D)</h1>
+          <h1 className="text-2xl font-semibold text-white">Endpoint analysis (3D)</h1>
           <p className="text-sm text-gray-400">
-            Load a structure and color residues by commitment <code>q_i</code> for a selected ensemble under a fixed model pair (A,B).
-            The base cartoon is gray; colored residues are overpainted on top.
+            Load a structure and color residues by commitment or frustration for a selected ensemble under a fixed
+            model pair (A,B). The base cartoon is gray; colored residues are overpainted on top.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -1817,7 +1898,7 @@ export default function DeltaCommitment3DPage() {
             </div>
 
             <div>
-              <label className="block text-xs text-gray-400 mb-1">Color by commitment</label>
+              <label className="block text-xs text-gray-400 mb-1">Color by sample</label>
               <select
                 value={String(commitmentRowIndex)}
                 onChange={(e) => setCommitmentRowIndex(Number(e.target.value))}
@@ -1830,21 +1911,32 @@ export default function DeltaCommitment3DPage() {
                 ))}
               </select>
               <p className="text-[11px] text-gray-500 mt-1">
-                Colors are derived from the selected commitment mode (see below).
+                The selected sample provides the residue values rendered on the structure.
               </p>
               {selectedCommitmentMeta && commitmentSampleIds.length > 0 && missingMdCommitmentSamples.length > 0 && (
                 <div className="mt-2 rounded-md border border-yellow-900 bg-yellow-950/20 p-2 text-[11px] text-yellow-200">
-                  Commitment rows missing for {missingMdCommitmentSamples.length} MD samples:
+                  Analysis rows missing for {missingMdCommitmentSamples.length} MD samples:
                   {' '}
                   {missingMdCommitmentSamples
                     .slice(0, 6)
                     .map((s) => (s.state_id ? `${s.name} (${s.state_id})` : s.name))
                     .join(', ')}
                   {missingMdCommitmentSamples.length > 6 ? ' ...' : ''}.
-                  {' '}Run Delta Commitment analysis again and include these samples to append them.
+                  {' '}Run endpoint analysis again and include these samples to append them.
                 </div>
               )}
-              <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2">
+              <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-2">
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">Metric</label>
+                  <select
+                    value={colorMetric}
+                    onChange={(e) => setColorMetric(e.target.value)}
+                    className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                  >
+                    <option value="commitment">Commitment</option>
+                    <option value="frustration">Frustration</option>
+                  </select>
+                </div>
                 <div>
                   <label className="block text-xs text-gray-400 mb-1">Residue mapping</label>
                   <select
@@ -1861,7 +1953,10 @@ export default function DeltaCommitment3DPage() {
                   </p>
                 </div>
                 <div>
-                  <label className="block text-xs text-gray-400 mb-1">Commitment mode</label>
+                  <label className="block text-xs text-gray-400 mb-1">
+                    {colorMetric === 'commitment' ? 'Commitment mode' : 'Frustration channel'}
+                  </label>
+                  {colorMetric === 'commitment' ? (
                   <select
                     value={commitmentMode}
                     onChange={(e) => setCommitmentMode(e.target.value)}
@@ -1875,18 +1970,30 @@ export default function DeltaCommitment3DPage() {
                       Mean field (smooth)
                     </option>
                   </select>
+                  ) : (
+                    <select
+                      value={frustrationChannel}
+                      onChange={(e) => setFrustrationChannel(e.target.value)}
+                      className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                    >
+                      <option value="sym">Symmetric</option>
+                      <option value="pol">Polarity</option>
+                    </select>
+                  )}
                   <p className="text-[11px] text-gray-500 mt-1">
-                    Centered mode calibrates each residue by a reference ensemble so "neutral" residues appear closer to white (0.5).
+                    {colorMetric === 'commitment'
+                      ? 'Centered mode calibrates each residue by a reference ensemble so neutral residues appear closer to white (0.5).'
+                      : 'Symmetric frustration highlights residues strained under both endpoints. Polarity frustration indicates whether the local strain is more active-like or inactive-like.'}
                   </p>
-                  {!hasAltCommitmentData && (
+                  {colorMetric === 'commitment' && !hasAltCommitmentData && (
                     <p className="text-[11px] text-yellow-300 mt-1">
-                      Centered/Mean require analysis artifacts generated with the latest backend. Re-run commitment analysis for this (A,B) pair.
+                      Centered/Mean require analysis artifacts generated with the latest backend. Re-run endpoint analysis for this (A,B) pair.
                     </p>
                   )}
                 </div>
               </div>
 
-              {commitmentMode === 'centered' && (
+              {colorMetric === 'commitment' && commitmentMode === 'centered' && (
                 <div className="mt-3">
                   <label className="block text-xs text-gray-400 mb-1">Reference ensemble(s)</label>
                   <select
@@ -1935,7 +2042,7 @@ export default function DeltaCommitment3DPage() {
                     />
                   </div>
                   <p className="text-[11px] text-gray-500">
-                    Each residue color is blended with the average commitment of its incident top edges (weighted by |ΔJ|).
+                    Each residue color is blended with the average value of its incident top edges (weighted by |ΔJ|).
                   </p>
                 </div>
               </div>
@@ -1980,7 +2087,7 @@ export default function DeltaCommitment3DPage() {
                       </div>
                       {coloringDebug.commitmentMode && (
                         <div>
-                          q: <span className="font-mono">{coloringDebug.commitmentMode}</span>
+                          mode: <span className="font-mono">{coloringDebug.commitmentMode}</span>
                           {coloringDebug.refCount ? (
                             <>
                               {' '}
@@ -2039,9 +2146,9 @@ export default function DeltaCommitment3DPage() {
 
             {missing && (
               <div className="rounded-md border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200 space-y-2">
-                <div>No matching commitment analysis found for this (A,B,params) selection.</div>
+                <div>No matching endpoint analysis found for this (A,B,params) selection.</div>
                 <div className="text-[11px] text-yellow-200">
-                  Go back to <span className="font-mono">Delta Potts Evaluation</span> and run commitment on at least one sample.
+                  Go back to <span className="font-mono">Endpoint analysis</span> and run the analysis on at least one sample.
                 </div>
               </div>
             )}
@@ -2098,7 +2205,7 @@ export default function DeltaCommitment3DPage() {
               <h2 className="text-sm font-semibold text-gray-200">Selected Residue Details</h2>
               <p className="text-[11px] text-gray-500">
                 Click a residue in 3D or select it here. Distributions are computed from the sample selected in
-                <span className="font-mono"> Color by commitment</span>.
+                <span className="font-mono"> Color by sample</span>.
               </p>
             </div>
             <div className="w-56">
@@ -2118,7 +2225,7 @@ export default function DeltaCommitment3DPage() {
 
           {(residueProfileLoading || !selectedSampleId) && (
             <p className="text-sm text-gray-400">
-              {selectedSampleId ? 'Computing residue profile…' : 'Select a sample in Color by commitment.'}
+              {selectedSampleId ? 'Computing residue profile…' : 'Select a sample in Color by sample.'}
             </p>
           )}
           {residueProfileError && <ErrorMessage message={residueProfileError} />}
