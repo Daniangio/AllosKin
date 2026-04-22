@@ -6,7 +6,7 @@ import numpy as np
 
 os.environ.setdefault("PHASE_DATA_ROOT", "/tmp/phase-test-data")
 
-from phase.potts.analysis_run import upsert_endpoint_frustration_analysis
+from phase.potts.analysis_run import load_endpoint_framewise_payload, upsert_endpoint_frustration_analysis
 from phase.potts.potts_model import PottsModel, save_potts_model
 from phase.potts.sample_io import save_sample_npz
 from phase.services.project_store import ProjectStore
@@ -337,3 +337,66 @@ def test_endpoint_frustration_progress_callback_reports_sample_progress(monkeypa
     assert progress_events
     assert progress_events[0] == ("Computing endpoint frustration", 0, 2)
     assert progress_events[-1] == ("Computing endpoint frustration", 2, 2)
+
+
+def test_endpoint_frustration_framewise_payload_includes_rankings_and_slice(monkeypatch, tmp_path):
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("PHASE_DATA_ROOT", str(data_root))
+
+    store = ProjectStore(base_dir=data_root / "projects")
+    store.create_project("Project", project_id="proj")
+    system = store.create_system("proj", name="System", system_id="sys")
+    store.save_system(system)
+
+    cluster_id = "cluster1"
+    cluster_dirs = store.ensure_cluster_directories("proj", "sys", cluster_id)
+    system_dir = data_root / "projects" / "proj" / "systems" / "sys"
+    np.savez_compressed(
+        cluster_dirs["cluster_dir"] / "cluster.npz",
+        residue_keys=np.asarray(["res_10", "res_20"], dtype=str),
+        cluster_counts=np.asarray([2, 2], dtype=np.int32),
+    )
+    edges = [(0, 1)]
+    _write_model(
+        cluster_dirs["potts_models_dir"],
+        system_dir,
+        "model-a",
+        "Active-like",
+        h=[np.asarray([0.0, 1.0]), np.asarray([0.4, -0.1])],
+        J={(0, 1): np.asarray([[0.2, -0.4], [0.1, 0.3]])},
+        edges=edges,
+    )
+    _write_model(
+        cluster_dirs["potts_models_dir"],
+        system_dir,
+        "model-b",
+        "Inactive-like",
+        h=[np.asarray([0.5, -0.2]), np.asarray([0.0, 0.2])],
+        J={(0, 1): np.asarray([[-0.1, 0.2], [0.0, -0.3]])},
+        edges=edges,
+    )
+    _write_sample(
+        system_dir,
+        cluster_id,
+        "md1",
+        {"name": "MD 1", "type": "md_eval", "method": "md_eval"},
+        labels=np.asarray([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=np.int32),
+    )
+
+    out = upsert_endpoint_frustration_analysis(
+        project_id="proj",
+        system_id="sys",
+        cluster_id=cluster_id,
+        model_a_ref="model-a",
+        model_b_ref="model-b",
+        sample_ids=["md1"],
+        top_k_edges=10,
+    )
+    framewise_path = Path(out["analysis_dir"]) / "samples" / "md1.npz"
+    payload = load_endpoint_framewise_payload(framewise_path, start=1, stop=4, step=2, include_ranks=True, include_edges=False)
+    assert payload["analysis_format_version"] == 2
+    assert payload["slice"]["frame_indices"] == [1, 3]
+    assert len(payload["node"]["sym"]) == 2
+    assert "ranking" in payload
+    assert len(payload["ranking"]["score_node_sym_topj_default"]) == 4
+    assert sorted(payload["ranking"]["rank_node_sym_topj_default"]) == [0, 1, 2, 3]

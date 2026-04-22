@@ -178,6 +178,25 @@ export function fetchClusterAnalysisData(projectId, systemId, clusterId, analysi
   );
 }
 
+export function fetchEndpointFrustrationFramewise(
+  projectId,
+  systemId,
+  clusterId,
+  analysisId,
+  sampleId,
+  options = {}
+) {
+  const params = new URLSearchParams();
+  params.set('start', String(Math.max(0, Number(options?.start ?? 0) || 0)));
+  if (options?.stop != null) params.set('stop', String(Math.max(0, Number(options.stop) || 0)));
+  params.set('step', String(Math.max(1, Number(options?.step ?? 1) || 1)));
+  params.set('includeRanks', options?.includeRanks === false ? '0' : '1');
+  params.set('includeEdges', options?.includeEdges ? '1' : '0');
+  return requestJSON(
+    `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/analyses/endpoint_frustration/${analysisId}/samples/${encodeURIComponent(sampleId)}/framewise?${params.toString()}`
+  );
+}
+
 export function deleteClusterAnalysis(projectId, systemId, clusterId, analysisType, analysisId) {
   return requestJSON(
     `/projects/${projectId}/systems/${systemId}/metastable/clusters/${clusterId}/analyses/${analysisType}/${analysisId}`,

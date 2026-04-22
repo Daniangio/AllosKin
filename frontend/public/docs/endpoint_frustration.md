@@ -63,6 +63,7 @@ Interpretation:
 
 - symmetric: hotspots strained under both endpoints
 - polarity: direction of the local conflict
+- webserver color convention for polarity: red means **more A-like** (less frustrated under model A), blue means more B-like
 
 ## Saved outputs
 
@@ -125,12 +126,24 @@ The endpoint page shows four bar plots for the selected sample:
 - residue frustration
 - edge frustration
 
+Frustration can be shown either as:
+
+- raw normalized values
+- centered values relative to selected reference MD trajectories already included in the analysis
+
+Color scale used in the web page:
+
+- symmetric (raw): green = low frustration, red = high frustration
+- symmetric (centered): green = lower than reference MD, red = higher than reference MD
+- polarity: red = more A-like, blue = more B-like
+
 Edge-weighted residue coloring:
 
 - blends residue values with incident edge values
 - weighted by `|ΔJ|`
 - default weight: `0.75`
 - default state on webserver: disabled
+- UI applies a post-blend contrast normalization to avoid flat/blunted colors when edge blending is enabled
 
 ## 3D page
 

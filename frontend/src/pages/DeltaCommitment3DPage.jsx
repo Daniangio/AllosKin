@@ -27,6 +27,7 @@ import HelpDrawer from '../components/common/HelpDrawer';
 import {
   fetchClusterAnalyses,
   fetchClusterAnalysisData,
+  fetchEndpointFrustrationFramewise,
   fetchPottsClusterInfo,
   fetchSampleResidueProfile,
   fetchSystem,
@@ -70,6 +71,44 @@ function commitmentColor(q) {
   return rgbToHex(lerp(255, 239, u), lerp(255, 68, u), lerp(255, 68, u));
 }
 
+function symmetricFrustrationColor(q) {
+  // Sequential map for symmetric frustration: low -> green, high -> red.
+  const t = clamp01((clamp01(q) - 0.5) * 2);
+  if (t <= 0.5) {
+    const u = t / 0.5;
+    return rgbToHex(lerp(34, 250, u), lerp(197, 204, u), lerp(94, 21, u));
+  }
+  const u = (t - 0.5) / 0.5;
+  return rgbToHex(lerp(250, 239, u), lerp(204, 68, u), lerp(21, 68, u));
+}
+
+function centeredSymmetricFrustrationColor(q) {
+  // Diverging map: lower-than-reference frustration -> green, baseline -> white, higher -> red.
+  const t = clamp01(q);
+  if (t <= 0.5) {
+    const u = t / 0.5;
+    return rgbToHex(lerp(34, 255, u), lerp(197, 255, u), lerp(94, 255, u));
+  }
+  const u = (t - 0.5) / 0.5;
+  return rgbToHex(lerp(255, 239, u), lerp(255, 68, u), lerp(255, 68, u));
+}
+
+function polarityFrustrationColor(q) {
+  // Raw polarity is z_A - z_B. A-like means lower A frustration => negative polarity.
+  // To keep PHASE semantics (red = more A-like), we flip the diverging direction.
+  return commitmentColor(1 - clamp01(q));
+}
+
+function metricColorHex(q, colorMetric, frustrationChannel, frustrationDisplayMode) {
+  if (colorMetric !== 'frustration') return commitmentColor(q);
+  if (frustrationChannel === 'sym') {
+    return frustrationDisplayMode === 'centered'
+      ? centeredSymmetricFrustrationColor(q)
+      : symmetricFrustrationColor(q);
+  }
+  return polarityFrustrationColor(q);
+}
+
 function sigmoid(x) {
   if (!Number.isFinite(x)) return 0.5;
   // numerically stable sigmoid
@@ -94,6 +133,43 @@ function parseResidueId(label) {
   if (!m) return null;
   const v = Number(m[0]);
   return Number.isFinite(v) ? v : null;
+}
+
+function metricLegendText(colorMetric, frustrationChannel, frustrationDisplayMode) {
+  if (colorMetric !== 'frustration') {
+    return 'Blue = more B-like, white = neutral, red = more A-like.';
+  }
+  if (frustrationChannel === 'sym') {
+    return frustrationDisplayMode === 'centered'
+      ? 'Green = lower frustration than reference MD, white = reference-like, red = higher frustration than reference MD.'
+      : 'Green = low symmetric frustration, yellow = medium, red = high symmetric frustration.';
+  }
+  return frustrationDisplayMode === 'centered'
+    ? 'Red = more A-like vs reference (less frustrated under model A), white = reference-like, blue = more B-like vs reference.'
+    : 'Red = more A-like (less frustrated under model A), white = balanced, blue = more B-like.';
+}
+
+function metricValueHint(q, colorMetric, frustrationChannel, frustrationDisplayMode) {
+  if (!Number.isFinite(q)) return '';
+  if (colorMetric !== 'frustration') {
+    if (q > 0.5) return 'towards A (red)';
+    if (q < 0.5) return 'towards B (blue)';
+    return 'neutral';
+  }
+  if (frustrationChannel === 'sym') {
+    if (frustrationDisplayMode === 'centered') {
+      if (q > 0.5) return 'more frustrated than reference (red)';
+      if (q < 0.5) return 'less frustrated than reference (green)';
+      return 'reference-like';
+    }
+    const t = clamp01((q - 0.5) * 2);
+    if (t >= 0.66) return 'high frustration (red)';
+    if (t <= 0.33) return 'low frustration (green)';
+    return 'intermediate frustration';
+  }
+  if (q < 0.5) return 'more A-like (red)';
+  if (q > 0.5) return 'more B-like (blue)';
+  return 'balanced';
 }
 
 function pieColor(idx) {
@@ -335,9 +411,20 @@ export default function DeltaCommitment3DPage() {
   const [commitmentMode, setCommitmentMode] = useState('prob'); // prob | centered | mu_sigmoid
   const [colorMetric, setColorMetric] = useState('commitment'); // commitment | frustration
   const [frustrationChannel, setFrustrationChannel] = useState('sym'); // sym | pol
+  const [frustrationDisplayMode, setFrustrationDisplayMode] = useState('raw'); // raw | centered
   const [referenceSampleIds, setReferenceSampleIds] = useState([]); // used for centered mode
   const [edgeSmoothEnabled, setEdgeSmoothEnabled] = useState(false);
   const [edgeSmoothStrength, setEdgeSmoothStrength] = useState(0.75); // 0..1
+  const [frameStart, setFrameStart] = useState(0);
+  const [frameStop, setFrameStop] = useState(100);
+  const [frameStep, setFrameStep] = useState(1);
+  const [frameWindow, setFrameWindow] = useState(null);
+  const [frameWindowLoading, setFrameWindowLoading] = useState(false);
+  const [frameWindowError, setFrameWindowError] = useState(null);
+  const [selectedFrameOffset, setSelectedFrameOffset] = useState(0);
+  const [topKFrames, setTopKFrames] = useState(10);
+  const [frameRankingMode, setFrameRankingMode] = useState('node_sym_topj');
+  const pendingFrameRef = useRef(null);
 
   // Residue-id mapping between cluster residues and the loaded PDB.
   // In practice, "label" (sequential) is the most robust across PDBs; "auth" depends on PDB numbering.
@@ -715,6 +802,10 @@ export default function DeltaCommitment3DPage() {
       return idx < raw.length ? String(raw[idx] || '') : '';
     });
   }, [analysisData, commitmentSampleIds, sampleCatalogById]);
+  const commitmentFrameCounts = useMemo(() => {
+    const raw = Array.isArray(analysisData?.data?.sample_frame_counts) ? analysisData.data.sample_frame_counts : [];
+    return raw.map((v) => Number(v));
+  }, [analysisData]);
   const missingMdCommitmentSamples = useMemo(() => {
     const samples = Array.isArray(selectedCluster?.samples) ? selectedCluster.samples : [];
     const analyzed = new Set(commitmentSampleIds.map((sid) => String(sid)));
@@ -796,7 +887,7 @@ export default function DeltaCommitment3DPage() {
 
   // Default reference set for centered mode: use MD samples if present, else the first available sample.
   useEffect(() => {
-    if (commitmentMode !== 'centered') return;
+    if (commitmentMode !== 'centered' && !(colorMetric === 'frustration' && frustrationDisplayMode === 'centered')) return;
     if (referenceSampleIds.length) return;
     if (!commitmentSampleIds.length) return;
     const md = commitmentSampleIds.filter((sid, idx) => {
@@ -805,7 +896,30 @@ export default function DeltaCommitment3DPage() {
     });
     if (md.length) setReferenceSampleIds(md);
     else setReferenceSampleIds([commitmentSampleIds[0]]);
-  }, [commitmentMode, referenceSampleIds.length, commitmentSampleIds, commitmentTypes]);
+  }, [commitmentMode, colorMetric, frustrationDisplayMode, referenceSampleIds.length, commitmentSampleIds, commitmentTypes]);
+
+  const selectedSampleId = useMemo(() => {
+    if (!Array.isArray(commitmentSampleIds) || !commitmentSampleIds.length) return '';
+    const sid = commitmentSampleIds[commitmentRowIndex];
+    return sid ? String(sid) : '';
+  }, [commitmentSampleIds, commitmentRowIndex]);
+
+  const selectedSampleLabel = useMemo(() => {
+    if (!Array.isArray(commitmentLabels) || !commitmentLabels.length) return '';
+    return String(commitmentLabels[commitmentRowIndex] || selectedSampleId || '');
+  }, [commitmentLabels, commitmentRowIndex, selectedSampleId]);
+
+  const selectedSampleFrameCount = useMemo(() => {
+    const raw = commitmentFrameCounts?.[commitmentRowIndex];
+    return Number.isFinite(raw) ? Math.max(0, Number(raw)) : 0;
+  }, [commitmentFrameCounts, commitmentRowIndex]);
+
+  const frustrationReferenceIdxs = useMemo(() => {
+    if (!referenceSampleIds.length || !commitmentSampleIds.length) return [];
+    return referenceSampleIds
+      .map((sid) => commitmentSampleIds.indexOf(String(sid)))
+      .filter((idx) => Number.isInteger(idx) && idx >= 0);
+  }, [referenceSampleIds, commitmentSampleIds]);
 
   const centeredCalib = useMemo(() => {
     if (commitmentMode !== 'centered') return null;
@@ -875,14 +989,72 @@ export default function DeltaCommitment3DPage() {
     return { thresholds, alphas, eps };
   }, [commitmentMode, dhTable, pNode, referenceSampleIds, commitmentSampleIds, kList]);
 
+  const frustrationReferenceNodeMean = useMemo(() => {
+    const matrix = frustrationChannel === 'pol' ? frustrationNodePolMean : frustrationNodeSymMean;
+    if (!Array.isArray(matrix) || !frustrationReferenceIdxs.length) return null;
+    const n = residueLabels.length;
+    const out = new Array(n).fill(0);
+    const counts = new Array(n).fill(0);
+    for (const ridx of frustrationReferenceIdxs) {
+      const row = matrix?.[ridx];
+      if (!Array.isArray(row)) continue;
+      for (let i = 0; i < Math.min(n, row.length); i += 1) {
+        const v = Number(row[i]);
+        if (!Number.isFinite(v)) continue;
+        out[i] += v;
+        counts[i] += 1;
+      }
+    }
+    return out.map((sum, i) => (counts[i] > 0 ? sum / counts[i] : NaN));
+  }, [frustrationChannel, frustrationNodePolMean, frustrationNodeSymMean, frustrationReferenceIdxs, residueLabels.length]);
+
+  const frustrationReferenceEdgeMean = useMemo(() => {
+    const matrix = frustrationChannel === 'pol' ? frustrationEdgePolMean : frustrationEdgeSymMean;
+    if (!Array.isArray(matrix) || !frustrationReferenceIdxs.length) return null;
+    const n = Array.isArray(matrix[0]) ? matrix[0].length : 0;
+    const out = new Array(n).fill(0);
+    const counts = new Array(n).fill(0);
+    for (const ridx of frustrationReferenceIdxs) {
+      const row = matrix?.[ridx];
+      if (!Array.isArray(row)) continue;
+      for (let i = 0; i < Math.min(n, row.length); i += 1) {
+        const v = Number(row[i]);
+        if (!Number.isFinite(v)) continue;
+        out[i] += v;
+        counts[i] += 1;
+      }
+    }
+    return out.map((sum, i) => (counts[i] > 0 ? sum / counts[i] : NaN));
+  }, [frustrationChannel, frustrationEdgePolMean, frustrationEdgeSymMean, frustrationReferenceIdxs]);
+
+  const currentFrameIndices = useMemo(
+    () => (Array.isArray(frameWindow?.slice?.frame_indices) ? frameWindow.slice.frame_indices.map((v) => Number(v)) : []),
+    [frameWindow]
+  );
+  const currentFrustrationNodeRow = useMemo(() => {
+    const node = frameWindow?.node;
+    const rows = frustrationChannel === 'pol' ? node?.pol : node?.sym;
+    if (!Array.isArray(rows) || !rows.length) return null;
+    const idx = Math.max(0, Math.min(Number(selectedFrameOffset) || 0, rows.length - 1));
+    return Array.isArray(rows[idx]) ? rows[idx].map((v) => Number(v)) : null;
+  }, [frameWindow, frustrationChannel, selectedFrameOffset]);
+
   const qRowValues = useMemo(() => {
     if (colorMetric === 'frustration') {
       const matrix = frustrationChannel === 'pol' ? frustrationNodePolMean : frustrationNodeSymMean;
-      if (!Array.isArray(matrix) || !matrix.length) return null;
-      const row = matrix[commitmentRowIndex];
-      if (!Array.isArray(row) || !row.length) return null;
-      const base = row.map((v) => Number(v));
-      if (frustrationChannel === 'pol') {
+      const rawRow =
+        (Array.isArray(currentFrustrationNodeRow) && currentFrustrationNodeRow.length
+          ? currentFrustrationNodeRow
+          : (Array.isArray(matrix) && Array.isArray(matrix[commitmentRowIndex]) ? matrix[commitmentRowIndex].map((v) => Number(v)) : null));
+      if (!Array.isArray(rawRow) || !rawRow.length) return null;
+      const centered = frustrationDisplayMode === 'centered' && Array.isArray(frustrationReferenceNodeMean) && frustrationReferenceNodeMean.length;
+      const base = centered
+        ? rawRow.map((v, idx) => {
+            const ref = Number(frustrationReferenceNodeMean[idx]);
+            return Number.isFinite(v) && Number.isFinite(ref) ? v - ref : v;
+          })
+        : rawRow.map((v) => Number(v));
+      if (frustrationChannel === 'pol' || centered) {
         const finite = base.filter((v) => Number.isFinite(v));
         const maxAbs = finite.length ? Math.max(...finite.map((v) => Math.abs(v))) : 1;
         const scale = maxAbs > 1e-9 ? maxAbs : 1;
@@ -969,8 +1141,11 @@ export default function DeltaCommitment3DPage() {
   }, [
     colorMetric,
     frustrationChannel,
+    frustrationDisplayMode,
     frustrationNodePolMean,
     frustrationNodeSymMean,
+    currentFrustrationNodeRow,
+    frustrationReferenceNodeMean,
     commitmentMatrix,
     commitmentRowIndex,
     commitmentMode,
@@ -993,8 +1168,13 @@ export default function DeltaCommitment3DPage() {
     if (colorMetric === 'frustration') {
       const matrix = frustrationChannel === 'pol' ? frustrationEdgePolMean : frustrationEdgeSymMean;
       if (!matrix || !Array.isArray(matrix[commitmentRowIndex])) return null;
-      const row = matrix[commitmentRowIndex].map((v) => Number(v));
-      if (frustrationChannel === 'pol') {
+      const centered = frustrationDisplayMode === 'centered' && Array.isArray(frustrationReferenceEdgeMean) && frustrationReferenceEdgeMean.length;
+      const row = matrix[commitmentRowIndex].map((v, idx) => {
+        const base = Number(v);
+        const ref = Number(frustrationReferenceEdgeMean?.[idx]);
+        return centered && Number.isFinite(base) && Number.isFinite(ref) ? base - ref : base;
+      });
+      if (frustrationChannel === 'pol' || centered) {
         const finite = row.filter((v) => Number.isFinite(v));
         const maxAbs = finite.length ? Math.max(...finite.map((v) => Math.abs(v))) : 1;
         const scale = maxAbs > 1e-9 ? maxAbs : 1;
@@ -1032,8 +1212,10 @@ export default function DeltaCommitment3DPage() {
   }, [
     colorMetric,
     frustrationChannel,
+    frustrationDisplayMode,
     frustrationEdgePolMean,
     frustrationEdgeSymMean,
+    frustrationReferenceEdgeMean,
     qEdgeMatrix,
     commitmentRowIndex,
     commitmentMode,
@@ -1048,17 +1230,6 @@ export default function DeltaCommitment3DPage() {
     });
   }, [residueLabels.length]);
 
-  const selectedSampleId = useMemo(() => {
-    if (!Array.isArray(commitmentSampleIds) || !commitmentSampleIds.length) return '';
-    const sid = commitmentSampleIds[commitmentRowIndex];
-    return sid ? String(sid) : '';
-  }, [commitmentSampleIds, commitmentRowIndex]);
-
-  const selectedSampleLabel = useMemo(() => {
-    if (!Array.isArray(commitmentLabels) || !commitmentLabels.length) return '';
-    return String(commitmentLabels[commitmentRowIndex] || selectedSampleId || '');
-  }, [commitmentLabels, commitmentRowIndex, selectedSampleId]);
-
   const qByEdgeIndex = useMemo(() => {
     const map = new Map();
     if (!Array.isArray(topEdgeIndices) || !Array.isArray(qEdgeRowValues)) return map;
@@ -1070,6 +1241,111 @@ export default function DeltaCommitment3DPage() {
     }
     return map;
   }, [topEdgeIndices, qEdgeRowValues]);
+  useEffect(() => {
+    if (!currentFrameIndices.length) {
+      setSelectedFrameOffset(0);
+      return;
+    }
+    setSelectedFrameOffset((prev) => Math.max(0, Math.min(Number(prev) || 0, currentFrameIndices.length - 1)));
+  }, [currentFrameIndices]);
+  const selectedAbsoluteFrame = useMemo(() => {
+    if (!currentFrameIndices.length) return null;
+    const idx = Math.max(0, Math.min(Number(selectedFrameOffset) || 0, currentFrameIndices.length - 1));
+    return Number(currentFrameIndices[idx]);
+  }, [currentFrameIndices, selectedFrameOffset]);
+
+  const rankedFrames = useMemo(() => {
+    const ranking = frameWindow?.ranking;
+    if (!ranking) return [];
+    let rank = [];
+    let score = [];
+    if (frameRankingMode === 'node_pol_abs_topj') {
+      rank = Array.isArray(ranking.rank_node_pol_abs_topj_default) ? ranking.rank_node_pol_abs_topj_default : [];
+      score = Array.isArray(ranking.score_node_pol_abs_topj_default) ? ranking.score_node_pol_abs_topj_default : [];
+    } else {
+      rank = Array.isArray(ranking.rank_node_sym_topj_default) ? ranking.rank_node_sym_topj_default : [];
+      score = Array.isArray(ranking.score_node_sym_topj_default) ? ranking.score_node_sym_topj_default : [];
+    }
+    return rank.slice(0, Math.max(1, Number(topKFrames) || 10)).map((frameIdx) => ({
+      frameIndex: Number(frameIdx),
+      score: Number(score[Number(frameIdx)]),
+    }));
+  }, [frameWindow, frameRankingMode, topKFrames]);
+
+  const jumpToFrame = useCallback((frameIndex) => {
+    const target = Number(frameIndex);
+    if (!Number.isInteger(target) || target < 0) return;
+    const idx = currentFrameIndices.indexOf(target);
+    if (idx >= 0) {
+      setSelectedFrameOffset(idx);
+      return;
+    }
+    const step = Math.max(1, Number(frameStep) || 1);
+    const radius = 50 * step;
+    pendingFrameRef.current = target;
+    setFrameStart(Math.max(0, target - radius));
+    setFrameStop(target + radius + 1);
+  }, [currentFrameIndices, frameStep]);
+
+  useEffect(() => {
+    if (!selectedSampleFrameCount) return;
+    setFrameStop((prev) => {
+      const next = Math.min(selectedSampleFrameCount, Math.max(1, Number(prev) || 100));
+      return next > 0 ? next : Math.min(100, selectedSampleFrameCount);
+    });
+    setFrameStart((prev) => Math.max(0, Math.min(Number(prev) || 0, Math.max(0, selectedSampleFrameCount - 1))));
+  }, [selectedSampleFrameCount]);
+
+  useEffect(() => {
+    if (!selectedCommitmentMeta?.analysis_id || !selectedSampleId) {
+      setFrameWindow(null);
+      setFrameWindowError(null);
+      return;
+    }
+    let cancelled = false;
+    const run = async () => {
+      setFrameWindowLoading(true);
+      setFrameWindowError(null);
+      try {
+        const payload = await fetchEndpointFrustrationFramewise(
+          projectId,
+          systemId,
+          selectedClusterId,
+          selectedCommitmentMeta.analysis_id,
+          selectedSampleId,
+          {
+            start: frameStart,
+            stop: frameStop,
+            step: frameStep,
+            includeRanks: true,
+            includeEdges: false,
+          }
+        );
+        if (cancelled) return;
+        setFrameWindow(payload);
+        const requested = pendingFrameRef.current;
+        const indices = Array.isArray(payload?.slice?.frame_indices) ? payload.slice.frame_indices.map((v) => Number(v)) : [];
+        if (Number.isInteger(requested) && indices.length) {
+          const idx = indices.indexOf(requested);
+          setSelectedFrameOffset(idx >= 0 ? idx : 0);
+        } else {
+          setSelectedFrameOffset(0);
+        }
+        pendingFrameRef.current = null;
+      } catch (err) {
+        if (!cancelled) {
+          setFrameWindow(null);
+          setFrameWindowError(err.message || 'Failed to load framewise frustration window.');
+        }
+      } finally {
+        if (!cancelled) setFrameWindowLoading(false);
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, systemId, selectedClusterId, selectedCommitmentMeta, selectedSampleId, frameStart, frameStop, frameStep]);
 
   const selectedEdgeEntries = useMemo(() => {
     if (!Array.isArray(edgesAll)) return [];
@@ -1131,15 +1407,26 @@ export default function DeltaCommitment3DPage() {
       sumWD[s] += w * d;
     }
 
-    const out = new Array(N);
+    const mixed = new Array(N);
     for (let i = 0; i < N; i += 1) {
       const qi = clamp01(Number(qRowValues[i]));
       const di = qi - 0.5;
       const de = sumW[i] > 0 ? sumWD[i] / sumW[i] : 0;
       const dMix = (1 - strength) * di + strength * de;
-      out[i] = 0.5 + dMix;
+      mixed[i] = dMix;
     }
-    return out;
+
+    // Preserve visual contrast: blending in q-space shrinks dynamic range toward 0.5.
+    const baseAbs = qRowValues
+      .map((q) => Number(q))
+      .filter((q) => Number.isFinite(q))
+      .map((q) => Math.abs(clamp01(q) - 0.5));
+    const mixAbs = mixed.filter((d) => Number.isFinite(d)).map((d) => Math.abs(d));
+    const baseMax = baseAbs.length ? Math.max(...baseAbs) : 0;
+    const mixMax = mixAbs.length ? Math.max(...mixAbs) : 0;
+    const gain = mixMax > 1e-9 ? Math.min(4, Math.max(1, baseMax / mixMax)) : 1;
+
+    return mixed.map((d) => (Number.isFinite(d) ? 0.5 + clamp(d * gain, -0.5, 0.5) : NaN));
   }, [
     edgeSmoothEnabled,
     edgeSmoothStrength,
@@ -1273,11 +1560,14 @@ export default function DeltaCommitment3DPage() {
       commitmentMode,
       colorMetric,
       frustrationChannel,
-      sampleLabel: commitmentLabels?.[commitmentRowIndex] ? String(commitmentLabels[commitmentRowIndex]) : '',
+      sampleLabel:
+        colorMetric === 'frustration' && selectedAbsoluteFrame != null
+          ? `${commitmentLabels?.[commitmentRowIndex] ? String(commitmentLabels[commitmentRowIndex]) : ''} · frame ${selectedAbsoluteFrame}`
+          : (commitmentLabels?.[commitmentRowIndex] ? String(commitmentLabels[commitmentRowIndex]) : ''),
       authToQ,
       labelSeqToQ,
     };
-  }, [coloringPayload, residueIdMode, commitmentMode, colorMetric, frustrationChannel, commitmentLabels, commitmentRowIndex]);
+  }, [coloringPayload, residueIdMode, commitmentMode, colorMetric, frustrationChannel, commitmentLabels, commitmentRowIndex, selectedAbsoluteFrame]);
 
   // Allow residue selection directly from 3D clicks.
   useEffect(() => {
@@ -1375,7 +1665,7 @@ export default function DeltaCommitment3DPage() {
       const ids = bucket[b];
       if (!ids.length) continue;
       const qCenter = b / (bins - 1);
-      const colorHex = commitmentColor(qCenter);
+      const colorHex = metricColorHex(qCenter, colorMetric, frustrationChannel, frustrationDisplayMode);
       const colorValue = hexToInt(colorHex);
       const propFn =
         prop === 'auth'
@@ -1452,6 +1742,9 @@ export default function DeltaCommitment3DPage() {
     coloringPayload,
     residueIdMode,
     commitmentMode,
+    colorMetric,
+    frustrationChannel,
+    frustrationDisplayMode,
     referenceSampleIds.length,
     clearOverpaint,
     getBaseComponentWrapper,
@@ -1584,7 +1877,7 @@ export default function DeltaCommitment3DPage() {
         // Boost contrast a bit for edges (q values are often close to 0.5).
         const d = q - 0.5;
         const qVis = 0.5 + Math.sign(d) * Math.pow(Math.abs(d) * 2, 0.65) / 2;
-        colors.push(hexToInt(commitmentColor(qVis)));
+        colors.push(hexToInt(metricColorHex(qVis, colorMetric, frustrationChannel, frustrationDisplayMode)));
       }
       qUsed.push(q);
 
@@ -1643,6 +1936,9 @@ export default function DeltaCommitment3DPage() {
     dEdge,
     residueIdMode,
     residueLabels,
+    colorMetric,
+    frustrationChannel,
+    frustrationDisplayMode,
   ]);
 
   useEffect(() => {
@@ -1711,6 +2007,11 @@ export default function DeltaCommitment3DPage() {
     const q = Array.isArray(qRowValuesEdgeSmoothed) ? Number(qRowValuesEdgeSmoothed[selectedResidueIndex]) : NaN;
     return Number.isFinite(q) ? q : selectedResidueQ;
   }, [qRowValuesEdgeSmoothed, selectedResidueIndex, selectedResidueQ]);
+
+  const colorLegend = useMemo(
+    () => metricLegendText(colorMetric, frustrationChannel, frustrationDisplayMode),
+    [colorMetric, frustrationChannel, frustrationDisplayMode]
+  );
 
   const nodeSlices = useMemo(() => {
     const probs = residueProfile?.node_probs;
@@ -1993,7 +2294,34 @@ export default function DeltaCommitment3DPage() {
                 </div>
               </div>
 
-              {colorMetric === 'commitment' && commitmentMode === 'centered' && (
+              {colorMetric === 'frustration' && (
+                <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Frustration display</label>
+                    <select
+                      value={frustrationDisplayMode}
+                      onChange={(e) => setFrustrationDisplayMode(e.target.value)}
+                      className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                    >
+                      <option value="raw">Raw normalized</option>
+                      <option value="centered">Centered vs reference MD</option>
+                    </select>
+                    <p className="text-[11px] text-gray-500 mt-1">
+                      Centered mode subtracts the mean value of the selected reference MD trajectories residue-by-residue.
+                    </p>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Frustration source</label>
+                    <div className="rounded-md border border-gray-800 bg-gray-950/40 px-3 py-2 text-sm text-gray-200">
+                      {Array.isArray(currentFrustrationNodeRow) && selectedAbsoluteFrame != null
+                        ? `Frame ${selectedAbsoluteFrame} from ${selectedSampleLabel || selectedSampleId}`
+                        : `Summary mean for ${selectedSampleLabel || selectedSampleId}`}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {((colorMetric === 'commitment' && commitmentMode === 'centered') || (colorMetric === 'frustration' && frustrationDisplayMode === 'centered')) && (
                 <div className="mt-3">
                   <label className="block text-xs text-gray-400 mb-1">Reference ensemble(s)</label>
                   <select
@@ -2012,8 +2340,114 @@ export default function DeltaCommitment3DPage() {
                     ))}
                   </select>
                   <p className="text-[11px] text-gray-500 mt-1">
-                    Tip: select all MD ensembles (or any set you treat as a "baseline") to reduce artifacts from mixed-state marginals.
+                    Tip: select the MD trajectories you want to use as the visualization baseline.
                   </p>
+                </div>
+              )}
+
+              {colorMetric === 'frustration' && (
+                <div className="mt-3 rounded-md border border-gray-800 bg-gray-950/30 p-3 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <p className="text-sm font-medium text-white">Frame browser</p>
+                      <p className="text-[11px] text-gray-500">Loads only a selected window of analyzed frames.</p>
+                    </div>
+                    {frameWindowLoading ? <span className="text-xs text-cyan-300">Loading…</span> : null}
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">Start</label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={frameStart}
+                        onChange={(e) => setFrameStart(Math.max(0, Number(e.target.value) || 0))}
+                        className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">Stop</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={frameStop}
+                        onChange={(e) => setFrameStop(Math.max(1, Number(e.target.value) || 1))}
+                        className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">Step</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={frameStep}
+                        onChange={(e) => setFrameStep(Math.max(1, Number(e.target.value) || 1))}
+                        className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                      />
+                    </div>
+                  </div>
+                  {frameWindowError ? <p className="text-xs text-red-300">{frameWindowError}</p> : null}
+                  {currentFrameIndices.length ? (
+                    <div className="space-y-2">
+                      <input
+                        type="range"
+                        min={0}
+                        max={Math.max(0, currentFrameIndices.length - 1)}
+                        step={1}
+                        value={Math.max(0, Math.min(Number(selectedFrameOffset) || 0, currentFrameIndices.length - 1))}
+                        onChange={(e) => setSelectedFrameOffset(Number(e.target.value))}
+                        className="w-full"
+                      />
+                      <div className="flex items-center justify-between text-[11px] text-gray-400">
+                        <span>Window size: {currentFrameIndices.length}</span>
+                        <span>
+                          Frame {selectedAbsoluteFrame ?? '-'} · offset {Math.max(0, Math.min(Number(selectedFrameOffset) || 0, currentFrameIndices.length - 1))}
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-gray-500">No frame window loaded yet.</p>
+                  )}
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">Top frames</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={topKFrames}
+                        onChange={(e) => setTopKFrames(Math.max(1, Number(e.target.value) || 1))}
+                        className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">Ranking mode</label>
+                      <select
+                        value={frameRankingMode}
+                        onChange={(e) => setFrameRankingMode(e.target.value)}
+                        className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                      >
+                        <option value="node_sym_topj">Top symmetric hotspots</option>
+                        <option value="node_pol_abs_topj">Top polarity magnitude</option>
+                      </select>
+                    </div>
+                  </div>
+                  {rankedFrames.length ? (
+                    <div className="space-y-1 max-h-48 overflow-auto pr-1">
+                      {rankedFrames.map((item) => (
+                        <button
+                          key={`frame-rank:${item.frameIndex}`}
+                          type="button"
+                          onClick={() => jumpToFrame(item.frameIndex)}
+                          className="w-full flex items-center justify-between rounded border border-gray-800 bg-gray-950/40 px-3 py-2 text-left hover:border-gray-600"
+                        >
+                          <span className="text-sm text-gray-200">Frame {item.frameIndex}</span>
+                          <span className="text-xs text-cyan-300">{Number.isFinite(item.score) ? item.score.toFixed(4) : 'n/a'}</span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-gray-500">Ranking data unavailable for this analysis yet.</p>
+                  )}
                 </div>
               )}
 
@@ -2164,7 +2598,7 @@ export default function DeltaCommitment3DPage() {
               <div>
                 <h2 className="text-sm font-semibold text-gray-200">3D Viewer</h2>
                 <p className="text-[11px] text-gray-500">
-                  Blue ≈ q→0, white ≈ q≈0.5, red ≈ q→1.
+                  {colorLegend}
                 </p>
               </div>
               <button
@@ -2258,21 +2692,24 @@ export default function DeltaCommitment3DPage() {
                         <span className="text-gray-400">Valid frames:</span> {residueProfile.node_valid_count} / {residueProfile.n_frames}
                       </p>
                       <div className="flex items-center gap-2">
-                        <span className="text-gray-400">Commitment q:</span>
+                        <span className="text-gray-400">
+                          {colorMetric === 'frustration' ? 'Displayed value:' : 'Commitment q:'}
+                        </span>
                         <span
                           className="inline-flex items-center rounded px-2 py-0.5 text-[11px] font-semibold text-black"
-                          style={{ backgroundColor: commitmentColor(selectedResidueQVis) }}
+                          style={{
+                            backgroundColor: metricColorHex(
+                              selectedResidueQVis,
+                              colorMetric,
+                              frustrationChannel,
+                              frustrationDisplayMode
+                            ),
+                          }}
                         >
                           {Number.isFinite(selectedResidueQ) ? selectedResidueQ.toFixed(3) : 'n/a'}
                         </span>
                         <span className="text-[11px] text-gray-500">
-                          {Number.isFinite(selectedResidueQ)
-                            ? selectedResidueQ > 0.5
-                              ? 'towards A (red)'
-                              : selectedResidueQ < 0.5
-                              ? 'towards B (blue)'
-                              : 'neutral'
-                            : ''}
+                          {metricValueHint(selectedResidueQ, colorMetric, frustrationChannel, frustrationDisplayMode)}
                         </span>
                       </div>
                       {nodeSlices.length > 0 && (
@@ -2338,7 +2775,11 @@ export default function DeltaCommitment3DPage() {
                               </span>
                               <span
                                 className="inline-flex items-center rounded px-2 py-0.5 text-[11px] font-semibold text-black"
-                                style={{ backgroundColor: Number.isFinite(q) ? commitmentColor(q) : '#9ca3af' }}
+                                style={{
+                                  backgroundColor: Number.isFinite(q)
+                                    ? metricColorHex(q, colorMetric, frustrationChannel, frustrationDisplayMode)
+                                    : '#9ca3af',
+                                }}
                               >
                                 {Number.isFinite(q) ? q.toFixed(3) : 'n/a'}
                               </span>
@@ -2362,13 +2803,7 @@ export default function DeltaCommitment3DPage() {
                                   valid: {profile?.valid_count ?? 0} / {residueProfile.n_frames}
                                 </div>
                                 <div>
-                                  {Number.isFinite(q)
-                                    ? q > 0.5
-                                      ? 'towards A (red)'
-                                      : q < 0.5
-                                      ? 'towards B (blue)'
-                                      : 'neutral'
-                                    : ''}
+                                  {metricValueHint(q, colorMetric, frustrationChannel, frustrationDisplayMode)}
                                 </div>
                                 {slices.length > 0 && (
                                   <button

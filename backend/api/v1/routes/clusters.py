@@ -36,6 +36,7 @@ from phase.workflows.clustering import (
 from phase.workflows.backmapping import build_backmapping_npz
 from backend.tasks import run_backmapping_job, run_cluster_job, run_sample_backmapping_job
 from phase.potts.potts_model import interpolate_potts_models, load_potts_model, save_potts_model, zero_sum_gauge_model
+from phase.potts.analysis_run import load_endpoint_framewise_payload
 
 
 router = APIRouter()
@@ -859,6 +860,72 @@ async def get_cluster_analysis_data(
         raise HTTPException(status_code=500, detail=f"Failed to load analysis NPZ: {exc}") from exc
 
     return {"metadata": _convert_nan_to_none(meta), "data": _convert_nan_to_none(payload)}
+
+
+@router.get(
+    "/projects/{project_id}/systems/{system_id}/metastable/clusters/{cluster_id}/analyses/endpoint_frustration/{analysis_id}/samples/{sample_id}/framewise",
+    summary="Load sliced framewise endpoint frustration tensors and ranking data for one analyzed sample.",
+)
+async def get_endpoint_frustration_framewise(
+    project_id: str,
+    system_id: str,
+    cluster_id: str,
+    analysis_id: str,
+    sample_id: str,
+    start: int = 0,
+    stop: int | None = None,
+    step: int = 1,
+    includeRanks: bool = True,
+    includeEdges: bool = False,
+):
+    try:
+        project_store.get_system(project_id, system_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="System not found.")
+
+    cluster_dirs = project_store.ensure_cluster_directories(project_id, system_id, cluster_id)
+    analysis_dir = cluster_dirs["cluster_dir"] / "analyses" / "endpoint_frustration" / analysis_id
+    meta_path = analysis_dir / "analysis_metadata.json"
+    framewise_path = analysis_dir / "samples" / f"{sample_id}.npz"
+    if not meta_path.exists() or not framewise_path.exists():
+        raise HTTPException(status_code=404, detail="Framewise sample analysis not found on disk.")
+
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read analysis metadata: {exc}") from exc
+
+    sample_name = str(sample_id)
+    try:
+        with np.load(analysis_dir / "analysis.npz", allow_pickle=False) as summary_data:
+            sample_ids = [str(v) for v in np.asarray(summary_data["sample_ids"], dtype=str).tolist()] if "sample_ids" in summary_data.files else []
+            sample_labels = [str(v) for v in np.asarray(summary_data["sample_labels"], dtype=str).tolist()] if "sample_labels" in summary_data.files else []
+        if sample_id in sample_ids:
+            idx = sample_ids.index(sample_id)
+            if idx < len(sample_labels):
+                sample_name = str(sample_labels[idx])
+    except Exception:
+        pass
+
+    try:
+        payload = load_endpoint_framewise_payload(
+            framewise_path,
+            start=start,
+            stop=stop,
+            step=step,
+            include_ranks=bool(includeRanks),
+            include_edges=bool(includeEdges),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to load framewise endpoint frustration data: {exc}") from exc
+
+    payload.update(
+        {
+            "sample_id": sample_id,
+            "sample_name": sample_name,
+        }
+    )
+    return _convert_nan_to_none(payload)
 
 
 @router.delete(

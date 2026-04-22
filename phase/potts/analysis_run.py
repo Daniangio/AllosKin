@@ -2361,6 +2361,141 @@ def _compute_edge_frustration_raw(edge_energies: np.ndarray, edge_neighbors: Seq
     return out
 
 
+def _compute_endpoint_frame_scores(
+    node_sym: np.ndarray,
+    node_pol: np.ndarray,
+    *,
+    top_j: int = 10,
+) -> dict[str, np.ndarray]:
+    node_sym = np.asarray(node_sym, dtype=np.float32)
+    node_pol = np.asarray(node_pol, dtype=np.float32)
+    if node_sym.ndim != 2 or node_pol.ndim != 2:
+        raise ValueError("node_sym and node_pol must be 2D.")
+    if node_sym.shape != node_pol.shape:
+        raise ValueError("node_sym and node_pol must have the same shape.")
+    t_count, n_residues = node_sym.shape
+    if n_residues <= 0:
+        j = 0
+        score_sym_topj = np.zeros((t_count,), dtype=np.float32)
+        score_pol_abs_topj = np.zeros((t_count,), dtype=np.float32)
+    else:
+        j = max(1, min(int(top_j), int(n_residues)))
+        node_sym_sorted = np.sort(node_sym, axis=1)[:, ::-1]
+        node_pol_abs_sorted = np.sort(np.abs(node_pol), axis=1)[:, ::-1]
+        score_sym_topj = np.sum(node_sym_sorted[:, :j], axis=1, dtype=np.float32)
+        score_pol_abs_topj = np.sum(node_pol_abs_sorted[:, :j], axis=1, dtype=np.float32)
+    score_sym_mean = np.mean(node_sym, axis=1, dtype=np.float32) if t_count else np.zeros((0,), dtype=np.float32)
+    score_pol_abs_mean = (
+        np.mean(np.abs(node_pol), axis=1, dtype=np.float32) if t_count else np.zeros((0,), dtype=np.float32)
+    )
+    rank_sym_topj = np.argsort(score_sym_topj)[::-1].astype(np.int32) if t_count else np.zeros((0,), dtype=np.int32)
+    rank_pol_abs_topj = (
+        np.argsort(score_pol_abs_topj)[::-1].astype(np.int32) if t_count else np.zeros((0,), dtype=np.int32)
+    )
+    frame_index = np.arange(t_count, dtype=np.int32)
+    return {
+        "analysis_format_version": np.asarray([2], dtype=np.int32),
+        "ranking_default_top_j": np.asarray([j], dtype=np.int32),
+        "frame_index": frame_index,
+        "frame_index_filtered": frame_index.copy(),
+        "frame_score_node_sym_topj_default": np.asarray(score_sym_topj, dtype=np.float32),
+        "frame_score_node_sym_mean": np.asarray(score_sym_mean, dtype=np.float32),
+        "frame_score_node_pol_abs_topj_default": np.asarray(score_pol_abs_topj, dtype=np.float32),
+        "frame_score_node_pol_abs_mean": np.asarray(score_pol_abs_mean, dtype=np.float32),
+        "frame_rank_node_sym_topj_default": np.asarray(rank_sym_topj, dtype=np.int32),
+        "frame_rank_node_pol_abs_topj_default": np.asarray(rank_pol_abs_topj, dtype=np.int32),
+    }
+
+
+def ensure_endpoint_framewise_rankings(npz_path: str | Path, *, default_top_j: int = 10) -> dict[str, np.ndarray]:
+    path = Path(npz_path)
+    with np.load(path, allow_pickle=False) as data:
+        payload = {key: np.asarray(data[key]) for key in data.files}
+    required = (
+        "frame_score_node_sym_topj_default",
+        "frame_score_node_sym_mean",
+        "frame_score_node_pol_abs_topj_default",
+        "frame_score_node_pol_abs_mean",
+        "frame_rank_node_sym_topj_default",
+        "frame_rank_node_pol_abs_topj_default",
+        "frame_index",
+    )
+    if all(key in payload for key in required):
+        return payload
+    node_sym = np.asarray(payload.get("frustration_node_sym_framewise"), dtype=np.float32)
+    node_pol = np.asarray(payload.get("frustration_node_pol_framewise"), dtype=np.float32)
+    ranking = _compute_endpoint_frame_scores(node_sym, node_pol, top_j=default_top_j)
+    payload.update(ranking)
+    np.savez_compressed(path, **payload)
+    return payload
+
+
+def load_endpoint_framewise_payload(
+    npz_path: str | Path,
+    *,
+    start: int = 0,
+    stop: int | None = None,
+    step: int = 1,
+    include_ranks: bool = True,
+    include_edges: bool = False,
+    default_top_j: int = 10,
+) -> dict[str, Any]:
+    payload = ensure_endpoint_framewise_rankings(npz_path, default_top_j=default_top_j)
+    frame_index = np.asarray(
+        payload.get("frame_index_filtered", payload.get("frame_index", np.zeros((0,), dtype=np.int32))),
+        dtype=np.int32,
+    )
+    frame_count = int(frame_index.shape[0])
+    start_i = max(0, int(start or 0))
+    step_i = max(1, int(step or 1))
+    stop_i = frame_count if stop is None else max(start_i, min(frame_count, int(stop)))
+    selection = np.arange(start_i, stop_i, step_i, dtype=np.int32)
+
+    def _slice(name: str) -> list[Any]:
+        arr = np.asarray(payload.get(name))
+        if arr.ndim == 0:
+            return [arr.item()]
+        return np.asarray(arr[selection]).tolist()
+
+    out: dict[str, Any] = {
+        "frame_count": frame_count,
+        "slice": {
+            "start": start_i,
+            "stop": stop_i,
+            "step": step_i,
+            "frame_indices": np.asarray(frame_index[selection], dtype=np.int32).tolist(),
+        },
+        "node": {
+            "sym": _slice("frustration_node_sym_framewise"),
+            "pol": _slice("frustration_node_pol_framewise"),
+            "global_sym": _slice("global_node_sym_framewise"),
+            "global_pol": _slice("global_node_pol_framewise"),
+        },
+        "analysis_format_version": int(
+            np.asarray(payload.get("analysis_format_version", np.asarray([1], dtype=np.int32))).ravel()[0]
+        ),
+    }
+    if include_edges:
+        out["edge"] = {
+            "sym": _slice("frustration_edge_sym_framewise"),
+            "pol": _slice("frustration_edge_pol_framewise"),
+            "global_sym": _slice("global_edge_sym_framewise"),
+            "global_pol": _slice("global_edge_pol_framewise"),
+            "selected_edge_indices": np.asarray(payload.get("selected_edge_indices", np.zeros((0,), dtype=np.int32)), dtype=np.int32).tolist(),
+        }
+    if include_ranks:
+        out["ranking"] = {
+            "default_top_j": int(np.asarray(payload.get("ranking_default_top_j", np.asarray([default_top_j], dtype=np.int32))).ravel()[0]),
+            "score_node_sym_topj_default": np.asarray(payload.get("frame_score_node_sym_topj_default", np.zeros((0,), dtype=np.float32)), dtype=np.float32).tolist(),
+            "score_node_sym_mean": np.asarray(payload.get("frame_score_node_sym_mean", np.zeros((0,), dtype=np.float32)), dtype=np.float32).tolist(),
+            "score_node_pol_abs_topj_default": np.asarray(payload.get("frame_score_node_pol_abs_topj_default", np.zeros((0,), dtype=np.float32)), dtype=np.float32).tolist(),
+            "score_node_pol_abs_mean": np.asarray(payload.get("frame_score_node_pol_abs_mean", np.zeros((0,), dtype=np.float32)), dtype=np.float32).tolist(),
+            "rank_node_sym_topj_default": np.asarray(payload.get("frame_rank_node_sym_topj_default", np.zeros((0,), dtype=np.int32)), dtype=np.int32).tolist(),
+            "rank_node_pol_abs_topj_default": np.asarray(payload.get("frame_rank_node_pol_abs_topj_default", np.zeros((0,), dtype=np.int32)), dtype=np.int32).tolist(),
+        }
+    return out
+
+
 def _run_endpoint_frustration_batch(
     payloads: Sequence[dict[str, Any]],
     *,
@@ -2628,6 +2763,20 @@ def _endpoint_frustration_sample_worker(payload: dict[str, Any]) -> dict[str, An
         global_edge_pol_mean = 0.0
         global_edge_pol_std = 0.0
 
+    framewise = {
+        "frustration_node_sym_framewise": np.asarray(node_sym, dtype=np.float32),
+        "frustration_node_pol_framewise": np.asarray(node_pol, dtype=np.float32),
+        "frustration_edge_sym_framewise": np.asarray(edge_sym, dtype=np.float32),
+        "frustration_edge_pol_framewise": np.asarray(edge_pol, dtype=np.float32),
+        "global_node_sym_framewise": np.asarray(global_node_sym_series, dtype=np.float32),
+        "global_node_pol_framewise": np.asarray(global_node_pol_series, dtype=np.float32),
+        "global_edge_sym_framewise": np.asarray(global_edge_sym_series, dtype=np.float32),
+        "global_edge_pol_framewise": np.asarray(global_edge_pol_series, dtype=np.float32),
+        "frame_count": np.asarray([n_frames], dtype=np.int32),
+        "selected_edge_indices": np.asarray(top_edge_indices, dtype=np.int32),
+    }
+    framewise.update(_compute_endpoint_frame_scores(node_sym, node_pol, top_j=10))
+
     return {
         "sample_id": sample_id,
         "sample_label": sample_label,
@@ -2666,18 +2815,7 @@ def _endpoint_frustration_sample_worker(payload: dict[str, Any]) -> dict[str, An
         "global_edge_sym_std": global_edge_sym_std,
         "global_edge_pol_mean": global_edge_pol_mean,
         "global_edge_pol_std": global_edge_pol_std,
-        "framewise": {
-            "frustration_node_sym_framewise": np.asarray(node_sym, dtype=np.float32),
-            "frustration_node_pol_framewise": np.asarray(node_pol, dtype=np.float32),
-            "frustration_edge_sym_framewise": np.asarray(edge_sym, dtype=np.float32),
-            "frustration_edge_pol_framewise": np.asarray(edge_pol, dtype=np.float32),
-            "global_node_sym_framewise": np.asarray(global_node_sym_series, dtype=np.float32),
-            "global_node_pol_framewise": np.asarray(global_node_pol_series, dtype=np.float32),
-            "global_edge_sym_framewise": np.asarray(global_edge_sym_series, dtype=np.float32),
-            "global_edge_pol_framewise": np.asarray(global_edge_pol_series, dtype=np.float32),
-            "frame_count": np.asarray([n_frames], dtype=np.int32),
-            "selected_edge_indices": np.asarray(top_edge_indices, dtype=np.int32),
-        },
+        "framewise": framewise,
     }
 
 
@@ -2950,7 +3088,12 @@ def upsert_endpoint_frustration_analysis(
 
     np.savez_compressed(
         npz_path,
-        analysis_format_version=np.asarray([1], dtype=np.int32),
+        analysis_format_version=np.asarray([2], dtype=np.int32),
+        sample_framewise_available=np.asarray([1], dtype=np.int32),
+        framewise_default_start=np.asarray([0], dtype=np.int32),
+        framewise_default_stop=np.asarray([100], dtype=np.int32),
+        framewise_default_step=np.asarray([1], dtype=np.int32),
+        framewise_default_top_j=np.asarray([10], dtype=np.int32),
         edges=np.asarray(edges, dtype=np.int32),
         D_residue=np.asarray(d_residue, dtype=np.float32),
         D_edge=np.asarray(d_edge, dtype=np.float32),
@@ -3009,7 +3152,7 @@ def upsert_endpoint_frustration_analysis(
     meta = {
         "analysis_id": analysis_id,
         "analysis_type": "endpoint_frustration",
-        "analysis_format_version": 1,
+        "analysis_format_version": 2,
         "created_at": created_at,
         "updated_at": now,
         "project_id": project_id,
@@ -3024,6 +3167,9 @@ def upsert_endpoint_frustration_analysis(
         "md_label_mode": md_label_mode,
         "drop_invalid": bool(drop_invalid),
         "top_k_edges": int(top_k_e),
+        "sample_framewise_available": True,
+        "framewise_default_window": {"start": 0, "stop": 100, "step": 1},
+        "framewise_default_top_j": 10,
         "workers_used": int(workers_used),
         "paths": {
             "analysis_npz": str(npz_path.relative_to(system_dir)),

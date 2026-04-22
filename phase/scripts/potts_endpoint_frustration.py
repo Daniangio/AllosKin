@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
             progress_callback=progress_cb if args.progress else None,
         )
     finally:
-        if progress_bar not in (None, False):
+        if progress_bar is not None and progress_bar is not False:
             progress_bar.close()
     meta = out.get("metadata") or {}
     print(f"[endpoint_frustration] analysis_id={meta.get('analysis_id')}")

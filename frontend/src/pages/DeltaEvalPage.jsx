@@ -35,9 +35,26 @@ function colorDiverging(value, maxAbs = 0.5) {
   return rgbToHex(lerp(245, 49, -x), lerp(245, 112, -x), lerp(245, 204, -x));
 }
 
-function colorSequential(value, maxValue = 1) {
-  const t = clamp01(Number(value) / Math.max(1e-6, Number(maxValue) || 1));
-  return rgbToHex(lerp(235, 185, t), lerp(235, 28, t), lerp(235, 28, t));
+function colorDivergingGreenRed(value, maxAbs = 0.5) {
+  const scale = Math.max(1e-6, Number(maxAbs) || 0.5);
+  const x = Math.max(-1, Math.min(1, Number(value) / scale));
+  if (x >= 0) {
+    return rgbToHex(lerp(245, 239, x), lerp(245, 68, x), lerp(245, 68, x));
+  }
+  return rgbToHex(lerp(245, 34, -x), lerp(245, 197, -x), lerp(245, 94, -x));
+}
+
+function colorSequentialGreenRed(value, minValue, maxValue) {
+  const minV = Number.isFinite(Number(minValue)) ? Number(minValue) : 0;
+  const maxV = Number.isFinite(Number(maxValue)) ? Number(maxValue) : 1;
+  const span = Math.max(1e-6, maxV - minV);
+  const t = clamp01((Number(value) - minV) / span);
+  if (t <= 0.5) {
+    const u = t / 0.5;
+    return rgbToHex(lerp(34, 250, u), lerp(197, 204, u), lerp(94, 21, u));
+  }
+  const u = (t - 0.5) / 0.5;
+  return rgbToHex(lerp(250, 239, u), lerp(204, 68, u), lerp(21, 68, u));
 }
 
 function edgeLabel(edge, residueLabels) {
@@ -103,6 +120,12 @@ function metricScale(values, centered = false) {
   return centered ? Math.max(0.05, maxAbs) : Math.max(0.1, maxVal);
 }
 
+function metricMinMax(values) {
+  const finite = (values || []).map(Number).filter((v) => Number.isFinite(v));
+  if (!finite.length) return { min: 0, max: 1 };
+  return { min: Math.min(...finite), max: Math.max(...finite) };
+}
+
 function makeHorizontalBar(values, labels, colors, title, xTitle, limit) {
   const rows = labels.map((label, idx) => ({ label, value: Number(values[idx]), color: colors[idx] })).filter((row) => Number.isFinite(row.value));
   rows.sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
@@ -156,6 +179,8 @@ export default function DeltaEvalPage() {
   const [selectedSampleId, setSelectedSampleId] = useState('');
   const [commitmentCentered, setCommitmentCentered] = useState(true);
   const [frustrationChannel, setFrustrationChannel] = useState('sym');
+  const [frustrationDisplayMode, setFrustrationDisplayMode] = useState('raw');
+  const [referenceSampleIds, setReferenceSampleIds] = useState([]);
   const [edgeBlendEnabled, setEdgeBlendEnabled] = useState(false);
   const [edgeBlendStrength, setEdgeBlendStrength] = useState(0.75);
   const [residueLimit, setResidueLimit] = useState(60);
@@ -398,6 +423,10 @@ export default function DeltaEvalPage() {
     const raw = Array.isArray(analysisData?.data?.sample_labels) ? analysisData.data.sample_labels.map(String) : [];
     return sampleIds.map((sid, idx) => raw[idx] || sid);
   }, [analysisData, sampleIds]);
+  const sampleTypes = useMemo(() => {
+    const raw = Array.isArray(analysisData?.data?.sample_types) ? analysisData.data.sample_types.map(String) : [];
+    return sampleIds.map((sid, idx) => raw[idx] || '');
+  }, [analysisData, sampleIds]);
   const sampleIndexById = useMemo(() => {
     const map = new Map();
     sampleIds.forEach((sid, idx) => map.set(String(sid), idx));
@@ -414,7 +443,23 @@ export default function DeltaEvalPage() {
     }
   }, [sampleIds, selectedSampleId, sampleIndexById]);
 
+  useEffect(() => {
+    if (frustrationDisplayMode !== 'centered') return;
+    if (referenceSampleIds.length) return;
+    if (!sampleIds.length) return;
+    const md = sampleIds.filter((sid, idx) => String(sampleTypes[idx] || '').toLowerCase().includes('md'));
+    if (md.length) setReferenceSampleIds(md);
+    else setReferenceSampleIds([sampleIds[0]]);
+  }, [frustrationDisplayMode, referenceSampleIds.length, sampleIds, sampleTypes]);
+
   const selectedSampleIndex = useMemo(() => sampleIndexById.get(String(selectedSampleId)), [sampleIndexById, selectedSampleId]);
+  const frustrationReferenceIdxs = useMemo(
+    () =>
+      referenceSampleIds
+        .map((sid) => sampleIndexById.get(String(sid)))
+        .filter((idx) => Number.isInteger(idx) && idx >= 0),
+    [referenceSampleIds, sampleIndexById]
+  );
   const topEdgeIndices = useMemo(
     () => (Array.isArray(analysisData?.data?.top_edge_indices) ? analysisData.data.top_edge_indices.map((v) => Number(v)) : []),
     [analysisData]
@@ -440,15 +485,49 @@ export default function DeltaEvalPage() {
     if (!Number.isInteger(selectedSampleIndex)) return [];
     const key = frustrationChannel === 'pol' ? 'frustration_node_pol_mean' : 'frustration_node_sym_mean';
     const matrix = Array.isArray(analysisData?.data?.[key]) ? analysisData.data[key] : [];
-    return Array.isArray(matrix[selectedSampleIndex]) ? matrix[selectedSampleIndex].map((v) => Number(v)) : [];
-  }, [analysisData, selectedSampleIndex, frustrationChannel]);
+    const row = Array.isArray(matrix[selectedSampleIndex]) ? matrix[selectedSampleIndex].map((v) => Number(v)) : [];
+    if (frustrationDisplayMode !== 'centered' || !frustrationReferenceIdxs.length) return row;
+    const ref = new Array(row.length).fill(0);
+    const counts = new Array(row.length).fill(0);
+    for (const ridx of frustrationReferenceIdxs) {
+      const refRow = Array.isArray(matrix[ridx]) ? matrix[ridx] : null;
+      if (!refRow) continue;
+      for (let i = 0; i < Math.min(row.length, refRow.length); i += 1) {
+        const v = Number(refRow[i]);
+        if (!Number.isFinite(v)) continue;
+        ref[i] += v;
+        counts[i] += 1;
+      }
+    }
+    return row.map((v, i) => {
+      const mean = counts[i] > 0 ? ref[i] / counts[i] : NaN;
+      return Number.isFinite(v) && Number.isFinite(mean) ? v - mean : v;
+    });
+  }, [analysisData, selectedSampleIndex, frustrationChannel, frustrationDisplayMode, frustrationReferenceIdxs]);
 
   const frustrationEdgeRaw = useMemo(() => {
     if (!Number.isInteger(selectedSampleIndex)) return [];
     const key = frustrationChannel === 'pol' ? 'frustration_edge_pol_mean' : 'frustration_edge_sym_mean';
     const matrix = Array.isArray(analysisData?.data?.[key]) ? analysisData.data[key] : [];
-    return Array.isArray(matrix[selectedSampleIndex]) ? matrix[selectedSampleIndex].map((v) => Number(v)) : [];
-  }, [analysisData, selectedSampleIndex, frustrationChannel]);
+    const row = Array.isArray(matrix[selectedSampleIndex]) ? matrix[selectedSampleIndex].map((v) => Number(v)) : [];
+    if (frustrationDisplayMode !== 'centered' || !frustrationReferenceIdxs.length) return row;
+    const ref = new Array(row.length).fill(0);
+    const counts = new Array(row.length).fill(0);
+    for (const ridx of frustrationReferenceIdxs) {
+      const refRow = Array.isArray(matrix[ridx]) ? matrix[ridx] : null;
+      if (!refRow) continue;
+      for (let i = 0; i < Math.min(row.length, refRow.length); i += 1) {
+        const v = Number(refRow[i]);
+        if (!Number.isFinite(v)) continue;
+        ref[i] += v;
+        counts[i] += 1;
+      }
+    }
+    return row.map((v, i) => {
+      const mean = counts[i] > 0 ? ref[i] / counts[i] : NaN;
+      return Number.isFinite(v) && Number.isFinite(mean) ? v - mean : v;
+    });
+  }, [analysisData, selectedSampleIndex, frustrationChannel, frustrationDisplayMode, frustrationReferenceIdxs]);
 
   const commitmentResidueBlended = useMemo(
     () =>
@@ -476,24 +555,43 @@ export default function DeltaEvalPage() {
   const frustrationResidueColors = useMemo(() => {
     if (frustrationChannel === 'pol') {
       const scale = metricScale(frustrationResidueBlended, true);
-      return frustrationResidueBlended.map((v) => colorDiverging(v, scale));
+      return frustrationResidueBlended.map((v) => colorDiverging(-v, scale));
     }
-    const scale = metricScale(frustrationResidueBlended, false);
-    return frustrationResidueBlended.map((v) => colorSequential(v, scale));
-  }, [frustrationResidueBlended, frustrationChannel]);
+    if (frustrationDisplayMode === 'centered') {
+      const scale = metricScale(frustrationResidueBlended, true);
+      return frustrationResidueBlended.map((v) => colorDivergingGreenRed(v, scale));
+    }
+    const { min, max } = metricMinMax(frustrationResidueBlended);
+    return frustrationResidueBlended.map((v) => colorSequentialGreenRed(v, min, max));
+  }, [frustrationResidueBlended, frustrationChannel, frustrationDisplayMode]);
   const frustrationEdgeColors = useMemo(() => {
     if (frustrationChannel === 'pol') {
       const scale = metricScale(frustrationEdgeRaw, true);
-      return frustrationEdgeRaw.map((v) => colorDiverging(v, scale));
+      return frustrationEdgeRaw.map((v) => colorDiverging(-v, scale));
     }
-    const scale = metricScale(frustrationEdgeRaw, false);
-    return frustrationEdgeRaw.map((v) => colorSequential(v, scale));
-  }, [frustrationEdgeRaw, frustrationChannel]);
+    if (frustrationDisplayMode === 'centered') {
+      const scale = metricScale(frustrationEdgeRaw, true);
+      return frustrationEdgeRaw.map((v) => colorDivergingGreenRed(v, scale));
+    }
+    const { min, max } = metricMinMax(frustrationEdgeRaw);
+    return frustrationEdgeRaw.map((v) => colorSequentialGreenRed(v, min, max));
+  }, [frustrationEdgeRaw, frustrationChannel, frustrationDisplayMode]);
 
   const edgeLabels = useMemo(
     () => topEdgeIndices.map((raw) => edgeLabel(edgesAll[Number(raw)], residueLabels) || `edge_${raw}`),
     [topEdgeIndices, edgesAll, residueLabels]
   );
+
+  const frustrationAxisLabel = useMemo(() => {
+    if (frustrationChannel === 'pol') {
+      return frustrationDisplayMode === 'centered'
+        ? 'centered polarity frustration (red = more A-like, blue = more B-like)'
+        : 'polarity frustration (red = more A-like, blue = more B-like)';
+    }
+    return frustrationDisplayMode === 'centered'
+      ? 'centered symmetric frustration (green = lower than ref, red = higher than ref)'
+      : 'symmetric frustration (green = low, red = high)';
+  }, [frustrationChannel, frustrationDisplayMode]);
 
   const residueCommitmentPlot = useMemo(
     () =>
@@ -526,10 +624,10 @@ export default function DeltaEvalPage() {
         residueLabels,
         frustrationResidueColors,
         edgeBlendEnabled ? 'Residue frustration (edge-weighted blend)' : 'Residue frustration',
-        frustrationChannel === 'pol' ? 'polarity frustration' : 'symmetric frustration',
+        frustrationAxisLabel,
         residueLimit
       ),
-    [frustrationResidueBlended, residueLabels, frustrationResidueColors, edgeBlendEnabled, frustrationChannel, residueLimit]
+    [frustrationResidueBlended, residueLabels, frustrationResidueColors, edgeBlendEnabled, frustrationAxisLabel, residueLimit]
   );
   const edgeFrustrationPlot = useMemo(
     () =>
@@ -538,10 +636,10 @@ export default function DeltaEvalPage() {
         edgeLabels,
         frustrationEdgeColors,
         'Edge frustration',
-        frustrationChannel === 'pol' ? 'polarity frustration' : 'symmetric frustration',
+        frustrationAxisLabel,
         edgeLimit
       ),
-    [frustrationEdgeRaw, edgeLabels, frustrationEdgeColors, frustrationChannel, edgeLimit]
+    [frustrationEdgeRaw, edgeLabels, frustrationEdgeColors, frustrationAxisLabel, edgeLimit]
   );
 
   const selectedSampleName = useMemo(() => {
@@ -821,6 +919,17 @@ export default function DeltaEvalPage() {
                     </select>
                   </div>
                   <div>
+                    <label className="block text-xs text-gray-400 mb-1">Frustration display</label>
+                    <select
+                      value={frustrationDisplayMode}
+                      onChange={(e) => setFrustrationDisplayMode(e.target.value)}
+                      className="bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                    >
+                      <option value="raw">Raw normalized</option>
+                      <option value="centered">Centered vs reference MD</option>
+                    </select>
+                  </div>
+                  <div>
                     <label className="block text-xs text-gray-400 mb-1">Residues shown</label>
                     <input
                       type="number"
@@ -843,6 +952,27 @@ export default function DeltaEvalPage() {
                     />
                   </div>
                 </div>
+
+                {frustrationDisplayMode === 'centered' ? (
+                  <div className="rounded-md border border-gray-700 bg-gray-900/50 p-3 space-y-2">
+                    <label className="block text-xs text-gray-400">Reference ensemble(s)</label>
+                    <select
+                      multiple
+                      value={referenceSampleIds}
+                      onChange={(e) => setReferenceSampleIds(Array.from(e.target.selectedOptions).map((o) => String(o.value)))}
+                      className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100 h-24"
+                    >
+                      {sampleIds.map((sid, idx) => (
+                        <option key={`fr-ref:${sid}`} value={sid}>
+                          {sampleTypes[idx] ? `${sampleLabels[idx] || sid} (${sampleTypes[idx]})` : sampleLabels[idx] || sid}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-[11px] text-gray-500">
+                      The selected reference trajectories define the baseline that is subtracted residue-by-residue and edge-by-edge.
+                    </p>
+                  </div>
+                ) : null}
 
                 <div className="rounded-md border border-gray-700 bg-gray-900/50 p-3 space-y-2">
                   <label className="flex items-center gap-2 text-sm text-gray-200">
