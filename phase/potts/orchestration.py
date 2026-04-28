@@ -15,6 +15,7 @@ import numpy as np
 from phase.io.data import load_npz
 from phase.potts.analysis_run import (
     ANALYSIS_METADATA_FILENAME,
+    _compute_contact_edges_from_pdbs,
     _completion_cost_from_curve,
     _convert_nan_to_none,
     _delta_js_row_node_edge_values,
@@ -41,6 +42,101 @@ from phase.services.project_store import ProjectStore
 ProgressCallback = Optional[Callable[[str, int, int], None]]
 _POTTS_ANALYSIS_SAMPLE_CACHE: dict[tuple[str, bool, str, bool], dict[str, Any]] = {}
 _POTTS_ANALYSIS_MODEL_CACHE: dict[str, Any] = {}
+
+
+def _load_cluster_residue_mapping(cluster_npz_path: Path) -> tuple[list[str], dict[str, str]]:
+    residue_keys: list[str] = []
+    residue_mapping: dict[str, str] = {}
+    try:
+        with np.load(cluster_npz_path, allow_pickle=True) as cluster_npz:
+            if "residue_keys" in cluster_npz:
+                residue_keys = [str(v) for v in np.asarray(cluster_npz["residue_keys"]).tolist()]
+            raw_meta = cluster_npz.get("metadata_json")
+            if raw_meta is not None:
+                meta_json = raw_meta.item() if isinstance(raw_meta, np.ndarray) else raw_meta
+                if isinstance(meta_json, bytes):
+                    meta_json = meta_json.decode("utf-8", errors="ignore")
+                meta = json.loads(str(meta_json)) if meta_json else {}
+                if isinstance(meta, dict):
+                    residue_mapping = {str(k): str(v) for k, v in (meta.get("residue_mapping") or {}).items()}
+    except Exception:
+        return residue_keys, residue_mapping
+    return residue_keys, residue_mapping
+
+
+def _resolve_analysis_contact_edges(
+    *,
+    store: ProjectStore,
+    project_id: str,
+    system_id: str,
+    md_samples: Sequence[dict[str, Any]],
+    state_ids: Sequence[str] | None,
+    pdbs: Sequence[str] | None,
+    cluster_npz_path: Path,
+    cutoff: float,
+    atom_mode: str,
+) -> list[tuple[int, int]]:
+    residue_keys, residue_mapping = _load_cluster_residue_mapping(cluster_npz_path)
+    if not residue_keys:
+        return []
+
+    system_meta = store.get_system(project_id, system_id)
+    explicit_state_ids = [str(v).strip() for v in (state_ids or []) if str(v).strip()]
+    inferred_state_ids: list[str] = []
+    if not explicit_state_ids:
+        inferred_state_ids = sorted(
+            {
+                str(sample.get("state_id") or "").strip()
+                for sample in (md_samples or [])
+                if str(sample.get("state_id") or "").strip()
+            }
+        )
+    all_state_ids = explicit_state_ids or inferred_state_ids
+    if not all_state_ids:
+        all_state_ids = [
+            str(state_id)
+            for state_id, state in (system_meta.states or {}).items()
+            if getattr(state, "pdb_file", None)
+        ]
+
+    pdb_paths: list[Path] = []
+    for state_id in all_state_ids:
+        state = (system_meta.states or {}).get(state_id)
+        if state is None:
+            continue
+        pdb_rel = getattr(state, "pdb_file", None)
+        if not pdb_rel:
+            continue
+        p = store.resolve_path(project_id, system_id, str(pdb_rel))
+        if p.exists():
+            pdb_paths.append(p)
+    for value in (pdbs or []):
+        raw = str(value).strip()
+        if not raw:
+            continue
+        p = Path(raw)
+        if not p.is_absolute():
+            p = store.resolve_path(project_id, system_id, raw)
+        if p.exists():
+            pdb_paths.append(p)
+
+    dedup_paths: list[Path] = []
+    seen: set[str] = set()
+    for p in pdb_paths:
+        rp = str(p.resolve())
+        if rp in seen:
+            continue
+        seen.add(rp)
+        dedup_paths.append(Path(rp))
+    if not dedup_paths:
+        return []
+    return _compute_contact_edges_from_pdbs(
+        dedup_paths,
+        residue_keys,
+        residue_mapping,
+        float(cutoff),
+        str(atom_mode or "CA").upper(),
+    )
 
 
 def _derive_residue_display_labels(
@@ -369,6 +465,11 @@ def prepare_potts_analysis_batch(
     drop_invalid: bool = True,
     n_workers: int | None = None,
     analysis_id: str | None = None,
+    analysis_edge_mode: str | None = None,
+    analysis_contact_cutoff: float | None = None,
+    analysis_contact_atom_mode: str | None = None,
+    analysis_contact_state_ids: Sequence[str] | None = None,
+    analysis_contact_pdbs: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     data_root = Path(os.getenv("PHASE_DATA_ROOT", "/app/data"))
     store = ProjectStore(base_dir=data_root / "projects")
@@ -400,10 +501,39 @@ def prepare_potts_analysis_batch(
             model_ref=str(model_ref),
         )
 
-    if model is not None:
-        edges_for_metrics = list(model.edges or [])
-    else:
+    edge_mode = str(analysis_edge_mode or "").strip().lower()
+    if edge_mode and edge_mode not in {"model", "cluster", "contact", "all_vs_all"}:
+        raise ValueError("analysis_edge_mode must be one of: model, cluster, contact, all_vs_all.")
+    if not edge_mode:
+        edge_mode = "model" if model is not None else "cluster"
+    contact_cutoff = float(analysis_contact_cutoff if analysis_contact_cutoff is not None else 10.0)
+    if not np.isfinite(contact_cutoff) or contact_cutoff <= 0.0:
+        raise ValueError("analysis_contact_cutoff must be > 0.")
+    contact_atom_mode = str(analysis_contact_atom_mode or "CA").strip().upper()
+    if contact_atom_mode not in {"CA", "CM"}:
+        raise ValueError("analysis_contact_atom_mode must be one of: CA, CM.")
+
+    if edge_mode == "model":
+        edges_for_metrics = list((model.edges if model is not None else cluster_edges) or [])
+    elif edge_mode == "cluster":
         edges_for_metrics = list(cluster_edges or [])
+    elif edge_mode == "all_vs_all":
+        n_res = int(len(K))
+        edges_for_metrics = [(i, j) for i in range(n_res) for j in range(i + 1, n_res)]
+    else:
+        edges_for_metrics = _resolve_analysis_contact_edges(
+            store=store,
+            project_id=project_id,
+            system_id=system_id,
+            md_samples=md_samples,
+            state_ids=analysis_contact_state_ids,
+            pdbs=analysis_contact_pdbs,
+            cluster_npz_path=cluster_path,
+            cutoff=contact_cutoff,
+            atom_mode=contact_atom_mode,
+        )
+        if not edges_for_metrics:
+            raise ValueError("No contact edges found for analysis. Check states/PDBs and contact cutoff.")
     edges_for_metrics = sorted(
         {
             (min(int(r), int(s)), max(int(r), int(s)))
@@ -517,6 +647,13 @@ def prepare_potts_analysis_batch(
         "md_label_mode": str(md_label_mode or "assigned"),
         "drop_invalid": bool(drop_invalid),
         "edges_for_metrics": [tuple(map(int, edge)) for edge in edges_for_metrics],
+        "edge_selection": {
+            "mode": edge_mode,
+            "contact_cutoff": (float(contact_cutoff) if edge_mode == "contact" else None),
+            "contact_atom_mode": (contact_atom_mode if edge_mode == "contact" else None),
+            "contact_state_ids": [str(v) for v in (analysis_contact_state_ids or []) if str(v).strip()],
+            "contact_pdbs": [str(v) for v in (analysis_contact_pdbs or []) if str(v).strip()],
+        },
         "md_samples": len(md_samples),
         "other_samples": len(other_samples),
         "payloads": payloads,
@@ -642,6 +779,7 @@ def aggregate_potts_analysis_batch(
     md_label_mode = str(prepared.get("md_label_mode") or "assigned")
     drop_invalid = bool(prepared.get("drop_invalid", True))
     edges_for_metrics = [tuple(map(int, edge)) for edge in (prepared.get("edges_for_metrics") or [])]
+    edge_selection = dict(prepared.get("edge_selection") or {})
 
     written_comparisons: list[dict[str, Any]] = []
     written_energies: list[dict[str, Any]] = []
@@ -692,6 +830,7 @@ def aggregate_potts_analysis_batch(
                     "analysis_npz": _relativize(npz_path, system_dir),
                 },
                 "summary": row.get("summary") or {},
+                "edge_selection": edge_selection,
             }
             (analysis_dir / ANALYSIS_METADATA_FILENAME).write_text(json.dumps(_convert_nan_to_none(meta), indent=2), encoding="utf-8")
             written_comparisons.append(meta)
@@ -721,6 +860,7 @@ def aggregate_potts_analysis_batch(
                     "analysis_npz": _relativize(npz_path, system_dir),
                 },
                 "summary": row.get("summary") or {},
+                "edge_selection": edge_selection,
             }
             (analysis_dir / ANALYSIS_METADATA_FILENAME).write_text(json.dumps(_convert_nan_to_none(meta), indent=2), encoding="utf-8")
             written_energies.append(meta)
@@ -733,6 +873,7 @@ def aggregate_potts_analysis_batch(
         "energies_written": len(written_energies),
         "model_id": model_id,
         "model_name": model_name,
+        "edge_selection": edge_selection,
         "skipped_samples": skipped_samples,
         "workers_used": int(max(1, workers_used)),
     }

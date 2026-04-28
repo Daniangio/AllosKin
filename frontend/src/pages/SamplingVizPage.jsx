@@ -205,6 +205,10 @@ export default function SamplingVizPage() {
   const [runAnalysisModelId, setRunAnalysisModelId] = useState('');
   const [selectedPoseStateId, setSelectedPoseStateId] = useState('');
   const [energyLoadLimit, setEnergyLoadLimit] = useState(1500);
+  const [analysisEdgeMode, setAnalysisEdgeMode] = useState('model');
+  const [analysisContactCutoff, setAnalysisContactCutoff] = useState('10');
+  const [analysisContactAtomMode, setAnalysisContactAtomMode] = useState('CA');
+  const [edgeDisplayMode, setEdgeDisplayMode] = useState('all');
 
   const [selectedMdSampleId, setSelectedMdSampleId] = useState('');
   const [selectedSampleId, setSelectedSampleId] = useState('');
@@ -606,16 +610,52 @@ export default function SamplingVizPage() {
     return Array.isArray(arr) ? arr : [];
   }, [comparisonData]);
 
+  const modelEdgeSet = useMemo(() => {
+    const out = new Set();
+    (clusterInfo?.edges || []).forEach((edge) => {
+      if (!Array.isArray(edge) || edge.length < 2) return;
+      const a = Number(edge[0]);
+      const b = Number(edge[1]);
+      if (!Number.isFinite(a) || !Number.isFinite(b)) return;
+      const r = Math.min(a, b);
+      const s = Math.max(a, b);
+      out.add(`${r}-${s}`);
+    });
+    return out;
+  }, [clusterInfo]);
+
+  const filteredEdgePayload = useMemo(() => {
+    if (!edges.length || !edgeJs.length) return { edges: [], edgeJs: [] };
+    const mode = edgeDisplayMode || 'all';
+    if (mode === 'all') return { edges, edgeJs };
+    const nextEdges = [];
+    const nextVals = [];
+    edges.forEach((edge, idx) => {
+      if (!Array.isArray(edge) || edge.length < 2) return;
+      const a = Number(edge[0]);
+      const b = Number(edge[1]);
+      const key = `${Math.min(a, b)}-${Math.max(a, b)}`;
+      const isInModel = modelEdgeSet.has(key);
+      if ((mode === 'within_model' && isInModel) || (mode === 'over_model' && !isInModel)) {
+        nextEdges.push(edge);
+        nextVals.push(edgeJs[idx]);
+      }
+    });
+    return { edges: nextEdges, edgeJs: nextVals };
+  }, [edges, edgeJs, edgeDisplayMode, modelEdgeSet]);
+
   const topResidues = useMemo(() => topK(nodeJs, residueLabels, 10), [nodeJs, residueLabels]);
   const topEdges = useMemo(() => {
-    if (!edges.length || !edgeJs.length) return [];
-    const labels = edges.map((e) => `${residueLabels[e[0]] ?? e[0]} — ${residueLabels[e[1]] ?? e[1]}`);
-    return topK(edgeJs, labels, 10);
-  }, [edges, edgeJs, residueLabels]);
+    const currentEdges = filteredEdgePayload.edges;
+    const currentEdgeJs = filteredEdgePayload.edgeJs;
+    if (!currentEdges.length || !currentEdgeJs.length) return [];
+    const labels = currentEdges.map((e) => `${residueLabels[e[0]] ?? e[0]} — ${residueLabels[e[1]] ?? e[1]}`);
+    return topK(currentEdgeJs, labels, 10);
+  }, [filteredEdgePayload, residueLabels]);
 
   const edgeMatrix = useMemo(
-    () => buildEdgeMatrix(residueLabels.length, edges, edgeJs),
-    [residueLabels, edges, edgeJs]
+    () => buildEdgeMatrix(residueLabels.length, filteredEdgePayload.edges, filteredEdgePayload.edgeJs),
+    [residueLabels, filteredEdgePayload]
   );
   const edgeMatrixHasValues = useMemo(
     () => edgeMatrix?.some((row) => row?.some((val) => Number.isFinite(val))),
@@ -634,7 +674,13 @@ export default function SamplingVizPage() {
         cluster_id: selectedClusterId,
         md_label_mode: 'assigned',
         keep_invalid: false,
+        analysis_edge_mode: analysisEdgeMode || 'model',
       };
+      if ((analysisEdgeMode || 'model') === 'contact') {
+        const parsedCutoff = Number(analysisContactCutoff);
+        if (Number.isFinite(parsedCutoff) && parsedCutoff > 0) payload.analysis_contact_cutoff = parsedCutoff;
+        payload.analysis_contact_atom_mode = analysisContactAtomMode || 'CA';
+      }
       if (runAnalysisModelId) payload.model_id = runAnalysisModelId;
       const res = await submitPottsAnalysisJob(payload);
       setAnalysisJob({ ...res, model_id: runAnalysisModelId });
@@ -642,7 +688,15 @@ export default function SamplingVizPage() {
     } catch (err) {
       setAnalysesError(err.message || 'Failed to submit analysis job.');
     }
-  }, [projectId, systemId, selectedClusterId, runAnalysisModelId]);
+  }, [
+    projectId,
+    systemId,
+    selectedClusterId,
+    runAnalysisModelId,
+    analysisEdgeMode,
+    analysisContactCutoff,
+    analysisContactAtomMode,
+  ]);
 
   const handleAppendStatePoseEnergy = useCallback(async () => {
     if (!selectedClusterId || !selectedAnalysisModelId || !selectedPoseStateId) return;
@@ -1218,6 +1272,42 @@ export default function SamplingVizPage() {
                   ))}
                 </select>
               </div>
+              <div className="space-y-1">
+                <label className="block text-xs text-gray-400">Metric edge set</label>
+                <select
+                  value={analysisEdgeMode}
+                  onChange={(e) => setAnalysisEdgeMode(e.target.value)}
+                  className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
+                >
+                  <option value="model">Potts model edges</option>
+                  <option value="cluster">Cluster edges</option>
+                  <option value="contact">Contact edges (custom cutoff)</option>
+                  <option value="all_vs_all">All residue pairs</option>
+                </select>
+              </div>
+              {analysisEdgeMode === 'contact' && (
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="space-y-1">
+                    <label className="block text-xs text-gray-400">Contact cutoff (A)</label>
+                    <input
+                      value={analysisContactCutoff}
+                      onChange={(e) => setAnalysisContactCutoff(e.target.value)}
+                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="block text-xs text-gray-400">Atom mode</label>
+                    <select
+                      value={analysisContactAtomMode}
+                      onChange={(e) => setAnalysisContactAtomMode(e.target.value)}
+                      className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
+                    >
+                      <option value="CA">CA</option>
+                      <option value="CM">CM</option>
+                    </select>
+                  </div>
+                </div>
+              )}
               <button
                 type="button"
                 onClick={handleRunAnalysis}
@@ -1252,6 +1342,22 @@ export default function SamplingVizPage() {
               <p className="text-[11px] text-gray-500">
                 Energy histograms can require large payloads because each analysis stores one energy per frame. By default, the page loads a
                 random server-side subset of 1500 energies per sample.
+              </p>
+            </div>
+
+            <div className="space-y-2 rounded-md border border-gray-800 bg-gray-950/40 p-3">
+              <p className="text-xs font-semibold text-gray-300">Edge Display Filter</p>
+              <select
+                value={edgeDisplayMode}
+                onChange={(e) => setEdgeDisplayMode(e.target.value)}
+                className="w-full bg-gray-900 border border-gray-700 rounded-md px-3 py-2 text-white"
+              >
+                <option value="all">All analysis edges</option>
+                <option value="within_model">Only within model cutoff</option>
+                <option value="over_model">Only over model cutoff</option>
+              </select>
+              <p className="text-[11px] text-gray-500">
+                Uses current Potts model edges as the cutoff mask: edges in model = within cutoff, others = over cutoff.
               </p>
             </div>
 

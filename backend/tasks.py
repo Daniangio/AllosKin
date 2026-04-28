@@ -1524,6 +1524,11 @@ def run_potts_analysis_job(
                 md_label_mode=md_label_mode,
                 drop_invalid=not keep_invalid,
                 n_workers=workers_val,
+                analysis_edge_mode=params.get("analysis_edge_mode"),
+                analysis_contact_cutoff=params.get("analysis_contact_cutoff"),
+                analysis_contact_atom_mode=params.get("analysis_contact_atom_mode"),
+                analysis_contact_state_ids=params.get("analysis_contact_state_ids"),
+                analysis_contact_pdbs=params.get("analysis_contact_pdbs"),
             )
             payloads = prepared.get("payloads") or []
             analysis_id = str(prepared.get("analysis_id") or "")

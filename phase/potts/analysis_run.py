@@ -1316,6 +1316,11 @@ def analyze_cluster_samples(
     md_label_mode: str = "assigned",
     drop_invalid: bool = True,
     n_workers: int | None = None,
+    analysis_edge_mode: str | None = None,
+    analysis_contact_cutoff: float | None = None,
+    analysis_contact_atom_mode: str | None = None,
+    analysis_contact_state_ids: Sequence[str] | None = None,
+    analysis_contact_pdbs: Sequence[str] | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> Dict[str, Any]:
     """
@@ -1333,6 +1338,11 @@ def analyze_cluster_samples(
         md_label_mode=md_label_mode,
         drop_invalid=drop_invalid,
         n_workers=n_workers,
+        analysis_edge_mode=analysis_edge_mode,
+        analysis_contact_cutoff=analysis_contact_cutoff,
+        analysis_contact_atom_mode=analysis_contact_atom_mode,
+        analysis_contact_state_ids=analysis_contact_state_ids,
+        analysis_contact_pdbs=analysis_contact_pdbs,
         progress_callback=progress_callback,
     ).get("metadata", {})
 

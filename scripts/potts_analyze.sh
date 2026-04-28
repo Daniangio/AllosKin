@@ -90,6 +90,19 @@ MD_LABEL_MODE="$(printf "%s" "$MD_LABEL_MODE" | tr '[:upper:]' '[:lower:]')"
 if [ "$MD_LABEL_MODE" != "halo" ]; then MD_LABEL_MODE="assigned"; fi
 KEEP_INVALID="$(prompt "Keep invalid SA rows? (y/N)" "N")"
 KEEP_INVALID="$(printf "%s" "$KEEP_INVALID" | tr '[:upper:]' '[:lower:]')"
+ANALYSIS_EDGE_MODE="$(prompt "Analysis edge mode (model/cluster/contact/all_vs_all)" "model")"
+ANALYSIS_EDGE_MODE="$(printf "%s" "$ANALYSIS_EDGE_MODE" | tr '[:upper:]' '[:lower:]')"
+if [ "$ANALYSIS_EDGE_MODE" != "cluster" ] && [ "$ANALYSIS_EDGE_MODE" != "contact" ] && [ "$ANALYSIS_EDGE_MODE" != "all_vs_all" ]; then
+  ANALYSIS_EDGE_MODE="model"
+fi
+CONTACT_CUTOFF="10.0"
+CONTACT_ATOM_MODE="CA"
+if [ "$ANALYSIS_EDGE_MODE" = "contact" ]; then
+  CONTACT_CUTOFF="$(prompt "Contact cutoff (A)" "10.0")"
+  CONTACT_ATOM_MODE="$(prompt "Contact atom mode (CA/CM)" "CA")"
+  CONTACT_ATOM_MODE="$(printf "%s" "$CONTACT_ATOM_MODE" | tr '[:lower:]' '[:upper:]')"
+  if [ "$CONTACT_ATOM_MODE" != "CM" ]; then CONTACT_ATOM_MODE="CA"; fi
+fi
 WORKERS="$(prompt "Workers (0=auto)" "0")"
 SHOW_PROGRESS="$(prompt "Show progress? (Y/n)" "Y")"
 SHOW_PROGRESS="$(printf "%s" "$SHOW_PROGRESS" | tr '[:upper:]' '[:lower:]')"
@@ -101,9 +114,13 @@ CMD=(
   --cluster-id "$CLUSTER_ID"
   --md-label-mode "$MD_LABEL_MODE"
   --workers "$WORKERS"
+  --analysis-edge-mode "$ANALYSIS_EDGE_MODE"
 )
 if [ -n "$MODEL_ID" ]; then CMD+=(--model "$MODEL_ID"); fi
 if [ "$KEEP_INVALID" = "y" ] || [ "$KEEP_INVALID" = "yes" ]; then CMD+=(--keep-invalid); fi
+if [ "$ANALYSIS_EDGE_MODE" = "contact" ]; then
+  CMD+=(--analysis-contact-cutoff "$CONTACT_CUTOFF" --analysis-contact-atom-mode "$CONTACT_ATOM_MODE")
+fi
 if [ "$SHOW_PROGRESS" != "n" ] && [ "$SHOW_PROGRESS" != "no" ]; then CMD+=(--progress); fi
 
 echo ""

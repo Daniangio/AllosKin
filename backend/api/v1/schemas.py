@@ -149,6 +149,11 @@ class PottsAnalysisJobRequest(BaseModel):
     plm_init_model: Optional[str] = None
     plm_resume_model: Optional[str] = None
     plm_val_frac: Optional[float] = None
+    analysis_edge_mode: Optional[str] = None  # model|cluster|contact|all_vs_all
+    analysis_contact_cutoff: Optional[float] = None
+    analysis_contact_atom_mode: Optional[str] = None  # CA|CM
+    analysis_contact_state_ids: Optional[List[str]] = None
+    analysis_contact_pdbs: Optional[List[str]] = None
 
 
 class MdSamplesRefreshJobRequest(BaseModel):

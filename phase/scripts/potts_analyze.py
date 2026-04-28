@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 from phase.potts.analysis_run import analyze_cluster_samples, append_state_pose_energies
+from phase.services.project_store import ProjectStore
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -20,6 +21,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--md-label-mode", default="assigned", choices=["assigned", "halo"])
     ap.add_argument("--keep-invalid", action="store_true", help="Do not drop invalid SA samples (invalid_mask rows).")
     ap.add_argument("--workers", type=int, default=0, help="Parallel workers for local analysis (0=auto).")
+    ap.add_argument("--analysis-edge-mode", default="", choices=["", "model", "cluster", "contact", "all_vs_all"], help="Edge set used for JS metrics.")
+    ap.add_argument("--analysis-contact-cutoff", type=float, default=10.0, help="Contact cutoff in Angstrom when --analysis-edge-mode=contact.")
+    ap.add_argument("--analysis-contact-atom-mode", default="CA", choices=["CA", "CM"], help="Contact definition atom mode.")
+    ap.add_argument("--analysis-contact-state-id", action="append", default=[], help="State id used to build contact edges (repeatable).")
+    ap.add_argument("--analysis-contact-pdb", action="append", default=[], help="Explicit PDB path used to build contact edges (repeatable).")
     ap.add_argument("--progress", action="store_true", help="Show progress while running local analysis.")
     ap.add_argument("--pose-only", action="store_true", help="Append single-PDB state energies under an existing model-energy analysis context.")
     ap.add_argument("--state-pose-id", action="append", default=[], help="State id to evaluate as a single PDB pose. Repeatable.")
@@ -71,6 +77,11 @@ def main(argv: list[str] | None = None) -> int:
             md_label_mode=args.md_label_mode,
             drop_invalid=not bool(args.keep_invalid),
             n_workers=(int(args.workers) if int(args.workers) > 0 else None),
+            analysis_edge_mode=(args.analysis_edge_mode or None),
+            analysis_contact_cutoff=float(args.analysis_contact_cutoff),
+            analysis_contact_atom_mode=str(args.analysis_contact_atom_mode or "CA"),
+            analysis_contact_state_ids=[str(v).strip() for v in (args.analysis_contact_state_id or []) if str(v).strip()],
+            analysis_contact_pdbs=[str(v).strip() for v in (args.analysis_contact_pdb or []) if str(v).strip()],
             progress_callback=progress_cb,
         )
     print(summary)

@@ -417,6 +417,17 @@ async def submit_potts_analysis_job(
         raise HTTPException(status_code=400, detail="md_label_mode must be 'assigned' or 'halo'.")
     if payload.workers is not None and int(payload.workers) < 0:
         raise HTTPException(status_code=400, detail="workers must be >= 0.")
+    analysis_edge_mode = (payload.analysis_edge_mode or "").strip().lower()
+    if analysis_edge_mode and analysis_edge_mode not in {"model", "cluster", "contact", "all_vs_all"}:
+        raise HTTPException(status_code=400, detail="analysis_edge_mode must be one of: model, cluster, contact, all_vs_all.")
+    if payload.analysis_contact_cutoff is not None:
+        cutoff = float(payload.analysis_contact_cutoff)
+        if cutoff <= 0:
+            raise HTTPException(status_code=400, detail="analysis_contact_cutoff must be > 0.")
+    if payload.analysis_contact_atom_mode is not None:
+        atom_mode = str(payload.analysis_contact_atom_mode).strip().upper()
+        if atom_mode not in {"CA", "CM"}:
+            raise HTTPException(status_code=400, detail="analysis_contact_atom_mode must be one of: CA, CM.")
 
     pose_only = bool(payload.pose_only)
     state_pose_ids = [str(v).strip() for v in (payload.state_pose_ids or []) if str(v).strip()]
