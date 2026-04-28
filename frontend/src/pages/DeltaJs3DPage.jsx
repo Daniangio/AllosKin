@@ -104,6 +104,20 @@ function jsABOTag(dA, dB) {
   return ranked[0][0];
 }
 
+function formatAnalysisShortMeta(entry) {
+  const ts = String(entry?.updated_at || entry?.created_at || '').slice(0, 19) || 'n/a';
+  const n = Number(entry?.summary?.n_samples || 0);
+  const md = String(entry?.md_label_mode || 'assigned');
+  const invalid = Boolean(entry?.drop_invalid) ? 'drop invalid' : 'keep invalid';
+  if (entry?.model_a_id || entry?.model_b_id) {
+    const a = String(entry?.model_a_name || entry?.model_a_id || 'A').slice(0, 18);
+    const b = String(entry?.model_b_name || entry?.model_b_id || 'B').slice(0, 18);
+    return `${ts} · n=${n} · ${a} vs ${b} · ${md} · ${invalid}`;
+  }
+  const edge = String(entry?.edge_source || entry?.edge_mode || 'cluster');
+  return `${ts} · n=${n} · edge=${edge} · ${md} · ${invalid}`;
+}
+
 export default function DeltaJs3DPage() {
   const { projectId, systemId } = useParams();
   const location = useLocation();
@@ -128,14 +142,6 @@ export default function DeltaJs3DPage() {
   const [clusterInfo, setClusterInfo] = useState(null);
   const [clusterInfoError, setClusterInfoError] = useState(null);
   const [loadedStructureStateId, setLoadedStructureStateId] = useState('');
-
-  const [modelAId, setModelAId] = useState('');
-  const [modelBId, setModelBId] = useState('');
-  const [useModelPair, setUseModelPair] = useState(false);
-  const [edgeMode, setEdgeMode] = useState('contact');
-  const [mdLabelMode, setMdLabelMode] = useState('assigned');
-  const [keepInvalid, setKeepInvalid] = useState(false);
-  const dropInvalid = !keepInvalid;
 
   const [analyses, setAnalyses] = useState([]);
   const [analysesError, setAnalysesError] = useState(null);
@@ -180,21 +186,6 @@ export default function DeltaJs3DPage() {
     () => (system?.metastable_clusters || []).filter((run) => run.path && run.status !== 'failed'),
     [system]
   );
-  const selectedCluster = useMemo(
-    () => clusterOptions.find((c) => c.cluster_id === selectedClusterId) || null,
-    [clusterOptions, selectedClusterId]
-  );
-  const pottsModels = useMemo(() => selectedCluster?.potts_models || [], [selectedCluster]);
-  const deltaModels = useMemo(
-    () =>
-      pottsModels.filter((m) => {
-        const params = m.params || {};
-        if (params.fit_mode === 'delta') return true;
-        const kind = params.delta_kind || '';
-        return typeof kind === 'string' && kind.startsWith('delta_');
-      }),
-    [pottsModels]
-  );
   const stateOptions = useMemo(() => {
     const raw = system?.states;
     if (!raw) return [];
@@ -236,17 +227,8 @@ export default function DeltaJs3DPage() {
   }, [analysisData, clusterInfo, residueLabels.length]);
 
   const matchingAnalyses = useMemo(() => {
-    const expectedEdgeSource = useModelPair ? 'potts_intersection' : edgeMode;
-    const base = analyses.filter(
-      (a) =>
-        (a.md_label_mode || 'assigned').toLowerCase() === mdLabelMode &&
-        Boolean(a.drop_invalid) === Boolean(dropInvalid) &&
-        (useModelPair
-          ? a.model_a_id === modelAId && a.model_b_id === modelBId
-          : !a.model_a_id && !a.model_b_id && String(a.edge_source || a.edge_mode || 'cluster') === expectedEdgeSource)
-    );
-    if (!base.length) return [];
-    const sorted = [...base].sort((x, y) => {
+    if (!analyses.length) return [];
+    const sorted = [...analyses].sort((x, y) => {
       const nx = Number(x?.summary?.n_samples || 0);
       const ny = Number(y?.summary?.n_samples || 0);
       if (ny !== nx) return ny - nx;
@@ -255,7 +237,7 @@ export default function DeltaJs3DPage() {
       return (Number.isFinite(ty) ? ty : 0) - (Number.isFinite(tx) ? tx : 0);
     });
     return sorted;
-  }, [analyses, modelAId, modelBId, mdLabelMode, dropInvalid, useModelPair, edgeMode]);
+  }, [analyses]);
 
   useEffect(() => {
     if (!matchingAnalyses.length) {
@@ -276,16 +258,12 @@ export default function DeltaJs3DPage() {
     if (!selectedClusterId) return;
     setClusterInfoError(null);
     try {
-      setClusterInfo(
-        await fetchPottsClusterInfo(projectId, systemId, selectedClusterId, {
-          modelId: useModelPair ? modelAId || undefined : undefined,
-        })
-      );
+      setClusterInfo(await fetchPottsClusterInfo(projectId, systemId, selectedClusterId));
     } catch (err) {
       setClusterInfoError(err.message || 'Failed to load cluster info.');
       setClusterInfo(null);
     }
-  }, [projectId, systemId, selectedClusterId, modelAId, useModelPair]);
+  }, [projectId, systemId, selectedClusterId]);
 
   const loadAnalyses = useCallback(async () => {
     if (!selectedClusterId) return;
@@ -338,25 +316,6 @@ export default function DeltaJs3DPage() {
     loadAnalyses();
     loadFilterSetups();
   }, [selectedClusterId, loadClusterInfo, loadAnalyses, loadFilterSetups]);
-
-  useEffect(() => {
-    if (!useModelPair) {
-      setModelAId('');
-      setModelBId('');
-      return;
-    }
-    if (!deltaModels.length) {
-      setModelAId('');
-      setModelBId('');
-      return;
-    }
-    const ids = new Set(deltaModels.map((m) => m.model_id));
-    if (!modelAId || !ids.has(modelAId)) setModelAId(deltaModels[0].model_id);
-    if (!modelBId || !ids.has(modelBId)) {
-      const other = deltaModels.find((m) => m.model_id !== (modelAId || deltaModels[0].model_id));
-      setModelBId((other || deltaModels[0]).model_id);
-    }
-  }, [deltaModels, modelAId, modelBId, useModelPair]);
 
   useEffect(() => {
     const run = async () => {
@@ -934,103 +893,34 @@ export default function DeltaJs3DPage() {
                 ))}
               </select>
             </div>
-            <label className="flex items-center gap-2 text-sm text-gray-200">
-              <input
-                type="checkbox"
-                checked={useModelPair}
-                onChange={(e) => setUseModelPair(e.target.checked)}
-                className="h-4 w-4 text-cyan-500 rounded border-gray-700 bg-gray-950"
-              />
-              Filter by Potts model pair (optional)
-            </label>
-            {useModelPair && (
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="block text-xs text-gray-400 mb-1">Model A</label>
-                  <select
-                    value={modelAId}
-                    onChange={(e) => setModelAId(e.target.value)}
-                    className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-                  >
-                    {deltaModels.map((m) => (
-                      <option key={m.model_id} value={m.model_id}>
-                        {m.name || m.model_id}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs text-gray-400 mb-1">Model B</label>
-                  <select
-                    value={modelBId}
-                    onChange={(e) => setModelBId(e.target.value)}
-                    className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-                  >
-                    {deltaModels.map((m) => (
-                      <option key={m.model_id} value={m.model_id}>
-                        {m.name || m.model_id}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            )}
-            {useModelPair && !deltaModels.length && (
-              <div className="text-[11px] text-yellow-400">No delta models available on this cluster.</div>
-            )}
-            {!useModelPair && (
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">Edge mode (model-free analyses)</label>
-                <select
-                  value={edgeMode}
-                  onChange={(e) => setEdgeMode(e.target.value)}
-                  className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-                >
-                  <option value="contact">contact</option>
-                  <option value="all_vs_all">all_vs_all</option>
-                  <option value="cluster">cluster</option>
-                </select>
-              </div>
-            )}
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="block text-xs text-gray-400 mb-1">MD labels</label>
-                <select
-                  value={mdLabelMode}
-                  onChange={(e) => setMdLabelMode(e.target.value)}
-                  className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-                >
-                  <option value="assigned">assigned</option>
-                  <option value="halo">halo</option>
-                </select>
-              </div>
-              <div className="flex items-end">
-                <label className="flex items-center gap-2 text-sm text-gray-200">
-                  <input
-                    type="checkbox"
-                    checked={keepInvalid}
-                    onChange={(e) => setKeepInvalid(e.target.checked)}
-                    className="h-4 w-4 text-cyan-500 rounded border-gray-700 bg-gray-950"
-                  />
-                  Keep invalid
-                </label>
-              </div>
-            </div>
             <div>
               <label className="block text-xs text-gray-400 mb-1">Analysis run</label>
-              <select
-                value={selectedAnalysisId}
-                onChange={(e) => setSelectedAnalysisId(e.target.value)}
-                className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-              >
-                {!matchingAnalyses.length && <option value="">No matching analyses</option>}
-                {matchingAnalyses.map((a) => (
-                  <option key={a.analysis_id} value={a.analysis_id}>
-                    {String(a.updated_at || a.created_at || '').slice(0, 19)} · n={Number(a?.summary?.n_samples || 0)} ·{' '}
-                    {String(a.analysis_id).slice(0, 8)}
-                  </option>
-                ))}
-              </select>
+              {!matchingAnalyses.length && (
+                <div className="rounded-md border border-gray-800 bg-gray-950/40 px-2 py-2 text-sm text-gray-500">
+                  No analyses in this cluster.
+                </div>
+              )}
+              {!!matchingAnalyses.length && (
+                <div className="max-h-52 overflow-auto rounded-md border border-gray-800 bg-gray-950/30">
+                  {matchingAnalyses.map((a) => {
+                    const aid = String(a.analysis_id);
+                    const active = aid === String(selectedAnalysisId);
+                    return (
+                      <button
+                        key={aid}
+                        type="button"
+                        onClick={() => setSelectedAnalysisId(aid)}
+                        className={`w-full text-left px-3 py-2 border-b border-gray-900 hover:bg-gray-800/40 ${
+                          active ? 'bg-cyan-950/40 border-l-2 border-l-cyan-500' : ''
+                        }`}
+                      >
+                        <div className="text-xs text-gray-100">{aid}</div>
+                        <div className="text-[11px] text-gray-400">{formatAnalysisShortMeta(a)}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
             <div>
               <label className="block text-xs text-gray-400 mb-1">Color by sample</label>
@@ -1148,7 +1038,7 @@ export default function DeltaJs3DPage() {
             {analysisDataError && <ErrorMessage message={analysisDataError} />}
             {!selectedMeta && (
               <div className="rounded-md border border-yellow-800 bg-yellow-950/30 p-3 text-sm text-yellow-200">
-                No matching delta_js analysis for this selection.
+                No delta_js analysis found in this cluster.
               </div>
             )}
           </div>

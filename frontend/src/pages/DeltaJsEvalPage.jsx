@@ -82,6 +82,20 @@ function aboLabel(dA, dB) {
   return arr[0][0];
 }
 
+function formatAnalysisShortMeta(entry) {
+  const ts = String(entry?.updated_at || entry?.created_at || '').slice(0, 19) || 'n/a';
+  const n = Number(entry?.summary?.n_samples || 0);
+  const md = String(entry?.md_label_mode || 'assigned');
+  const invalid = Boolean(entry?.drop_invalid) ? 'drop invalid' : 'keep invalid';
+  if (entry?.model_a_id || entry?.model_b_id) {
+    const a = String(entry?.model_a_name || entry?.model_a_id || 'A').slice(0, 18);
+    const b = String(entry?.model_b_name || entry?.model_b_id || 'B').slice(0, 18);
+    return `${ts} · n=${n} · ${a} vs ${b} · ${md} · ${invalid}`;
+  }
+  const edge = String(entry?.edge_source || entry?.edge_mode || 'cluster');
+  return `${ts} · n=${n} · edge=${edge} · ${md} · ${invalid}`;
+}
+
 export default function DeltaJsEvalPage() {
   const { projectId, systemId } = useParams();
   const location = useLocation();
@@ -327,17 +341,8 @@ export default function DeltaJsEvalPage() {
   }, [selectedClusterId, modelAId, loadClusterInfo]);
 
   const matchingAnalyses = useMemo(() => {
-    const dropInvalid = !keepInvalid;
-    const expectedEdgeSource = useModelPair ? 'potts_intersection' : edgeMode;
-    const base = analyses.filter((a) => {
-      if ((a.md_label_mode || 'assigned').toLowerCase() !== mdLabelMode) return false;
-      if (Boolean(a.drop_invalid) !== Boolean(dropInvalid)) return false;
-      if (useModelPair) return a.model_a_id === modelAId && a.model_b_id === modelBId;
-      if (a.model_a_id || a.model_b_id) return false;
-      return String(a.edge_source || a.edge_mode || 'cluster') === expectedEdgeSource;
-    });
-    if (!base.length) return [];
-    const scored = [...base].sort((x, y) => {
+    if (!analyses.length) return [];
+    const scored = [...analyses].sort((x, y) => {
       const nx = Number(x?.summary?.n_samples || 0);
       const ny = Number(y?.summary?.n_samples || 0);
       if (ny !== nx) return ny - nx;
@@ -346,7 +351,7 @@ export default function DeltaJsEvalPage() {
       return (Number.isFinite(ty) ? ty : 0) - (Number.isFinite(tx) ? tx : 0);
     });
     return scored;
-  }, [analyses, modelAId, modelBId, mdLabelMode, keepInvalid, useModelPair, edgeMode]);
+  }, [analyses]);
 
   useEffect(() => {
     if (!matchingAnalyses.length) {
@@ -1197,19 +1202,32 @@ export default function DeltaJsEvalPage() {
             </label>
             <div>
               <label className="block text-xs text-gray-400 mb-1">Analysis run</label>
-              <select
-                value={selectedAnalysisId}
-                onChange={(e) => setSelectedAnalysisId(e.target.value)}
-                className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
-              >
-                {!matchingAnalyses.length && <option value="">No matching analyses</option>}
-                {matchingAnalyses.map((a) => (
-                  <option key={a.analysis_id} value={a.analysis_id}>
-                    {String(a.updated_at || a.created_at || '').slice(0, 19)} · n={Number(a?.summary?.n_samples || 0)} ·{' '}
-                    {String(a.analysis_id).slice(0, 8)}
-                  </option>
-                ))}
-              </select>
+              {!matchingAnalyses.length && (
+                <div className="rounded-md border border-gray-800 bg-gray-950/40 px-2 py-2 text-sm text-gray-500">
+                  No analyses in this cluster.
+                </div>
+              )}
+              {!!matchingAnalyses.length && (
+                <div className="max-h-52 overflow-auto rounded-md border border-gray-800 bg-gray-950/30">
+                  {matchingAnalyses.map((a) => {
+                    const aid = String(a.analysis_id);
+                    const active = aid === String(selectedAnalysisId);
+                    return (
+                      <button
+                        key={aid}
+                        type="button"
+                        onClick={() => setSelectedAnalysisId(aid)}
+                        className={`w-full text-left px-3 py-2 border-b border-gray-900 hover:bg-gray-800/40 ${
+                          active ? 'bg-cyan-950/40 border-l-2 border-l-cyan-500' : ''
+                        }`}
+                      >
+                        <div className="text-xs text-gray-100">{aid}</div>
+                        <div className="text-[11px] text-gray-400">{formatAnalysisShortMeta(a)}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
             <JsRangeFilterBuilder rules={jsFilters} onChange={setJsFilters} />
             <FilterSetupManager
