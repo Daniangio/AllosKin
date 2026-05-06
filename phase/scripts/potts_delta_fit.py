@@ -6,8 +6,13 @@ import os
 from pathlib import Path
 import uuid
 
+import numpy as np
+
+from phase.io.data import load_npz
+from phase.potts.sample_io import load_sample_npz
 from phase.services.project_store import ProjectStore
 from phase.potts.delta_fit import _device_arg, _load_labels_from_npz  # keep CLI behavior consistent
+from phase.workflows.clustering import evaluate_state_with_models
 from phase.potts.potts_model import (
     add_potts_models,
     fit_potts_delta_pseudolikelihood_torch,
@@ -129,11 +134,113 @@ def main(argv: list[str] | None = None) -> int:
     if not npz_path.exists():
         raise SystemExit(f"Cluster NPZ not found: {npz_path}")
 
-    labels = _load_labels_from_npz(
-        npz_path,
-        state_ids=state_ids,
-        unassigned_policy=str(args.unassigned_policy),
-    )
+    samples_meta = cluster_entry.get("samples")
+    if not isinstance(samples_meta, list):
+        samples_meta = []
+
+    def _sample_npz_path(sample_entry: dict) -> Path | None:
+        paths = sample_entry.get("paths") or {}
+        rel = None
+        if isinstance(paths, dict):
+            rel = paths.get("summary_npz") or paths.get("path")
+        rel = rel or sample_entry.get("path")
+        if not rel:
+            return None
+        p = Path(str(rel))
+        if p.is_absolute():
+            return p
+        return store.resolve_path(project_id, system_id, str(rel))
+
+    try:
+        labels = _load_labels_from_npz(
+            npz_path,
+            state_ids=state_ids,
+            unassigned_policy=str(args.unassigned_policy),
+        )
+    except ValueError as exc:
+        # Fallback for split/derived macro states that are not present in cluster frame_state_ids.
+        msg = str(exc)
+        if "No frames matched state_ids" not in msg:
+            raise
+        frames_ds = load_npz(str(npz_path), unassigned_policy=str(args.unassigned_policy), allow_missing_edges=True)
+        available_ids = sorted({str(v) for v in (np.asarray(frames_ds.frame_state_ids).astype(str).tolist() if frames_ds.frame_state_ids is not None else [])})
+        fallback_blocks = []
+        unresolved: list[str] = []
+        for state_id in state_ids:
+            md_candidates = [
+                s
+                for s in samples_meta
+                if isinstance(s, dict)
+                and str(s.get("type") or "").strip().lower() == "md_eval"
+                and str(s.get("state_id") or "").strip() == str(state_id)
+            ]
+            md_candidates.sort(key=lambda s: str(s.get("created_at") or ""))
+            block = None
+            for sample_entry in reversed(md_candidates):
+                sp = _sample_npz_path(sample_entry)
+                if sp is None or not sp.exists():
+                    continue
+                try:
+                    sample_ds = load_sample_npz(sp)
+                    labels_arr = np.asarray(sample_ds.labels_assigned, dtype=int)
+                    if labels_arr.ndim == 2 and labels_arr.shape[0] > 0:
+                        block = labels_arr
+                        break
+                except Exception:
+                    continue
+
+            if block is None:
+                # Build/refresh md_eval labels for this state on demand.
+                try:
+                    sample_entry = evaluate_state_with_models(
+                        project_id,
+                        system_id,
+                        cluster_id,
+                        state_id,
+                        store=store,
+                        workers=0,
+                    )
+                    if isinstance(sample_entry, dict):
+                        sid_new = str(sample_entry.get("sample_id") or "")
+                        if sid_new:
+                            replaced = False
+                            for idx_existing, existing in enumerate(samples_meta):
+                                if isinstance(existing, dict) and str(existing.get("sample_id") or "") == sid_new:
+                                    samples_meta[idx_existing] = sample_entry
+                                    replaced = True
+                                    break
+                            if not replaced:
+                                samples_meta.append(sample_entry)
+                            cluster_entry["samples"] = samples_meta
+                            system_meta.metastable_clusters = clusters
+                            store.save_system(system_meta)
+                    sp = _sample_npz_path(sample_entry) if isinstance(sample_entry, dict) else None
+                    if sp is not None and sp.exists():
+                        sample_ds = load_sample_npz(sp)
+                        labels_arr = np.asarray(sample_ds.labels_assigned, dtype=int)
+                        if labels_arr.ndim == 2 and labels_arr.shape[0] > 0:
+                            block = labels_arr
+                except Exception:
+                    block = None
+
+            if block is None:
+                unresolved.append(state_id)
+                continue
+            fallback_blocks.append(block)
+
+        if not fallback_blocks:
+            details = f" Available frame_state_ids in cluster: {available_ids[:20]}"
+            if len(available_ids) > 20:
+                details += f" (+{len(available_ids)-20} more)"
+            if unresolved:
+                details += f". Missing/unusable descriptor states: {sorted(set(unresolved))}"
+            raise SystemExit(f"{msg}.{details}")
+
+        labels = np.concatenate(fallback_blocks, axis=0)
+        print(
+            f"[delta] note: state_ids {state_ids} not found in cluster frame_state_ids; "
+            f"loaded {labels.shape[0]} frame(s) from md_eval sample labels instead."
+        )
     if labels.shape[1] != len(base_model.h):
         raise SystemExit("Labels do not match base model size.")
 

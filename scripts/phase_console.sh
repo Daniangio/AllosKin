@@ -236,7 +236,7 @@ cluster_menu() {
     echo "System: ${OFFLINE_SYSTEM_NAME:-$OFFLINE_SYSTEM_ID} (${OFFLINE_SYSTEM_ID})"
     echo "Cluster: ${OFFLINE_CLUSTER_NAME:-$OFFLINE_CLUSTER_ID} (${OFFLINE_CLUSTER_ID})"
     echo ""
-    ACTION_LINES=$'list-models|List Potts models\nlist-samples|List sampling runs\nfit|Fit Potts model\nfit-delta|Fit delta Potts model\nlambda-model|Create lambda model\nsample|Run sampling\nsampling-analysis|Sampling Explorer analysis\nendpoint-frustration|Endpoint frustration analysis\nlambda-sweep|Lambda sweep sampling\ngibbs-relax|Gibbs relaxation analysis\nligand-completion|Ligand completion analysis\ndelta-js|Delta JS analysis\npotts-nn|Potts NN mapping analysis\nbackmapping-dataset|Build backmapping dataset\npatch-cluster|Patch cluster residues\nrefresh-md|Recompute MD samples\nassign-md|Assign selected macro states\nback|Back to systems'
+    ACTION_LINES=$'list-models|List Potts models\nlist-samples|List sampling runs\nfit|Fit Potts model\nfit-delta|Fit delta Potts model\nlambda-model|Create lambda model\nsample|Run sampling\nsampling-analysis|Sampling Explorer analysis\nendpoint-frustration|Endpoint frustration analysis\nlambda-sweep|Lambda sweep sampling\ngibbs-relax|Gibbs relaxation analysis\nligand-completion|Ligand completion analysis\ndelta-js|Delta JS analysis\npotts-nn|Potts NN mapping analysis\nbackmapping-dataset|Build backmapping dataset\npatch-cluster|Patch cluster residues\nassign-md|Assign macro states to cluster (md_eval)\nback|Back to systems'
     ACTION_ROW="$(offline_choose_one "Cluster actions:" "$ACTION_LINES")"
     ACTION="$(printf "%s" "$ACTION_ROW" | awk -F'|' '{print $1}')"
     case "$ACTION" in
@@ -372,41 +372,41 @@ cluster_menu() {
           --cluster-id "$OFFLINE_CLUSTER_ID"
         pause
         ;;
-      refresh-md)
-        ensure_env || return 0
-        "${ROOT_DIR}/scripts/md_samples_refresh.sh" \
-          --root "$OFFLINE_ROOT" \
-          --project-id "$OFFLINE_PROJECT_ID" \
-          --system-id "$OFFLINE_SYSTEM_ID" \
-          --cluster-id "$OFFLINE_CLUSTER_ID"
-        pause
-        ;;
       assign-md)
         ensure_env || return 0
-        STATE_ROWS="$(offline_select_states)"
-        if [ -z "$(printf "%s" "$STATE_ROWS" | awk 'NF {print; exit}')" ]; then
-          echo "No states selected."
-          pause
-          continue
+        STATE_IDS=""
+        if prompt_bool "Assign all descriptor-ready macro states? (Y/n)" "Y"; then
+          STATE_IDS=""
+        else
+          STATE_ROWS="$(offline_select_states)"
+          if [ -z "$(printf "%s" "$STATE_ROWS" | awk 'NF {print; exit}')" ]; then
+            echo "No states selected."
+            pause
+            continue
+          fi
+          STATE_IDS="$(printf "%s\n" "$STATE_ROWS" | awk -F'|' '{print $1}' | awk 'NF' | paste -sd',' -)"
+          if [ -z "$STATE_IDS" ]; then
+            echo "No states selected."
+            pause
+            continue
+          fi
         fi
         RES_WORKERS="$(prompt "Residue workers per state (1=sequential, 0=auto)" "0")"
         if ! [[ "$RES_WORKERS" =~ ^-?[0-9]+$ ]]; then
           RES_WORKERS="0"
         fi
-        while IFS= read -r STATE_ROW; do
-          [ -z "$STATE_ROW" ] && continue
-          STATE_ID="$(printf "%s" "$STATE_ROW" | awk -F'|' '{print $1}')"
-          [ -z "$STATE_ID" ] && continue
-          python -m phase.scripts.evaluate_state \
-            --root "$OFFLINE_ROOT" \
-            --project-id "$OFFLINE_PROJECT_ID" \
-            --system-id "$OFFLINE_SYSTEM_ID" \
-            --cluster-id "$OFFLINE_CLUSTER_ID" \
-            --state-id "$STATE_ID" \
-            --workers "$RES_WORKERS"
-        done <<EOF
-$STATE_ROWS
-EOF
+        CMD=(
+          python -m phase.scripts.evaluate_all_states
+          --root "$OFFLINE_ROOT"
+          --project-id "$OFFLINE_PROJECT_ID"
+          --system-id "$OFFLINE_SYSTEM_ID"
+          --cluster-id "$OFFLINE_CLUSTER_ID"
+          --workers "$RES_WORKERS"
+        )
+        if [ -n "$STATE_IDS" ]; then
+          CMD+=(--state-ids "$STATE_IDS")
+        fi
+        "${CMD[@]}"
         pause
         ;;
       back|"")

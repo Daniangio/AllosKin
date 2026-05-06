@@ -39,6 +39,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--cleanup", action="store_true", help="Delete duplicate md_eval sample folders (default).")
     ap.add_argument("--no-cleanup", dest="cleanup", action="store_false", help="Keep duplicate md_eval sample folders.")
     ap.set_defaults(cleanup=True)
+    ap.add_argument(
+        "--state-ids",
+        default="",
+        help="Optional comma-separated state ids. If set, only these states are evaluated.",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="Residue prediction workers per state (0=auto, 1=sequential).",
+    )
     args = ap.parse_args(argv)
 
     root = Path(args.root).expanduser().resolve() / "projects"
@@ -58,6 +69,13 @@ def main(argv: list[str] | None = None) -> int:
         samples = []
 
     descriptor_states = [s for s in system_meta.states.values() if getattr(s, "descriptor_file", None)]
+    selected_state_ids = [s.strip() for s in str(args.state_ids or "").split(",") if s.strip()]
+    if selected_state_ids:
+        selected_set = set(selected_state_ids)
+        descriptor_states = [s for s in descriptor_states if str(getattr(s, "state_id", "")) in selected_set]
+        missing = sorted(selected_set - {str(getattr(s, "state_id", "")) for s in descriptor_states})
+        if missing:
+            print(f"[evaluate-all] warning: states not found or not descriptor-ready: {missing}")
     if not descriptor_states:
         print("[evaluate-all] no states with descriptors found.")
         return 0
@@ -96,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
             state_id,
             store=store,
             sample_id=reuse_id,
+            workers=int(args.workers),
         )
 
         # Replace-or-append the sample entry.
@@ -134,4 +153,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
