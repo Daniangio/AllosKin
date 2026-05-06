@@ -182,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 try:
                     sample_ds = load_sample_npz(sp)
-                    labels_arr = np.asarray(sample_ds.labels_assigned, dtype=int)
+                    labels_arr = np.asarray(sample_ds.labels, dtype=int)
                     if labels_arr.ndim == 2 and labels_arr.shape[0] > 0:
                         block = labels_arr
                         break
@@ -217,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
                     sp = _sample_npz_path(sample_entry) if isinstance(sample_entry, dict) else None
                     if sp is not None and sp.exists():
                         sample_ds = load_sample_npz(sp)
-                        labels_arr = np.asarray(sample_ds.labels_assigned, dtype=int)
+                        labels_arr = np.asarray(sample_ds.labels, dtype=int)
                         if labels_arr.ndim == 2 and labels_arr.shape[0] > 0:
                             block = labels_arr
                 except Exception:
@@ -233,7 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             if len(available_ids) > 20:
                 details += f" (+{len(available_ids)-20} more)"
             if unresolved:
-                details += f". Missing/unusable descriptor states: {sorted(set(unresolved))}"
+                details += f". Missing/unusable md_eval states: {sorted(set(unresolved))}"
             raise SystemExit(f"{msg}.{details}")
 
         labels = np.concatenate(fallback_blocks, axis=0)
