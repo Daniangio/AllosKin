@@ -166,6 +166,8 @@ export default function DeltaJs3DPage() {
   const [edgeSmoothStrength, setEdgeSmoothStrength] = useState(0.75);
   const [hideSingleCluster, setHideSingleCluster] = useState(true);
   const [jsFilters, setJsFilters] = useState([{ aMin: 0, aMax: 1, bMin: 0, bMax: 1 }]);
+  const [orderJsA, setOrderJsA] = useState('lowest');
+  const [orderJsB, setOrderJsB] = useState('highest');
 
   useEffect(() => {
     const run = async () => {
@@ -568,6 +570,34 @@ export default function DeltaJs3DPage() {
       color: inRange ? jsABOColor(dA, dB) : '#9ca3af',
     };
   }, [selectedResidueIndex, residueLabels, rowDistances, jsFilters]);
+
+  const rankedFilteredResidues = useMemo(() => {
+    const out = [];
+    const wantALow = orderJsA === 'lowest';
+    const wantBLow = orderJsB === 'lowest';
+    for (let i = 0; i < residueLabels.length && i < rowDistances.length; i += 1) {
+      const pair = Array.isArray(rowDistances[i]) ? rowDistances[i] : [];
+      const dAraw = Number(pair[0]);
+      const dBraw = Number(pair[1]);
+      if (!Number.isFinite(dAraw) || !Number.isFinite(dBraw)) continue;
+      if (!passesAnyJsFilter(dAraw, dBraw, jsFilters)) continue;
+      if (hideSingleCluster && singleClusterByResidue[i]) continue;
+      const dA = normJs(dAraw);
+      const dB = normJs(dBraw);
+      const termA = wantALow ? dA : 1 - dA;
+      const termB = wantBLow ? dB : 1 - dB;
+      const score = termA + termB;
+      out.push({
+        residueIndex: i,
+        residueLabel: residueLabels[i] || String(i),
+        jsA: dAraw,
+        jsB: dBraw,
+        score,
+      });
+    }
+    out.sort((a, b) => a.score - b.score);
+    return out;
+  }, [rowDistances, residueLabels, jsFilters, hideSingleCluster, singleClusterByResidue, orderJsA, orderJsB]);
 
   const handleSaveFilterSetup = useCallback(async () => {
     if (!selectedClusterId) return;
@@ -1016,6 +1046,36 @@ export default function DeltaJs3DPage() {
                 />
               </div>
             </div>
+            <div className="rounded-md border border-gray-800 bg-gray-950/30 p-2 space-y-2">
+              <div className="text-xs text-gray-300 font-medium">Residue ranking rule</div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">JS(A)</label>
+                  <select
+                    value={orderJsA}
+                    onChange={(e) => setOrderJsA(e.target.value)}
+                    className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                  >
+                    <option value="lowest">lowest</option>
+                    <option value="highest">highest</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">JS(B)</label>
+                  <select
+                    value={orderJsB}
+                    onChange={(e) => setOrderJsB(e.target.value)}
+                    className="w-full bg-gray-950 border border-gray-800 rounded-md px-2 py-2 text-sm text-gray-100"
+                  >
+                    <option value="lowest">lowest</option>
+                    <option value="highest">highest</option>
+                  </select>
+                </div>
+              </div>
+              <div className="text-[11px] text-gray-500">
+                Score = term(A) + term(B), where lowest uses JS and highest uses (1 - JS), on normalized JS.
+              </div>
+            </div>
             <div className="rounded-md border border-gray-800 bg-gray-950/30 p-2 space-y-1">
               <div className="text-xs text-gray-400">Selected residue (click on 3D)</div>
               {selectedResidueInfo ? (
@@ -1072,6 +1132,50 @@ export default function DeltaJs3DPage() {
               <div ref={containerRef} className="w-full h-full relative" />
             </div>
             {analysisDataLoading && <p className="mt-2 text-sm text-gray-400">Loading analysis…</p>}
+          </div>
+          <div className="rounded-lg border border-gray-800 bg-gray-900/40 p-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-gray-200">Filtered Residues Ranking</h2>
+              <div className="text-xs text-gray-400">{rankedFilteredResidues.length} residues</div>
+            </div>
+            <div className="mt-2 text-[11px] text-gray-500">
+              Ordered by current rule and current filters. Lower score first.
+            </div>
+            <div className="mt-3 max-h-72 overflow-auto rounded-md border border-gray-800">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-950/70 sticky top-0">
+                  <tr className="text-gray-300">
+                    <th className="px-2 py-2 text-left">Residue</th>
+                    <th className="px-2 py-2 text-right">JS A</th>
+                    <th className="px-2 py-2 text-right">JS B</th>
+                    <th className="px-2 py-2 text-right">Score</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {!rankedFilteredResidues.length && (
+                    <tr>
+                      <td colSpan={4} className="px-2 py-3 text-center text-gray-500">
+                        No residues pass current filters.
+                      </td>
+                    </tr>
+                  )}
+                  {rankedFilteredResidues.map((row) => (
+                    <tr
+                      key={`rank:${row.residueIndex}`}
+                      className={`border-t border-gray-900 hover:bg-gray-800/40 cursor-pointer ${
+                        row.residueIndex === selectedResidueIndex ? 'bg-cyan-950/20' : ''
+                      }`}
+                      onClick={() => setSelectedResidueIndex(row.residueIndex)}
+                    >
+                      <td className="px-2 py-1.5 text-gray-200">{row.residueLabel}</td>
+                      <td className="px-2 py-1.5 text-right text-gray-300">{row.jsA.toFixed(4)}</td>
+                      <td className="px-2 py-1.5 text-right text-gray-300">{row.jsB.toFixed(4)}</td>
+                      <td className="px-2 py-1.5 text-right text-gray-100">{row.score.toFixed(4)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </main>
       </div>
