@@ -534,6 +534,13 @@ export default function PottsNearestNeighborPage() {
           </button>
           <button
             type="button"
+            onClick={() => navigate(`/projects/${projectId}/systems/${systemId}/sampling/potts_nn_mapping_compare${selectedClusterId ? `?cluster_id=${encodeURIComponent(selectedClusterId)}` : ''}`)}
+            className="inline-flex items-center gap-2 text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:bg-gray-700/40"
+          >
+            Compare experiments
+          </button>
+          <button
+            type="button"
             onClick={() => setHelpOpen(true)}
             className="inline-flex items-center gap-2 text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:bg-gray-700/40"
           >

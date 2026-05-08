@@ -1724,12 +1724,23 @@ export default function SamplingVizPage() {
                               },
                             ],
                             layout: {
-                              margin: { l: 60, r: 10, t: 20, b: 60 },
+                              margin: { l: 80, r: 20, t: 20, b: 120 },
                               paper_bgcolor: '#ffffff',
                               plot_bgcolor: '#ffffff',
                               font: { color: '#111827' },
-                              xaxis: { title: 'Residue', color: '#111827' },
-                              yaxis: { title: 'Residue', color: '#111827' },
+                              xaxis: {
+                                title: 'Residue',
+                                color: '#111827',
+                                tickangle: -45,
+                                automargin: true,
+                                tickfont: { size: 10 },
+                              },
+                              yaxis: {
+                                title: 'Residue',
+                                color: '#111827',
+                                automargin: true,
+                                tickfont: { size: 10 },
+                              },
                             },
                           })
                         }
@@ -1762,14 +1773,23 @@ export default function SamplingVizPage() {
                         },
                       ]}
                       layout={{
-                        margin: { l: 50, r: 10, t: 10, b: 50 },
+                        margin: { l: 70, r: 20, t: 10, b: 110 },
                         paper_bgcolor: '#ffffff',
                         plot_bgcolor: '#ffffff',
                         font: { color: '#111827' },
+                        xaxis: {
+                          tickangle: -45,
+                          automargin: true,
+                          tickfont: { size: 9 },
+                        },
+                        yaxis: {
+                          automargin: true,
+                          tickfont: { size: 9 },
+                        },
                       }}
                       config={{ displayModeBar: false, responsive: true }}
                       useResizeHandler
-                      style={{ width: '100%', height: '220px' }}
+                      style={{ width: '100%', height: '300px' }}
                     />
                   )}
                   {!!topEdges.length && (

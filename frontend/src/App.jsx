@@ -20,6 +20,7 @@ import GibbsRelaxation3DPage from './pages/GibbsRelaxation3DPage';
 import LigandCompletionPage from './pages/LigandCompletionPage';
 import PottsNearestNeighborPage from './pages/PottsNearestNeighborPage';
 import PottsNearestNeighborGraphPage from './pages/PottsNearestNeighborGraphPage';
+import PottsNearestNeighborComparePage from './pages/PottsNearestNeighborComparePage';
 import MolstarDebugPage from './pages/MolstarDebugPage';
 import HealthPage from './pages/HealthPage';
 import JobStatusPage from './pages/JobStatusPage';
@@ -83,6 +84,10 @@ export default function App() {
           <Route
             path="/projects/:projectId/systems/:systemId/sampling/potts_nn_mapping_graph"
             element={<PottsNearestNeighborGraphPage />}
+          />
+          <Route
+            path="/projects/:projectId/systems/:systemId/sampling/potts_nn_mapping_compare"
+            element={<PottsNearestNeighborComparePage />}
           />
           <Route path="/results" element={<ResultsPage />} />
           <Route path="/results/:jobId" element={<ResultDetailPage />} />
