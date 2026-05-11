@@ -864,6 +864,13 @@ export default function DeltaJsEvalPage() {
           >
             3D JS View
           </button>
+          <button
+            type="button"
+            onClick={() => navigate(`/projects/${projectId}/systems/${systemId}/sampling/delta_js_table${samplingSuffix}`)}
+            className="text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:border-gray-500"
+          >
+            Multi-traj table
+          </button>
         </div>
       </div>
 

@@ -14,6 +14,7 @@ import DeltaEvalPage from './pages/DeltaEvalPage';
 import DeltaCommitment3DPage from './pages/DeltaCommitment3DPage';
 import DeltaJsEvalPage from './pages/DeltaJsEvalPage';
 import DeltaJs3DPage from './pages/DeltaJs3DPage';
+import DeltaJsTablePage from './pages/DeltaJsTablePage';
 import LambdaSweepPage from './pages/LambdaSweepPage';
 import GibbsRelaxationPage from './pages/GibbsRelaxationPage';
 import GibbsRelaxation3DPage from './pages/GibbsRelaxation3DPage';
@@ -60,6 +61,10 @@ export default function App() {
           <Route
             path="/projects/:projectId/systems/:systemId/sampling/delta_js_3d"
             element={<DeltaJs3DPage />}
+          />
+          <Route
+            path="/projects/:projectId/systems/:systemId/sampling/delta_js_table"
+            element={<DeltaJsTablePage />}
           />
           <Route
             path="/projects/:projectId/systems/:systemId/sampling/lambda_sweep"

@@ -882,14 +882,23 @@ export default function DeltaJs3DPage() {
             Residue coloring from JS distance to A and B references: red=A-like, blue=B-like, green=similar to both, purple=far from both.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={() => setHelpOpen(true)}
-          className="text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:border-gray-500 inline-flex items-center gap-2"
-        >
-          <CircleHelp className="h-4 w-4" />
-          Help
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => navigate(`/projects/${projectId}/systems/${systemId}/sampling/delta_js_table${selectedClusterId ? `?cluster_id=${encodeURIComponent(selectedClusterId)}` : ''}`)}
+            className="text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:border-gray-500"
+          >
+            Multi-traj table
+          </button>
+          <button
+            type="button"
+            onClick={() => setHelpOpen(true)}
+            className="text-xs px-3 py-2 rounded-md border border-gray-700 text-gray-200 hover:border-gray-500 inline-flex items-center gap-2"
+          >
+            <CircleHelp className="h-4 w-4" />
+            Help
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-[360px_1fr] gap-4">

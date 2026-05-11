@@ -61,6 +61,71 @@ def _convert_nan_to_none(obj: Any):
     return obj
 
 
+def _derive_cluster_residue_display_labels(
+    *,
+    project_id: str,
+    system_id: str,
+    residue_keys: List[str],
+    residue_mapping: Dict[str, str] | None = None,
+    selected_state_ids: List[str] | None = None,
+) -> List[str]:
+    labels = [str(v) for v in (residue_keys or [])]
+    if not labels:
+        return labels
+
+    try:
+        system_meta = project_store.get_system(project_id, system_id)
+    except Exception:
+        return labels
+
+    states = (getattr(system_meta, "states", None) or {})
+    mapping = {str(k): str(v) for k, v in (residue_mapping or {}).items()}
+    candidates = [str(sid) for sid in (selected_state_ids or []) if str(sid) in states]
+    if not candidates:
+        candidates = [str(sid) for sid, st in states.items() if getattr(st, "pdb_file", None)]
+
+    state_pdb: Path | None = None
+    for state_id in candidates:
+        state = states.get(state_id)
+        if state is None:
+            continue
+        if not mapping and getattr(state, "residue_mapping", None):
+            mapping = {str(k): str(v) for k, v in (state.residue_mapping or {}).items()}
+        pdb_rel = getattr(state, "pdb_file", None)
+        if not pdb_rel:
+            continue
+        candidate = project_store.resolve_path(project_id, system_id, str(pdb_rel))
+        if candidate.exists():
+            state_pdb = candidate
+            break
+    if state_pdb is None:
+        return labels
+
+    try:
+        import MDAnalysis as mda  # type: ignore
+        universe = mda.Universe(str(state_pdb))
+        resname_map = {int(res.resid): str(res.resname).strip() for res in universe.residues}
+    except Exception:
+        return labels
+
+    output: List[str] = []
+    for key in labels:
+        selection = str(mapping.get(key) or key)
+        resid_val: int | None = None
+        match = re.search(r"(?:resid|resnum)\s+(-?\d+)", selection)
+        if match:
+            resid_val = int(match.group(1))
+        else:
+            tail = re.search(r"(\d+)$", key)
+            if tail:
+                resid_val = int(tail.group(1))
+        if resid_val is not None and resid_val in resname_map:
+            output.append(f"{resname_map[resid_val]}{resid_val}")
+        else:
+            output.append(key)
+    return output
+
+
 def _remove_results_dir(path_value: str | None, *, system_dir: Path | None = None) -> None:
     if not isinstance(path_value, str) or not path_value:
         return
@@ -483,6 +548,8 @@ async def get_potts_cluster_info(
     edges: list[list[int]] = []
     edges_source = "none"
     model_name: str | None = None
+    residue_mapping: Dict[str, str] = {}
+    selected_state_ids: List[str] = []
 
     try:
         with np.load(cluster_path, allow_pickle=True) as data:
@@ -501,6 +568,18 @@ async def get_potts_cluster_info(
                 edges = np.asarray(data["edges"], dtype=int).tolist()
             if edges:
                 edges_source = "cluster"
+            raw_meta = data.get("metadata_json")
+            if raw_meta is not None:
+                meta_json = raw_meta.item() if isinstance(raw_meta, np.ndarray) else raw_meta
+                if isinstance(meta_json, bytes):
+                    meta_json = meta_json.decode("utf-8", errors="ignore")
+                meta = json.loads(str(meta_json)) if meta_json else {}
+                if isinstance(meta, dict):
+                    residue_mapping = {str(k): str(v) for k, v in (meta.get("residue_mapping") or {}).items()}
+                    selected_state_ids = [
+                        str(v)
+                        for v in (meta.get("selected_state_ids") or meta.get("selected_metastable_ids") or [])
+                    ]
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to load cluster NPZ: {exc}") from exc
 
@@ -523,11 +602,20 @@ async def get_potts_cluster_info(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Failed to load Potts model NPZ: {exc}") from exc
 
+    residue_display_labels = _derive_cluster_residue_display_labels(
+        project_id=project_id,
+        system_id=system_id,
+        residue_keys=residue_keys,
+        residue_mapping=residue_mapping,
+        selected_state_ids=selected_state_ids,
+    )
+
     return {
         "cluster_id": cluster_id,
         "n_residues": int(len(residue_keys)),
         "n_edges": int(len(edges)),
         "residue_keys": residue_keys,
+        "residue_display_labels": residue_display_labels,
         "cluster_counts": cluster_counts,
         "edges": edges,
         "edges_source": edges_source,
