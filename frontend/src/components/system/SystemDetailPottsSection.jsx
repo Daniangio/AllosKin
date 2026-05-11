@@ -204,6 +204,58 @@ export default function SystemDetailPottsSection(props) {
     [mdSamples, sampleBackmappingSampleId]
   );
 
+  const renderInlineSampleInfo = (sample) => {
+    if (!sample || !infoSample || sample.sample_id !== infoSample.sample_id) return null;
+    return (
+      <div className="rounded-md border border-gray-800 bg-gray-950/60 p-2 text-[11px] text-gray-300 space-y-2">
+        <div className="flex items-start justify-between gap-2">
+          <div>
+            <p className="text-xs font-semibold text-white">{infoSample.name || infoSample.sample_id}</p>
+            <p className="text-[10px] text-gray-500">Sample info</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setInfoSampleId(null)}
+            className="text-gray-400 hover:text-gray-200"
+            aria-label="Close sample info"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        <div className="space-y-1">
+          <div><span className="text-gray-400">id:</span> {infoSample.sample_id}</div>
+          {infoSample.created_at && <div><span className="text-gray-400">created:</span> {infoSample.created_at}</div>}
+          {infoSample.method && <div><span className="text-gray-400">method:</span> {infoSample.method}</div>}
+          {infoSample.model_names && infoSample.model_names.length > 0 && (
+            <div><span className="text-gray-400">models:</span> {infoSample.model_names.join(', ')}</div>
+          )}
+          {infoSample.path && <div><span className="text-gray-400">path:</span> {infoSample.path}</div>}
+          {infoSampleStats && (
+            <>
+              <div><span className="text-gray-400">frames:</span> {infoSampleStats.n_frames}</div>
+              <div><span className="text-gray-400">residues:</span> {infoSampleStats.n_residues}</div>
+              <div>
+                <span className="text-gray-400">invalid:</span>{' '}
+                {infoSampleStats.invalid_count} ({(infoSampleStats.invalid_fraction * 100).toFixed(2)}%)
+              </div>
+            </>
+          )}
+          {infoSampleStatsError && (
+            <div className="text-red-300">{infoSampleStatsError}</div>
+          )}
+        </div>
+        {(infoSample.summary || infoSample.params) && (
+          <details className="text-[11px] text-gray-300">
+            <summary className="cursor-pointer text-gray-200">Run details</summary>
+            <pre className="mt-2 max-h-56 overflow-auto rounded bg-gray-900 p-2 text-[10px] text-gray-300">
+              {JSON.stringify(infoSample.summary || infoSample.params, null, 2)}
+            </pre>
+          </details>
+        )}
+      </div>
+    );
+  };
+
   useEffect(() => {
     const load = async () => {
       setInfoSampleStats(null);
@@ -586,77 +638,77 @@ export default function SystemDetailPottsSection(props) {
                         ? `dataset ${backmappingStatus}`
                         : 'no dataset';
                     return (
-                      <div
-                        key={sample.sample_id || sample.path}
-                        className="flex items-center justify-between gap-2 rounded-md border border-gray-800 bg-gray-950/50 px-2 py-1"
-                      >
-                        <div className="min-w-0">
-                          <p className="text-[11px] text-gray-300 truncate">{label}</p>
-                          <p className="text-[10px] text-gray-500 truncate">
-                            {backmappingStatusLabel}
-                            {isBackmappingActive && backmapping.meta?.progress !== undefined
-                              ? ` • ${backmapping.meta.progress}%`
-                              : ''}
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => setInfoSampleId(sample.sample_id)}
-                            className="text-gray-400 hover:text-gray-200"
-                            aria-label={`Show info for ${label}`}
-                          >
-                            <Info className="h-4 w-4" />
-                          </button>
-                          {stateId && (
+                      <div key={sample.sample_id || sample.path} className="space-y-2">
+                        <div className="flex items-center justify-between gap-2 rounded-md border border-gray-800 bg-gray-950/50 px-2 py-1">
+                          <div className="min-w-0">
+                            <p className="text-[11px] text-gray-300 truncate">{label}</p>
+                            <p className="text-[10px] text-gray-500 truncate">
+                              {backmappingStatusLabel}
+                              {isBackmappingActive && backmapping.meta?.progress !== undefined
+                                ? ` • ${backmapping.meta.progress}%`
+                                : ''}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2">
                             <button
                               type="button"
-                              onClick={() =>
-                                openDescriptorExplorer({
-                                  clusterId: pottsFitClusterId,
-                                  stateId,
-                                  metastableId: sample.metastable_id || null,
-                                })
+                              onClick={() => setInfoSampleId(sample.sample_id)}
+                              className="text-gray-400 hover:text-gray-200"
+                              aria-label={`Show info for ${label}`}
+                            >
+                              <Info className="h-4 w-4" />
+                            </button>
+                            {stateId && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  openDescriptorExplorer({
+                                    clusterId: pottsFitClusterId,
+                                    stateId,
+                                    metastableId: sample.metastable_id || null,
+                                  })
+                                }
+                                className="text-gray-400 hover:text-cyan-300"
+                                aria-label={`View ${label} in Descriptor Explorer`}
+                              >
+                                <Eye className="h-4 w-4" />
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setSampleBackmappingSampleId(sample.sample_id || '');
+                                setSampleBackmappingFile(null);
+                                setSampleBackmappingError(null);
+                                setSampleBackmappingUploadProgress(null);
+                                setSampleBackmappingOpen(true);
+                              }}
+                              className={`${
+                                canBuildBackmapping ? 'text-gray-400 hover:text-cyan-300' : 'text-gray-700 cursor-not-allowed'
+                              }`}
+                              aria-label={`Build backmapping dataset for ${label}`}
+                              disabled={!canBuildBackmapping}
+                              title={
+                                canBuildBackmapping
+                                  ? 'Build or rebuild backmapping dataset'
+                                  : 'Backmapping dataset currently requires a state-based MD sample'
                               }
-                              className="text-gray-400 hover:text-cyan-300"
-                              aria-label={`View ${label} in Descriptor Explorer`}
                             >
-                              <Eye className="h-4 w-4" />
+                              <UploadCloud className="h-4 w-4" />
                             </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setSampleBackmappingSampleId(sample.sample_id || '');
-                              setSampleBackmappingFile(null);
-                              setSampleBackmappingError(null);
-                              setSampleBackmappingUploadProgress(null);
-                              setSampleBackmappingOpen(true);
-                            }}
-                            className={`${
-                              canBuildBackmapping ? 'text-gray-400 hover:text-cyan-300' : 'text-gray-700 cursor-not-allowed'
-                            }`}
-                            aria-label={`Build backmapping dataset for ${label}`}
-                            disabled={!canBuildBackmapping}
-                            title={
-                              canBuildBackmapping
-                                ? 'Build or rebuild backmapping dataset'
-                                : 'Backmapping dataset currently requires a state-based MD sample'
-                            }
-                          >
-                            <UploadCloud className="h-4 w-4" />
-                          </button>
-                          {backmapping.path && (
-                            <button
-                              type="button"
-                              onClick={() => handleDownloadSampleBackmapping(pottsFitClusterId, sample)}
-                              className="text-gray-400 hover:text-cyan-300"
-                              aria-label={`Download backmapping dataset for ${label}`}
-                            >
-                              <Download className="h-4 w-4" />
-                            </button>
-                          )}
+                            {backmapping.path && (
+                              <button
+                                type="button"
+                                onClick={() => handleDownloadSampleBackmapping(pottsFitClusterId, sample)}
+                                className="text-gray-400 hover:text-cyan-300"
+                                aria-label={`Download backmapping dataset for ${label}`}
+                              >
+                                <Download className="h-4 w-4" />
+                              </button>
+                            )}
+                          </div>
                         </div>
+                        {renderInlineSampleInfo(sample)}
                       </div>
                     );
                   })}
@@ -669,10 +721,8 @@ export default function SystemDetailPottsSection(props) {
               {gibbsSamples.length > 0 && (
                 <div className="space-y-1 mt-2">
                   {gibbsSamples.map((sample) => (
-                      <div
-                        key={sample.sample_id || sample.path}
-                        className="flex items-center justify-between gap-2 rounded-md border border-gray-800 bg-gray-950/40 px-2 py-1 text-[11px] text-gray-300"
-                      >
+                    <div key={sample.sample_id || sample.path} className="space-y-2">
+                      <div className="flex items-center justify-between gap-2 rounded-md border border-gray-800 bg-gray-950/40 px-2 py-1 text-[11px] text-gray-300">
                         <span className="truncate">{sample.name || 'Gibbs sample'} • {sample.created_at || ''}</span>
                         <div className="flex items-center gap-2">
                           <button
@@ -705,6 +755,8 @@ export default function SystemDetailPottsSection(props) {
                           </button>
                         </div>
                       </div>
+                      {renderInlineSampleInfo(sample)}
+                    </div>
                     ))}
                 </div>
               )}
@@ -715,10 +767,8 @@ export default function SystemDetailPottsSection(props) {
               {saSamples.length > 0 && (
                 <div className="space-y-1 mt-2">
                   {saSamples.map((sample) => (
-                      <div
-                        key={sample.sample_id || sample.path}
-                        className="flex items-center justify-between gap-2 rounded-md border border-gray-800 bg-gray-950/40 px-2 py-1 text-[11px] text-gray-300"
-                      >
+                    <div key={sample.sample_id || sample.path} className="space-y-2">
+                      <div className="flex items-center justify-between gap-2 rounded-md border border-gray-800 bg-gray-950/40 px-2 py-1 text-[11px] text-gray-300">
                         <span className="truncate">{sample.name || 'SA sample'} • {sample.created_at || ''}</span>
                         <div className="flex items-center gap-2">
                           <button
@@ -751,59 +801,12 @@ export default function SystemDetailPottsSection(props) {
                           </button>
                         </div>
                       </div>
+                      {renderInlineSampleInfo(sample)}
+                    </div>
                     ))}
                 </div>
               )}
             </div>
-
-            {infoSample && (
-              <div className="rounded-md border border-gray-800 bg-gray-950/60 p-2 text-[11px] text-gray-300 space-y-2">
-                <div className="flex items-start justify-between gap-2">
-                  <div>
-                    <p className="text-xs font-semibold text-white">{infoSample.name || infoSample.sample_id}</p>
-                    <p className="text-[10px] text-gray-500">Sample info</p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setInfoSampleId(null)}
-                    className="text-gray-400 hover:text-gray-200"
-                    aria-label="Close sample info"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-                <div className="space-y-1">
-                  <div><span className="text-gray-400">id:</span> {infoSample.sample_id}</div>
-                  {infoSample.created_at && <div><span className="text-gray-400">created:</span> {infoSample.created_at}</div>}
-                  {infoSample.method && <div><span className="text-gray-400">method:</span> {infoSample.method}</div>}
-                  {infoSample.model_names && infoSample.model_names.length > 0 && (
-                    <div><span className="text-gray-400">models:</span> {infoSample.model_names.join(', ')}</div>
-                  )}
-                  {infoSample.path && <div><span className="text-gray-400">path:</span> {infoSample.path}</div>}
-                  {infoSampleStats && (
-                    <>
-                      <div><span className="text-gray-400">frames:</span> {infoSampleStats.n_frames}</div>
-                      <div><span className="text-gray-400">residues:</span> {infoSampleStats.n_residues}</div>
-                      <div>
-                        <span className="text-gray-400">invalid:</span>{' '}
-                        {infoSampleStats.invalid_count} ({(infoSampleStats.invalid_fraction * 100).toFixed(2)}%)
-                      </div>
-                    </>
-                  )}
-                  {infoSampleStatsError && (
-                    <div className="text-red-300">{infoSampleStatsError}</div>
-                  )}
-                </div>
-                {(infoSample.summary || infoSample.params) && (
-                  <details className="text-[11px] text-gray-300">
-                    <summary className="cursor-pointer text-gray-200">Run details</summary>
-                    <pre className="mt-2 max-h-56 overflow-auto rounded bg-gray-900 p-2 text-[10px] text-gray-300">
-                      {JSON.stringify(infoSample.summary || infoSample.params, null, 2)}
-                    </pre>
-                  </details>
-                )}
-              </div>
-            )}
           </div>
         </aside>
       </div>

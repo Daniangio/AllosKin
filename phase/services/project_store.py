@@ -37,7 +37,9 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(".json.tmp")
+    # Use a unique temp file per write to avoid collisions when multiple
+    # save operations target the same JSON path in close succession.
+    tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     with open(tmp_path, "w") as fh:
         json.dump(payload, fh, indent=2)
     tmp_path.replace(path)
