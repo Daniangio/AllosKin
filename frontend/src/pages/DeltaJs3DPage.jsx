@@ -43,6 +43,17 @@ function normJs(x) {
   return clamp01(Number(x) / JS_MAX);
 }
 
+function passesFiltersByMode(dA, dB, rules, normalizedMode) {
+  if (normalizedMode) return passesAnyJsFilter(Number(dA) / JS_MAX, Number(dB) / JS_MAX, rules);
+  const scaledRules = (Array.isArray(rules) ? rules : []).map((r) => ({
+    aMin: Number(r?.aMin) * JS_MAX,
+    aMax: Number(r?.aMax) * JS_MAX,
+    bMin: Number(r?.bMin) * JS_MAX,
+    bMax: Number(r?.bMax) * JS_MAX,
+  }));
+  return passesAnyJsFilter(Number(dA), Number(dB), scaledRules);
+}
+
 function rgbToHex(r, g, b) {
   const to = (v) => {
     const x = Math.max(0, Math.min(255, Math.round(v)));
@@ -166,6 +177,7 @@ export default function DeltaJs3DPage() {
   const [edgeSmoothStrength, setEdgeSmoothStrength] = useState(0.75);
   const [hideSingleCluster, setHideSingleCluster] = useState(true);
   const [jsFilters, setJsFilters] = useState([{ aMin: 0, aMax: 1, bMin: 0, bMax: 1 }]);
+  const [displayNormalizedJs, setDisplayNormalizedJs] = useState(true);
   const [orderJsA, setOrderJsA] = useState('lowest');
   const [orderJsB, setOrderJsB] = useState('highest');
 
@@ -558,7 +570,7 @@ export default function DeltaJs3DPage() {
     const dA = Number(pair[0]);
     const dB = Number(pair[1]);
     if (!Number.isFinite(dA) || !Number.isFinite(dB)) return null;
-    const inRange = passesAnyJsFilter(dA, dB, jsFilters);
+    const inRange = passesFiltersByMode(dA, dB, jsFilters, displayNormalizedJs);
     const tag = jsABOTag(dA, dB);
     return {
       residueIndex: idx,
@@ -569,7 +581,7 @@ export default function DeltaJs3DPage() {
       tag,
       color: inRange ? jsABOColor(dA, dB) : '#9ca3af',
     };
-  }, [selectedResidueIndex, residueLabels, rowDistances, jsFilters]);
+  }, [selectedResidueIndex, residueLabels, rowDistances, jsFilters, displayNormalizedJs]);
 
   const rankedFilteredResidues = useMemo(() => {
     const out = [];
@@ -580,7 +592,7 @@ export default function DeltaJs3DPage() {
       const dAraw = Number(pair[0]);
       const dBraw = Number(pair[1]);
       if (!Number.isFinite(dAraw) || !Number.isFinite(dBraw)) continue;
-      if (!passesAnyJsFilter(dAraw, dBraw, jsFilters)) continue;
+      if (!passesFiltersByMode(dAraw, dBraw, jsFilters, displayNormalizedJs)) continue;
       if (hideSingleCluster && singleClusterByResidue[i]) continue;
       const dA = normJs(dAraw);
       const dB = normJs(dBraw);
@@ -597,7 +609,7 @@ export default function DeltaJs3DPage() {
     }
     out.sort((a, b) => a.score - b.score);
     return out;
-  }, [rowDistances, residueLabels, jsFilters, hideSingleCluster, singleClusterByResidue, orderJsA, orderJsB]);
+  }, [rowDistances, residueLabels, jsFilters, hideSingleCluster, singleClusterByResidue, orderJsA, orderJsB, displayNormalizedJs]);
 
   const handleSaveFilterSetup = useCallback(async () => {
     if (!selectedClusterId) return;
@@ -667,7 +679,7 @@ export default function DeltaJs3DPage() {
       const auth = Number.isFinite(canonicalAuth)
         ? Number(canonicalAuth) - Number(loadedStateResidShift || 0)
         : null;
-      const inRange = passesAnyJsFilter(dA, dB, jsFilters);
+      const inRange = passesFiltersByMode(dA, dB, jsFilters, displayNormalizedJs);
       const color =
         !inRange || (hideSingleCluster && singleClusterByResidue[i]) ? '#9ca3af' : jsABOColor(dA, dB);
       if (Number.isFinite(auth)) {
@@ -678,7 +690,7 @@ export default function DeltaJs3DPage() {
       colorsLabel.push(color);
     }
     return { residueIdsAuth, colorsAuth, residueIdsLabel, colorsLabel };
-  }, [rowDistances, residueLabels, hideSingleCluster, singleClusterByResidue, jsFilters, loadedStateResidShift]);
+  }, [rowDistances, residueLabels, hideSingleCluster, singleClusterByResidue, jsFilters, loadedStateResidShift, displayNormalizedJs]);
 
   const getBaseComponentWrapper = useCallback(() => {
     const plugin = pluginRef.current;
@@ -1020,6 +1032,20 @@ export default function DeltaJs3DPage() {
               </div>
             </div>
             <JsRangeFilterBuilder rules={jsFilters} onChange={setJsFilters} />
+            <div className="rounded-md border border-gray-800 bg-gray-950/30 p-2 space-y-2">
+              <label className="flex items-center gap-2 text-sm text-gray-200">
+                <input
+                  type="checkbox"
+                  checked={displayNormalizedJs}
+                  onChange={(e) => setDisplayNormalizedJs(e.target.checked)}
+                  className="h-4 w-4 text-cyan-500 rounded border-gray-700 bg-gray-950"
+                />
+                Use normalized JS for display filters [0,1]
+              </label>
+              <p className="text-[11px] text-gray-500">
+                If disabled, filter values are interpreted in raw JS units [0, ln(2)].
+              </p>
+            </div>
             <FilterSetupManager
               setups={filterSetups}
               selectedSetupId={selectedFilterSetupId}

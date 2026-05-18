@@ -30,6 +30,17 @@ function normJs(x) {
   return clamp01(Number(x) / JS_MAX);
 }
 
+function passesFiltersByMode(dA, dB, rules, normalizedMode) {
+  if (normalizedMode) return passesAnyJsFilter(Number(dA) / JS_MAX, Number(dB) / JS_MAX, rules);
+  const scaledRules = (Array.isArray(rules) ? rules : []).map((r) => ({
+    aMin: Number(r?.aMin) * JS_MAX,
+    aMax: Number(r?.aMax) * JS_MAX,
+    bMin: Number(r?.bMin) * JS_MAX,
+    bMax: Number(r?.bMax) * JS_MAX,
+  }));
+  return passesAnyJsFilter(Number(dA), Number(dB), scaledRules);
+}
+
 function edgeLabel(edge, residueLabels) {
   if (!Array.isArray(edge) || edge.length < 2) return '';
   const r = Number(edge[0]);
@@ -115,6 +126,7 @@ export default function DeltaJsEvalPage() {
   const [topKEdges, setTopKEdges] = useState(2000);
   const [hideSingleClusterResidues, setHideSingleClusterResidues] = useState(false);
   const [jsFilters, setJsFilters] = useState([{ aMin: 0, aMax: 1, bMin: 0, bMax: 1 }]);
+  const [displayNormalizedJs, setDisplayNormalizedJs] = useState(true);
   const [edgeBlendEnabled, setEdgeBlendEnabled] = useState(false);
   const [edgeBlendStrength, setEdgeBlendStrength] = useState(0.75);
 
@@ -629,7 +641,7 @@ export default function DeltaJsEvalPage() {
       for (const row of plotRows) {
         const dA = Number(a?.[row]?.[i]);
         const dB = Number(b?.[row]?.[i]);
-        if (passesAnyJsFilter(dA, dB, jsFilters)) return true;
+        if (passesFiltersByMode(dA, dB, jsFilters, displayNormalizedJs)) return true;
       }
       return false;
     });
@@ -662,6 +674,7 @@ export default function DeltaJsEvalPage() {
     hideSingleClusterResidues,
     singleClusterByResidue,
     jsFilters,
+    displayNormalizedJs,
   ]);
 
   const edgeMatrix = useMemo(() => {
@@ -674,7 +687,7 @@ export default function DeltaJsEvalPage() {
       for (const row of plotRows) {
         const dA = Number(a?.[row]?.[c]);
         const dB = Number(b?.[row]?.[c]);
-        if (passesAnyJsFilter(dA, dB, jsFilters)) return true;
+        if (passesFiltersByMode(dA, dB, jsFilters, displayNormalizedJs)) return true;
       }
       return false;
     });
@@ -697,7 +710,7 @@ export default function DeltaJsEvalPage() {
       }
     }
     return { x, y, color, custom };
-  }, [data, plotRows, analysisSampleLabels, analysisSampleIds, residueLabels, jsFilters]);
+  }, [data, plotRows, analysisSampleLabels, analysisSampleIds, residueLabels, jsFilters, displayNormalizedJs]);
 
   const blendedNodeMatrix = useMemo(() => {
     if (!edgeBlendEnabled) return null;
@@ -763,7 +776,7 @@ export default function DeltaJsEvalPage() {
       for (let rr = 0; rr < plotRows.length; rr += 1) {
         const dA = Number(rowA[rr][c]);
         const dB = Number(rowB[rr][c]);
-        if (passesAnyJsFilter(dA, dB, jsFilters)) return true;
+        if (passesFiltersByMode(dA, dB, jsFilters, displayNormalizedJs)) return true;
       }
       return false;
     });
@@ -798,6 +811,7 @@ export default function DeltaJsEvalPage() {
     hideSingleClusterResidues,
     singleClusterByResidue,
     jsFilters,
+    displayNormalizedJs,
   ]);
 
   const contactPdbList = useMemo(
@@ -1237,6 +1251,20 @@ export default function DeltaJsEvalPage() {
               )}
             </div>
             <JsRangeFilterBuilder rules={jsFilters} onChange={setJsFilters} />
+            <div className="rounded-md border border-gray-800 bg-gray-950/30 p-3 space-y-2">
+              <div className="text-xs text-gray-300">JS units for display/filtering</div>
+              <label className="flex items-center gap-2 text-xs text-gray-200">
+                <input
+                  type="checkbox"
+                  checked={displayNormalizedJs}
+                  onChange={(e) => setDisplayNormalizedJs(e.target.checked)}
+                />
+                Use normalized JS in [0,1] (default)
+              </label>
+              <p className="text-[11px] text-gray-500">
+                When enabled, display filters are applied on normalized JS. Raw JS range is [0, ln(2)].
+              </p>
+            </div>
             <FilterSetupManager
               setups={filterSetups}
               selectedSetupId={selectedFilterSetupId}

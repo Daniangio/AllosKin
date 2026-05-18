@@ -60,6 +60,23 @@ function jsABOColor(dA, dB, alpha = 1) {
   return rgba(r, g, b, alpha);
 }
 
+function jsForDisplay(value, normalized) {
+  const v = Number(value);
+  if (!Number.isFinite(v)) return Number.NaN;
+  return normalized ? (v / JS_MAX) : v;
+}
+
+function passesFiltersByMode(dA, dB, rules, normalizedMode) {
+  if (normalizedMode) return passesAnyJsFilter(Number(dA) / JS_MAX, Number(dB) / JS_MAX, rules);
+  const scaledRules = (Array.isArray(rules) ? rules : []).map((r) => ({
+    aMin: Number(r?.aMin) * JS_MAX,
+    aMax: Number(r?.aMax) * JS_MAX,
+    bMin: Number(r?.bMin) * JS_MAX,
+    bMax: Number(r?.bMax) * JS_MAX,
+  }));
+  return passesAnyJsFilter(Number(dA), Number(dB), scaledRules);
+}
+
 function formatAnalysisShortMeta(entry) {
   const ts = String(entry?.updated_at || entry?.created_at || '').slice(0, 19) || 'n/a';
   const n = Number(entry?.summary?.n_samples || 0);
@@ -163,6 +180,9 @@ export default function DeltaJsTablePage() {
 
   const [selectedSampleIds, setSelectedSampleIds] = useState([]);
   const [jsFilters, setJsFilters] = useState([{ aMin: 0, aMax: 1, bMin: 0, bMax: 1 }]);
+  const [edgeSmoothEnabled, setEdgeSmoothEnabled] = useState(false);
+  const [edgeSmoothStrength, setEdgeSmoothStrength] = useState(0.75);
+  const [displayNormalizedJs, setDisplayNormalizedJs] = useState(true);
 
   const [filterSetups, setFilterSetups] = useState([]);
   const [filterSetupsError, setFilterSetupsError] = useState(null);
@@ -358,6 +378,14 @@ export default function DeltaJsTablePage() {
     analysisSampleIds.forEach((sid, idx) => m.set(String(sid), idx));
     return m;
   }, [analysisSampleIds]);
+  const jsEdgeA = useMemo(() => (Array.isArray(data?.data?.js_edge_a) ? data.data.js_edge_a : []), [data]);
+  const jsEdgeB = useMemo(() => (Array.isArray(data?.data?.js_edge_b) ? data.data.js_edge_b : []), [data]);
+  const topEdgeIndices = useMemo(
+    () => (Array.isArray(data?.data?.top_edge_indices) ? data.data.top_edge_indices : []),
+    [data]
+  );
+  const edgesAll = useMemo(() => (Array.isArray(data?.data?.edges) ? data.data.edges : []), [data]);
+  const DEdge = useMemo(() => (Array.isArray(data?.data?.D_edge) ? data.data.D_edge : []), [data]);
 
   useEffect(() => {
     if (!analysisSampleIds.length) {
@@ -389,12 +417,62 @@ export default function DeltaJsTablePage() {
       if (idx == null) continue;
       perTrajPass[sid] = new Array(residueLabels.length).fill(false);
       values[sid] = new Array(residueLabels.length).fill(null);
+      const useEdgeBlend =
+        edgeSmoothEnabled &&
+        edgeSmoothStrength > 0 &&
+        Array.isArray(jsEdgeA?.[idx]) &&
+        Array.isArray(jsEdgeB?.[idx]) &&
+        topEdgeIndices.length > 0;
+      let blendedA = null;
+      let blendedB = null;
+      if (useEdgeBlend) {
+        const nRes = residueLabels.length;
+        const dA0 = new Array(nRes).fill(Number.NaN);
+        const dB0 = new Array(nRes).fill(Number.NaN);
+        for (let r = 0; r < nRes; r += 1) {
+          dA0[r] = Number(nodeA?.[idx]?.[r]);
+          dB0[r] = Number(nodeB?.[idx]?.[r]);
+        }
+        const sumW = new Array(nRes).fill(0);
+        const sumWA = new Array(nRes).fill(0);
+        const sumWB = new Array(nRes).fill(0);
+        for (let col = 0; col < topEdgeIndices.length; col += 1) {
+          const eidx = Number(topEdgeIndices[col]);
+          const e = edgesAll?.[eidx];
+          if (!Array.isArray(e) || e.length < 2) continue;
+          const r = Number(e[0]);
+          const s = Number(e[1]);
+          if (!Number.isInteger(r) || !Number.isInteger(s) || r < 0 || s < 0 || r >= nRes || s >= nRes) continue;
+          const dAe = Number(jsEdgeA[idx][col]);
+          const dBe = Number(jsEdgeB[idx][col]);
+          if (!Number.isFinite(dAe) || !Number.isFinite(dBe)) continue;
+          const wRaw = Number.isFinite(Number(DEdge?.[eidx])) ? Math.abs(Number(DEdge[eidx])) : 1.0;
+          const w = wRaw > 1e-12 ? wRaw : 1.0;
+          sumW[r] += w;
+          sumWA[r] += w * dAe;
+          sumWB[r] += w * dBe;
+          sumW[s] += w;
+          sumWA[s] += w * dAe;
+          sumWB[s] += w * dBe;
+        }
+        blendedA = new Array(nRes).fill(Number.NaN);
+        blendedB = new Array(nRes).fill(Number.NaN);
+        const strength = clamp01(Number(edgeSmoothStrength));
+        for (let r = 0; r < nRes; r += 1) {
+          const dAVal = dA0[r];
+          const dBVal = dB0[r];
+          const eA = sumW[r] > 0 ? sumWA[r] / sumW[r] : dAVal;
+          const eB = sumW[r] > 0 ? sumWB[r] / sumW[r] : dBVal;
+          blendedA[r] = Number.isFinite(dAVal) ? ((1 - strength) * dAVal + strength * eA) : Number.NaN;
+          blendedB[r] = Number.isFinite(dBVal) ? ((1 - strength) * dBVal + strength * eB) : Number.NaN;
+        }
+      }
       for (let r = 0; r < residueLabels.length; r += 1) {
-        const dA = Number(nodeA?.[idx]?.[r]);
-        const dB = Number(nodeB?.[idx]?.[r]);
+        const dA = blendedA ? Number(blendedA[r]) : Number(nodeA?.[idx]?.[r]);
+        const dB = blendedB ? Number(blendedB[r]) : Number(nodeB?.[idx]?.[r]);
         if (!Number.isFinite(dA) || !Number.isFinite(dB)) continue;
         values[sid][r] = { dA, dB };
-        const pass = passesAnyJsFilter(dA, dB, jsFilters);
+        const pass = passesFiltersByMode(dA, dB, jsFilters, displayNormalizedJs);
         perTrajPass[sid][r] = pass;
         if (pass) include[r] = true;
       }
@@ -437,7 +515,22 @@ export default function DeltaJsTablePage() {
       return String(a.residue).localeCompare(String(b.residue));
     });
     return rows;
-  }, [data, selectedSampleIds, sampleIndexById, residueLabels, jsFilters, rowGroups]);
+  }, [
+    data,
+    selectedSampleIds,
+    sampleIndexById,
+    residueLabels,
+    jsFilters,
+    displayNormalizedJs,
+    rowGroups,
+    edgeSmoothEnabled,
+    edgeSmoothStrength,
+    jsEdgeA,
+    jsEdgeB,
+    topEdgeIndices,
+    edgesAll,
+    DEdge,
+  ]);
 
   const groupedRows = useMemo(() => {
     const out = [];
@@ -700,6 +793,47 @@ export default function DeltaJsTablePage() {
             </div>
 
             <JsRangeFilterBuilder rules={jsFilters} onChange={setJsFilters} />
+            <div className="rounded-md border border-gray-800 bg-gray-950/30 p-3 space-y-2">
+              <div className="text-xs text-gray-300">Residue score mode</div>
+              <label className="flex items-center gap-2 text-xs text-gray-200">
+                <input
+                  type="checkbox"
+                  checked={edgeSmoothEnabled}
+                  onChange={(e) => setEdgeSmoothEnabled(e.target.checked)}
+                />
+                Edge-weighted node blending
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="range"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={edgeSmoothStrength}
+                  onChange={(e) => setEdgeSmoothStrength(Number(e.target.value))}
+                  disabled={!edgeSmoothEnabled}
+                  className="w-full"
+                />
+                <span className="text-xs text-gray-400 w-12 text-right">{edgeSmoothStrength.toFixed(2)}</span>
+              </div>
+              <p className="text-[11px] text-gray-500">
+                Off: node-only JS. On: blend node JS with adjacent edge JS using the selected weight.
+              </p>
+            </div>
+            <div className="rounded-md border border-gray-800 bg-gray-950/30 p-3 space-y-2">
+              <div className="text-xs text-gray-300">JS units</div>
+              <label className="flex items-center gap-2 text-xs text-gray-200">
+                <input
+                  type="checkbox"
+                  checked={displayNormalizedJs}
+                  onChange={(e) => setDisplayNormalizedJs(e.target.checked)}
+                />
+                Show normalized JS in [0,1] (default)
+              </label>
+              <p className="text-[11px] text-gray-500">
+                Raw JS uses natural logs and ranges in [0, ln(2)=0.693]. Normalized JS = raw / ln(2).
+              </p>
+            </div>
             <FilterSetupManager
               setups={filterSetups}
               selectedSetupId={selectedFilterSetupId}
@@ -846,6 +980,8 @@ export default function DeltaJsTablePage() {
                           {row.cellValues.map((cell) => {
                             const dA = Number(cell?.value?.dA);
                             const dB = Number(cell?.value?.dB);
+                            const dAShow = jsForDisplay(dA, displayNormalizedJs);
+                            const dBShow = jsForDisplay(dB, displayNormalizedJs);
                             const has = Number.isFinite(dA) && Number.isFinite(dB);
                             const bg = has ? jsABOColor(dA, dB, cell.passes ? 0.95 : 0.25) : 'rgba(31,41,55,1)';
                             return (
@@ -853,9 +989,13 @@ export default function DeltaJsTablePage() {
                                 key={`c:${row.residueIndex}:${cell.sampleId}`}
                                 className="px-2 py-1 text-gray-100 border-l border-gray-900 whitespace-nowrap"
                                 style={{ background: bg }}
-                                title={has ? `JS(A)=${dA.toFixed(4)}; JS(B)=${dB.toFixed(4)}${cell.passes ? '' : ' (not passing filter)'}` : 'No value'}
+                                title={
+                                  has
+                                    ? `JS(A): raw=${dA.toFixed(4)}, norm=${(dA / JS_MAX).toFixed(4)}; JS(B): raw=${dB.toFixed(4)}, norm=${(dB / JS_MAX).toFixed(4)}${cell.passes ? '' : ' (not passing filter)'}`
+                                    : 'No value'
+                                }
                               >
-                                {has ? `${dA.toFixed(2)} / ${dB.toFixed(2)}` : '-'}
+                                {has ? `${dAShow.toFixed(2)} / ${dBShow.toFixed(2)}` : '-'}
                               </td>
                             );
                           })}
@@ -879,10 +1019,17 @@ export default function DeltaJsTablePage() {
               ].map((row) => (
                 <div key={row.label} className="rounded border border-gray-800 p-2" style={{ background: jsABOColor(row.dA, row.dB, 0.95) }}>
                   <div className="font-semibold text-white">{row.label}</div>
-                  <div className="text-gray-100">JS(A)={row.dA.toFixed(1)}, JS(B)={row.dB.toFixed(1)}</div>
+                  <div className="text-gray-100">
+                    {displayNormalizedJs
+                      ? `JS(A)=${(row.dA / JS_MAX).toFixed(2)}, JS(B)=${(row.dB / JS_MAX).toFixed(2)}`
+                      : `JS(A)=${row.dA.toFixed(2)}, JS(B)=${row.dB.toFixed(2)}`}
+                  </div>
                 </div>
               ))}
             </div>
+            <p className="mt-2 text-[11px] text-gray-500">
+              Colors are always computed from raw JS; this toggle changes only displayed numeric units.
+            </p>
           </div>
         </main>
       </div>
