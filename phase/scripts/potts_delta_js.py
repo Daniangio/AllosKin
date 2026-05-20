@@ -30,7 +30,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--keep-invalid", action="store_true")
     ap.add_argument("--top-k-residues", type=int, default=20)
     ap.add_argument("--top-k-edges", type=int, default=30)
-    ap.add_argument("--node-edge-alpha", type=float, default=0.5)
     ap.add_argument(
         "--edge-mode",
         default="",
@@ -85,7 +84,6 @@ def main(argv: list[str] | None = None) -> int:
         drop_invalid=not bool(args.keep_invalid),
         top_k_residues=int(args.top_k_residues),
         top_k_edges=int(args.top_k_edges),
-        node_edge_alpha=float(args.node_edge_alpha),
         edge_mode=(edge_mode or None),
         contact_state_ids=contact_state_ids or None,
         contact_pdbs=contact_pdbs or None,

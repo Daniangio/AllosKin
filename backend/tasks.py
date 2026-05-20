@@ -2761,7 +2761,6 @@ def run_delta_js_job(
         top_k_residues = int(params.get("top_k_residues", 20))
         top_k_edges = int(params.get("top_k_edges", 30))
         ranking_method = str(params.get("ranking_method") or "js_ab").strip()
-        node_edge_alpha = float(params.get("node_edge_alpha", 0.5))
         edge_mode = str(params.get("edge_mode") or "").strip().lower()
         if edge_mode and edge_mode not in {"cluster", "all_vs_all", "contact"}:
             raise ValueError("edge_mode must be one of: cluster, all_vs_all, contact.")
@@ -2805,7 +2804,6 @@ def run_delta_js_job(
             top_k_residues=top_k_residues,
             top_k_edges=top_k_edges,
             ranking_method=ranking_method,
-            node_edge_alpha=node_edge_alpha,
             edge_mode=(edge_mode or None),
             contact_state_ids=contact_state_ids,
             contact_pdbs=contact_pdbs,

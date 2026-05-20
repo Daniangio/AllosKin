@@ -1074,11 +1074,6 @@ async def submit_delta_js_job(
         raise HTTPException(status_code=400, detail="top_k_residues must be >= 1.")
     if payload.top_k_edges is not None and int(payload.top_k_edges) < 1:
         raise HTTPException(status_code=400, detail="top_k_edges must be >= 1.")
-    if payload.node_edge_alpha is not None:
-        alpha = float(payload.node_edge_alpha)
-        if not (0.0 <= alpha <= 1.0):
-            raise HTTPException(status_code=400, detail="node_edge_alpha must be in [0,1].")
-
     edge_mode = str(payload.edge_mode or "").strip().lower()
     if edge_mode and edge_mode not in {"cluster", "all_vs_all", "contact"}:
         raise HTTPException(status_code=400, detail="edge_mode must be one of: cluster, all_vs_all, contact.")

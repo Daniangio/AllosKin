@@ -246,16 +246,28 @@ export default function SamplingVizPage() {
     [stateEntries]
   );
 
+  const analysisLinkedSampleIds = useMemo(() => {
+    if (!selectedAnalysisModelId) return new Set();
+    const linked = new Set();
+    analyses.forEach((analysis) => {
+      if (analysis?.model_id !== selectedAnalysisModelId) return;
+      const sampleId = String(analysis?.sample_id || '').trim();
+      if (sampleId) linked.add(sampleId);
+    });
+    return linked;
+  }, [analyses, selectedAnalysisModelId]);
+
   const filteredSamples = useMemo(() => {
     if (!selectedAnalysisModelId) return sampleEntries;
     return sampleEntries.filter((s) => {
       if (s.type === 'md_eval') return true;
       if (s.type === 'potts_lambda_sweep') return true;
+      if (analysisLinkedSampleIds.has(String(s.sample_id || ''))) return true;
       const ids = Array.isArray(s.model_ids) ? s.model_ids : s.model_id ? [s.model_id] : [];
       if (!ids.length) return true;
       return ids.includes(selectedAnalysisModelId);
     });
-  }, [sampleEntries, selectedAnalysisModelId]);
+  }, [sampleEntries, selectedAnalysisModelId, analysisLinkedSampleIds]);
   const gibbsSamples = useMemo(
     () => filteredSamples.filter((s) => s.type === 'potts_sampling' && s.method === 'gibbs'),
     [filteredSamples]
@@ -1209,6 +1221,9 @@ export default function SamplingVizPage() {
                             <span className="text-[10px] text-gray-500 whitespace-nowrap">
                               {group.mdVsCount} compare · {group.energyCount} energy
                             </span>
+                          </div>
+                          <div className="text-[10px] text-gray-500 mt-0.5 font-mono">
+                            {String(group.modelId || '').slice(0, 8)}
                           </div>
                         </button>
                         <button

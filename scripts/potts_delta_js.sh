@@ -47,34 +47,6 @@ if [ -z "$CLUSTER_ID" ]; then
   exit 1
 fi
 
-USE_MODELS="false"
-if prompt_bool "Use Potts model pair (for edge set + optional ref inference)? (y/N)" "N"; then
-  USE_MODELS="true"
-fi
-
-MODEL_A_ID=""
-MODEL_B_ID=""
-if [ "$USE_MODELS" = "true" ]; then
-  MODEL_LINES="$(_offline_list list-models --project-id "$OFFLINE_PROJECT_ID" --system-id "$OFFLINE_SYSTEM_ID" || true)"
-  MODEL_LINES="$(printf "%s\n" "$MODEL_LINES" | awk -F'|' -v cid="$CLUSTER_ID" '$4==cid')"
-  if [ -z "$(trim "$MODEL_LINES")" ]; then
-    echo "No Potts models found for cluster: $CLUSTER_ID" >&2
-    exit 1
-  fi
-  MODEL_A_ROW="$(offline_choose_one "Select model A:" "$MODEL_LINES")"
-  MODEL_A_ID="$(printf "%s" "$MODEL_A_ROW" | awk -F'|' '{print $1}')"
-  MODEL_B_ROW="$(offline_choose_one "Select model B:" "$MODEL_LINES")"
-  MODEL_B_ID="$(printf "%s" "$MODEL_B_ROW" | awk -F'|' '{print $1}')"
-  if [ -z "$MODEL_A_ID" ] || [ -z "$MODEL_B_ID" ]; then
-    echo "Model A and B are required." >&2
-    exit 1
-  fi
-  if [ "$MODEL_A_ID" = "$MODEL_B_ID" ]; then
-    echo "Model A and B must be different." >&2
-    exit 1
-  fi
-fi
-
 export _PHASE_DJS_ROOT="$OFFLINE_ROOT"
 export _PHASE_DJS_PROJECT="$OFFLINE_PROJECT_ID"
 export _PHASE_DJS_SYSTEM="$OFFLINE_SYSTEM_ID"
@@ -111,22 +83,18 @@ fi
 
 REF_A_IDS=""
 REF_B_IDS=""
-if [ "$USE_MODELS" = "true" ] && prompt_bool "Infer references from model state_ids? (Y/n)" "Y"; then
-  :
-else
-  MD_LINES="$(printf "%s\n" "$SAMPLE_LINES" | awk -F'|' '$3=="md_eval"')"
-  if [ -z "$(trim "$MD_LINES")" ]; then
-    echo "No md_eval samples available for manual references." >&2
-    exit 1
-  fi
-  REF_A_ROWS="$(offline_choose_multi "Select reference samples for side A:" "$MD_LINES")"
-  REF_B_ROWS="$(offline_choose_multi "Select reference samples for side B:" "$MD_LINES")"
-  REF_A_IDS="$(printf "%s\n" "$REF_A_ROWS" | awk -F'|' '{print $1}' | awk 'NF' | paste -sd',' -)"
-  REF_B_IDS="$(printf "%s\n" "$REF_B_ROWS" | awk -F'|' '{print $1}' | awk 'NF' | paste -sd',' -)"
-  if [ -z "$REF_A_IDS" ] || [ -z "$REF_B_IDS" ]; then
-    echo "Reference samples for both A and B are required." >&2
-    exit 1
-  fi
+MD_LINES="$(printf "%s\n" "$SAMPLE_LINES" | awk -F'|' '$3=="md_eval"')"
+if [ -z "$(trim "$MD_LINES")" ]; then
+  echo "No md_eval samples available for manual references." >&2
+  exit 1
+fi
+REF_A_ROWS="$(offline_choose_multi "Select reference samples for side A:" "$MD_LINES")"
+REF_B_ROWS="$(offline_choose_multi "Select reference samples for side B:" "$MD_LINES")"
+REF_A_IDS="$(printf "%s\n" "$REF_A_ROWS" | awk -F'|' '{print $1}' | awk 'NF' | paste -sd',' -)"
+REF_B_IDS="$(printf "%s\n" "$REF_B_ROWS" | awk -F'|' '{print $1}' | awk 'NF' | paste -sd',' -)"
+if [ -z "$REF_A_IDS" ] || [ -z "$REF_B_IDS" ]; then
+  echo "Reference samples for both A and B are required." >&2
+  exit 1
 fi
 
 EDGE_MODE=""
@@ -134,28 +102,26 @@ CONTACT_STATE_IDS=""
 CONTACT_PDBS=""
 CONTACT_CUTOFF="10.0"
 CONTACT_ATOM_MODE="CA"
-if [ "$USE_MODELS" != "true" ]; then
-  EDGE_MODE="$(prompt "Edge mode (cluster/all_vs_all/contact)" "contact")"
-  EDGE_MODE="$(printf "%s" "$EDGE_MODE" | tr '[:upper:]' '[:lower:]')"
-  case "$EDGE_MODE" in
-    cluster|all_vs_all|contact) ;;
-    *) EDGE_MODE="contact" ;;
-  esac
-  if [ "$EDGE_MODE" = "contact" ]; then
-    if prompt_bool "Select contact PDBs from states? (Y/n)" "Y"; then
-      STATE_ROWS="$(offline_select_states)"
-      CONTACT_STATE_IDS="$(printf "%s\n" "$STATE_ROWS" | awk -F'|' '{print $1}' | awk 'NF' | paste -sd',' -)"
-    fi
-    CONTACT_PDBS="$(prompt "Extra contact PDB paths (comma separated, optional)" "")"
-    CONTACT_PDBS="$(trim "$CONTACT_PDBS")"
-    CONTACT_CUTOFF="$(prompt "Contact cutoff (A)" "10.0")"
-    CONTACT_ATOM_MODE="$(prompt "Contact atom mode (CA/CM)" "CA")"
-    CONTACT_ATOM_MODE="$(printf "%s" "$CONTACT_ATOM_MODE" | tr '[:lower:]' '[:upper:]')"
-    if [ "$CONTACT_ATOM_MODE" != "CM" ]; then CONTACT_ATOM_MODE="CA"; fi
-    if [ -z "$CONTACT_STATE_IDS" ] && [ -z "$CONTACT_PDBS" ]; then
-      echo "edge_mode=contact requires at least one state or PDB path." >&2
-      exit 1
-    fi
+EDGE_MODE="$(prompt "Edge mode (cluster/all_vs_all/contact)" "contact")"
+EDGE_MODE="$(printf "%s" "$EDGE_MODE" | tr '[:upper:]' '[:lower:]')"
+case "$EDGE_MODE" in
+  cluster|all_vs_all|contact) ;;
+  *) EDGE_MODE="contact" ;;
+esac
+if [ "$EDGE_MODE" = "contact" ]; then
+  if prompt_bool "Select contact PDBs from states? (Y/n)" "Y"; then
+    STATE_ROWS="$(offline_select_states)"
+    CONTACT_STATE_IDS="$(printf "%s\n" "$STATE_ROWS" | awk -F'|' '{print $1}' | awk 'NF' | paste -sd',' -)"
+  fi
+  CONTACT_PDBS="$(prompt "Extra contact PDB paths (comma separated, optional)" "")"
+  CONTACT_PDBS="$(trim "$CONTACT_PDBS")"
+  CONTACT_CUTOFF="$(prompt "Contact cutoff (A)" "10.0")"
+  CONTACT_ATOM_MODE="$(prompt "Contact atom mode (CA/CM)" "CA")"
+  CONTACT_ATOM_MODE="$(printf "%s" "$CONTACT_ATOM_MODE" | tr '[:lower:]' '[:upper:]')"
+  if [ "$CONTACT_ATOM_MODE" != "CM" ]; then CONTACT_ATOM_MODE="CA"; fi
+  if [ -z "$CONTACT_STATE_IDS" ] && [ -z "$CONTACT_PDBS" ]; then
+    echo "edge_mode=contact requires at least one state or PDB path." >&2
+    exit 1
   fi
 fi
 
@@ -166,7 +132,6 @@ KEEP_INVALID="false"
 if prompt_bool "Keep invalid frames? (y/N)" "N"; then KEEP_INVALID="true"; fi
 TOP_K_RES="$(prompt "Top residues" "20")"
 TOP_K_EDGES="$(prompt "Top edges" "2000")"
-ALPHA="$(prompt "Node/edge mix alpha [0..1]" "0.5")"
 
 CMD=(
   "$PYTHON_BIN" -m phase.scripts.potts_delta_js
@@ -178,18 +143,13 @@ CMD=(
   --md-label-mode "$MD_LABEL_MODE"
   --top-k-residues "$TOP_K_RES"
   --top-k-edges "$TOP_K_EDGES"
-  --node-edge-alpha "$ALPHA"
+  --edge-mode "$EDGE_MODE"
 )
 
-if [ "$USE_MODELS" = "true" ]; then
-  CMD+=(--model-a-id "$MODEL_A_ID" --model-b-id "$MODEL_B_ID")
-else
-  CMD+=(--edge-mode "$EDGE_MODE")
-  if [ -n "$CONTACT_STATE_IDS" ]; then CMD+=(--contact-state-ids "$CONTACT_STATE_IDS"); fi
-  if [ -n "$CONTACT_PDBS" ]; then CMD+=(--contact-pdbs "$CONTACT_PDBS"); fi
-  if [ "$EDGE_MODE" = "contact" ]; then
-    CMD+=(--contact-cutoff "$CONTACT_CUTOFF" --contact-atom-mode "$CONTACT_ATOM_MODE")
-  fi
+if [ -n "$CONTACT_STATE_IDS" ]; then CMD+=(--contact-state-ids "$CONTACT_STATE_IDS"); fi
+if [ -n "$CONTACT_PDBS" ]; then CMD+=(--contact-pdbs "$CONTACT_PDBS"); fi
+if [ "$EDGE_MODE" = "contact" ]; then
+  CMD+=(--contact-cutoff "$CONTACT_CUTOFF" --contact-atom-mode "$CONTACT_ATOM_MODE")
 fi
 if [ -n "$REF_A_IDS" ]; then CMD+=(--ref-a-sample-ids "$REF_A_IDS"); fi
 if [ -n "$REF_B_IDS" ]; then CMD+=(--ref-b-sample-ids "$REF_B_IDS"); fi
@@ -198,13 +158,8 @@ if [ "$KEEP_INVALID" = "true" ]; then CMD+=(--keep-invalid); fi
 echo ""
 echo "Running delta JS analysis..."
 echo "  cluster: $CLUSTER_ID"
-if [ "$USE_MODELS" = "true" ]; then
-  echo "  model A: $MODEL_A_ID"
-  echo "  model B: $MODEL_B_ID"
-else
-  echo "  model pair: (none)"
-  echo "  edge mode: $EDGE_MODE"
-fi
+echo "  model pair: (none)"
+echo "  edge mode: $EDGE_MODE"
 echo "  sample_ids: $SAMPLE_IDS"
 echo ""
 exec "${CMD[@]}"

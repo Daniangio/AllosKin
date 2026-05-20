@@ -246,7 +246,6 @@ class DeltaJsJobRequest(BaseModel):
     top_k_residues: Optional[int] = None
     top_k_edges: Optional[int] = None
     ranking_method: Optional[str] = None
-    node_edge_alpha: Optional[float] = None
     edge_mode: Optional[str] = None  # cluster|all_vs_all|contact (required if no model pair)
     contact_state_ids: Optional[List[str]] = None
     contact_pdbs: Optional[List[str]] = None

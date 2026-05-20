@@ -6,13 +6,10 @@ This analysis compares each sample against two references (A and B) using Jensen
 - `JS(B)`: distance of the sample distribution from reference B
 - lower JS means more similar
 
-Potts models are optional:
-- if provided, model pair is used to define the edge set and can auto-infer references from model state_ids
-- if not provided, you must choose an edge mode:
-  - `cluster`: use edges from `cluster.npz`
-  - `all_vs_all`: complete graph over residues
-  - `contact`: build edges from structure contacts (same contact logic used in Potts fitting)
-and provide explicit reference sample sets A and B
+Choose an edge mode and explicit reference sample sets A and B:
+- `cluster`: use edges from `cluster.npz`
+- `all_vs_all`: complete graph over residues
+- `contact`: build edges from structure contacts (same contact logic used in Potts fitting)
 
 ## Exact Formulas (Current `upsert_delta_js_analysis`)
 
@@ -55,9 +52,7 @@ Weighted aggregates (stored as scalar summaries in analysis NPZ):
 `JS_edge_weighted^A(s) = sum_(i,j in topE) D_{ij} * JS_{ij}^A(s) / sum_(i,j in topE) D_{ij}`
 `JS_edge_weighted^B(s) = sum_(i,j in topE) D_{ij} * JS_{ij}^B(s) / sum_(i,j in topE) D_{ij}`
 
-Final mixed score (`node_edge_alpha = alpha`):
-- `JS_mixed^A(s) = (1 - alpha) * JS_node_weighted^A(s) + alpha * JS_edge_weighted^A(s)`
-- `JS_mixed^B(s) = (1 - alpha) * JS_node_weighted^B(s) + alpha * JS_edge_weighted^B(s)`
+Node/edge mixing is not stored by the analysis. Any node + edge combination is a visualization-time choice.
 
 If no edges are available, edge-weighted terms fall back to node-weighted values.
 
@@ -97,7 +92,6 @@ So the final edge score is driven mostly by edges that truly separate A from B.
 
 - `top_k_residues`: number of residues kept in top ranking (`D_residue`)
 - `top_k_edges`: number of edges kept in top ranking (`D_edge`)
-- `node_edge_alpha` in `[0,1]`: interpolation used only for scalar summary outputs (`js_mixed_a/b`), not for the default residue/edge heatmaps
 - `ranking_method`: currently only `js_ab`
 - `md_label_mode`: `assigned` or `halo`
 - `drop_invalid`: drops frames flagged as invalid in sample metadata

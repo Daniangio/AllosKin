@@ -325,14 +325,14 @@ export default function DeltaJsEvalPage() {
       });
       const arr = Array.isArray(res?.setups) ? res.setups : [];
       setFilterSetups(arr);
-      if (!arr.some((x) => String(x?.setup_id) === String(selectedFilterSetupId))) {
-        setSelectedFilterSetupId(arr.length ? String(arr[0].setup_id) : '');
-      }
+      setSelectedFilterSetupId((prev) =>
+        arr.some((x) => String(x?.setup_id) === String(prev)) ? prev : (arr.length ? String(arr[0].setup_id) : '')
+      );
     } catch (err) {
       setFilterSetups([]);
       setFilterSetupsError(err.message || 'Failed to load filter setups.');
     }
-  }, [projectId, systemId, selectedClusterId, selectedFilterSetupId]);
+  }, [projectId, systemId, selectedClusterId]);
 
   useEffect(() => {
     if (!selectedClusterId) return;

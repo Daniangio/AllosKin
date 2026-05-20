@@ -3576,7 +3576,6 @@ def upsert_delta_js_analysis(
     top_k_residues: int = 20,
     top_k_edges: int = 30,
     ranking_method: str = "js_ab",
-    node_edge_alpha: float = 0.5,
     edge_mode: str | None = None,
     contact_state_ids: Sequence[str] | None = None,
     contact_pdbs: Sequence[str] | None = None,
@@ -3611,10 +3610,6 @@ def upsert_delta_js_analysis(
     ranking_method = (ranking_method or "js_ab").strip().lower()
     if ranking_method not in {"js_ab"}:
         raise ValueError("ranking_method must be 'js_ab'.")
-    node_edge_alpha = float(node_edge_alpha)
-    if not np.isfinite(node_edge_alpha) or node_edge_alpha < 0.0 or node_edge_alpha > 1.0:
-        raise ValueError("node_edge_alpha must be in [0,1].")
-
     edge_mode = (edge_mode or "").strip().lower()
     if edge_mode and edge_mode not in {"cluster", "all_vs_all", "contact"}:
         raise ValueError("edge_mode must be one of: cluster, all_vs_all, contact.")
@@ -3963,7 +3958,6 @@ def upsert_delta_js_analysis(
             "md_label_mode": md_label_mode,
             "drop_invalid": bool(drop_invalid),
             "ranking_method": ranking_method,
-            "node_edge_alpha": float(node_edge_alpha),
             "ref_a": list(map(str, sorted(ref_ids_a))),
             "ref_b": list(map(str, sorted(ref_ids_b))),
         }
@@ -4075,9 +4069,6 @@ def upsert_delta_js_analysis(
     js_node_weighted_b = np.zeros((len(merged),), dtype=float)
     js_edge_weighted_a = np.zeros((len(merged),), dtype=float)
     js_edge_weighted_b = np.zeros((len(merged),), dtype=float)
-    js_mixed_a = np.zeros((len(merged),), dtype=float)
-    js_mixed_b = np.zeros((len(merged),), dtype=float)
-
     top_edge_weights = np.asarray([float(D_edge[int(eidx)]) for eidx in top_edge_indices.tolist()], dtype=float)
     for row, sid in enumerate(merged):
         entry = sample_by_id.get(sid)
@@ -4129,13 +4120,6 @@ def upsert_delta_js_analysis(
             js_edge_weighted_a[row] = js_node_weighted_a[row]
             js_edge_weighted_b[row] = js_node_weighted_b[row]
 
-        a_node = float(js_node_weighted_a[row])
-        b_node = float(js_node_weighted_b[row])
-        a_edge = float(js_edge_weighted_a[row])
-        b_edge = float(js_edge_weighted_b[row])
-        js_mixed_a[row] = (1.0 - node_edge_alpha) * a_node + node_edge_alpha * a_edge
-        js_mixed_b[row] = (1.0 - node_edge_alpha) * b_node + node_edge_alpha * b_edge
-
     p_node_ref_a_padded = np.zeros((N, K_max), dtype=float)
     p_node_ref_b_padded = np.zeros((N, K_max), dtype=float)
     for i in range(N):
@@ -4166,9 +4150,6 @@ def upsert_delta_js_analysis(
         js_node_weighted_b=np.asarray(js_node_weighted_b, dtype=float),
         js_edge_weighted_a=np.asarray(js_edge_weighted_a, dtype=float),
         js_edge_weighted_b=np.asarray(js_edge_weighted_b, dtype=float),
-        js_mixed_a=np.asarray(js_mixed_a, dtype=float),
-        js_mixed_b=np.asarray(js_mixed_b, dtype=float),
-        node_edge_alpha=np.asarray([float(node_edge_alpha)], dtype=float),
     )
 
     now = _utc_now()
@@ -4205,7 +4186,6 @@ def upsert_delta_js_analysis(
         "top_k_residues": int(top_k_r),
         "top_k_edges": int(top_k_e),
         "ranking_method": ranking_method,
-        "node_edge_alpha": float(node_edge_alpha),
         "reference_sample_ids_a": list(ref_ids_a),
         "reference_sample_ids_b": list(ref_ids_b),
         "paths": {"analysis_npz": str(npz_path.relative_to(system_dir))},
